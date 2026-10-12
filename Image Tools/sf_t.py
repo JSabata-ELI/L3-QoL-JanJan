@@ -81,8 +81,9 @@ def _make_stepped_lut_sf(stops):
     return lut
 
 # NI Vision "Binary", measured off the real viewer — same table and rule as in is_t.py,
-# where how it was measured is written down. 15 colours, black below the first band, one
-# colour per 1024 stored 16-bit units. No white and no grey anywhere in the cycle.
+# where how it was measured is written down. 256 entries on the absolute scale (raw
+# counts >> 4): entry 0 black, 255 white, 1..254 the 15-colour cycle — a new colour every
+# 16 counts.
 _NI_BINARY_CYCLE_SF = [
     (255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
     (255,127,0), (255,0,127), (127,255,0), (127,0,255), (0,127,255), (0,255,127),
@@ -90,23 +91,47 @@ _NI_BINARY_CYCLE_SF = [
 ]
 
 def _make_ni_binary_lut_sf():
-    """The NI Binary rule as a 256-entry LUT over the ABSOLUTE 8-bit scale.
+    """The NI Binary table as a 256-entry LUT over the ABSOLUTE 8-bit scale.
 
-    This tab renders from 8-bit images, so unlike the Image Slider it cannot take the
-    exact 16-bit path: one code is 257 stored units against a 1024-unit band."""
+    This tab renders from 8-bit images (code = stored / 257, NI uses stored >> 8), so
+    unlike the Image Slider a code can land one entry out."""
+    i = _np_grad.arange(256)
     table = _np_grad.array([(0, 0, 0)] + _NI_BINARY_CYCLE_SF, dtype=_np_grad.uint8)
-    band = (_np_grad.arange(256, dtype=_np_grad.int64) * 257) // 1024
-    return table[_np_grad.where(band <= 0, 0, (band - 1) % 15 + 1)]
+    lut = table[_np_grad.where(i == 0, 0, (i - 1) % 15 + 1)]
+    lut[255] = (255, 255, 255)
+    return lut
 
-# "False Colors" (same definition as in is_t.py): dark blue → violet → purple →
-# magenta → pink → white, with the stops crowded at the bottom so faint detail gets
-# most of the colour range.
-_FALSE_COLORS_STOPS_SF = [
-    (0.00, (0,0,0)), (0.03, (25,0,70)), (0.07, (45,0,120)), (0.12, (70,0,160)),
-    (0.20, (100,0,180)), (0.30, (130,5,185)), (0.42, (160,20,180)),
-    (0.55, (190,40,175)), (0.68, (215,70,170)), (0.80, (235,105,170)),
-    (0.90, (247,150,185)), (0.96, (252,200,215)), (1.00, (255,255,255)),
-]
+def _make_ni_false_colors_lut_sf():
+    """NI Vision "False Colors", measured off the real viewer — same formula as
+    is_t._make_ni_false_colors_lut, where how it was measured is written down.
+
+    256 entries on the absolute scale: hue one full turn backwards (magenta → blue →
+    green → yellow → red → pink), lightness a 12-entry triangle (the contour bands),
+    fading to black below entry 50 and to white above 220; entry 0 grey, 252..254
+    greys, 255 white. This tab renders from 8-bit images (code = stored / 257, NI
+    uses stored >> 8), so a code can land one entry out."""
+    np_ = _np_grad
+    i = np_.arange(256, dtype=np_.float64)
+    hue = (321.0 - 1.3967 * i) % 360.0
+    light = 0.425 + 0.025 * (6.0 - np_.abs(i % 12.0 - 6.0))
+    light -= 0.006 * np_.clip(50.0 - i, 0.0, None)
+    light += (1.0 / 120.0) * np_.clip(i - 220.0, 0.0, None)
+    light = np_.clip(light, 0.0, 1.0)
+    chroma = 1.0 - np_.abs(2.0 * light - 1.0)
+    hp = hue / 60.0
+    x = chroma * (1.0 - np_.abs(hp % 2.0 - 1.0))
+    z = np_.zeros_like(i)
+    seg = hp.astype(np_.int64) % 6
+    r = np_.choose(seg, [chroma, x, z, z, x, chroma])
+    g = np_.choose(seg, [x, chroma, chroma, x, z, z])
+    b = np_.choose(seg, [z, z, x, chroma, chroma, x])
+    m = light - chroma / 2.0
+    lut = np_.rint(np_.stack([r + m, g + m, b + m], 1) * 255.0).clip(0, 255).astype(np_.uint8)
+    lut[0] = (58, 58, 58)
+    for k in (252, 253, 254):
+        lut[k] = (k, k, k)
+    lut[255] = (255, 255, 255)
+    return lut
 
 # "Rainbow" (same definition as in is_t.py): the NI Vision palette — blue to red with
 # a prominent green middle, 0 black and 255 white.
@@ -120,7 +145,7 @@ SF_GRADIENTS: dict = {
     "Grayscale":       None,
     "Gradient":        _make_lut_sf([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
     "Binary":          _make_ni_binary_lut_sf(),
-    "False Colors":    _make_lut_sf(_FALSE_COLORS_STOPS_SF),
+    "False Colors":    _make_ni_false_colors_lut_sf(),
     "Rainbow":         _make_lut_sf(_RAINBOW_STOPS_SF),
     # Red / yellow lowered, pale yellow added, white kept at the top; see is_t.py.
     "Hot":             _make_lut_sf([(0,(0,0,0)),(0.27,(255,0,0)),(0.53,(255,255,0)),(0.78,(255,255,190)),(1,(255,255,255))]),
@@ -132,8 +157,9 @@ SF_GRADIENTS: dict = {
     "Turbo":           _make_lut_sf([(0,(48,18,59)),(0.2,(70,131,193)),(0.4,(48,210,142)),(0.6,(194,228,59)),(0.8,(244,117,22)),(1,(122,4,3))]),
 }
 
-# Palettes mapped onto the frame's own p0.5..p99.5 window — see is_t.ADAPTIVE_PALETTES.
-ADAPTIVE_PALETTES_SF = frozenset({"False Colors"})
+# Palettes mapped onto the frame's own p0.5..p99.5 window — empty since False Colors
+# was measured as absolute; see is_t.ADAPTIVE_PALETTES.
+ADAPTIVE_PALETTES_SF: frozenset = frozenset()
 # Cyclic palettes are ABSOLUTE: NI's Binary bands are fixed and do not follow the frame,
 # so no stretch may run first (see is_t.CYCLIC_PALETTES).
 CYCLIC_PALETTES_SF = frozenset({"Binary"})
@@ -476,13 +502,6 @@ def _full_scale_for_mode(mode: str, path=None, info: dict = None) -> float:
     if path is None:
         return img_scale.FULL_SCALE_16
     return img_scale.full_scale_for_pil(path, info or {}, mode)
-
-
-def _cpva_fetch_channels(pattern: str = "**",
-                         timeout: float = CPVA_HTTP_TIMEOUT) -> "list[str]":
-    """Return all archiver channel names matching `pattern` (default: all).
-    Cached process-wide, so opening a second picker costs nothing."""
-    return cpva.fetch_channels_cached(pattern, timeout=timeout)
 
 
 def _load_csv_for_day(day: date, cols: "list[str]",
@@ -1191,7 +1210,12 @@ def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None
         day_dir = hf.parent
     target_ns = _ts_ns_target(dt_obj, ts_ns)
     first_folder = None
-    for delta in (0, -1, 1, -2, 2):
+    # The hour the shot falls in, and its two neighbours. An hour further out cannot
+    # hold a match: IMG_MATCH_TOL_NS is 30 s, so a frame that close to a moment inside
+    # hour H is in H or, right at an edge, in H±1 — never in H±2. Those two used to be
+    # probed as well, which is two more camera-folder listings (~150 ms each over SMB)
+    # per camera on every day that found nothing.
+    for delta in (0, -1, 1):
         h = (hour_utc + delta) % 24
         closed = _hour_is_closed(day, h)
         if h in hour_cache:
@@ -1477,9 +1501,6 @@ class _PreviewSignals(QObject):
     # title suffix goes away and the log says what it cost.
     day_fill_done = Signal(int, int, int)
 
-class _ChannelSignals(QObject):
-    loaded = Signal(list)  # archiver channel names
-
 class _NoScrollComboBox(QComboBox):
     def wheelEvent(self, event):
         event.ignore()
@@ -1653,6 +1674,10 @@ class _DayResult:
     #                Nothing failed, so it is never drawn like a failure; pressing
     #                Load images fills these same days in without reading the
     #                archiver again.
+    #   "skipped"  — Load images: nothing on this day fell inside the tolerance, so
+    #                no frame was looked for. Nothing failed here either — there was
+    #                simply no shot worth a picture, and walking the share for the
+    #                closest shot instead is the slowest thing this tab can do.
     # Every searched day produces one of these, so a day can never quietly vanish from
     # the table; only "ok" days can be previewed, saved or sent to the Slider.
     def __init__(self, day: date, best_row: "dict | None", col: str,
@@ -1802,6 +1827,9 @@ class ShotFinderWidget(QWidget):
         # replaces the thread-per-click: a fast drag used to start one thread per
         # shot it flew past.
         self._preview_cache = _PreviewCache()
+        # Decoded frames, independent of the display settings — see _decoded_frame.
+        self._decoded_lock = threading.Lock()
+        self._decoded_store: OrderedDict = OrderedDict()
         self._preview_pool = QThreadPool(self)
         self._preview_pool.setMaxThreadCount(6)
 
@@ -1822,7 +1850,11 @@ class ShotFinderWidget(QWidget):
         # restored HERE, before _build_ui — which must therefore not clear them.
         self._pv_cfg: list[dict] = []
         self._pv_rows: list[dict] = []
-        self._custom_labels: dict[str, str] = {}   # col → name to display
+        # Everything the shared picker has ticked, by ITS name for the PV, and the
+        # part of it whose eye is shut. A shut eye means "keep it picked, but give it
+        # no row here" — the rows in _pv_cfg are the open-eyed ones.
+        self._pv_registered: list[str] = []
+        self._pv_hidden: set[str] = set()
         self._load_pv_state()
 
         # The picked time window — the Image Slider's own picker fills these in.
@@ -1873,16 +1905,6 @@ class ShotFinderWidget(QWidget):
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        # Floating Tool-window dropdowns stay on top of every other tab unless
-        # they are explicitly hidden with the widget.
-        for name in ("_pv_dropdown",):
-            dd = getattr(self, name, None)
-            if dd is not None:
-                dd.hide()
-        for name in ("_pv_search",):
-            le = getattr(self, name, None)
-            if le is not None:
-                le.clear()
         # Target / tolerance live in the spin boxes until something asks for them.
         self._sync_pv_cfg_from_rows()
         self._save_pv_state()
@@ -2001,11 +2023,12 @@ class ShotFinderWidget(QWidget):
         # kept in this tab's own state file next to the PV list.
         self._sections: dict = {}
 
-        def _add_section(key, title, default_expanded=True):
+        def _add_section(key, title, default_expanded=True, uppercase=True):
             cls = _section_cls()
             sec = cls(title, key,
                       bool(self._ui_state.get(f"sec_{key}", default_expanded)),
-                      accent=_SECTION_ACCENTS.get(key, "#4a78c0"))
+                      accent=_SECTION_ACCENTS.get(key, "#4a78c0"),
+                      uppercase=uppercase)
             sec.toggled.connect(self._on_section_toggled)
             self._sections[key] = sec
             panel_lay.addWidget(sec)
@@ -2024,7 +2047,8 @@ class ShotFinderWidget(QWidget):
         panel_lay.addLayout(_exp_row)
 
         s_time = _add_section("time",    "Source",               True)
-        s_pv   = _add_section("pv",      "PVs",                  True)
+        s_pv   = _add_section("pv",      "PVs",                  True,
+                              uppercase=False)
         s_cam  = _add_section("cameras", "Cameras",              True)
         # Same key as before ("search"), so the remembered open/closed state of this
         # section survives the rename.
@@ -2127,36 +2151,31 @@ class ShotFinderWidget(QWidget):
         self._prog_lbl.setStyleSheet("font-size: 10px; color: #555;")
         ll.addWidget(self._prog_lbl)
 
-        # ── PV search state ───────────────────────────────────────────────
+        # ── PV list state ─────────────────────────────────────────────────
         # ONE ordered list of picked PVs. Each entry carries its own "filter"
         # flag: checked = the search filters on it (target ± tolerance),
         # unchecked = its value is only displayed on the results/images.
-        # _pv_cfg [{col, target, tol, filter, scale}] and _custom_labels are set up
-        # (and restored from the saved state) in __init__ — clearing them here would
+        # _pv_cfg [{col, target, tol, filter}] and _pv_hidden are set up (and
+        # restored from the saved state) in __init__ — clearing them here would
         # throw the operator's PV list away on every restart.
         self._pv_rows: list[dict] = []            # widgets, parallel to _pv_cfg
-        self._all_pv_channels: list[str] = []     # fetched archiver channels
-        self._chan_loading = False
-        self._pv_suggestions: list[tuple[str, str]] = []  # (display, col_key)
-        self._rebuild_pv_suggestions()
 
         # ══════════════════ Group: PVs ══════════════════════════════════════
-        # PV selection — one search box for every PV, presets and archiver alike
+        # WHICH PVs is one question and it is asked in one place: the Image Slider's
+        # own picker, opened by this button. The search box that used to sit here had
+        # its own copy of the channel list and its own names for the PVs it added, so
+        # a PV added in one tab was unknown in the other. Now both read the shared
+        # registry (is_t.pv_registry_save) — this panel keeps only what is ITS OWN:
+        # which PVs the search filters on, and the band each one is judged against.
         ll = s_pv.body_layout
-        self._pv_search = QLineEdit()
-        self._pv_search.setPlaceholderText("search PV, or type a channel name…")
-        self._pv_search.setToolTip(
-            "Add any archiver PV: type fragments to search the channel list, or type a\n"
-            "channel name in full and take the ➕ row (or press Enter) to add it as it\n"
-            "stands — that also works for a PV the fetched list does not carry.\n"
-            "Tick a PV to search by it (target ± tolerance); leave it unticked to only\n"
-            "show its value in the results and on the images.\n"
-            "Right-click a PV row to rename it, give it a scale factor, copy its\n"
-            "archiver channel name or remove it.")
-        self._pv_search.textEdited.connect(self._on_pv_search_changed)
-        self._pv_search.returnPressed.connect(self._on_pv_search_return)
-        ll.addWidget(self._pv_search)
-        self._pv_dropdown = self._make_pv_dropdown(self._on_pv_dropdown_clicked)
+        self._btn_pv_cfg = QPushButton("⚙  Configure PVs")
+        self._btn_pv_cfg.setToolTip(
+            "Choose which PVs to search and show — the Image Slider's own picker,\n"
+            "so a PV added or renamed in one tab is the same PV in the other.\n"
+            "A PV with its eye open gets a row below; tick that row to search by it\n"
+            "(target ± tolerance), leave it unticked to only show its value.")
+        self._btn_pv_cfg.clicked.connect(self._open_pv_config)
+        ll.addWidget(self._btn_pv_cfg)
 
         # One dynamic row per picked PV
         self._pv_container = QWidget()
@@ -2341,7 +2360,8 @@ class ShotFinderWidget(QWidget):
             "comparable between frames and between cameras.\n"
             "ON: a dim frame becomes readable, but colours no longer mean the same "
             "intensity from frame to frame.\n"
-            "The Binary and False Colors palettes always map per frame, by design.")
+            "Binary and False Colors are copies of the NI viewer's palettes: leave "
+            "this OFF to see them as NI shows them.")
         self._cb_auto_stretch.toggled.connect(self._on_auto_stretch_toggled)
         row_con.addWidget(self._cb_auto_stretch)
         ll.addLayout(row_con)
@@ -2489,10 +2509,19 @@ class ShotFinderWidget(QWidget):
         if not self._pv_cfg:
             self._pv_cfg = [{"col": "sbw4", "target": 10.0, "tol": 0.0,
                              "filter": True}]
+        # ...and the picker has to come up with the same PVs ticked, or a first run
+        # would open it on an empty list while a row was on the panel.
+        if not self._pv_registered:
+            self._pv_registered = [self._name_for_col(c["col"])
+                                   for c in self._pv_cfg]
         self._rebuild_pv_rows()
         self._update_date_info()
         QTimer.singleShot(300, self._load_cameras)
-        QTimer.singleShot(400, self._fetch_channel_list)
+        # Warm the shared channel listing (~9700 names) so the picker opens ready
+        # instead of downloading while the operator looks at an empty list. Cached
+        # process-wide by cpva.fetch_channels_cached, so the Slider's picker and this
+        # one download it once between them.
+        QTimer.singleShot(400, self._warm_channel_list)
 
     # ── RESULT TABS (one per searched camera) ─────────────────────────────────
     #
@@ -2613,6 +2642,8 @@ class ShotFinderWidget(QWidget):
     def _day_open(self) -> bool:
         """Is the shot list on screen? The window's visibility is the only truth —
         a child of a hidden window is not "hidden" as far as Qt is concerned."""
+        if getattr(self, "_day_switching", False):
+            return False      # held on screen across a camera-tab switch, but closed
         win = getattr(self, "_day_window", None)
         return bool(win is not None and win.isVisible())
 
@@ -2654,7 +2685,10 @@ class ShotFinderWidget(QWidget):
             self._day_slider.setEnabled(False)
             self._day_slider_busy = False
         win = getattr(self, "_day_window", None)
-        if win is not None and win.isVisible():
+        # During a camera-tab switch the window stays up: it is about to be refilled
+        # for the other camera, and hiding it first made the whole window blink.
+        if (win is not None and win.isVisible()
+                and not getattr(self, "_day_switching", False)):
             win.blockSignals(True)            # its own finished() lands back here
             win.hide()
             win.blockSignals(False)
@@ -2668,6 +2702,8 @@ class ShotFinderWidget(QWidget):
         self._sync_scope_selector()
 
     def _show_day_panel(self, dr):
+        # A window held up across a camera-tab switch is now really open again.
+        self._day_switching = False
         self._day_dr = dr
         self._day_rows = list(dr.rows_in_tol)
         # Camera of the SEARCH, not of the live list — the rows were found with it.
@@ -2687,8 +2723,13 @@ class ShotFinderWidget(QWidget):
             self._day_window_placed = True
         # After show(): the scope selector reads _day_open() to decide whether the
         # "selected shot" scope is reachable at all.
+        # Raised only when it comes up: a window already on screen being refilled
+        # (another day, another camera, a search row arriving) stays where it is in
+        # the stack instead of jumping in front of everything.
+        was_up = self._day_window.isVisible()
         self._day_window.show()
-        self._day_window.raise_()
+        if not was_up:
+            self._day_window.raise_()
         self._sync_scope_selector()
         if not self._restoring_focus:
             self._focus_day = dr.day
@@ -3669,7 +3710,11 @@ class ShotFinderWidget(QWidget):
         # where everything is dropped anyway, so it is also where the cache is emptied
         # — otherwise a long session could hold fifteen hundred camera folders in
         # memory, and a re-searched day would keep answering from yesterday's listing.
-        self._scan_cache.forget()
+        # A REUSED run is not a new search: it is the second half of the one whose
+        # rows are being kept, over the same days and the same cameras, so emptying
+        # the cache here only made it re-read every folder it had just read.
+        if not keep_rows:
+            self._scan_cache.forget()
         self._results_tabs.blockSignals(True)
         _kept_tables = [t for t, _r in keep.values()]
         while self._results_tabs.count():
@@ -3758,22 +3803,32 @@ class ShotFinderWidget(QWidget):
         want_day = self._focus_day
         want_ns = self._focus_shot_ns
         want_panel = self._focus_panel_open
-        # The panel belongs to the tab we are leaving.
-        self._hide_day_panel()
-        if want_day is None:
-            self._on_selection_changed()
-            return
+        # The panel belongs to the tab we are leaving. When it is going to be reopened
+        # for the same day, the window itself stays up (see _hide_day_panel) and is
+        # only refilled; it is hidden at the end if the reopen does not happen.
+        self._day_switching = bool(want_panel and want_day is not None)
+        try:
+            self._hide_day_panel()
+            if want_day is None:
+                self._on_selection_changed()
+                return
 
-        results = self._day_results
-        row = next((i for i, dr in enumerate(results) if dr.day == want_day), None)
-        if row is None:
-            # This camera has not answered for that day (yet). The wish is KEPT, so a
-            # row arriving later from a still-running search is selected the moment it
-            # lands (_maybe_restore_focus_row) instead of the day being lost.
-            self._on_selection_changed()
-            return
+            results = self._day_results
+            row = next((i for i, dr in enumerate(results) if dr.day == want_day), None)
+            if row is None:
+                # This camera has not answered for that day (yet). The wish is KEPT,
+                # so a row arriving later from a still-running search is selected the
+                # moment it lands (_maybe_restore_focus_row) instead of the day being
+                # lost.
+                self._on_selection_changed()
+                return
 
-        self._restore_focus_to_row(row, want_day, want_ns, want_panel)
+            self._restore_focus_to_row(row, want_day, want_ns, want_panel)
+        finally:
+            if self._day_switching:
+                # Not reopened after all: close it now, the way it used to close.
+                self._day_switching = False
+                self._hide_day_panel()
 
     def _restore_focus_to_row(self, row: int, want_day, want_ns, want_panel: bool):
         """Put the remembered day (and shot) back on screen in the tab now in front."""
@@ -3870,10 +3925,36 @@ class ShotFinderWidget(QWidget):
         self._load_cameras()
 
     # ── PV column helpers ─────────────────────────────────────────────────
+    # This tab names a PV by its COLUMN key — a preset key ("sbw4") or, for anything
+    # else, the archiver channel itself. The shared PV registry (the one the Image
+    # Slider's picker writes, see is_t.pv_registry_save) names the same PVs by their
+    # DISPLAY name ("SBW4"), and an added PV there is keyed by its channel. So the two
+    # name spaces differ in exactly one place — the presets — and these two functions
+    # are the whole translation. Everything else on both sides is left as it was.
+    @staticmethod
+    def _name_for_col(col: str) -> str:
+        """The shared registry's name for one of this tab's columns."""
+        sl = _get_slider_module()
+        for name, c in sl.PV_DISPLAY_TO_COL.items():
+            if c == col:
+                return name
+        return col
+
+    @staticmethod
+    def _col_for_name(name: str) -> str:
+        """This tab's column key for a name the shared picker handed back."""
+        sl = _get_slider_module()
+        return sl.PV_DISPLAY_TO_COL.get(name, name)
+
     def _col_label(self, col: str) -> str:
-        """A name typed in the Rename dialog wins over the preset label — wanting to
-        see a different name is the only reason that dialog would ever be used."""
-        return self._custom_labels.get(col) or PV_COLUMNS.get(col, col)
+        """A name typed in the picker wins over the preset label — wanting to see a
+        different name is the only reason anyone renames a PV.
+
+        The names live in the SHARED registry, so a PV renamed in the Image Slider
+        reads the same here and the other way round."""
+        sl = _get_slider_module()
+        return (sl.PV_LABELS.get(self._name_for_col(col))
+                or PV_COLUMNS.get(col, col))
 
     def _col_short(self, col: str) -> str:
         return self._col_label(col).split(" [")[0]
@@ -3975,246 +4056,100 @@ class ShotFinderWidget(QWidget):
             return "—"
         if col in PV_COLUMNS:
             return "J"
-        return ""   # arbitrary channel — no assumed unit
+        # An added channel carries no unit of its own, but the operator may have typed
+        # one into the shared picker. Still nothing rather than a guess when not.
+        try:
+            sl = _get_slider_module()
+            # Shown, never edited here: `mm^2` reads as `mm²`.
+            return sl.unit_text(sl.PV_CUSTOM_UNITS.get(self._name_for_col(col), ""))
+        except Exception:
+            return ""
 
-    # ── PV search bar / suggestions ───────────────────────────────────────
-    def _rebuild_pv_suggestions(self):
-        """Build the (display, col_key) suggestion list: presets first, then
-        any fetched archiver channels not already covered by a preset."""
-        seen_channels = set()
-        sugg: list[tuple[str, str]] = []
-        for col, label in PV_COLUMNS.items():
-            sugg.append((label, col))
-            ch = CPVA_CHANNEL_MAP.get(col)
-            if ch:
-                seen_channels.add(ch)
-        for ch in self._all_pv_channels:
-            if ch in seen_channels:
-                continue
-            sugg.append((ch, ch))
-        self._pv_suggestions = sugg
-
-    def _fetch_channel_list(self):
-        if self._all_pv_channels or self._chan_loading:
-            return
-        self._chan_loading = True
-        sig = self._chan_sig = _ChannelSignals()
-        sig.loaded.connect(self._on_channels_loaded)
-
+    # ── the shared PV picker ──────────────────────────────────────────────
+    def _warm_channel_list(self):
+        """Pull the archiver's channel listing into the shared cache, off the UI
+        thread. Nothing here needs the answer — the picker asks for it again and is
+        served from memory."""
         def worker():
             try:
-                chans = _cpva_fetch_channels("**")
-            except Exception as exc:
-                self._chan_err = f"{type(exc).__name__}: {exc}"
-                chans = []
-            sig.loaded.emit(chans)
-
-        self._chan_err = ""
+                cpva.fetch_channels_cached("**", timeout=CPVA_HTTP_TIMEOUT)
+            except Exception:
+                pass          # the picker retries and says so itself
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_channels_loaded(self, chans: list):
-        self._chan_loading = False
-        self._all_pv_channels = list(chans)
-        self._rebuild_pv_suggestions()
-        if chans:
-            self._log(f"PV channels available: {len(chans)}")
-            # A query typed while the list was downloading matched presets only;
-            # redo it now that all channels are known.
-            if self._pv_search.text().strip():
-                self._on_pv_search_changed(self._pv_search.text())
-        else:
-            self._log(f"PV channel list unavailable ({self._chan_err or 'empty'}); "
-                      "presets + free-typed channels still work.")
+    def _open_pv_config(self):
+        """The Image Slider's PV picker, opened as a plain picker.
 
-    def _make_pv_dropdown(self, callback):
-        """Floating, focus-free filtered list — same pattern as the camera search."""
-        dd = QTableWidget(0, 1)
-        dd.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        dd.horizontalHeader().setVisible(False)
-        dd.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        dd.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        dd.verticalHeader().setVisible(False)
-        dd.setWindowFlags(
-            Qt.WindowType.Tool |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint)
-        dd.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        dd.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        dd.clicked.connect(callback)
-        dd.setStyleSheet(
-            "QTableWidget { border: 1px solid #2d7dff; background: #fff; }"
-            "QTableWidget::item:selected { background: #2d7dff; color: #fff; }")
-        return dd
+        What comes back is split in two, the way the Image Finder splits it: the
+        REGISTRY (added PVs, names, units) is shared and goes to the shared store,
+        while the BAND each PV is judged against — target, tolerance and whether the
+        search filters on it at all — belongs to this tab and is kept here, matched
+        back onto the PVs that are still picked.
 
-    _PV_DROPDOWN_MAX = 200
-
-    # Query parsing + ranking are shared with the Image Slider's PV picker; these
-    # stay as thin aliases so the existing call sites read unchanged.
-    _split_query     = staticmethod(cpva.split_query)
-    _tokens_in_order = staticmethod(cpva.tokens_in_order)
-    _rank_pv_match   = staticmethod(cpva.rank_pv_match)
-
-    def _populate_pv_dropdown(self, text, dropdown, anchor, exclude):
-        tokens = self._split_query(text)
-        dropdown.hide()
-        dropdown.setRowCount(0)
-        if not tokens:
-            return
-        # The startup fetch may have failed or may still be in flight — retry so
-        # the search isn't stuck on presets for the rest of the session.
-        if not self._all_pv_channels:
-            self._fetch_channel_list()
-        scored = []
-        for i, (disp, key) in enumerate(self._pv_suggestions):
-            if key in exclude:
-                continue
-            s = self._rank_pv_match(disp, key, tokens)
-            if s is not None:
-                scored.append((s, i, disp, key))
-        scored.sort(key=lambda t: (t[0], t[1]))
-        shown = scored[:self._PV_DROPDOWN_MAX]
-
-        def _hint_row(txt: str) -> QTableWidgetItem:
-            r = dropdown.rowCount()
-            dropdown.insertRow(r)
-            it = QTableWidgetItem(txt)
-            it.setForeground(QColor("#777"))
-            dropdown.setItem(r, 0, it)
-            return it
-
-        for _s, _i, disp, key in shown:
-            r = dropdown.rowCount()
-            dropdown.insertRow(r)
-            it = QTableWidgetItem(disp)
-            # Presets are listed under a short label ("SBW4 [J]") that does not
-            # say which beamline the channel is on — show the archiver name.
-            chan = self._col_channel(key)
-            if chan != disp:
-                it.setToolTip(chan)
-            it.setData(Qt.ItemDataRole.UserRole, key)
-            dropdown.setItem(r, 0, it)
-        if len(scored) > len(shown):
-            # No UserRole → _on_pv_dropdown_clicked ignores this hint row.
-            _hint_row(f"… {len(scored) - len(shown)} more matches — refine the search")
-
-        # "Add by name": a single bare word is offered as an archiver channel name of
-        # its own, so a PV the fetched list does not carry — or any PV at all while the
-        # list is down — can still be added. Same rule Enter follows: "023 l3" is a
-        # query, not a name, and is not offered.
-        literal = (text or "").strip()
-        if (len(tokens) != 1 or tokens[0] != literal.lower() or literal in exclude
-                or any(k == literal for _s, _i, _d, k in shown)):
-            literal = ""
-        if literal:
-            it = _hint_row(f'➕  add "{literal}" as an archiver channel name')
-            it.setForeground(QColor("#1a6aee"))
-            it.setToolTip("Takes the typed text as the channel name itself — for a PV "
-                          "that is not in the fetched list.")
-            it.setData(Qt.ItemDataRole.UserRole, literal)
-
-        if not dropdown.rowCount():
-            if not self._chan_loading:
-                return
-            # Without this the box looks empty-and-final while the ~9700 channel
-            # list is still downloading; _on_channels_loaded re-runs the query when
-            # it lands.
-            _hint_row("loading PV list…")
-        row_h = max(22, dropdown.verticalHeader().defaultSectionSize())
-        popup_h = min(dropdown.rowCount() * row_h + 6, 360)
-        popup_w = max(300, anchor.width() + 20)
-        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
-        dropdown.setGeometry(pos.x(), pos.y(), popup_w, popup_h)
-        dropdown.show()
-        dropdown.raise_()
-        QTimer.singleShot(0, anchor.setFocus)
-
-    def _on_pv_search_changed(self, text: str):
-        self._populate_pv_dropdown(text, self._pv_dropdown, self._pv_search,
-                                   {c["col"] for c in self._pv_cfg})
-
-    def _on_pv_dropdown_clicked(self, index):
-        it = self._pv_dropdown.item(index.row(), 0)
-        if it is None:
-            return
-        key = it.data(Qt.ItemDataRole.UserRole)
-        if not key:
-            return          # the "… N more matches" hint row
-        self._pv_dropdown.hide()
-        self._pv_search.clear()
-        self._add_pv_col(key)
-
-    def _best_pv_match(self, tokens) -> "str | None":
-        """Channel key of the top-ranked suggestion for `tokens`, or None."""
-        exclude = {c["col"] for c in self._pv_cfg}
-        best = None
-        for i, (disp, key) in enumerate(self._pv_suggestions):
-            if key in exclude:
-                continue
-            s = self._rank_pv_match(disp, key, tokens)
-            if s is not None and (best is None or (s, i) < best[0]):
-                best = ((s, i), key)
-        return best[1] if best else None
-
-    def _on_pv_search_return(self):
-        txt = self._pv_search.text().strip()
-        if not txt:
-            return
-        tokens = self._split_query(txt)
-        if not tokens:
-            return
-        # A single bare word is still taken literally, so a channel that is not
-        # in the fetched list can be typed in by hand. "023 l3" / "*023*l3*" is a
-        # query though — Enter takes its best match instead of registering a PV
-        # by that name, which could never return data.
-        if len(tokens) != 1 or tokens[0] != txt.lower():
-            hit = self._best_pv_match(tokens)
-            if hit is None:
-                return
-            txt = hit
-        self._pv_dropdown.hide()
-        self._pv_search.clear()
-        self._add_pv_col(txt)
-
-    def _preset_for_channel(self, channel: str) -> "str | None":
-        """The preset column that already reads `channel`, if there is one. A channel
-        name typed in full must not become a second column reading exactly what a
-        preset reads — two rows, one number, and only one of them carrying the
-        preset's unit."""
-        return next((c for c in PV_COLUMNS
-                     if CPVA_CHANNEL_MAP.get(c, c) == channel), None)
-
-    def _register_col(self, col: str) -> str:
-        col = (col or "").strip()
-        preset = self._preset_for_channel(col)
-        if preset is not None:
-            return preset
-        if col and col not in PV_COLUMNS and col not in self._custom_labels:
-            self._custom_labels[col] = col   # arbitrary channel; label == name
-        return col
-
-    def _add_pv_col(self, col: str, filter_by: bool = True):
-        """Add a PV to the list. New PVs are filter PVs by default — that is what
-        the search box is normally used for; untick the row to only show it."""
-        col = self._register_col(col)
-        if not col:
-            return
-        if any(c["col"] == col for c in self._pv_cfg):
-            # Silence here read as "the click did nothing" — most often after typing
-            # a channel name that a preset already covers.
-            self._log(f"{self._col_short(col)} is already in the PV list.")
-            return
+        Min/Max and "What it is" are switched off: this tab judges a PV against a
+        target ± tolerance typed on its own row, so a second alarm band would only
+        contradict it, and every PV it can read is an archiver channel."""
+        sl = _get_slider_module()
         self._sync_pv_cfg_from_rows()
-        self._pv_cfg.append({"col": col, "target": 10.0, "tol": 0.0,
-                             "filter": bool(filter_by)})
+        picked_names = [self._name_for_col(c["col"]) for c in self._pv_cfg]
+        # The eye is what decides whether a PV gets a row here, so "hidden" is every
+        # picked-and-registered PV that has no row.
+        hidden = {n for n in self._pv_registered if n not in picked_names}
+        dlg = sl.PvConfigDialog(picked_names + sorted(hidden),
+                                sl.PV_CUSTOM_CHANNELS, sl.PV_DERIVED, sl.PV_LABELS,
+                                hidden=hidden, units=sl.PV_CUSTOM_UNITS,
+                                limits=sl.PV_LIMITS, parent=self,
+                                show_limits=False, show_kind=False)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sl.PV_CUSTOM_CHANNELS.clear()
+        sl.PV_CUSTOM_CHANNELS.update(dlg.custom_channels())
+        sl.PV_DERIVED[:] = dlg.derived_defs()
+        sl.PV_LABELS.clear()
+        sl.PV_LABELS.update(dlg.labels())
+        sl.PV_CUSTOM_UNITS.clear()
+        sl.PV_CUSTOM_UNITS.update(dlg.custom_units())
+        sl.PV_LIMITS.clear()
+        sl.PV_LIMITS.update(dlg.limits())
+        sl.pv_registry_save()
+
+        selected = list(dlg.selected_names())
+        self._pv_registered = selected
+        hidden_now = set(dlg.hidden_names()) & set(selected)
+        # A formula is computed, not archived. This tab reads channels straight out of
+        # the archiver (see the note on PV_COLUMNS), so a formula row would come back
+        # empty on every day — say so once rather than let it sit there reading "—".
+        dropped = [n for n in selected if sl.pv_is_derived(n)]
+        visible = [n for n in selected
+                   if n not in hidden_now and not sl.pv_is_derived(n)]
+        # The band each PV was judged against survives the trip: matched back by the
+        # column, so re-opening the picker to add one PV cannot retype the others.
+        old = {c["col"]: c for c in self._pv_cfg}
+        self._pv_cfg = []
+        for name in visible:
+            col = self._col_for_name(name)
+            self._pv_cfg.append(old.get(col) or {
+                "col": col, "target": 10.0, "tol": 0.0, "filter": True})
+        self._pv_hidden = hidden_now
         self._rebuild_pv_rows()
         self._save_pv_state()
-        chan = self._col_channel(col)
-        short = self._col_short(col)
-        self._log(f"PV added: {short}" + (f"  ({chan})" if chan != short else ""))
+        if dropped:
+            self._log("Formulas are not searchable here — "
+                      + ", ".join(dropped) + " left out of the list.")
+        self._log(f"PV list: {len(self._pv_cfg)} shown"
+                  + (f", {len(hidden_now)} hidden" if hidden_now else ""))
 
     def _remove_pv_col(self, col: str):
+        """The ✕ on a row: this PV stops being read at all.
+
+        Taken out of the picked set as well, not merely off the panel — the ✕ on a row
+        and the ✕ in the picker are two ends of one switch, the way the picker's own
+        tick box and its ✕ are."""
         self._sync_pv_cfg_from_rows()
         self._pv_cfg = [c for c in self._pv_cfg if c["col"] != col]
+        name = self._name_for_col(col)
+        self._pv_registered = [n for n in self._pv_registered if n != name]
+        self._pv_hidden.discard(name)
         self._rebuild_pv_rows()
         self._save_pv_state()
 
@@ -4239,7 +4174,12 @@ class ShotFinderWidget(QWidget):
         """Give a PV the name the operator wants to READ — a channel added by name is
         called "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy", which is unreadable in a 280 px
         row and over a picture. Display only: the channel stays the identity
-        everywhere, so a rename cannot repoint a column at different data."""
+        everywhere, so a rename cannot repoint a column at different data.
+
+        The name goes into the SHARED registry, so the Image Slider and the Image
+        Finder print the PV under it too — one PV, one name, whichever tab you are in."""
+        sl = _get_slider_module()
+        name = self._name_for_col(col)
         txt, ok = QInputDialog.getText(
             self, "Rename PV", f"Name shown for\n{self._col_channel(col)}",
             QLineEdit.EchoMode.Normal, self._col_label(col))
@@ -4247,12 +4187,11 @@ class ShotFinderWidget(QWidget):
             return
         txt = txt.strip()
         self._sync_pv_cfg_from_rows()
-        if txt and txt != PV_COLUMNS.get(col, col):
-            self._custom_labels[col] = txt
-        elif col in PV_COLUMNS:
-            self._custom_labels.pop(col, None)     # back to the preset label
+        if txt and txt != PV_COLUMNS.get(col, col) and txt != name:
+            sl.PV_LABELS[name] = txt
         else:
-            self._custom_labels[col] = col         # a channel is its own name
+            sl.PV_LABELS.pop(name, None)      # back to the PV's own name
+        sl.pv_registry_save()
         self._rebuild_pv_rows()
         self._save_pv_state()
 
@@ -4301,13 +4240,35 @@ class ShotFinderWidget(QWidget):
         # left open while it is being built.
         self._ui_state = self._read_ui_state_file()
         data = self._ui_state
+        sl = _get_slider_module()
+        # The added PVs, their names and their units are SHARED with the Image Slider
+        # and the Image Finder now. Load the registry before anything reads a label.
+        try:
+            sl.pv_registry_load()
+        except Exception:
+            pass
         if not data:
             return                  # no state yet, or unreadable — start empty
+
+        # One-off migration. This tab used to keep its own names in "pv_labels",
+        # keyed by its own column keys. Anything the shared registry does not already
+        # know is copied across, so nobody loses a name they typed — and the old key
+        # is left in the file, because an older build reading it still wants it.
         labels = data.get("pv_labels")
         if isinstance(labels, dict):
+            moved = False
             for k, v in labels.items():
-                if isinstance(k, str) and isinstance(v, str) and v.strip():
-                    self._custom_labels[k] = v.strip()
+                if not (isinstance(k, str) and isinstance(v, str) and v.strip()):
+                    continue
+                name = self._name_for_col(k)
+                if name not in sl.PV_LABELS:
+                    sl.PV_LABELS[name] = v.strip()
+                    moved = True
+            if moved:
+                try:
+                    sl.pv_registry_save()
+                except Exception:
+                    pass
 
         def _num(entry, key, default):
             try:
@@ -4321,8 +4282,6 @@ class ShotFinderWidget(QWidget):
             col = str(e.get("col", "")).strip()
             if not col or any(c["col"] == col for c in self._pv_cfg):
                 continue
-            if col not in PV_COLUMNS:
-                self._custom_labels.setdefault(col, col)
             # Only these four keys are read back: a state file written by the version
             # that had a per-PV "scale" must not resurrect it as a hidden factor.
             self._pv_cfg.append({"col":    col,
@@ -4330,15 +4289,30 @@ class ShotFinderWidget(QWidget):
                                  "tol":    _num(e, "tol", 0.0),
                                  "filter": bool(e.get("filter", True))})
 
+        # A PV that is picked but has no row (its eye is shut in the picker). Kept
+        # apart from _pv_cfg: it has no band, and giving it one the operator never
+        # typed is how a hidden PV would come back filtering the search.
+        hidden = data.get("pv_hidden")
+        self._pv_hidden = {str(n) for n in hidden if isinstance(n, str)} \
+            if isinstance(hidden, list) else set()
+        # Everything the picker should come up with ticked: the rows, plus the hidden
+        # ones. A file written before the picker existed has no list, so it is the
+        # rows alone — which is exactly what that build was reading.
+        reg = data.get("pv_registered")
+        if isinstance(reg, list):
+            self._pv_registered = [str(n) for n in reg if isinstance(n, str)]
+        else:
+            self._pv_registered = [self._name_for_col(c["col"])
+                                   for c in self._pv_cfg]
+
     def _save_pv_state(self):
         # A remembered list is a convenience, never a must — _write_ui_state_file
-        # swallows a failed write.
+        # swallows a failed write. The NAMES are not written here any more: they live
+        # in the shared registry, written by pv_registry_save.
         self._write_ui_state_file(
             {"pv_cfg": [dict(c) for c in self._pv_cfg],
-             # Only names that differ from the PV's own: storing a label equal to
-             # the preset label would freeze today's wording into the saved state.
-             "pv_labels": {k: v for k, v in self._custom_labels.items()
-                           if v and v != k and v != PV_COLUMNS.get(k)}})
+             "pv_hidden": sorted(self._pv_hidden),
+             "pv_registered": list(self._pv_registered)})
 
     def _make_remove_btn(self, slot) -> QPushButton:
         btn = QPushButton("✕")
@@ -4818,6 +4792,40 @@ class ShotFinderWidget(QWidget):
         self._bc_applied = bc
         self._on_preview_ready(out_img, energy_text, gen)
 
+    _DECODED_KEEP = 16
+
+    def _decoded_frame(self, img_path: Path):
+        """(float pixels, PNG info, mode, full scale) of one frame — off the share the
+        first time, from memory after that.
+
+        The rendered memory (_preview_cache) is keyed by the display settings too, so
+        every new Contrast / Brightness / Gamma / Auto / colour-map value missed it and
+        read the file again: 130-160 ms per change. The decoded pixels do not depend on
+        those settings, so the last few frames are kept here and a new setting is only
+        a re-render. Called from worker threads, hence the lock."""
+        from PIL import Image as _PilImg
+        import numpy as _np
+        key = str(img_path)
+        store = self._decoded_store
+        with self._decoded_lock:
+            hit = store.get(key)
+            if hit is not None:
+                store.move_to_end(key)
+                return hit
+        pil = _PilImg.open(str(img_path))
+        if pil.mode in ("I", "I;16"):
+            arr_f = _np.array(pil, dtype=_np.float32)
+        else:
+            arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+        info, mode = dict(pil.info), pil.mode
+        full_scale = _full_scale_for_mode(mode, img_path, info)
+        val = (arr_f, info, mode, full_scale)
+        with self._decoded_lock:
+            store[key] = val
+            while len(store) > self._DECODED_KEEP:
+                store.popitem(last=False)
+        return val
+
     def _render_preview_frame(self, img_path: Path, gradient_name: str = "",
                               auto: bool = False, gamma=None,
                               contrast: int = 0, offset: int = 0):
@@ -4827,18 +4835,8 @@ class ShotFinderWidget(QWidget):
         preview needs — and touches nothing on the widget, so the answer can be kept
         in memory and handed out again later."""
         from PySide6.QtGui import QImage
-        from PIL import Image as _PilImg
-        import numpy as _np
 
-        pil = _PilImg.open(str(img_path))
-        if pil.mode in ("I", "I;16"):
-            arr_f = _np.array(pil, dtype=_np.float32)
-        elif pil.mode in ("RGB", "RGBA"):
-            arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
-        else:
-            arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
-
-        full_scale = _full_scale_for_mode(pil.mode, img_path, pil.info)
+        arr_f, info, mode, full_scale = self._decoded_frame(img_path)
         # `bc_out` comes back with what the Auto passes actually applied, so the
         # greyed-out sliders can be parked on it and Auto gamma costs no second
         # median pass over the frame.
@@ -4853,15 +4851,15 @@ class ShotFinderWidget(QWidget):
         # Auto box is on, the widget it stands for holds a zero.
         a_con = int(bc_out.get("contrast", contrast))
         a_off = int(bc_out.get("offset", offset))
-        # pil.info, not a second open of the same file: a share read is 130–160 ms.
+        # The PNG info, not a second open of the same file: a share read is 130–160 ms.
         # Branch on the MODE, not on full_scale: a 16-bit frame shown on its camera's
         # reference range has a full_scale of its own and is not an 8-bit source.
         note = (
-            img_scale.meta_from_info(pil.info, arr_f).scale_note(
+            img_scale.meta_from_info(info, arr_f).scale_note(
                 auto, gamma, bc_out.get("gamma"),
                 img_scale.current_reference_bits(img_scale.camera_from_path(img_path)),
                 a_con, a_off)
-            if pil.mode in ("I", "I;16")
+            if mode in ("I", "I;16")
             else "8-bit source  ·  absolute scale")
 
         w, h = arr.shape[1], arr.shape[0]
@@ -5999,6 +5997,28 @@ class ShotFinderWidget(QWidget):
                         _eta.step("fr")
                         continue
 
+                    # A day where NOTHING fell inside the tolerance has no shot worth a
+                    # picture. The row still names the closest shot, but that shot was
+                    # not asked for — and looking for its frame is the slowest thing
+                    # this tab does: a moment nothing was recorded near never hits the
+                    # early exit in _find_image_in_day, so it walks all five hour
+                    # folders of every camera instead of stopping at the first. Those
+                    # were the rows the operator watched crawl while the table already
+                    # said "nothing in range".
+                    if not rows_in_tol:
+                        for _cam in cams:
+                            out = dict(base)
+                            out.update({"hour_folder": None, "folder_path": None,
+                                        "img_path": None, "cam": _cam,
+                                        "status": "skipped", "reason": ""})
+                            self._sig.result.emit(out)
+                            # One step PER CAMERA: in an image run the tracker was
+                            # built with n_cams steps a day, so stepping once would
+                            # leave the bar short of the end by the cameras skipped.
+                            _prog.cam_done(day)
+                            _eta.step("fr")
+                        continue
+
                     # The frames of this day are handed to the pool and the loop moves
                     # on to the next day's numbers: the share walk of one day now
                     # overlaps the archiver read of the next, and the cameras of a day
@@ -6073,6 +6093,10 @@ class ShotFinderWidget(QWidget):
         if status == "no_image":
             return (IMG_MARK_MISSING, QColor("#a11"),
                     reason or "Looked for, no frame found")
+        if status == "skipped":
+            return (IMG_MARK_NOT_TRIED, QColor("#856404"),
+                    "No shot fell inside the tolerance on this day, so no frame "
+                    "was looked for.\nWiden the tolerance to search this day.")
         return (IMG_MARK_NOT_TRIED, QColor("#555555"),
                 "Not looked for yet — press Load images")
 
@@ -6178,7 +6202,7 @@ class ShotFinderWidget(QWidget):
         folder_path = result.get("folder_path")
         img_path    = result.get("img_path")
         folder_str  = (str(folder_path) if folder_path
-                       else ("—" if status == "data" else "Not found"))
+                       else ("—" if status in ("data", "skipped") else "Not found"))
 
         prague_str = dt_obj.strftime("%H:%M:%S.%f")[:-3]
         best_ns    = best_row.get("_ns")
@@ -6238,7 +6262,17 @@ class ShotFinderWidget(QWidget):
         diff_str = "\n".join(diff_lines)
 
         n_tol = len(rows_in_tol)
-        if status == "data":
+        if status == "skipped":
+            # Nothing was in range, so no picture was looked for. Yellow, like every
+            # other "nothing in range" row — it is a finding, not a failure, and the
+            # row says plainly that the share was never walked for it.
+            status_str = "⚠ nothing in range · closest shot"
+            if off_pvs:
+                status_str += " · " + "; ".join(off_pvs)
+            status_str += " · image not searched"
+            status_color = QColor("#856404")
+            row_bg       = QColor("#fff3cd")
+        elif status == "data":
             # Load data: nothing failed, so nothing here is red. The row says what
             # was found and that the picture has simply not been asked for.
             # n_tol == 0: the day answered, but no shot is inside the tolerance.
@@ -6462,12 +6496,19 @@ class ShotFinderWidget(QWidget):
                       + (f", {n_close} day(s) with nothing in range" if n_close else ""))
             self._sync_export_buttons()
             return
+        # Rows the search deliberately did not walk the share for are counted apart:
+        # lumping them under "without" would read as a failed look-up on a day where
+        # nothing was ever looked up.
+        n_skip = sum(1 for dr in all_results if dr.status == "skipped")
+        n_miss = n - n_ok - n_skip
         self._result_lbl.setText(
             f"Results: {n_ok} with an image"
-            + (f", {n - n_ok} without" if n > n_ok else "")
+            + (f", {n_miss} without" if n_miss else "")
+            + (f", {n_skip} skipped (nothing in range)" if n_skip else "")
             + (f"  ({n_cams} cameras)" if n_cams > 1 else "")
             + (f"   ·   {' , '.join(bands)}" if bands else ""))
-        self._log(f"Search done — {n} row(s), {n_ok} with an image")
+        self._log(f"Search done — {n} row(s), {n_ok} with an image"
+                  + (f", {n_skip} skipped (nothing in range)" if n_skip else ""))
         # _set_busy(False) re-enables every control, so the export buttons must be
         # re-evaluated afterwards: they act on the tab in front, not on the whole search.
         self._sync_export_buttons()
@@ -6629,6 +6670,7 @@ class ShotFinderWidget(QWidget):
 
         copied = 0
         errors = 0
+        written = []   # every file written, for Open in the Saved box
         for dr in results_to_save:
             if dr.status != "ok":
                 self._log(f"{dr.day}: {dr.reason or 'nothing found'}, skipping")
@@ -6706,6 +6748,7 @@ class ShotFinderWidget(QWidget):
                     w, h = arr.shape[1], arr.shape[0]
                 except Exception:
                     shutil.copy2(img, dst)
+                    written.append(dst)
                     copied += 1
                     continue
                 grad_name = self._gradient_cb.currentText()
@@ -6821,14 +6864,15 @@ class ShotFinderWidget(QWidget):
                     _get_slider_module()._copy_metadata_into_png(img, dst, save_txt=False)
                 except Exception:
                     pass
+                written.append(dst)
                 copied += 1
                 self._log(f"{dr.day}: saved {dst.name}")
             except Exception as e:
                 self._log(f"{dr.day}: copy error {e}")
                 errors += 1
 
-        QMessageBox.information(self, "Save images",
-            f"Saved: {copied}\nErrors: {errors}\n\nFolder: {out_path}")
+        _get_slider_module().show_saved_box(self, "Save images",
+            f"Saved: {copied}\nErrors: {errors}\n\nFolder: {out_path}", written)
 
     def _send_to_workshop(self):
         """Send currently previewed image to Workshop tab."""
@@ -6899,6 +6943,15 @@ def install_wheel_guard(app):
 
         def eventFilter(self, obj, ev):
             t = ev.type()
+            if t == QEvent.Type.Polish and isinstance(obj, self._GUARDED):
+                # Spin boxes and drop-downs come with Qt's WheelFocus: the wheel
+                # notch ITSELF hands them the focus, with the same "mouse" reason
+                # a click gives, before this filter sees the notch -- so every
+                # field the pointer crossed counted as clicked and took the
+                # value change. Without WheelFocus only a click or Tab focuses.
+                if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                    obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
                 # Popup and menu reasons are left as they are: closing a drop-down
                 # hands the focus back, which must not undo the click that opened it.

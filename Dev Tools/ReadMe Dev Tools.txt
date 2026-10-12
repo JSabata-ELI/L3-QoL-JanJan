@@ -12,7 +12,7 @@ WHAT IT DOES
   programs, and puts those programs onto the shares where everybody
   runs them from.
 
-  One window, two tabs sharing one log:
+  One window (it opens maximised), two tabs sharing one log:
 
     Builder        source folder  ->  a program
     Copy Manager   a program      ->  the shares
@@ -45,9 +45,20 @@ BUILDER
   named after the version, together with a copy of the sources, the
   icon, BOTH documentation files (the short one and the detailed one),
   and any images or sounds folder the program needs at run time.
+  The icon is also built into the program file. At the end the log
+  says whether the finished program really carries its icon; a
+  Warning there means its taskbar button would be blank — usually
+  icon.ico is missing from the project folder.
 
-  When a build finishes it switches to the Copy Manager with those
-  projects already ticked.
+  The order you tick in is the order they build in: each ticked line
+  shows its place as a number left of the tick box, e.g. "2.".
+  Unticking one moves the
+  rest up; Select all keeps what you already ticked first.
+
+  With "Copy after build" on, each program is copied to the ticked
+  Copy Manager destinations straight after its own build, and only
+  then does the next one start building. The copy reports come at
+  the end.
 
   A project can also declare helper programs — small programs that
   live in the same folder but are started on their own. Those appear
@@ -70,7 +81,11 @@ COPY MANAGER
   helper is an indented line with its own tick box, version and
   status. Ticking the program ticks its helpers as well and opens the
   list; unticking a helper afterwards sticks, so you can publish just
-  the application.
+  the application. A helper is published inside the application's
+  folder — Software\Diagnostic\Diagnostic Webex listener — because it
+  is a part of that application; one still lying in the top folder
+  from before is moved there the next time it is published.
+  Publishing the application leaves that helper folder alone.
 
   Copy publishes to whichever destinations you ticked. Before it
   overwrites anything, the previous version is moved into the
@@ -83,7 +98,8 @@ COPY MANAGER
 
     ReadMe only       refresh just the documentation files — both the
                       short one and the detailed one
-    Fix               repair old archive folders
+    Fix               repair old archive folders, the helper
+                      programs' folders included
     Build internal    build the shared support folder
     Deploy internal   push that folder to the selected programs
 

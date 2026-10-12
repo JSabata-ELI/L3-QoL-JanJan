@@ -141,6 +141,12 @@ ALWAYS_IGNORE = {
     "dist", "Matlab", "Icons", ".vscode", ".venv", ".git",
 }
 
+# Dev Tools runs windowed, so every console program it starts (py, PyInstaller
+# and PyInstaller's own helper processes) would otherwise open a console window
+# of its own that flashes up and takes the keyboard focus. The output is read
+# through the pipe anyway; the children inherit the hidden console.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 def parse_version_tuple(ver: str):
     m = RE_VER.match(ver or "")
     if not m:
@@ -183,6 +189,94 @@ def exe_icon_count(exe: Path) -> int:
         return int(_ex(str(exe), -1, None, None, 0))
     except Exception:
         return -1
+
+
+class TextLogPump:
+    """Collects log lines for one Text widget and writes them in batches.
+
+    A build prints thousands of lines, and each one used to be its own
+    after(0) callback doing an insert and a scroll, in both log panes — the
+    window lagged behind the build. Lines are now queued (from any thread) and
+    written by one callback every ~40 ms: one insert, one scroll. One pump per
+    widget, shared by every writer, so the lines keep their order.
+    """
+
+    FLUSH_MS = 40
+
+    def __init__(self, widget, should_scroll):
+        self.widget = widget
+        self.should_scroll = should_scroll
+        self._lock = threading.Lock()
+        self._pending: list[str] = []
+        self._scheduled = False
+
+    def write(self, line: str):
+        with self._lock:
+            self._pending.append(line)
+            if self._scheduled:
+                return
+            self._scheduled = True
+        try:
+            self.widget.after(self.FLUSH_MS, self._flush)
+        except Exception:
+            with self._lock:
+                self._scheduled = False
+
+    def _flush(self):
+        with self._lock:
+            text = "".join(s + "\n" for s in self._pending)
+            self._pending.clear()
+            self._scheduled = False
+        if not text:
+            return
+        w = self.widget
+        try:
+            w.configure(state="normal")
+            w.insert("end", text)
+            if self.should_scroll():
+                w.see("end")
+            w.configure(state="disabled")
+        except Exception:
+            pass
+
+    def discard_pending(self):
+        with self._lock:
+            self._pending.clear()
+
+
+def place_dialog(win, parent):
+    """Show a dialog that was built while withdrawn, centred over the app.
+
+    A Toplevel shown straight away appears at the screen corner at its empty
+    size and then jumps and grows while it is filled — a visible flash. Create
+    it, withdraw() it at once, fill it, then call this.
+    """
+    try:
+        win.update_idletasks()
+        top = parent.winfo_toplevel()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - h) // 3
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        win.transient(top)
+    except tk.TclError:
+        pass
+    win.deiconify()
+    try:
+        win.grab_set()
+    except tk.TclError:
+        pass
+
+
+def log_pump(widget, should_scroll=None) -> TextLogPump:
+    """The pump of this Text widget, created on first use."""
+    pump = getattr(widget, "_dev_log_pump", None)
+    if pump is None:
+        if should_scroll is None:
+            should_scroll = lambda: widget.yview()[1] >= 0.95
+        pump = TextLogPump(widget, should_scroll)
+        widget._dev_log_pump = pump
+    return pump
 
 
 def run(cmd, cwd: Path):
@@ -233,6 +327,14 @@ class BuilderUI(ttk.Frame):
         self.projects_sorted: list[Path] = []
 
         self.project_checks: dict[str, tk.BooleanVar] = {}
+        # Program names (projects and helpers) in the order they were ticked:
+        # BUILD selected builds them in this order, each copied straight after
+        # its own build. The number is shown in each ticked row's text.
+        self._tick_order: list[str] = []
+        self._check_texts: dict[str, tuple[tk.StringVar, str]] = {}
+        self._order_vars: dict[str, tk.StringVar] = {}
+        # program name -> its order-number label, restyled with the row focus
+        self._order_labels: dict[str, ttk.Label] = {}
         self.project_rows: dict[str, ttk.Frame] = {}
         self.project_next_override: dict[str, str] = {}
         self.project_next_labels: dict[str, tk.StringVar] = {}
@@ -255,6 +357,7 @@ class BuilderUI(ttk.Frame):
         # program name -> (row frame, name tick box, version label), for both
         # projects and helpers: the focus highlight works the same for both.
         self.row_widgets: dict[str, tuple] = {}
+        self._section_headers: dict[str, ttk.Label] = {}
 
         # Both answers cost a folder scan or a share read, and every redraw asks
         # for them once per row; they only change when a build writes a version.
@@ -289,29 +392,11 @@ class BuilderUI(ttk.Frame):
             cm = getattr(self, "_cm_ref", None)
             if cm is not None:
                 cm._log_autoscroll = True
-        for w in [self._log_widget, getattr(self, "_local_log", None)]:
-            if w is None:
-                continue
-            is_local = (w is getattr(self, "_local_log", None))
-            def _append(w=w, is_local=is_local):
-                try:
-                    w.configure(state="normal")
-                    w.insert("end", msg + "\n")
-                    if is_local:
-                        should_scroll = self._local_log_autoscroll
-                    else:
-                        # Sdílený CM log — použij jeho vlastní autoscroll flag pokud existuje
-                        cm = getattr(self, "_cm_ref", None)
-                        should_scroll = cm._log_autoscroll if cm is not None else (w.yview()[1] >= 0.95)
-                    if should_scroll:
-                        w.see("end")
-                    w.configure(state="disabled")
-                except Exception:
-                    pass
-            try:
-                w.after(0, _append)
-            except Exception:
-                pass
+        # The shared pane's pump was made by the Copy Manager (with its own
+        # autoscroll flag); the local pane's pump in _build_ui.
+        for w in (self._log_widget, getattr(self, "_local_log", None)):
+            if w is not None:
+                log_pump(w).write(msg)
 
     def _on_local_log_scroll(self, event=None):
         self.after(50, self._check_local_log_position)
@@ -334,6 +419,7 @@ class BuilderUI(ttk.Frame):
             if w is None:
                 continue
             try:
+                log_pump(w).discard_pending()
                 w.configure(state="normal")
                 w.delete("1.0", "end")
                 w.configure(state="disabled")
@@ -550,7 +636,7 @@ class BuilderUI(ttk.Frame):
         ttk.Button(left_top, text="Select all", command=self._select_all_projects).pack(side="left")
         ttk.Button(left_top, text="Clear", command=self._clear_all_projects).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(left_top, text="Show ignored", variable=self.show_ignored,
-                        command=self._render_project_buttons).pack(side="left", padx=(10, 0))
+                        command=self._layout_project_rows).pack(side="left", padx=(10, 0))
 
         canvas_wrap = ttk.Frame(left)
         canvas_wrap.pack(fill="both", expand=True, padx=8, pady=8)
@@ -621,6 +707,13 @@ class BuilderUI(ttk.Frame):
         self.copy_after_build_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(actions, text="Copy after build",
                         variable=self.copy_after_build_var).pack(side="left", padx=(16, 0))
+        # Remembered between runs: when ticked, a differing icon.ico on a
+        # destination is overwritten without the Icon conflict dialog.
+        self.replace_icons_var = tk.BooleanVar(
+            value=bool(load_json(SETTINGS_PATH, {}).get("replace_icons_without_asking", False)))
+        ttk.Checkbutton(actions, text="Replace icons without asking",
+                        variable=self.replace_icons_var,
+                        command=self._save_replace_icons).pack(side="left", padx=(8, 0))
 
         log_frame = ttk.LabelFrame(right, text="Log")
         log_frame.pack(fill="both", expand=True, pady=(0, 4))
@@ -634,11 +727,17 @@ class BuilderUI(ttk.Frame):
         _lvsb.pack(side="right", fill="y")
         _lhsb.pack(side="bottom", fill="x")
         self._local_log.pack(side="left", fill="both", expand=True)
+        log_pump(self._local_log, lambda: self._local_log_autoscroll)
         self._local_log.bind("<MouseWheel>", self._on_local_log_scroll)
         _lvsb.bind("<ButtonRelease-1>", self._on_local_log_scrollbar_release)
         btn_row = ttk.Frame(log_frame)
         btn_row.pack(fill="x", padx=6, pady=(0, 4))
         ttk.Button(btn_row, text="Clear", command=self._clear_local_log).pack(side="left")
+
+    def _save_replace_icons(self):
+        settings = load_json(SETTINGS_PATH, {})
+        settings["replace_icons_without_asking"] = bool(self.replace_icons_var.get())
+        save_json(SETTINGS_PATH, settings)
 
     def _render_project_buttons(self):
         for child in self.btn_frame.winfo_children():
@@ -668,107 +767,141 @@ class BuilderUI(ttk.Frame):
         # show up on the next refresh, not on the next run of Dev Tools.
         self.helpers_by_parent = self.find_helpers(self.projects_sorted)
 
-        groups = {"Main project": [], "Side project": [], "Ignored project": []}
+        # Every project gets its row here, Ignored ones too: changing a group or
+        # Show ignored then only moves rows (_layout_project_rows) instead of
+        # destroying and recreating the whole list, which flashed.
+        self._section_headers = {
+            grp: ttk.Label(self.btn_frame, text=title, font=("Segoe UI", 9, "bold"))
+            for grp, title in self._SECTIONS
+        }
+        for p in self.projects_sorted:
+            row = ttk.Frame(self.btn_frame)
+
+            var = self.project_checks.get(p.name)
+            if var is None:
+                var = tk.BooleanVar(value=False)
+                self.project_checks[p.name] = var
+            self.project_rows[p.name] = row
+
+            helpers = self.helpers_of(p.name)
+            if helpers:
+                # Folded by default: most projects have no helpers and an
+                # always-open tree would push the projects themselves off the
+                # visible part of the list.
+                open_now = p.name in self.expanded_projects
+                btn = ttk.Button(row, text="▾" if open_now else "▸", width=2,
+                                 command=lambda pn=p.name: self._toggle_expanded(pn))
+                btn.pack(side="left", padx=(0, 2))
+                self.expander_buttons[p.name] = btn
+            else:
+                # Keeps every project's tick box on the same left edge, so a
+                # row with an expander does not read as indented.
+                ttk.Label(row, text=" ", width=3).pack(side="left")
+
+            # Everything from the tick box rightwards lives in its own frame,
+            # and that frame is what the focus highlight paints. The slot for
+            # the arrow stays outside it: a highlight drawn across an empty
+            # slot looks like a hole punched in it.
+            band = ttk.Frame(row)
+            band.pack(side="left", fill="both", expand=True)
+
+            num_lbl = self._order_label(band, p.name)
+            num_lbl.pack(side="left")
+            self._order_labels[p.name] = num_lbl
+            num_lbl.bind("<Button-1>", lambda e, pp=p: self._on_project_clicked(pp))
+
+            cb = ttk.Checkbutton(
+                band, textvariable=self._check_text_var(p.name, p.name),
+                variable=var, style="Row.TCheckbutton",
+                command=lambda pp=p: self._on_project_check_clicked(pp)
+            )
+            cb.pack(side="left", anchor="w")
+
+            next_var = tk.StringVar(value=f"Next: {self.effective_next_version_for_project(p.name)}")
+            self.project_next_labels[p.name] = next_var
+
+            ver_lbl = ttk.Label(band, textvariable=next_var, width=18,
+                                style="Row.TLabel")
+            ver_lbl.pack(side="right", padx=(8, 0))
+            ttk.Button(band, text="ReadMe", width=8,
+                       command=lambda pp=p: self._open_readme(pp)).pack(side="right", padx=(4, 0))
+            ttk.Button(band, text="Details", width=7,
+                       command=lambda pp=p: self._on_project_clicked(pp)).pack(side="right")
+
+            # Clicking the row itself is the same as pressing Details, and on
+            # a program that carries helpers it opens them: the helpers are
+            # what the click is usually about.
+            self.row_widgets[p.name] = (band, cb, ver_lbl)
+
+            for w in (row, band, ver_lbl):
+                w.bind("<Button-1>", lambda e, pp=p: self._on_project_clicked(pp))
+
+            if helpers:
+                self.helper_rows[p.name] = [self._build_helper_row(h)
+                                            for h in helpers]
+
+        self.btn_frame.columnconfigure(0, weight=1)
+        self._layout_project_rows()
+        self._focused_row_name = None
+        self._update_focus_styles()
+
+    _SECTIONS = (("Main project", "Main projects"),
+                 ("Side project", "Side projects"),
+                 ("Ignored project", "Ignored projects"))
+
+    def _layout_project_rows(self):
+        """Place the existing rows into their sections — nothing is rebuilt.
+
+        Called for a group change and for Show ignored: grid() on a row that is
+        already gridded only moves it, so the list changes without a flash.
+        """
+        groups = {grp: [] for grp, _ in self._SECTIONS}
         for p in self.projects_sorted:
             g = self.project_groups.get(p.name, "Main project")
             groups.get(g, groups["Main project"]).append(p)
 
-        row_idx = 0
         show_ign = self.show_ignored.get()
-        sections = [("Main projects", groups["Main project"]),
-                    ("Side projects", groups["Side project"])]
-        if show_ign:
-            sections.append(("Ignored projects", groups["Ignored project"]))
-        for section_title, projects in sections:
-            if not projects:
-                continue
-            hdr = ttk.Label(self.btn_frame, text=section_title,
-                            font=("Segoe UI", 9, "bold"))
-            hdr.grid(row=row_idx, column=0, sticky="w", padx=4, pady=(8, 2))
-            row_idx += 1
-
-            for p in projects:
-                row = ttk.Frame(self.btn_frame)
-                row.grid(row=row_idx, column=0, sticky="ew", padx=4, pady=2)
-
-                var = self.project_checks.get(p.name)
-                if var is None:
-                    var = tk.BooleanVar(value=False)
-                    self.project_checks[p.name] = var
-                self.project_rows[p.name] = row
-
-                helpers = self.helpers_of(p.name)
-                if helpers:
-                    # Folded by default: most projects have no helpers and an
-                    # always-open tree would push the projects themselves off the
-                    # visible part of the list.
-                    open_now = p.name in self.expanded_projects
-                    btn = ttk.Button(row, text="▾" if open_now else "▸", width=2,
-                                     command=lambda pn=p.name: self._toggle_expanded(pn))
-                    btn.pack(side="left", padx=(0, 2))
-                    self.expander_buttons[p.name] = btn
+        visible: set[str] = set()
+        row_idx = 0
+        for grp, _title in self._SECTIONS:
+            hdr = self._section_headers.get(grp)
+            projects = groups[grp]
+            shown = bool(projects) and (grp != "Ignored project" or show_ign)
+            if hdr is not None:
+                if shown:
+                    hdr.grid(row=row_idx, column=0, sticky="w", padx=4, pady=(8, 2))
+                    row_idx += 1
                 else:
-                    # Keeps every project's tick box on the same left edge, so a
-                    # row with an expander does not read as indented.
-                    ttk.Label(row, text=" ", width=3).pack(side="left")
+                    hdr.grid_remove()
+            for p in projects:
+                row = self.project_rows.get(p.name)
+                hrows = self.helper_rows.get(p.name, [])
+                if not shown:
+                    for w in [row] + hrows:
+                        if w is not None:
+                            w.grid_remove()
+                    continue
+                visible.add(p.name)
+                if row is not None:
+                    row.grid(row=row_idx, column=0, sticky="ew", padx=4, pady=2)
+                    row_idx += 1
+                open_now = p.name in self.expanded_projects
+                for hrow in hrows:
+                    hrow.grid(row=row_idx, column=0, sticky="ew", padx=(26, 4), pady=1)
+                    row_idx += 1
+                    if not open_now:
+                        hrow.grid_remove()
 
-                # Everything from the tick box rightwards lives in its own frame,
-                # and that frame is what the focus highlight paints. The slot for
-                # the arrow stays outside it: a highlight drawn across an empty
-                # slot looks like a hole punched in it.
-                band = ttk.Frame(row)
-                band.pack(side="left", fill="both", expand=True)
-
-                cb = ttk.Checkbutton(
-                    band, text=p.name, variable=var, style="Row.TCheckbutton",
-                    command=lambda pp=p: self._on_project_check_clicked(pp)
-                )
-                cb.pack(side="left", anchor="w")
-
-                next_var = tk.StringVar(value=f"Next: {self.effective_next_version_for_project(p.name)}")
-                self.project_next_labels[p.name] = next_var
-
-                ver_lbl = ttk.Label(band, textvariable=next_var, width=18,
-                                    style="Row.TLabel")
-                ver_lbl.pack(side="right", padx=(8, 0))
-                ttk.Button(band, text="ReadMe", width=8,
-                           command=lambda pp=p: self._open_readme(pp)).pack(side="right", padx=(4, 0))
-                ttk.Button(band, text="Details", width=7,
-                           command=lambda pp=p: self._on_project_clicked(pp)).pack(side="right")
-
-                # Clicking the row itself is the same as pressing Details, and on
-                # a program that carries helpers it opens them: the helpers are
-                # what the click is usually about.
-                self.row_widgets[p.name] = (band, cb, ver_lbl)
-
-                for w in (row, band, ver_lbl):
-                    w.bind("<Button-1>", lambda e, pp=p: self._on_project_clicked(pp))
-
-                row_idx += 1
-
-                if helpers:
-                    rows = []
-                    for h in helpers:
-                        rows.append(self._build_helper_row(h, row_idx))
-                        row_idx += 1
-                    self.helper_rows[p.name] = rows
-                    if p.name not in self.expanded_projects:
-                        for hrow in rows:
-                            hrow.grid_remove()
-
-        # A tick on a program that is no longer on the list (moved to Ignored
-        # with Show ignored off) is dropped: what builds has to be what you see.
+        # A tick on a program that is not on the list (moved to Ignored with
+        # Show ignored off) is dropped: what builds has to be what you see.
         for name, var in self.project_checks.items():
-            if name not in self.project_rows and var.get():
+            if name not in visible and var.get():
                 var.set(False)
                 for h in self.helpers_of(name):
                     hv = self.helper_checks.get(h["name"])
                     if hv is not None:
                         hv.set(False)
-
-        self.btn_frame.columnconfigure(0, weight=1)
-        self._focused_row_name = None
-        self._update_focus_styles()
+        self._sync_tick_order()
 
     def _focused_name(self) -> str | None:
         """The program the panel on the right is showing — project or helper."""
@@ -795,22 +928,34 @@ class BuilderUI(ttk.Frame):
                     w.configure(style=styles[0] if focused else styles[1])
                 except Exception:
                     pass
+            num = self._order_labels.get(name)
+            if num is not None:
+                try:
+                    num.configure(style="Focused.TLabel" if focused else "Row.TLabel")
+                except Exception:
+                    pass
 
         self._focused_row_name = new_name
 
-    def _build_helper_row(self, h: dict, row_idx: int) -> ttk.Frame:
-        """One indented row for a helper exe, under its parent."""
+    def _build_helper_row(self, h: dict) -> ttk.Frame:
+        """One indented row for a helper exe, under its parent (placed by
+        _layout_project_rows)."""
         name = h["name"]
         row = ttk.Frame(self.btn_frame)
-        row.grid(row=row_idx, column=0, sticky="ew", padx=(26, 4), pady=1)
 
         var = self.helper_checks.get(name)
         if var is None:
             var = tk.BooleanVar(value=False)
             self.helper_checks[name] = var
 
-        cb = ttk.Checkbutton(row, text=f"↳ {name}", variable=var,
-                             style="Row.TCheckbutton")
+        num_lbl = self._order_label(row, name)
+        num_lbl.pack(side="left")
+        self._order_labels[name] = num_lbl
+        num_lbl.bind("<Button-1>", lambda e, hh=h: self._select_helper(hh))
+
+        cb = ttk.Checkbutton(row, textvariable=self._check_text_var(name, f"↳ {name}"),
+                             variable=var, style="Row.TCheckbutton",
+                             command=lambda n=name: self._on_helper_check_clicked(n))
         cb.pack(side="left", anchor="w")
 
         next_var = tk.StringVar(value=f"Next: {self.effective_next_version_for_project(name)}")
@@ -872,6 +1017,13 @@ class BuilderUI(ttk.Frame):
                 var.set(f"Next: {self.effective_next_version_for_project(p.name)}")
         for name, var in self.helper_next_labels.items():
             var.set(f"Next: {self.effective_next_version_for_project(name)}")
+
+    def _refresh_version_label(self, name: str):
+        var = self.project_next_labels.get(name) or self.helper_next_labels.get(name)
+        if var is not None:
+            text = f"Next: {self.effective_next_version_for_project(name)}"
+            if var.get() != text:
+                var.set(text)
     # ----------------- ROOT CHANGE -----------------
     def _change_root(self):
         folder = filedialog.askdirectory(initialdir=str(self.root_folder))
@@ -905,9 +1057,9 @@ class BuilderUI(ttk.Frame):
         cfg = _load_devtools_config()
 
         win = tk.Toplevel(self)
+        win.withdraw()
         win.title("Set paths")
         win.resizable(False, False)
-        win.grab_set()
 
         ttk.Label(win, text="Configure shared paths for Dev Tools (Builder + Copy Manager).",
                   padding=(12, 10)).pack()
@@ -932,7 +1084,7 @@ class BuilderUI(ttk.Frame):
 
         def _browse(key, var):
             cur = var.get() or str(Path.home())
-            chosen = filedialog.askdirectory(title=f"Select folder", initialdir=cur)
+            chosen = filedialog.askdirectory(title="Select folder", initialdir=cur, parent=win)
             if chosen:
                 var.set(chosen)
 
@@ -971,9 +1123,10 @@ class BuilderUI(ttk.Frame):
                 cm._build_dest_rows()
                 cm._load_programs()
             win.destroy()
-            messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
+            self._log("Paths saved to %APPDATA%\\DevTools\\config.json")
 
         ttk.Button(win, text="Save", command=on_save, padding=(16, 6)).pack(pady=(8, 12))
+        place_dialog(win, self)
 
     def _reload_projects(self, select_first: bool):
         self.invalidate_version_cache()
@@ -1023,7 +1176,8 @@ class BuilderUI(ttk.Frame):
 
         self.group_var.set(self.project_groups.get(project_dir.name, "Main project"))
         self._update_focus_styles()
-        self._refresh_project_list_version_labels()
+        # Selecting changes no version; next_ver_var's trace has already
+        # refreshed this row's label.
 
     def _select_helper(self, h: dict):
         """Show a helper in the panel on the right, like a project.
@@ -1051,7 +1205,6 @@ class BuilderUI(ttk.Frame):
             pass
 
         self._update_focus_styles()
-        self._refresh_project_list_version_labels()
 
     def _open_helper_readme(self, h: dict):
         """A helper's own documentation, which lives in its parent's folder.
@@ -1095,7 +1248,8 @@ class BuilderUI(ttk.Frame):
         settings = load_json(SETTINGS_PATH, {})
         settings["project_groups"] = self.project_groups
         save_json(SETTINGS_PATH, settings)
-        self._render_project_buttons()
+        # The row moves to its new section; nothing is rebuilt.
+        self._layout_project_rows()
 
     def _on_project_check_clicked(self, project_dir: Path):
         # Ticking a program takes its helpers with it — that is the usual case,
@@ -1115,7 +1269,74 @@ class BuilderUI(ttk.Frame):
             # cursor looks like the tick did something it did not.
             if helpers and var.get():
                 self._toggle_expanded(project_dir.name, open_it=True)
+            # The program first, then its helpers: clicked one after another.
+            for n in [project_dir.name] + [h["name"] for h in helpers]:
+                self._note_tick(n)
         self._select_project(project_dir)
+
+    def _on_helper_check_clicked(self, name: str):
+        self._note_tick(name)
+
+    # ----------------- TICK ORDER -----------------
+    def _check_text_var(self, name: str, base: str) -> tk.StringVar:
+        """The tick box's text: the program name only. Its place in the build
+        order is shown separately, see _order_label()."""
+        entry = self._check_texts.get(name)
+        var = entry[0] if entry else tk.StringVar()
+        self._check_texts[name] = (var, base)
+        self._paint_order_mark(name)
+        return var
+
+    def _order_label(self, parent, name: str) -> ttk.Label:
+        """The build-order number, left of the tick box. Fixed width: the slot
+        is there even when empty, so a tick never shifts anything in the row,
+        and the numbers stand in one column."""
+        var = self._order_vars.get(name)
+        if var is None:
+            var = tk.StringVar()
+            self._order_vars[name] = var
+        lbl = ttk.Label(parent, textvariable=var, width=3, anchor="e",
+                        style="Row.TLabel")
+        self._paint_order_mark(name)
+        return lbl
+
+    def _is_ticked(self, name: str) -> bool:
+        var = self.project_checks.get(name) or self.helper_checks.get(name)
+        return bool(var is not None and var.get())
+
+    def _note_tick(self, name: str):
+        """Record a tick box change: a new tick goes to the end of the queue,
+        an untick leaves it (and everyone behind it moves up)."""
+        if self._is_ticked(name):
+            if name not in self._tick_order:
+                self._tick_order.append(name)
+        elif name in self._tick_order:
+            self._tick_order.remove(name)
+        self._refresh_order_marks()
+
+    def _sync_tick_order(self):
+        """Drop everything no longer ticked (ticks cleared by code)."""
+        before = list(self._tick_order)
+        self._tick_order = [n for n in self._tick_order if self._is_ticked(n)]
+        if before != self._tick_order:
+            self._refresh_order_marks()
+
+    def _paint_order_mark(self, name: str):
+        entry = self._check_texts.get(name)
+        if entry is not None:
+            var, base = entry
+            if var.get() != base:
+                var.set(base)
+        ovar = self._order_vars.get(name)
+        if ovar is not None:
+            pos = (self._tick_order.index(name) + 1) if name in self._tick_order else 0
+            text = f"{pos}." if pos else ""
+            if ovar.get() != text:
+                ovar.set(text)
+
+    def _refresh_order_marks(self):
+        for name in set(self._check_texts) | set(self._order_vars):
+            self._paint_order_mark(name)
 
     def _bind_next_version_trace(self):
         try:
@@ -1142,19 +1363,42 @@ class BuilderUI(ttk.Frame):
         else:
             self.project_next_override[name] = val.strip()
 
-        self._refresh_project_list_version_labels()
+        # Only the edited program's label can have changed.
+        self._refresh_version_label(name)
 
     def _select_all_projects(self):
         for var in self.project_checks.values():
             var.set(True)
         for var in self.helper_checks.values():
             var.set(True)
+        # What was already ticked keeps its place; the rest queue up behind it
+        # in list order, each program followed by its helpers.
+        for p in self.projects_sorted:
+            for n in [p.name] + [h["name"] for h in self.helpers_of(p.name)]:
+                if n not in self._tick_order:
+                    self._tick_order.append(n)
+        self._refresh_order_marks()
 
     def _clear_all_projects(self):
         for var in self.project_checks.values():
             var.set(False)
         for var in self.helper_checks.values():
             var.set(False)
+        self._tick_order.clear()
+        self._refresh_order_marks()
+
+    def _checked_in_tick_order(self) -> list[tuple[str, object]]:
+        """Every ticked program as ("project", Path) or ("helper", dict), in the
+        order the tick boxes were clicked. A tick the order somehow missed is
+        not dropped: it goes last, in list order."""
+        items: dict[str, tuple[str, object]] = {}
+        for p in self._get_checked_projects():
+            items[p.name] = ("project", p)
+        for h in self._get_checked_helpers():
+            items[h["name"]] = ("helper", h)
+        order = [n for n in self._tick_order if n in items]
+        order += [n for n in items if n not in order]
+        return [items[n] for n in order]
 
     def _get_checked_projects(self) -> list[Path]:
         out = []
@@ -1183,16 +1427,19 @@ class BuilderUI(ttk.Frame):
         if not builder_script.exists():
             return False, f"Builder script not found:\n{builder_script}"
         spec_file = builder_script.parent / "_internal_builder.spec"
+        # In the built Dev Tools sys.executable is Dev Tools itself — starting it
+        # would open a second Dev Tools window instead of Python.
+        py = "py" if getattr(_sys, "frozen", False) else _sys.executable
         if spec_file.exists():
-            cmd = [_sys.executable, "-m", "PyInstaller", "--noconfirm",
+            cmd = [py, "-m", "PyInstaller", "--noconfirm",
                    "--distpath", r"C:\Dev\dist", str(spec_file)]
         else:
-            cmd = [_sys.executable, str(builder_script)]
+            cmd = [py, str(builder_script)]
         if live_log:
             live_log(f"CMD: {' '.join(cmd)}\n")
         try:
             proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
-                             cwd=str(builder_script.parent))
+                             cwd=str(builder_script.parent), creationflags=NO_WINDOW)
             for line in proc.stdout:
                 line = line.rstrip()
                 if line and live_log:
@@ -1225,6 +1472,10 @@ class BuilderUI(ttk.Frame):
         for d in folders:
             for f in d.glob("*.py"):
                 if f.name.startswith(("test_", "_verify")):
+                    continue
+                # Every program has its own main.py entry point - those are
+                # different programs, not drifting copies of one module.
+                if f.stem == "main":
                     continue
                 homes.setdefault(f.stem, []).append(f)
         return homes
@@ -1304,28 +1555,11 @@ class BuilderUI(ttk.Frame):
 
         # Výstupní složka pro tuto verzi
         verdir = self.dist_root / p.name / f"v{ver}"
+        # This runs in the build thread, where no dialog may be opened — the
+        # question about a missing dist folder is asked in _build_selected
+        # before the thread starts.
         if not self.dist_root.exists():
-            import tkinter.messagebox as _mb
-            ans = _mb.askyesnocancel(
-                "dist folder missing",
-                f"Output folder does not exist:\n{self.dist_root}\n\n"
-                "Create it now?\n\n"
-                "Yes = create and continue\n"
-                "No = choose a different folder\n"
-                "Cancel = abort build",
-                parent=self,
-            )
-            if ans is None:
-                return False, f"Build aborted — dist folder not found:\n{self.dist_root}"
-            elif not ans:
-                chosen = filedialog.askdirectory(
-                    title="Select output (dist) folder",
-                    initialdir=str(self.dist_root.parent),
-                )
-                if not chosen:
-                    return False, "Build aborted — no output folder selected."
-                self.dist_root = Path(chosen)
-                verdir = self.dist_root / p.name / f"v{ver}"
+            return False, f"Build aborted — dist folder not found:\n{self.dist_root}"
         # Smaž existující verdir před buildem — PyInstaller --noconfirm selže na read-only
         # souborech (OneDrive je po sync označí jako read-only). Odstraníme je sami.
         if verdir.exists():
@@ -1475,6 +1709,7 @@ class BuilderUI(ttk.Frame):
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(p),
+            creationflags=NO_WINDOW,
         )
         for line in proc.stdout:
             line = line.rstrip()
@@ -1707,7 +1942,8 @@ class BuilderUI(ttk.Frame):
         _log(f"CMD: {' '.join(args)}\n")
 
         proc = subprocess.Popen(args, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, cwd=str(p))
+                                stderr=subprocess.STDOUT, text=True, cwd=str(p),
+                                creationflags=NO_WINDOW)
         for line in proc.stdout:
             line = line.rstrip()
             if line:
@@ -1811,13 +2047,35 @@ class BuilderUI(ttk.Frame):
         state = "normal" if enabled else "disabled"
         self.btn_build.config(state=state)
 
-    def _on_build_finished(self, ok_count: int, fail_count: int, failed: list, built_paths: list, built_projects: list = None, elapsed: float = 0.0):
+    def _on_build_finished(self, ok_count: int, fail_count: int, failed: list, built_paths: list, built_projects: list = None, elapsed: float = 0.0,
+                           copy_each: bool = False, copy_roots: list = None,
+                           copy_results: list = None, copy_time: float = 0.0):
         self._set_build_buttons_enabled(True)
+        cm = getattr(self, "_cm_ref", None)
+        if copy_each and cm is not None:
+            cm._set_busy(False)
         self.invalidate_version_cache()
+        old_names = [p.name for p in self.projects_sorted]
         self.projects_all = self.find_projects(self.root_folder)
-        self.reset_next_version_overrides()
         self.projects_sorted = self.sort_projects(self.projects_all)
-        self._render_project_buttons()
+        self.project_next_override.clear()
+        helper_names = lambda m: {k: [h["name"] for h in v] for k, v in m.items()}
+        old_helpers = helper_names(self.helpers_by_parent)
+        if ([p.name for p in self.projects_sorted] != old_names
+                or helper_names(self.find_helpers(self.projects_sorted)) != old_helpers):
+            self._render_project_buttons()
+        else:
+            # Same projects: only the version numbers moved, so only the
+            # labels change — no rebuild, no flash, the scroll stays put.
+            self._refresh_project_list_version_labels()
+        # A new version folder exists now; the Copy Manager shows it without
+        # a Refresh (and without rebuilding its list either).
+        cm = getattr(self, "_cm_ref", None)
+        if cm is not None:
+            try:
+                cm._update_rows_in_place()
+            except Exception:
+                pass
 
         prev_helper = self.selected_helper
         if self.selected_project is not None:
@@ -1870,7 +2128,20 @@ class BuilderUI(ttk.Frame):
             "failed": [f.split("\n")[0] for f in failed],
         }
 
-        if self.copy_after_build_var.get() and built_projects and self._on_build_done:
+        if copy_each and built_projects:
+            if not copy_roots:
+                # No destination = nothing was copied; say so next to the report.
+                self._log(summary, force_scroll=True)
+                self._log("Copy after build: no destination is ticked in "
+                          "Copy Manager — nothing was copied.", force_scroll=True)
+            else:
+                cm.copy_after_build_report(copy_results or [], copy_roots, copy_time,
+                                           summary, build_info)
+            if fail_count > 0:
+                messagebox.showwarning("Build finished with errors", "\n".join(
+                    [f"Failed: {fail_count}"] + [f.split('\n')[0] for f in failed[:10]]
+                ))
+        elif self.copy_after_build_var.get() and built_projects and self._on_build_done:
             self._on_build_done(built_projects, build_summary=summary, build_info=build_info)
         else:
             self._log(summary, force_scroll=True)
@@ -1880,12 +2151,49 @@ class BuilderUI(ttk.Frame):
                 ))
 
     # ----------------- BUILD ACTIONS -----------------
+    def _ensure_dist_root(self) -> bool:
+        """Make sure the output folder exists — asked here, on the UI thread,
+        because the build thread must not open dialogs."""
+        if self.dist_root.exists():
+            return True
+        ans = messagebox.askyesnocancel(
+            "dist folder missing",
+            f"Output folder does not exist:\n{self.dist_root}\n\n"
+            "Create it now?\n\n"
+            "Yes = create and continue\n"
+            "No = choose a different folder\n"
+            "Cancel = abort build",
+            parent=self,
+        )
+        if ans is None:
+            return False
+        if not ans:
+            chosen = filedialog.askdirectory(
+                title="Select output (dist) folder",
+                initialdir=str(self.dist_root.parent),
+                parent=self,
+            )
+            if not chosen:
+                return False
+            self.dist_root = Path(chosen)
+            return True
+        try:
+            self.dist_root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("dist folder", f"Could not create:\n{self.dist_root}\n\n{e}",
+                                 parent=self)
+            return False
+        return True
+
     def _build_selected(self):
-        projects = self._get_checked_projects()
-        helpers = self._get_checked_helpers()
-        if not projects and not helpers:
+        queue = self._checked_in_tick_order()
+        if not queue:
             messagebox.showinfo("No selection", "Select at least one project.")
             return
+
+        def _name(item):
+            kind, obj = item
+            return obj.name if kind == "project" else obj["name"]
 
         versions_by_name = {}
         invalid = []
@@ -1893,7 +2201,7 @@ class BuilderUI(ttk.Frame):
         # Helpers version independently of their parent — they are their own
         # program in dist, and a helper rebuilt on its own must not pretend to
         # be a new version of the app it came from.
-        for name in [p.name for p in projects] + [h["name"] for h in helpers]:
+        for name in [_name(it) for it in queue]:
             ver = self.effective_next_version_for_project(name).strip()
             if not ver:
                 invalid.append(f"{name}: (empty)")
@@ -1907,7 +2215,22 @@ class BuilderUI(ttk.Frame):
             )
             return
 
+        if not self._ensure_dist_root():
+            return
+
+        # Each program is copied straight after its own build, before the next
+        # one starts. The destinations are read here, on the UI thread.
+        cm = getattr(self, "_cm_ref", None)
+        copy_roots: list[Path] = []
+        copy_each = bool(self.copy_after_build_var.get() and cm is not None)
+        if copy_each:
+            copy_roots = cm._get_selected_destination_roots()
+            cm._set_busy(True)
+
         self._set_build_buttons_enabled(False)
+        total = len(queue)
+        self._log("Build order: " + ", ".join(
+            f"{i}. {_name(it)}" for i, it in enumerate(queue, 1)))
 
         def worker():
             import time as _time
@@ -1916,50 +2239,59 @@ class BuilderUI(ttk.Frame):
             failed = []
             built_paths = []
             built_projects = []
-            start_time = _time.perf_counter()
+            copy_results = []
+            build_time = 0.0
+            copy_time = 0.0
 
-            for p in projects:
-                ver = versions_by_name[p.name]
-                self._log(f"Building: {p.name}  ->  v{ver}")
+            for i, (kind, obj) in enumerate(queue, 1):
+                name = _name((kind, obj))
+                ver = versions_by_name[name]
+                what = "Building" if kind == "project" else "Building helper"
+                self._log(f"[{i}/{total}] {what}: {name}  ->  v{ver}")
                 t0 = _time.perf_counter()
-                if p.name.lower() == "internal builder":
+                if kind == "helper":
+                    ok, msg = self._build_one_helper(obj, ver, live_log=self._log)
+                elif name.lower() == "internal builder":
                     ok, msg = self._build_internal_builder_sync(live_log=self._log)
                 else:
-                    ok, msg = self._build_one_project(p, ver, live_log=self._log)
+                    ok, msg = self._build_one_project(obj, ver, live_log=self._log)
                 elapsed_one = _time.perf_counter() - t0
-                if ok:
-                    ok_count += 1
-                    # msg is the version folder the build landed in — carried into
-                    # the reports so they say WHERE the exe was built. The Internal
-                    # Builder branch returns a sentence instead, so only keep msg
-                    # when it actually looks like a path.
-                    built_paths.append((p.name, f"v{ver}", elapsed_one, _as_out_dir(msg)))
-                    built_projects.append((p, f"v{ver}"))
-                else:
-                    fail_count += 1
-                    failed.append(f"{p.name}:\n{msg}")
-
-            for h in helpers:
-                name = h["name"]
-                ver = versions_by_name[name]
-                self._log(f"Building helper: {name}  ->  v{ver}")
-                t0 = _time.perf_counter()
-                ok, msg = self._build_one_helper(h, ver, live_log=self._log)
-                elapsed_one = _time.perf_counter() - t0
-                if ok:
-                    ok_count += 1
-                    built_paths.append((name, f"v{ver}", elapsed_one, _as_out_dir(msg)))
-                    # Deploy keys on the dist folder's name, and a helper's dist
-                    # folder is named after the helper — so "Copy after build"
-                    # picks it up like any other program.
-                    built_projects.append((self.dist_root / name, f"v{ver}"))
-                else:
+                build_time += elapsed_one
+                if not ok:
                     fail_count += 1
                     failed.append(f"{name}:\n{msg}")
+                    continue
 
-            elapsed_total = _time.perf_counter() - start_time
+                ok_count += 1
+                # msg is the version folder the build landed in — carried into
+                # the reports so they say WHERE the exe was built. The Internal
+                # Builder branch returns a sentence instead, so only keep msg
+                # when it actually looks like a path.
+                built_paths.append((name, f"v{ver}", elapsed_one, _as_out_dir(msg)))
+                # Deploy keys on the dist folder's name, and a helper's dist
+                # folder is named after the helper — so "Copy after build"
+                # picks it up like any other program.
+                built_projects.append(
+                    (obj if kind == "project" else self.dist_root / name, f"v{ver}"))
+
+                if copy_each and copy_roots:
+                    self._log(f"[{i}/{total}] Copying: {name}  v{ver}")
+                    t1 = _time.perf_counter()
+                    try:
+                        copy_results.append(
+                            cm.copy_one_after_build(name, f"v{ver}", copy_roots))
+                    except Exception as e:
+                        self._log(f"[{name}] copy ERROR: {e}")
+                        copy_results.append({
+                            "name": name, "version": f"v{ver}", "dest_ok": 0,
+                            "error": str(e), "stats": {"program_failed": 1},
+                            "file_log": [f"  [failed  ]  {e}"]})
+                    copy_time += _time.perf_counter() - t1
+
             self.after(0, lambda: self._on_build_finished(
-                ok_count, fail_count, failed, built_paths, built_projects, elapsed_total))
+                ok_count, fail_count, failed, built_paths, built_projects,
+                build_time, copy_each=copy_each, copy_roots=copy_roots,
+                copy_results=copy_results, copy_time=copy_time))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2031,7 +2363,8 @@ class BuilderUI(ttk.Frame):
 
             if py_entry and py_entry.exists():
                 try:
-                    subprocess.Popen(["py", str(py_entry)], cwd=str(COPY_MANAGER_SRC_DIR))
+                    subprocess.Popen(["py", str(py_entry)], cwd=str(COPY_MANAGER_SRC_DIR),
+                                     creationflags=NO_WINDOW)
                     return
                 except Exception as e:
                     messagebox.showerror("Run failed", f"Could not start Copy manager script:\n{e}")

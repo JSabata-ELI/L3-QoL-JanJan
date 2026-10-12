@@ -26,6 +26,7 @@ about what crosses folder boundaries.
 | `Pulser Monitor` | Diode-array pulser analysis from camera frames | External¹ | PySide6 | yes |
 | `Shift planner` | Fill your availability into the shift spreadsheet | External¹ | tkinter | yes |
 | `Calibrations` | Energy-detector calibration | In progress | PySide6 | yes |
+| `Laser settings` | Is the machine set right for the hall being shot into? | In progress ³ | PySide6 | not yet |
 | `Launcher` | Starts everything else | Parts | tkinter | yes |
 | `Dev Tools` | Builder + Copy Manager (build and publish) | Personal | tkinter | yes |
 | `Internal Builder` | Builds the shared support folder | Personal | — | yes (by-product) |
@@ -48,6 +49,12 @@ Dev Tools ▸ Builder's project list, which takes any folder containing a `.py`
 (`b_t.py:314`); it is simply never built. It is written as one QWidget and is meant to
 become an **SPFE values** tab of CSS Logger rather than ship on its own.
 
+³ **Finished, but watching nothing yet.** `Laser settings` is listed in
+`IN_PROGRESS` because the hall shooting channels and the watched channels are not
+known yet: it comes up with five grey squares and an empty table until they are
+filled in on its Settings tab. Move the folder name to `SCRIPTS` in `Launcher/l.py`
+once they are, and build it.
+
 `SCRIPTS` also contains `"Chiller log"`, which normalises to match the real folder, so
 Chiller Log will appear under Scripts as soon as it is built.
 
@@ -55,7 +62,7 @@ Chiller Log will appear under Scripts as soon as it is built.
 
 | | has `icon.ico` | has `build_config.json` |
 |---|---|---|
-| Announcer, CSS Logger, Diagnostic, Image Tools, Internal Builder | yes | yes |
+| Announcer, CSS Logger, Diagnostic, Image Tools, Internal Builder, Laser settings | yes | yes |
 | Calibrations, Chiller Log, Dev Tools, Git Work, Launcher, Screenshots, Shift planner, Time Converter | yes | no (none needed) |
 | Pulser Monitor | **no** | yes |
 | SPFE Values | **no** | no (not built yet) |
@@ -229,10 +236,11 @@ Four homes, and the choice is never arbitrary.
 
 | Home | Used for | Programs |
 |------|----------|----------|
-| `%APPDATA%\<Name>\` | per-user preferences and caches; anything that must survive a redeploy | `Launcher`, `DevTools`, `GitWork`, `PulserMonitor` (the hand-tuned ROI boxes!), `ELI_ImageTools`, `ELI_Spectra`, `Diagnostic` (run status, and `okbase.json` — the canteen sign-in, which is why a rebuild inherits it) |
+| `%APPDATA%\<Name>\` | per-user preferences and caches; anything that must survive a redeploy | `Launcher`, `DevTools`, `GitWork`, `PulserMonitor` (the hand-tuned ROI boxes!), `ELI_ImageTools`, `ELI_Spectra`, `CSS Logger` (`logger_tabs.json` — the setting tabs), `LaserSettings` (the channels and their per-hall limits), `Diagnostic` (run status, and `okbase.json` — the canteen sign-in, which is why a rebuild inherits it) |
 | `%LOCALAPPDATA%\<Name>\` | the same, but for things too big to roam with the Windows profile | `Diagnostic\edge-profile` — the browser profile behind **Sign in with Edge** (`edge_cdp.py`). A Chromium profile is hundreds of megabytes of cache; it is deliberately NOT in the roaming `%APPDATA%` the rest of that program uses, and nothing in it needs to survive being deleted (it costs one extra sign-in) |
 | Next to the program | per-installation configuration and data | `Screenshots/custom_presets.json`, `Announcer/presets.json`, `CSS Logger/*.json`, `Chiller Log/chiller_archive.csv`, `Diagnostic/monitor_config.json` |
 | The scratch share | configuration that must be the same everywhere | `Diagnostic\monitor_pvs_shared.json` (the PV list, thresholds and monitoring settings) |
+| The scratch share, `Software\CPVA cache\` | archived data that cannot change any more, shared by every station | CSS Logger's day cache (`cpva_cache.py`): closed days of each signal, one `.npz` per signal per month. Outside every program folder, so a redeploy never wipes it; only the built program writes it (a source run leaves it off unless `CPVA_CACHE_DIR` is set) |
 | Inside the build | credentials that cannot be per-PC | `Diagnostic/notify_provision.dat` (Teams / SMTP / Webex) |
 
 Rules worth restating:
@@ -273,6 +281,7 @@ Several programs read the same archive, and the difference is the time scale.
 | Analyse the spectrometer | **CSS Logger** ▸ Spectra |
 | What did the pulsers do today | **Pulser Monitor** |
 | Tell me when the screen changes | **Announcer** |
+| Is the machine set right for the hall we are shooting into | **Laser settings** |
 
 Deliberate overlaps, so nobody merges them by mistake:
 
@@ -285,6 +294,10 @@ Deliberate overlaps, so nobody merges them by mistake:
 - **Announcer's PV badges vs Diagnostic's alerting.** Announcer's are a convenience
   beside its screen watch and only run while it is watching. Diagnostic is the real
   alerting.
+- **Laser settings vs Diagnostic.** Laser settings never alerts: it shows, on screen,
+  whether the machine matches the hall being shot into, and its limits change with
+  the hall. Diagnostic alerts on one set of thresholds regardless of where the shot
+  is going. Nothing in Laser settings writes, sounds or sends anything.
 - **Screenshots vs Image Tools.** Screenshots collects; Image Tools inspects.
 - **Extractor vs Dev Tools ▸ Deploy internal.** Same job; Extractor is the manual
   fallback and its folder list is out of date.
@@ -414,8 +427,6 @@ CSS Logger/              test_smoke.py, test_live_pacing.py,
 - **Pulser Monitor has no `icon.ico`.**
 - **Diagnostic, Pulser Monitor, Shift planner and Extractor are unclassified** in the
   Launcher and therefore land in "External".
-- **Diagnostic's History tab cannot run**: its input file
-  (`MasterOperations.parquet`) is no longer produced by anything.
 - **Extractor's folder list is out of date** — it names programs that no longer exist
   and misses every newer one. Use Dev Tools ▸ Copy Manager instead.
 - **Chiller Log** is not set up for a build (no `build_config.json`), and its settings

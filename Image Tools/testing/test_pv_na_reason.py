@@ -86,8 +86,10 @@ def main() -> int:
     check("the nearest reading is shown, not n/a",
           any(c.isdigit() for c in text) and not text.startswith(cpva.PV_TEXT_NOT_FOUND),
           f"text={text!r}")
-    check("and it is labelled with the offset", "2.5 s)" in text, f"text={text!r}")
-    check("greyed, so it cannot pass for this frame's own reading", grey)
+    # 05.10.2026: the label is the orange dot; the offset is in the tooltip.
+    check("and it carries the other-shot dot", grey == m.PV_STATE_HELD, f"state={grey!r}")
+    check("…the tooltip says how far: 2.5 s", "2.5 s" in (tip or ""), f"tip={tip!r}")
+    check("dotted, so it cannot pass for this frame's own reading", bool(grey))
     check("the tooltip names the moment it was read at", "Read at" in (tip or ""))
     off = v._pv_sample_offset_s("PTM1")
     check("the offset is signed and measured to the SAMPLE",
@@ -96,11 +98,11 @@ def main() -> int:
     # The BURN-IN is a permanent record: it must carry the same label the screen did.
     burn = m.pv_text_for_ts(frame, ["PTM1"])
     print(f"  burn-in: {burn!r}")
-    check("the burned-in line carries the offset too", "-2.5 s)" in burn,
+    check("the burned-in line carries the dot too", m.pv_bar_dot("held") in burn,
           f"burn={burn!r}")
     burn_on = m.pv_text_for_ts(published[41][0], ["PTM1"])
-    check("and a frame with its own reading burns in plainly", "s)" not in burn_on,
-          f"burn={burn_on!r}")
+    check("and a frame with its own reading burns in plainly",
+          m.pv_bar_plain(burn_on) == burn_on, f"burn={burn_on!r}")
 
     # A frame ON a reading keeps the plain number, no label, not greyed.
     text2, grey2, tip2 = show_frame(app, v, published[41][0])
@@ -125,9 +127,9 @@ def main() -> int:
     print(f"  in the hole: {text3!r}")
     for line in (tip3 or "(none)").splitlines():
         print(f"    {line}")
-    check("a frame inside the hole reads n/a, never a neighbouring shot",
-          text3.startswith(cpva.PV_TEXT_NOT_FOUND), f"text={text3!r}")
-    check("and n/a says why", "nearest" in (tip3 or "").lower(), f"tip={tip3!r}")
+    check("a frame inside the hole has no value (grey dot), never a neighbouring shot",
+          text3 == "" and grey3 == m.PV_STATE_NONE, f"text={text3!r} state={grey3!r}")
+    check("and the tooltip says why", "nearest" in (tip3 or "").lower(), f"tip={tip3!r}")
 
     text4, _g4, _t4 = show_frame(app, v2, dense[1000][0])
     check("an ordinary 3.3 Hz frame still reads its own value plainly",

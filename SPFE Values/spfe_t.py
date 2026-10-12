@@ -762,6 +762,26 @@ class SPFEValuesWidget(QWidget):
         self._save_timer.timeout.connect(self._flush_pending)
         self._campaign_shown = ""
 
+        # Small writes the operator made by typing -- a campaign name, a value
+        # in a column nobody recorded -- go through their own queue, never
+        # through _run: _run refuses while the start-up or a catch-up holds
+        # the program, and a refused write here is a value thrown away.
+        self._side_queue: list = []
+        self._side_lock = threading.Lock()
+        self._side_running = False
+
+        # What the day table was last built from. A refresh that would build
+        # exactly the same table recolours it in place instead, so the table
+        # does not jump back to its top or lose the cell that was picked.
+        self._shown_sig = None
+        # How many numbers the widest quantity has. Fixed for the life of the
+        # program (the field file is read once), and asked for by every cell.
+        try:
+            self._parts_n = max((len(r.columns) for r in self.fields.rows),
+                                default=1)
+        except Exception:
+            self._parts_n = 1
+
         # The folding sections of the toolbar, and which of them were left
         # open. Read before the panel is built, or every section would open on
         # every run.
@@ -1159,7 +1179,7 @@ class SPFEValuesWidget(QWidget):
         """The recorded days, to look at without leaving the day on screen."""
         if self._day_window is None:
             self._day_window = self._make_view_day_window()
-        self._refresh_day_list()
+        self._refresh_day_list(force=True)
         self._day_window.show()
         self._day_window.raise_()
         self._day_window.activateWindow()
@@ -1506,13 +1526,16 @@ class SPFEValuesWidget(QWidget):
             entries[column] = entry
 
         pct = limits.as_number(self.ed_warn_pct.text())
-        if pct is not None and pct >= 0:
+        pct_changed = False
+        if pct is not None and pct >= 0 and pct != self._warn_pct:
             self._warn_pct = pct
             self.cfg["warn_pct"] = pct
             store.save_config(self.cfg)
+            pct_changed = True
 
         self._refs_window.hide()
-        self._use_references(entries)
+        # The yellow band moves with the percentage even when no range did.
+        self._use_references(entries, force=pct_changed)
         self._set_status("Saving the references...", BLUE)
 
         def body():
@@ -1523,12 +1546,20 @@ class SPFEValuesWidget(QWidget):
 
         threading.Thread(target=body, daemon=True, name="spfe-refs").start()
 
-    def _use_references(self, entries: dict) -> None:
-        """Take a reference table into use and repaint what is on screen."""
-        if entries == self._refs:
+    def _use_references(self, entries: dict, *, force: bool = False) -> None:
+        """Take a reference table into use and recolour what is on screen.
+
+        Recoloured in place, never rebuilt: a range only changes colours and
+        tooltips, and a rebuild threw the table back to its top.
+        """
+        if entries == self._refs and not force:
             return
         self._refs = dict(entries)
-        self._refresh_today()
+        self._recolour(self.table)
+        hist = getattr(self, "hist_table", None)
+        if hist is not None and self._day_window is not None \
+                and self._day_window.isVisible():
+            self._recolour(hist)
 
     # ── background jobs ──────────────────────────────────────────────────
     def _run(self, fn, name: str):
@@ -1590,6 +1621,9 @@ class SPFEValuesWidget(QWidget):
                 self._bridge.log.emit(f"Sent {res.share_rows} queued rows to the share.")
             merged = self.store.references()
             self._bridge.finished.emit(lambda e=merged: self._use_references(e))
+            # Read here, off the UI thread, so the window shows the shared
+            # names from its cache from now on.
+            self.store.campaigns()
             self._reload_rows()
             if self.cfg.get("catch_up_on_start", True) and not self._fields_error:
                 self._catch_up()
@@ -1613,8 +1647,10 @@ class SPFEValuesWidget(QWidget):
 
         self._run(job, "Record now")
 
-    def _on_record_slot(self, slot: str):
-        if not self._guard_fields():
+    def _on_record_slot(self, slot: str, *, auto: bool = False):
+        # `auto` is the slot timer: nobody clicked anything, so nothing may
+        # open a window -- a problem goes to the status line instead.
+        if not self._guard_fields(quiet=auto):
             return
         hhmm = self.cfg.get("slot_morning" if slot == SLOT_MORNING else "slot_evening")
         h, m = store._parse_hhmm(hhmm)
@@ -1858,6 +1894,7 @@ class SPFEValuesWidget(QWidget):
                     f"Sent {res.share_rows} row(s) to the shared folder.", OK_GREEN)
             else:
                 self._bridge.status.emit("The shared folder is already up to date.", OK_GREEN)
+            self.store.campaigns()
             self._reload_rows()
 
         self._run(job, "Sync")
@@ -1884,7 +1921,7 @@ class SPFEValuesWidget(QWidget):
                 return
             self._last_slot_check = stamp
             self._append_log(f"{store.SLOT_HEADINGS[slot]} is due - recording.")
-            self._on_record_slot(slot)
+            self._on_record_slot(slot, auto=True)
             return
 
     # ── typed values save themselves ─────────────────────────────────────
@@ -1969,16 +2006,53 @@ class SPFEValuesWidget(QWidget):
             return
         rec.values[column] = text
         store.apply_defaults(self.fields, rec.values, rec.day)
+        self._set_status("Saving...", BLUE)
 
         def job():
-            res = self.store.save([rec])
+            # A second cell typed into the same column before the first one
+            # has been read back is already a recorded moment by the time its
+            # turn comes: it becomes a correction, not a second record.
+            if rec.stamp in {r.get("datetime", "") for r in self.store.all_rows()}:
+                res = self.store.update_values({rec.stamp: {column: text}})
+            else:
+                res = self.store.save([rec])
             self._bridge.status.emit(
                 res.problem or f"{self._heading_for(rec)} on "
                 f"{rec.day:%d.%m.%Y} written down by hand.",
                 WARN_RED if res.problem else OK_GREEN)
             self._reload_rows()
 
-        self._run(job, "Write down by hand")
+        self._side_job(job, "Write down by hand")
+
+    def _side_job(self, fn, name: str) -> None:
+        """Queue a small write the operator typed; never refused.
+
+        One worker, in order: two writes of the same file must not race, and a
+        name typed after a value must not overtake it.
+        """
+        with self._side_lock:
+            self._side_queue.append((fn, name))
+            if self._side_running:
+                return
+            self._side_running = True
+
+        def worker():
+            while True:
+                with self._side_lock:
+                    if not self._side_queue:
+                        self._side_running = False
+                        return
+                    job, label = self._side_queue.pop(0)
+                try:
+                    job()
+                except Exception as exc:
+                    self._bridge.log.emit(
+                        f"{label} failed: {type(exc).__name__}: {exc}\n"
+                        + traceback.format_exc())
+                    self._bridge.status.emit(
+                        f"{label} failed: {type(exc).__name__}: {exc}", WARN_RED)
+
+        threading.Thread(target=worker, daemon=True, name="spfe-typed").start()
 
     def _queue_edits(self, edits: dict, rec: Record):
         """Put the change on the queue and repaint the cell from the record.
@@ -2004,6 +2078,9 @@ class SPFEValuesWidget(QWidget):
         # The verdict was computed on the old number.
         self._flags.pop(rec.stamp, None)
         self._repaint_column(rec.stamp)
+        # The table already shows the new number; a later refresh must not
+        # take that for a change and rebuild the whole table for it.
+        self._shown_sig = self._signature(self._day, self._columns)
 
         self._set_status("Saving...", BLUE)
         self._save_timer.start()
@@ -2096,24 +2173,50 @@ class SPFEValuesWidget(QWidget):
         for c, rec in enumerate(self._columns):
             if rec.stamp != stamp:
                 continue
-            flags = self._flags_for(rec, self._day)
-            self._fill_depth += 1
-            try:
-                for r, row_def in enumerate(self.fields.rows):
-                    for line in self._lines_for(row_def):
-                        item = self.table.item(r, self._grid_col(c, line.index))
-                        if item is None:
-                            continue
-                        text, held = self._cell_text(line, rec, self._day)
-                        reason = flags.get(line.column, "")
-                        item.setText(text)
-                        item.setData(_ROLE_TEXT, text)
-                        item.setData(_ROLE_HELD, held)
-                        self._paint_cell(item, line, rec, reason, held,
-                                         day=self._day)
-            finally:
-                self._fill_depth -= 1
+            self._repaint_moment(self.table, c, rec, self._day, editable=True)
             return
+
+    def _repaint_moment(self, table: QTableWidget, c: int, rec: Record,
+                        day: date, *, editable: bool) -> None:
+        """Rewrite the cells of one moment in place: text, colours, tooltip.
+
+        The items stay the same objects, so the scroll position, the picked
+        cell and an editor open elsewhere are all left alone.
+        """
+        flags = self._flags_for(rec, day)
+        self._fill_depth += 1
+        try:
+            for r, row_def in enumerate(self.fields.rows):
+                for line in self._lines_for(row_def):
+                    item = table.item(r, self._grid_col(c, line.index))
+                    if item is None:
+                        continue
+                    text, held = self._cell_text(line, rec, day)
+                    reason = flags.get(line.column, "")
+                    if item.text() != text:
+                        item.setText(text)
+                    item.setData(_ROLE_TEXT, text)
+                    item.setData(_ROLE_HELD, held)
+                    self._paint_cell(item, line, rec, reason, held,
+                                     day=day, editable=editable)
+        finally:
+            self._fill_depth -= 1
+
+    def _recolour(self, table: QTableWidget) -> None:
+        """Every moment of a built table judged and painted again, in place.
+
+        What a new reference range, a new yellow width or a grown history
+        needs: the same numbers in the same cells, only their colours and
+        tooltips can change. Rebuilding the table for it threw the view back
+        to the top-left corner.
+        """
+        columns = getattr(table, "_spfe_columns", None)
+        day = getattr(table, "_spfe_day", None)
+        if columns is None or day is None:
+            return
+        editable = bool(getattr(table, "_spfe_editable", False))
+        for c, rec in enumerate(columns):
+            self._repaint_moment(table, c, rec, day, editable=editable)
 
     # ── the campaign ─────────────────────────────────────────────────────
     def _show_campaign(self):
@@ -2156,7 +2259,8 @@ class SPFEValuesWidget(QWidget):
                     f"The campaign ends on {day:%d.%m.%Y}.", OK_GREEN)
             self._bridge.finished.emit(self._show_campaign)
 
-        self._run(job, "Campaign")
+        self._set_status("Saving the campaign...", BLUE)
+        self._side_job(job, "Campaign")
 
     # ── deleting an extra column ─────────────────────────────────────────
     def _on_header_menu(self, pos):
@@ -2296,10 +2400,47 @@ class SPFEValuesWidget(QWidget):
             self._refresh_wanted = True
             return
         self._refresh_wanted = False
-        self._columns = self._columns_for(self._day)
+        columns = self._columns_for(self._day)
         self.lbl_day.setText(f"{self._day:%d.%m.%Y}  ({self._day:%A})")
         self._show_campaign()
-        self._fill_table(self.table, self._day, self._columns, editable=True)
+
+        sig = self._signature(self._day, columns)
+        if sig == self._shown_sig:
+            # Same day, same moments, same numbers: only a verdict can have
+            # changed (the history grew), and that is a colour, not a table.
+            self._recolour(self.table)
+            return
+
+        table = self.table
+        same_day = (self._shown_sig is not None
+                    and self._shown_sig[0] == self._day)
+        h = table.horizontalScrollBar().value()
+        v = table.verticalScrollBar().value()
+        cur = (table.currentRow(), table.currentColumn())
+        self._columns = columns
+        table.setUpdatesEnabled(False)
+        try:
+            self._fill_table(table, self._day, columns, editable=True)
+            # Where the operator was looking. A new day keeps the scroll, so
+            # stepping through days compares the same numbers; the picked
+            # cell only means something on the day it was picked.
+            table.horizontalScrollBar().setValue(h)
+            table.verticalScrollBar().setValue(v)
+            if same_day and cur[0] >= 0 and cur[1] >= 0 \
+                    and cur[0] < table.rowCount() \
+                    and cur[1] < table.columnCount():
+                table.setCurrentCell(*cur)
+        finally:
+            table.setUpdatesEnabled(True)
+        self._shown_sig = sig
+
+    @staticmethod
+    def _signature(day: date, columns: list[Record]) -> tuple:
+        """Everything the day table's cells are built from, in one value."""
+        return (day, tuple(
+            (rec.stamp, rec.slot, rec.source,
+             tuple(sorted((k, str(v)) for k, v in rec.values.items())))
+            for rec in columns))
 
     def _table_lines(self) -> list[_Line]:
         """Every number of the table, quantity by quantity.
@@ -2327,12 +2468,10 @@ class SPFEValuesWidget(QWidget):
 
         Derived, never written down: it is how many sub-columns every moment
         gets, and a quantity added to the field file with a fourth number has
-        to widen the table rather than fall off the end of it.
+        to widen the table rather than fall off the end of it. Worked out once
+        in __init__: it is asked for by every cell of every build.
         """
-        try:
-            return max((len(r.columns) for r in self.fields.rows), default=1)
-        except Exception:
-            return 1
+        return self._parts_n
 
     def _part_headings(self) -> list[str]:
         """The name of each sub-column: ['X', 'Y', 'SUM'].
@@ -2491,6 +2630,8 @@ class SPFEValuesWidget(QWidget):
             # The moments this table is showing, so that measuring its columns
             # does not have to know which of the two tables it is looking at.
             table._spfe_columns = list(columns)
+            table._spfe_day = day
+            table._spfe_editable = editable
             self._fit_columns(table)
             self._measure_rows(table)
             self._fit_rows(table)
@@ -2945,9 +3086,16 @@ class SPFEValuesWidget(QWidget):
         return sorted({r.get("date", "") for r in self._rows if r.get("date")},
                       reverse=True)
 
-    def _refresh_day_list(self):
-        """The day list of the View day window, if it has ever been opened."""
+    def _refresh_day_list(self, force: bool = False):
+        """The day list of the View day window -- only while it is open.
+
+        A hidden window is not kept up to date: opening it fills it (force),
+        and rebuilding its table after every background job was work nobody
+        could see.
+        """
         if self._day_window is None:
+            return
+        if not force and not self._day_window.isVisible():
             return
         days = self._recorded_days()
         counts: dict[str, int] = {}
@@ -3001,16 +3149,31 @@ class SPFEValuesWidget(QWidget):
         self._day_window.hide()
 
     def _on_cell_clicked(self, row: int, column: int):
-        """A quantity that carries a link opens it."""
+        """A quantity that carries a link opens it.
+
+        One table row is one QUANTITY, so the row is looked up in the
+        quantities -- not in _table_lines(), which has an entry per NUMBER and
+        opened the link of a different row as soon as a quantity above had
+        two or three numbers.
+        """
         if column != 1:
             return
-        lines = self._table_lines()
-        if not (0 <= row < len(lines)) or not lines[row].row.url:
+        rows = self.fields.rows
+        if not (0 <= row < len(rows)) or not rows[row].url:
             return
-        QDesktopServices.openUrl(QUrl(lines[row].row.url))
+        QDesktopServices.openUrl(QUrl(rows[row].url))
 
     # ── small helpers ────────────────────────────────────────────────────
-    def _guard_fields(self) -> bool:
+    def _guard_fields(self, quiet: bool = False) -> bool:
+        """`quiet`: called by a timer, not a click -- say it in the status
+        line, never in a message box that opens by itself."""
+        if quiet and (self._fields_error or not self.fields.pv_names):
+            msg = (f"spfe_fields.json cannot be read: {self._fields_error}"
+                   if self._fields_error
+                   else "No PV names are filled in yet - nothing was recorded.")
+            self._set_status(msg, WARN_RED)
+            self._append_log(msg)
+            return False
         if self._fields_error:
             QMessageBox.warning(self, "SPFE Values",
                                 f"spfe_fields.json cannot be read:\n\n{self._fields_error}")
@@ -3040,15 +3203,23 @@ class SPFEValuesWidget(QWidget):
         if folder is None:
             self._set_status("The shared folder has not answered yet.", WARN_RED)
             return
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass                       # opening it may still work
-        try:
-            _open_path(str(folder))
-            self._set_status(f"Opened {folder}.", INK_MUTED)
-        except Exception as exc:
-            self._set_status(f"Could not open the folder: {exc}", WARN_RED)
+        self._set_status(f"Opening {folder}...", BLUE)
+
+        # Off the UI thread: both calls touch the share, and a share that has
+        # just gone away answers after many seconds, not at once.
+        def body():
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass                   # opening it may still work
+            try:
+                _open_path(str(folder))
+                self._bridge.status.emit(f"Opened {folder}.", INK_MUTED)
+            except Exception as exc:
+                self._bridge.status.emit(
+                    f"Could not open the folder: {exc}", WARN_RED)
+
+        threading.Thread(target=body, daemon=True, name="spfe-open").start()
 
     def _set_busy(self, busy: bool):
         self._working = busy
@@ -3106,7 +3277,7 @@ class SPFEValuesWidget(QWidget):
         except Exception:
             pass
         for _ in range(20):            # at most two seconds, never more
-            if not self._saving:
+            if not self._saving and not self._side_running:
                 break
             QApplication.processEvents()
             time.sleep(0.1)

@@ -226,7 +226,8 @@ class AnnouncerWindow(QMainWindow):
         self.setCentralWidget(central)
 
         from wa_t import WatchTab
-        self._watch = WatchTab(self._engine, on_edit=self._edited)
+        self._watch = WatchTab(self._engine, on_edit=self.item_changed,
+                               on_open=self.edit_item)
         self._tabs.addTab(self._watch, "Watch")
 
         # Each editing tab is loaded on its own and a failure degrades to a red
@@ -382,18 +383,24 @@ class AnnouncerWindow(QMainWindow):
     def log(self, message, hint=None):
         self._watch.log(message, hint)
 
-    def _edited(self, item=None):
-        """Anything changed a watched item: repaint everything and save.
+    def item_changed(self, item):
+        """ONE item was changed in place — a tick, a limit, a name typed in.
 
-        `item` is set when the operator asked to edit that one, which the Watch
-        tab does on a double-click; the Values or Areas tab is then brought up
-        with it selected, because that is where it is edited.
+        Only the rows that show it are written again, on every tab, and the
+        lamp and the floating panel are put in step. Nothing is reloaded: the
+        set of rows is the same, so rebuilding the tables, re-reading the
+        pictures, the sounds and the speakers, and photographing the screen for
+        the Areas preview (all of which `refresh_tabs` does) would be work for
+        nothing, and the operator felt it as a lag after every click.
         """
-        self._engine.drop_missing()
-        self.refresh_tabs()
+        self._update_light()
+        for tab in (self._watch, self._values, self._areas):
+            if tab is not None:
+                try:
+                    tab.update_item(item)
+                except Exception as exc:
+                    self.log(f"A tab could not be brought up to date: {exc}")
         self.save_soon()
-        if item is not None:
-            self.edit_item(item)
 
     def edit_item(self, item):
         """Open the tab that owns this kind of item, with it selected."""
@@ -407,18 +414,28 @@ class AnnouncerWindow(QMainWindow):
             pass
 
     def refresh_tabs(self):
+        """The SET of rows changed — added, removed, another preset picked.
+
+        For one item changed in place, `item_changed` is the cheap way.
+        """
         # The lamp and the floating panel list the same rows as the tabs do, so
         # they are put back in step here too — a preset change alters all three.
         self._update_light()
-        for tab in (self._watch, self._values, self._areas, self._alarm_tab):
+        for tab in (self._watch, self._values, self._areas):
             if tab is None:
                 continue
             try:
                 tab.reload()
-            except AttributeError:
-                pass
             except Exception as exc:
                 self.log(f"A tab could not be refreshed: {exc}")
+        # The Alarm tab's own settings do not depend on the rows; only the two
+        # places belong to the preset. Reloading it re-read the image and sound
+        # folders, asked Windows for every speaker and decoded the picture.
+        if self._alarm_tab is not None:
+            try:
+                self._alarm_tab.preset_changed()
+            except Exception as exc:
+                self.log(f"The Alarm tab could not be refreshed: {exc}")
 
     def save_soon(self):
         self._save_timer.start()
@@ -485,7 +502,10 @@ class AnnouncerWindow(QMainWindow):
         }[colour])
         no_data = self._engine.no_data()
         self._mark.setVisible(no_data)
-        if self._hud is not None and self._hud.isVisible():
+        # Not while the circle is being placed: it is shown alone then, and the
+        # mark and the sentences popped up beside it on the next pass.
+        if self._hud is not None and self._hud.isVisible() \
+                and not self._hud.is_placing():
             self._hud.set_colour(colour)
             self._hud.set_no_data(no_data)
             self._hud.set_badges(self._badges())

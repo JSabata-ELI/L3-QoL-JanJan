@@ -12,7 +12,8 @@ WHAT IT DOES
   Sits in the Webex chat all day and waits for two commands. On /run
   it starts the Diagnostic program on this PC and switches its
   monitoring on, then writes back to the chat when the program is
-  really running. On /food it answers with the canteen menu.
+  really running. On /food it answers with the canteen menu, and
+  can order or cancel lunch.
 
   It exists because Diagnostic can only answer chat messages while
   it is open. This little program is the part that is always open,
@@ -51,10 +52,26 @@ THE CANTEEN MENU
       @Diagnostics /food          today
       @Diagnostics /food week     the whole week
 
-  It reads the menu Diagnostic saved earlier, so the answer arrives
-  with Diagnostic closed — which is the point. It says when the menu
-  was read, and if that was a long time ago it says so instead of
-  passing old food off as today's.
+  Every /food reads the menu from OKbase there and then, so the
+  answer arrives with Diagnostic closed — which is the point. Only
+  if that read fails (portal down, sign-in expired) does it answer
+  from the copy saved earlier, and then it says when that copy was
+  read and why it could not get a newer one, instead of passing old
+  food off as today's.
+
+  Ordering and cancelling lunch work here too, with Diagnostic
+  closed — the same commands as in Diagnostic:
+
+      @Diagnostics /food order friday 1 pin:bakoli
+      @Diagnostics /food cancel friday pin:tumida
+
+  Anybody allowed to command the bot may ask, unless Settings ->
+  Canteen menu -> "Restrict ordering to" names particular senders.
+  Every order or cancellation needs one of your one-time ordering
+  codes (the pin: word); it is used up only when the change is
+  really made. When 10 or fewer codes are left, the reply says so —
+  make a new list in Settings -> Canteen menu. /food order with no
+  meal named only shows the day's list and needs no code.
 
   While Diagnostic itself is open, this program stays quiet about
   /food and lets Diagnostic answer, so a question never gets two
@@ -64,6 +81,10 @@ THE CANTEEN MENU
   sign-in alive and reads the menu once a day, so the menu stays
   fresh and the sign-in does not have to be filled in again. That is
   the main reason to leave this window open.
+
+  It also sends the morning lunch reminder while Diagnostic is
+  closed: on working days from 08:00, if today has nothing ordered
+  and ordering is still open, one message that mentions you.
 
   Whose menu it is and how it gets saved is set in Diagnostic, in
   Settings -> Canteen menu.
@@ -94,6 +115,10 @@ WHAT IT NEEDS
   PV Monitor -> Settings -> Notifications -> Webex. One space there
   has to have "Listen for commands" ticked — that is the space this
   program watches. Nothing is configured here separately.
+
+  If that space has its "/food" box unticked, the canteen is off
+  there: /food only answers "not available in this room" and no
+  morning lunch reminder is posted.
 
   If the bot is not set up, the window says so and closes. That is
   the intended behaviour, not a crash.

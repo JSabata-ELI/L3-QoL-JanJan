@@ -95,6 +95,7 @@ class _Fake:
 
     def install(self):
         cpva_core.cpva_fetch_samples = self
+        cpva_core._DENSITY_MEMO.clear()      # each test is its own archive
         return self
 
     def raw_calls(self, channel):
@@ -176,8 +177,10 @@ def test_the_sparse_verdict_is_cheap():
     real = [(START + i * HOUR, float(i)) for i in range(72)]
     fake = _Fake({"MOTOR": _Chan(real, level="real")}).install()
     _res, _err, rep = _fetch(fake, ["MOTOR"])
+    # Density probe + opening request + the three days in day-sized steps
+    # (FILL_STEPS, so the graph fills in as it loads).
     check("a sparse signal over three days costs a handful of requests",
-          rep.requests <= 4, f"{rep.requests} requests")
+          rep.requests <= 5, f"{rep.requests} requests")
 
 
 def test_a_flat_thinned_series_is_thrown_away():

@@ -447,6 +447,16 @@ def _get_station_id() -> str:
     except Exception:
         return ""
 
+
+def _station_layout_name(station_id: str) -> str | None:
+    """Layout name for a hostname, tolerant of spelling: 'L3-OPR3', 'L3-OPR03',
+    'L3OPR3', 'opr3.domain' all give 'OPR-03'. None if no layout fits."""
+    m = re.search(r"(VIS|OPR)\D{0,2}0*(\d+)", (station_id or "").upper())
+    if not m:
+        return None
+    name = f"{m.group(1)}-{int(m.group(2)):02d}"
+    return name if name in MONITOR_LAYOUTS else None
+
 # Kamery dostupné na konkrétních stanicích.
 # Klíč = hostname uppercase. Hodnota = set UI názvů kamer.
 # Kamery neuvedené pro danou stanici budou zašedlé + tooltip se seznamem stanic kde jsou dostupné.
@@ -536,6 +546,12 @@ def _cam_available_here(cam: str, station: str) -> bool:
     if not assigned_to:
         return True  # není nikde explicitně → povolena všem
 
+    if station not in STATION_CAMERAS:
+        # Hostname spelled differently from the keys (e.g. 'L3-OPR03') → canonical key
+        lay = _station_layout_name(station)
+        if lay:
+            kind, num = lay.split("-")
+            station = f"L3-{kind}{int(num)}"
     return station in assigned_to
 
 # ---------------- konec STATION CONFIG ----------------
@@ -696,10 +712,13 @@ def monitors_for_cameras(cam_names: list[str]) -> list[int]:
     """Return sorted list of unique 0-based monitor indices where the CSS windows
     for the given cameras currently reside. Cameras with no visible window are skipped."""
     result: set[int] = set()
+    if not cam_names:
+        return []
+    windows = snapshot_windows()   # one desktop walk for every camera and needle
     for cam in cam_names:
         needles = _build_window_needles_static(cam)
         for needle in needles:
-            hwnd = find_window_by_title_substring(needle)
+            hwnd = find_window_by_title_substring(needle, snapshot=windows)
             if hwnd:
                 idx = monitor_index_for_hwnd(hwnd)
                 if idx is not None:
@@ -892,7 +911,28 @@ _EXCLUDED_WINDOW_CLASSES = {
     "tk",
 }
 
-def find_window_by_title_substring(substr: str, log=None) -> int | None:
+def snapshot_windows() -> list[tuple[int, str, str]]:
+    """Every visible, non-minimised, titled top-level window as
+    (hwnd, title, normalised title) — one EnumWindows pass that several title
+    searches can share instead of each walking the desktop again."""
+    out: list[tuple[int, str, str]] = []
+
+    def _cb(hwnd, lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return 1
+        if user32.IsIconic(hwnd):
+            return 1  # minimized — not usable as a capture target, and often a stale leftover
+        title = _get_window_text(hwnd)
+        if title:
+            out.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title, _norm_win_title(title)))
+        return 1
+
+    user32.EnumWindows(EnumWindowsProc(_cb), 0)
+    return out
+
+
+def find_window_by_title_substring(substr: str, log=None,
+                                   snapshot: list[tuple[int, str, str]] | None = None) -> int | None:
     if not substr:
         return None
     needle = _norm_win_title(substr)
@@ -902,28 +942,18 @@ def find_window_by_title_substring(substr: str, log=None) -> int | None:
     exact_matches: list[tuple[int, str]] = []
     loose_matches: list[tuple[int, str]] = []
 
-    def _cb(hwnd, lparam):
-        if not user32.IsWindowVisible(hwnd):
-            return 1
-        if user32.IsIconic(hwnd):
-            return 1  # minimized — not usable as a capture target, and often a stale leftover
-        title = _get_window_text(hwnd)
-        if not title:
-            return 1
-        norm_title = _norm_win_title(title)
+    for hwnd, title, norm_title in (snapshot if snapshot is not None else snapshot_windows()):
         if norm_title == needle:
-            exact_matches.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title))
-            return 1  # keep scanning in case of duplicates; exact match always wins anyway
+            # keep scanning in case of duplicates; exact match always wins anyway
+            exact_matches.append((hwnd, title))
+            continue
         if needle in norm_title:
             cls = _get_window_class(hwnd).lower()
             if cls in _EXCLUDED_WINDOW_CLASSES:
                 if log:
                     log(f"[WIN] ignored '{title}' (class={cls}) — not a camera window")
-                return 1
-            loose_matches.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title))
-        return 1
-
-    user32.EnumWindows(EnumWindowsProc(_cb), 0)
+                continue
+            loose_matches.append((hwnd, title))
 
     if exact_matches:
         return exact_matches[0][0]
@@ -1294,6 +1324,38 @@ def open_in_explorer(path: Path):
 
 
 # ---------------- UI helpers ----------------
+def install_wheel_guard(root: tk.Misc) -> None:
+    """The mouse wheel changes a combobox or spinbox only after it was clicked.
+
+    Tk's own class bindings change the value of whatever box is under the
+    pointer — a read-only combobox too, and it even fires <<ComboboxSelected>>
+    — so scrolling a window past one silently changed its setting. The class
+    bindings are replaced app-wide: an unfocused box lets the event pass on to
+    the window's own wheel binding (the page scrolls); the focused box runs Tk's
+    original script and stops the event there (the page stays put).
+    """
+    for cls in ("TCombobox", "TSpinbox"):
+        script = root.bind_class(cls, "<MouseWheel>")
+        if not script or callable(script):
+            continue
+
+        def _guard(event, script=script):
+            w = event.widget
+            try:
+                focused = str(root.focus_get()) == str(w)
+            except (KeyError, tk.TclError):
+                focused = False   # e.g. a combobox drop-down list has the focus
+            if not focused:
+                return None
+            try:
+                root.tk.eval(script.replace("%W", str(w)).replace("%D", str(event.delta)))
+            except tk.TclError:
+                pass
+            return "break"
+
+        root.bind_class(cls, "<MouseWheel>", _guard)
+
+
 class CollapsibleSection(ttk.Frame):
     def __init__(self, parent, title: str, expanded: bool = True):
         super().__init__(parent)
@@ -1363,6 +1425,12 @@ class ToolTip:
         self._after_id = None
 
     def _show(self):
+        self._after_id = None
+        try:
+            if not self.widget.winfo_exists():
+                return  # rebuilt away while the delay ran
+        except tk.TclError:
+            return
         txt = str(self.text_func() or "").strip()
         if not txt:
             return
@@ -1403,8 +1471,20 @@ class PreviewWindow(tk.Toplevel):
     # "Original" keeps the picture in the colours it arrived in (a colour camera
     # stays in colour); "Grayscale" deliberately drops them. Everything after
     # that is a false-colour map over the grey values.
-    _PALETTES = ["Original", "Grayscale", "Gradient", "Hot", "Viridis", "Plasma",
+    # The same list, in the same order, as Image Tools (is_t.GRADIENTS), with
+    # "Original" in the place of its "Default".
+    _PALETTES = ["Original", "Grayscale", "Gradient", "Binary", "False Colors",
+                 "Rainbow", "Hot", "Black and White", "Viridis", "Plasma",
                  "Inferno", "Jet", "Turbo"]
+    # Binary and False Colors are copies of the NI viewer's palettes, measured in
+    # Image Tools (see its is_t.py / STRUCTURE.md). Their colours are pinned to the
+    # camera's raw counts, so — as in Image Tools — they ignore Contrast, Brightness,
+    # Gamma and both Autos: any stretch would paint a colour that means a different
+    # value than it does in the NI window.
+    _NI_PALETTES = frozenset({"Binary", "False Colors"})
+    # Binary changes colour every 16 counts, so the picture may only be shrunk by
+    # picking whole pixels: the average of two cycle colours is a third, unrelated one.
+    _PIXEL_EXACT_PALETTES = frozenset({"Binary"})
 
     _LUTS: dict = {}  # lazy-built
 
@@ -1533,7 +1613,14 @@ class PreviewWindow(tk.Toplevel):
         tables = {
             "Gradient": [(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),
                          (0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))],
-            "Hot":      [(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))],
+            # NI Vision "Rainbow": blue to red with a wide green middle, 0 black,
+            # 255 white (same stops as Image Tools).
+            "Rainbow":  [(0.00,(0,0,0)),(0.04,(0,0,200)),(0.14,(0,40,255)),(0.26,(0,150,255)),
+                         (0.36,(0,230,180)),(0.46,(0,255,80)),(0.56,(90,255,0)),(0.66,(190,255,0)),
+                         (0.76,(255,220,0)),(0.86,(255,120,0)),(0.94,(255,0,0)),(1.00,(255,255,255))],
+            # Red / yellow lowered, pale yellow added, white kept at the top — as in
+            # Image Tools.
+            "Hot":      [(0,(0,0,0)),(0.27,(255,0,0)),(0.53,(255,255,0)),(0.78,(255,255,190)),(1,(255,255,255))],
             "Viridis":  [(0,(68,1,84)),(0.25,(59,82,139)),(0.5,(33,145,140)),(0.75,(94,201,98)),(1,(253,231,37))],
             "Plasma":   [(0,(13,8,135)),(0.25,(126,3,168)),(0.5,(204,71,120)),(0.75,(248,149,64)),(1,(240,249,33))],
             "Inferno":  [(0,(0,0,4)),(0.25,(87,16,110)),(0.5,(188,55,84)),(0.75,(249,142,9)),(1,(252,255,164))],
@@ -1542,8 +1629,94 @@ class PreviewWindow(tk.Toplevel):
         }
         if name in tables:
             cls._LUTS[name] = lut(tables[name])
+        elif name == "Binary":
+            cls._LUTS[name] = cls._ni_binary_lut()
+        elif name == "False Colors":
+            cls._LUTS[name] = cls._ni_false_colors_lut()
+        elif name == "Black and White":
+            a = np.zeros((256, 3), dtype=np.uint8)
+            a[128:] = 255
+            cls._LUTS[name] = a
         else:
             cls._LUTS[name] = None  # Grayscale = None
+
+    # NI Vision "Binary" (Image Tools is_t._NI_BINARY_CYCLE): 256 entries indexed by
+    # raw counts >> 4 — entry 0 black, 255 (saturated) white, 1..254 this 15-colour
+    # cycle, so a new colour every 16 counts.
+    _NI_BINARY_CYCLE = [
+        (255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
+        (255,127,0), (255,0,127), (127,255,0), (127,0,255), (0,127,255), (0,255,127),
+        (255,127,127), (127,255,127), (127,127,255),
+    ]
+
+    @classmethod
+    def _ni_binary_lut(cls):
+        import numpy as np
+        i = np.arange(256)
+        table = np.array([(0, 0, 0)] + cls._NI_BINARY_CYCLE, dtype=np.uint8)
+        a = table[np.where(i == 0, 0, (i - 1) % 15 + 1)]
+        a[255] = (255, 255, 255)
+        return a
+
+    @staticmethod
+    def _ni_false_colors_lut():
+        """NI Vision "False Colors" — the formula measured in Image Tools
+        (is_t._make_ni_false_colors_lut): hue one full turn backwards, a 12-entry
+        lightness triangle (the contour bands), fades at both ends, entry 0 grey,
+        252..254 greys, 255 white."""
+        import numpy as np
+        i = np.arange(256, dtype=np.float64)
+        hue = (321.0 - 1.3967 * i) % 360.0
+        light = 0.425 + 0.025 * (6.0 - np.abs(i % 12.0 - 6.0))
+        light -= 0.006 * np.clip(50.0 - i, 0.0, None)
+        light += (1.0 / 120.0) * np.clip(i - 220.0, 0.0, None)
+        light = np.clip(light, 0.0, 1.0)
+        chroma = 1.0 - np.abs(2.0 * light - 1.0)
+        hp = hue / 60.0
+        x = chroma * (1.0 - np.abs(hp % 2.0 - 1.0))
+        z = np.zeros_like(i)
+        seg = hp.astype(np.int64) % 6
+        r = np.choose(seg, [chroma, x, z, z, x, chroma])
+        g = np.choose(seg, [x, chroma, chroma, x, z, z])
+        b = np.choose(seg, [z, z, x, chroma, chroma, x])
+        m = light - chroma / 2.0
+        a = np.rint(np.stack([r + m, g + m, b + m], 1) * 255.0).clip(0, 255).astype(np.uint8)
+        a[0] = (58, 58, 58)
+        for k in (252, 253, 254):
+            a[k] = (k, k, k)
+        a[255] = (255, 255, 255)
+        return a
+
+    @staticmethod
+    def _ni_entry(img):
+        """The NI palette entry (0..255) of every pixel: raw camera counts >> 4.
+
+        An archive frame is 16-bit, stored as raw_counts * 65535 / (2**bits - 1)
+        with `bits` the bracket of the frame's own peak (`MaxValue` tEXt), and the
+        cameras are 12-bit, so raw counts come back exactly and the entry is the
+        same for the same intensity on every frame. A 16-bit file without
+        `MaxValue` is taken as already on the full 16-bit scale (stored >> 8). An
+        8-bit picture (a screen capture) has no counts left; its grey level is
+        the best stand-in."""
+        import math
+        import numpy as np
+        if img.mode in ("I", "I;16", "I;16B", "F"):
+            arr = np.asarray(img, dtype=np.float64)
+            try:
+                mv = float(img.info.get("MaxValue", ""))
+            except (TypeError, ValueError):
+                mv = 0.0
+            if mv > 0:
+                top = 2 ** max(1, math.ceil(math.log2(mv + 1))) - 1
+                raw = np.rint(arr * (top / 65535.0))
+                return (np.clip(raw, 0, 4095) / 16).astype(np.uint8)
+            return (np.clip(arr, 0, 65535) / 256).astype(np.uint8)
+        return np.array(img.convert("L"))
+
+    @classmethod
+    def _resample_for(cls, palette: str):
+        """How to shrink or enlarge a picture before `palette` is applied."""
+        return Image.NEAREST if palette in cls._PIXEL_EXACT_PALETTES else Image.LANCZOS
 
     def __init__(self, master, paths: list[Path],
                  on_keep=None, on_delete=None, on_try_again=None,
@@ -1587,6 +1760,16 @@ class PreviewWindow(tk.Toplevel):
         # per-image persistent state: path -> {"overlay": PIL RGBA Image | None, "palette": str,
         #   "brightness": int, "auto": bool, "contrast": int, "auto_bright": bool}
         self._img_states: dict[Path, dict] = {}
+        # Decoded pictures, so a tone change never reads the share again:
+        #   _src_cache  path -> the file as opened (fully loaded)
+        #   _fit_cache  (path, size, resample) -> that picture fitted to `size`
+        # Both are trimmed to the paths on screen whenever the path list changes.
+        self._src_cache: dict[Path, "Image.Image"] = {}
+        self._fit_cache: dict[tuple, "Image.Image"] = {}
+        self._popup_cache: dict[tuple, "Image.Image"] = {}   # same, hover size
+        self._cells: dict[Path, tk.Label] = {}   # path -> its thumbnail label
+        self._retone_id = None                   # pending after_idle retone
+        self._cap_font = tkfont.Font(font=("Segoe UI", 7))
 
         # ── cycle bar (auto runs only) ────────────────────────────
         if cycle_mode:
@@ -1634,29 +1817,35 @@ class PreviewWindow(tk.Toplevel):
         ttk.Label(bar, text="Contrast:").pack(side="left")
         self._contrast_scale = ttk.Scale(bar, from_=-127, to=127, orient="horizontal",
                   variable=self._contrast, length=120,
-                  command=lambda _: self._redraw())
+                  command=lambda _: self._schedule_retone())
         self._contrast_scale.pack(side="left", padx=(4, 2))
-        ttk.Button(bar, text="↺", width=3,
-                   command=self._reset_contrast).pack(side="left", padx=(0, 2))
-        ttk.Checkbutton(bar, text="Auto", variable=self._auto,
-                        command=self._on_auto_contrast_toggle).pack(side="left", padx=(0, 12))
+        b_c = ttk.Button(bar, text="↺", width=3, command=self._reset_contrast)
+        b_c.pack(side="left", padx=(0, 2))
+        a_c = ttk.Checkbutton(bar, text="Auto", variable=self._auto,
+                              command=self._on_auto_contrast_toggle)
+        a_c.pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Brightness:").pack(side="left")
         self._bright_scale = ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
                   variable=self._brightness, length=120,
-                  command=lambda _: self._redraw())
+                  command=lambda _: self._schedule_retone())
         self._bright_scale.pack(side="left", padx=(4, 2))
-        ttk.Button(bar, text="↺", width=3,
-                   command=self._reset_brightness).pack(side="left", padx=(0, 2))
-        ttk.Checkbutton(bar, text="Auto", variable=self._auto_bright,
-                        command=self._on_auto_bright_toggle).pack(side="left", padx=(0, 12))
+        b_b = ttk.Button(bar, text="↺", width=3, command=self._reset_brightness)
+        b_b.pack(side="left", padx=(0, 2))
+        a_b = ttk.Checkbutton(bar, text="Auto", variable=self._auto_bright,
+                              command=self._on_auto_bright_toggle)
+        a_b.pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Gamma:").pack(side="left")
-        ttk.Scale(bar, from_=0.2, to=3.0, orient="horizontal",
-                  variable=self._gamma, length=120,
-                  command=lambda _: self._redraw()).pack(side="left", padx=(4, 2))
-        ttk.Button(bar, text="↺", width=3,
-                   command=self._reset_gamma).pack(side="left")
+        s_g = ttk.Scale(bar, from_=0.2, to=3.0, orient="horizontal",
+                        variable=self._gamma, length=120,
+                        command=lambda _: self._schedule_retone())
+        s_g.pack(side="left", padx=(4, 2))
+        b_g = ttk.Button(bar, text="↺", width=3, command=self._reset_gamma)
+        b_g.pack(side="left")
+        # Greyed out together on an NI palette (see _NI_PALETTES); the two
+        # sliders also follow their Auto box — see _sync_tone_enable.
+        self._tone_widgets = [b_c, a_c, b_b, a_b, s_g, b_g]
 
         # Second row: what the grid looks like rather than what the tones are.
         bar2 = ttk.Frame(self, padding=(6, 4))
@@ -1670,8 +1859,9 @@ class PreviewWindow(tk.Toplevel):
         ttk.Label(bar2, text="Palette:").pack(side="left")
         self._palette = tk.StringVar(value="Original")
         ttk.Combobox(bar2, textvariable=self._palette, values=self._PALETTES,
-                     state="readonly", width=10).pack(side="left", padx=(4, 0))
-        self._palette.trace_add("write", lambda *_: self._redraw())
+                     state="readonly", width=16).pack(side="left", padx=(4, 0))
+        self._palette.trace_add("write", lambda *_: (self._sync_tone_enable(),
+                                                     self._schedule_retone()))
 
         # ── scrollable canvas ─────────────────────────────────────
         wrap = ttk.Frame(self)
@@ -1812,17 +2002,28 @@ class PreviewWindow(tk.Toplevel):
                                      auto_bright, brightness, gamma)
         return lut[arr], applied
 
+    def _sync_tone_enable(self):
+        """Grey out every tone control on an NI palette (they would do nothing);
+        otherwise each slider is live unless its own Auto box is on."""
+        ni = self._palette.get() in self._NI_PALETTES
+        for w in getattr(self, "_tone_widgets", []):
+            w.configure(state="disabled" if ni else "normal")
+        self._contrast_scale.configure(
+            state="disabled" if ni or self._auto.get() else "normal")
+        self._bright_scale.configure(
+            state="disabled" if ni or self._auto_bright.get() else "normal")
+
     def _on_auto_contrast_toggle(self):
         # Auto contrast overrides the manual Contrast slider → grey it out while on,
-        # and let _redraw park it at the auto-computed position.
-        self._contrast_scale.configure(state="disabled" if self._auto.get() else "normal")
-        self._redraw()
+        # and let the retone park it at the auto-computed position.
+        self._sync_tone_enable()
+        self._schedule_retone()
 
     def _on_auto_bright_toggle(self):
         # Auto brightness overrides the manual Brightness slider → grey it out while on,
-        # and let _redraw park it at the auto-computed position.
-        self._bright_scale.configure(state="disabled" if self._auto_bright.get() else "normal")
-        self._redraw()
+        # and let the retone park it at the auto-computed position.
+        self._sync_tone_enable()
+        self._schedule_retone()
 
     def _reset_contrast(self):
         """↺ next to Contrast — back to untouched, Auto included. With Auto left
@@ -1830,17 +2031,70 @@ class PreviewWindow(tk.Toplevel):
         self._auto.set(False)
         self._contrast_scale.configure(state="normal")
         self._contrast.set(0)
-        self._redraw()
+        self._schedule_retone()
 
     def _reset_brightness(self):
         self._auto_bright.set(False)
         self._bright_scale.configure(state="normal")
         self._brightness.set(0)
-        self._redraw()
+        self._schedule_retone()
 
     def _reset_gamma(self):
         self._gamma.set(1.0)
-        self._redraw()
+        self._schedule_retone()
+
+    # ── in-place tone update ──────────────────────────────────────
+    def _schedule_retone(self):
+        """A tone / palette setting changed: re-colour the thumbnails already on
+        screen once Tk is idle. A slider drag fires many times per second; they
+        all fold into one pass, and nothing is rebuilt or read from disk."""
+        if self._syncing_sliders or self._retone_id is not None:
+            return
+        self._retone_id = self.after_idle(self._retone)
+
+    def _retone(self, paths=None):
+        """Re-colour `paths` (default: every thumbnail on screen) in place."""
+        if paths is None:
+            self._retone_id = None
+        size = self._thumb_size
+        for path in (paths if paths is not None else list(self._cells)):
+            lbl = self._cells.get(path)
+            if lbl is None:
+                continue
+            pm = self._process(path, size)
+            if pm is None:
+                continue
+            try:
+                lbl.configure(image=pm)
+            except tk.TclError:
+                continue
+            lbl.image = pm   # the label keeps its own picture alive
+        self._sync_auto_sliders()
+
+    def _load_source(self, path: Path):
+        """The file as opened, read from disk once per window."""
+        img = self._src_cache.get(path)
+        if img is None:
+            img = Image.open(path)
+            img.load()
+            self._src_cache[path] = img
+        return img
+
+    def _fitted(self, path: Path, size: int, resample):
+        key = (path, size, resample)
+        img = self._fit_cache.get(key)
+        if img is None:
+            img = self._fit_to_box(self._load_source(path), size, resample)
+            self._fit_cache[key] = img
+        return img
+
+    def _trim_caches(self, size: int | None = None):
+        """Forget pictures no longer on screen (and fits of another size)."""
+        keep = set(self._paths)
+        self._src_cache = {p: im for p, im in self._src_cache.items() if p in keep}
+        self._fit_cache = {k: im for k, im in self._fit_cache.items()
+                           if k[0] in keep and (size is None or k[1] == size)}
+        self._popup_cache = {k: im for k, im in self._popup_cache.items() if k[0] in keep}
 
     def _sync_auto_sliders(self):
         """Move the disabled sliders to the position the auto modes computed, so
@@ -1859,7 +2113,7 @@ class PreviewWindow(tk.Toplevel):
             self._syncing_sliders = False
 
     @staticmethod
-    def _fit_to_box(img, size: int):
+    def _fit_to_box(img, size: int, resample=None):
         """Scale the WHOLE frame so its long side is exactly `size` — never a crop,
         and unlike Image.thumbnail() this also enlarges sources smaller than the
         box, so the Zoom slider grows every thumbnail by the same factor."""
@@ -1869,7 +2123,7 @@ class PreviewWindow(tk.Toplevel):
         scale = size / long_side
         box = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
         try:
-            return img.resize(box, Image.LANCZOS)
+            return img.resize(box, Image.LANCZOS if resample is None else resample)
         except Exception:
             # 1-bit / palette / I;16 sources reject the reducing filters
             return img.resize(box, Image.NEAREST)
@@ -1908,6 +2162,12 @@ class PreviewWindow(tk.Toplevel):
         change.
         """
         import numpy as np
+        if palette in cls._NI_PALETTES:
+            # View-only, as in Image Tools: no tone curve, the colour is the value.
+            if palette not in cls._LUTS:
+                cls._build_lut(palette)
+            applied = {"contrast": int(contrast), "brightness": int(brightness)}
+            return Image.fromarray(cls._LUTS[palette][cls._ni_entry(img)], "RGB"), applied
         stats = cls._stats_gray(img)
         lut, applied = cls._tone_lut(stats, auto_contrast, contrast,
                                      auto_bright, brightness, gamma)
@@ -1928,8 +2188,9 @@ class PreviewWindow(tk.Toplevel):
     def _process(self, path: Path, size: int) -> ImageTk.PhotoImage | None:
         try:
             state = self._img_states.get(path)
-            img = self._fit_to_box(Image.open(path), size)
-            base_rgb, applied = self._render_tuned(img, **self._settings_for(state))
+            settings = self._settings_for(state)
+            img = self._fitted(path, size, self._resample_for(settings["palette"]))
+            base_rgb, applied = self._render_tuned(img, **settings)
             if not state:
                 # This thumbnail used the global toolbar settings → remember where
                 # the auto modes landed so the sliders can be parked there.
@@ -1957,8 +2218,8 @@ class PreviewWindow(tk.Toplevel):
                 pass
         self._resize_after_id = self.after(220, self._relayout_if_needed)
 
-    def _on_hover_enter(self, path: Path):
-        self._show_popup(path)
+    def _on_hover_enter(self, path: Path, widget=None):
+        self._show_popup(path, widget)
 
     def _on_hover_leave(self, _event=None):
         self._hide_popup()
@@ -1976,13 +2237,19 @@ class PreviewWindow(tk.Toplevel):
         win.resizable(True, True)
 
         # ── state ─────────────────────────────────────────────────
-        _zoom = tk.DoubleVar(value=1.0)
+        _zoom = tk.DoubleVar(value=existing_state.get("zoom", 1.0))
         _draw_tool = tk.StringVar(value="none")
         _draw_color = tk.StringVar(value="#ff0000")
         _line_width = tk.IntVar(value=2)
         _img_ref = [None]
         _base_pil = [None]
-        _overlay_pil = [None]
+        _overlay_pil = [None]   # the drawing at the size on screen
+        # The drawing as last drawn on. A zoom change shows a resized copy of
+        # it, so zooming back and forth never blurs or throws the drawing away.
+        _overlay_src = [None]
+        _src_img = [None]       # the file, opened once for this window
+        _resized = [None, None]  # (zoom, resample) key, picture at that zoom
+        _render_id = [None]     # pending after_idle render
         _scale = [1.0]
         _drag_start = [None]
         _current_shape_ids = []
@@ -1994,6 +2261,7 @@ class PreviewWindow(tk.Toplevel):
         # Init overlay from existing state
         if existing_state.get("overlay") is not None:
             _overlay_pil[0] = existing_state["overlay"].copy()
+            _overlay_src[0] = _overlay_pil[0]
 
         # ── toolbar ───────────────────────────────────────────────
         bar = ttk.Frame(win, padding=(6, 4))
@@ -2008,27 +2276,34 @@ class PreviewWindow(tk.Toplevel):
         _contrast_scale_z = ttk.Scale(bar, from_=-127, to=127, orient="horizontal",
                   variable=_contrast_zoom, length=110)
         _contrast_scale_z.pack(side="left", padx=(4, 2))
-        ttk.Button(bar, text="↺", width=3,
-                   command=lambda: _reset_contrast_z()).pack(side="left", padx=(0, 2))
+        _tone_z = []   # greyed out together on an NI palette, see _sync_auto_enable
+        _tone_z.append(ttk.Button(bar, text="↺", width=3,
+                                  command=lambda: _reset_contrast_z()))
+        _tone_z[-1].pack(side="left", padx=(0, 2))
         _auto_zoom = tk.BooleanVar(value=existing_state.get("auto", self._auto.get()))
-        ttk.Checkbutton(bar, text="Auto", variable=_auto_zoom).pack(side="left", padx=(0, 12))
+        _tone_z.append(ttk.Checkbutton(bar, text="Auto", variable=_auto_zoom))
+        _tone_z[-1].pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Brightness:").pack(side="left")
         _bright_zoom = tk.IntVar(value=existing_state.get("brightness", self._brightness.get()))
         _bright_scale_z = ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
                   variable=_bright_zoom, length=110)
         _bright_scale_z.pack(side="left", padx=(4, 2))
-        ttk.Button(bar, text="↺", width=3,
-                   command=lambda: _reset_bright_z()).pack(side="left", padx=(0, 2))
+        _tone_z.append(ttk.Button(bar, text="↺", width=3,
+                                  command=lambda: _reset_bright_z()))
+        _tone_z[-1].pack(side="left", padx=(0, 2))
         _auto_bright_zoom = tk.BooleanVar(value=existing_state.get("auto_bright", self._auto_bright.get()))
-        ttk.Checkbutton(bar, text="Auto", variable=_auto_bright_zoom).pack(side="left", padx=(0, 12))
+        _tone_z.append(ttk.Checkbutton(bar, text="Auto", variable=_auto_bright_zoom))
+        _tone_z[-1].pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Gamma:").pack(side="left")
         _gamma_zoom = tk.DoubleVar(value=existing_state.get("gamma", self._gamma.get()))
-        ttk.Scale(bar, from_=0.2, to=3.0, orient="horizontal",
-                  variable=_gamma_zoom, length=110).pack(side="left", padx=(4, 2))
-        ttk.Button(bar, text="↺", width=3,
-                   command=lambda: _gamma_zoom.set(1.0)).pack(side="left")
+        _tone_z.append(ttk.Scale(bar, from_=0.2, to=3.0, orient="horizontal",
+                                 variable=_gamma_zoom, length=110))
+        _tone_z[-1].pack(side="left", padx=(4, 2))
+        _tone_z.append(ttk.Button(bar, text="↺", width=3,
+                                  command=lambda: _gamma_zoom.set(1.0)))
+        _tone_z[-1].pack(side="left")
 
         # Second row: palette and the decisions, so nothing runs off the edge.
         bar_b = ttk.Frame(win, padding=(6, 0))
@@ -2037,12 +2312,16 @@ class PreviewWindow(tk.Toplevel):
         ttk.Label(bar_b, text="Palette:").pack(side="left")
         _pal_zoom = tk.StringVar(value=existing_state.get("palette", self._palette.get()))
         ttk.Combobox(bar_b, textvariable=_pal_zoom, values=self._PALETTES,
-                     state="readonly", width=10).pack(side="left", padx=(4, 12))
+                     state="readonly", width=16).pack(side="left", padx=(4, 12))
 
         def _sync_auto_enable(*_):
-            _contrast_scale_z.configure(state="disabled" if _auto_zoom.get() else "normal")
-            _bright_scale_z.configure(state="disabled" if _auto_bright_zoom.get() else "normal")
+            ni = _pal_zoom.get() in self._NI_PALETTES
+            for w in _tone_z:
+                w.configure(state="disabled" if ni else "normal")
+            _contrast_scale_z.configure(state="disabled" if ni or _auto_zoom.get() else "normal")
+            _bright_scale_z.configure(state="disabled" if ni or _auto_bright_zoom.get() else "normal")
         _sync_auto_enable()
+        _pal_zoom.trace_add("write", _sync_auto_enable)
 
         def _reset_contrast_z():
             # Auto off as well — with Auto on, the next render parks the slider
@@ -2072,12 +2351,12 @@ class PreviewWindow(tk.Toplevel):
                 "zoom": _zoom.get(),
             }
             win.destroy()
-            self._redraw()
+            self._retone([path])   # only this picture changed
 
         def _revert_changes():
             self._img_states.pop(path, None)
             win.destroy()
-            self._redraw()
+            self._retone([path])
 
         ttk.Button(bar_b, text="✔ Apply", command=_apply_changes).pack(side="left", padx=(0, 4))
         ttk.Button(bar_b, text="↺ Revert", command=_revert_changes).pack(side="left")
@@ -2138,36 +2417,67 @@ class PreviewWindow(tk.Toplevel):
         def _new_overlay(w, h):
             from PIL import Image as PILImage
             _overlay_pil[0] = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+            _overlay_src[0] = _overlay_pil[0]
 
         def _push_undo():
+            # Called as a stroke starts: from here on the drawing on screen is
+            # the one being drawn on.
             if _overlay_pil[0] is not None:
                 _undo_stack.append(_overlay_pil[0].copy())
                 if len(_undo_stack) > 30:
                     _undo_stack.pop(0)
+                _overlay_src[0] = _overlay_pil[0]
 
         def _undo():
             if _undo_stack:
                 _overlay_pil[0] = _undo_stack.pop()
-                _render()
+                _overlay_src[0] = _overlay_pil[0]
+                _render_now()
 
         def _clear_overlay():
             if _overlay_pil[0] is not None:
                 _push_undo()
-                from PIL import Image as PILImage
-                _overlay_pil[0] = PILImage.new("RGBA", _overlay_pil[0].size, (0, 0, 0, 0))
-                _render()
+                _new_overlay(*_overlay_pil[0].size)
+                _render_now()
 
         # ── render ────────────────────────────────────────────────
         def _render(*_):
-            if _syncing[0]:
-                return  # slider write came from the auto-position sync, not the user
+            """A setting changed: render once Tk is idle, so a slider drag folds
+            into one render instead of one per pixel moved."""
+            if _syncing[0] or _render_id[0] is not None:
+                return  # sync write from the auto modes, or a render is already queued
+            try:
+                _render_id[0] = win.after_idle(_render_now)
+            except tk.TclError:
+                pass
+
+        def _render_now():
+            _render_id[0] = None
+            try:
+                if not win.winfo_exists():
+                    return
+            except tk.TclError:
+                return
             try:
                 from PIL import Image as PILImage
                 z = _zoom.get()
-                img = PILImage.open(path)
+                if _src_img[0] is None:
+                    img0 = PILImage.open(path)
+                    img0.load()
+                    _src_img[0] = img0
+                img = _src_img[0]
                 w = max(1, int(img.width * z))
                 h = max(1, int(img.height * z))
-                img_r = img.resize((w, h), PILImage.LANCZOS)
+                resample = self._resample_for(_pal_zoom.get())
+                if _resized[0] == ((w, h), resample):
+                    img_r = _resized[1]   # tone change only: no resize
+                else:
+                    try:
+                        img_r = img.resize((w, h), resample)
+                    except Exception:
+                        # 1-bit / palette / I;16 sources reject the reducing filters
+                        img_r = img.resize((w, h), PILImage.NEAREST)
+                    _resized[0], _resized[1] = ((w, h), resample), img_r
 
                 use_auto = _auto_zoom.get()
                 use_auto_bright = _auto_bright_zoom.get()
@@ -2190,8 +2500,14 @@ class PreviewWindow(tk.Toplevel):
                 _base_pil[0] = base_img
                 _scale[0] = z
 
-                if _overlay_pil[0] is None or _overlay_pil[0].size != (w, h):
+                if _overlay_src[0] is None:
                     _new_overlay(w, h)
+                elif _overlay_pil[0] is None or _overlay_pil[0].size != (w, h):
+                    # Another zoom: show the drawing resized from the one drawn
+                    # on — never thrown away, never resized from a resize.
+                    src_ov = _overlay_src[0]
+                    _overlay_pil[0] = (src_ov.copy() if src_ov.size == (w, h)
+                                       else src_ov.resize((w, h), PILImage.LANCZOS))
 
                 composite = PILImage.alpha_composite(base_img, _overlay_pil[0])
                 pm = ImageTk.PhotoImage(composite.convert("RGB"))
@@ -2427,7 +2743,8 @@ class PreviewWindow(tk.Toplevel):
                 x2 = int(max(sx, ix) / z)
                 y2 = int(max(sy, iy) / z)
                 if x2 > x1 and y2 > y1:
-                    _crop_rect[0] = (x1, y1, x2, y2)
+                    # Only magnifies — the crop for Save is set with the right
+                    # mouse button alone, never as a side effect of zooming.
                     # Vypočítej nový zoom aby výběr vyplnil canvas
                     try:
                         cw = canvas.winfo_width()
@@ -2544,13 +2861,22 @@ class PreviewWindow(tk.Toplevel):
     def _redraw(self):
         if self._syncing_sliders:
             return  # slider write came from the auto-position sync, not the user
+        self._hide_popup()   # its label is about to go — no <Leave> will come
+        if self._retone_id is not None:
+            try:
+                self.after_cancel(self._retone_id)   # the rebuild applies the tones anyway
+            except Exception:
+                pass
+            self._retone_id = None
         for w in self._inner.winfo_children():
             w.destroy()
         self._thumbs.clear()
+        self._cells.clear()
 
         size, cols, cols_fit = self._compute_layout()
         self._thumb_size = size
         self._grid_layout = (size, cols)
+        self._trim_caches(size)
 
         # Full rows share the leftover pixels evenly; a grid narrower than the
         # window (fewer images than fit) stays left-packed instead of drifting apart.
@@ -2583,15 +2909,17 @@ class PreviewWindow(tk.Toplevel):
 
         lbl = tk.Label(cell, image=pm, cursor="hand2",
                        relief="flat", bd=1)
+        lbl.image = pm
         lbl.pack(fill="both", expand=True)
-        lbl.bind("<Enter>", lambda e, p=path: self._on_hover_enter(p))
+        lbl.bind("<Enter>", lambda e, p=path, w=lbl: self._on_hover_enter(p, w))
         lbl.bind("<Leave>", lambda e, p=path: self._on_hover_leave(e))
         lbl.bind("<Button-1>", lambda e, p=path: self._on_click(p))
+        self._cells[path] = lbl
 
         # The caption must never be wider than the thumbnail: a wider cell
         # would push the grid past the canvas width, and Tk answers that by
         # squeezing the cells — which clips the image instead of scaling it.
-        cap_font = tkfont.Font(font=("Segoe UI", 7))
+        cap_font = self._cap_font
         caption = display_timestamp_only(path.name)
         extra = self._caption_extra.get(path, "")
         if cap_font.measure(caption) > size and " " in caption:
@@ -2697,32 +3025,84 @@ class PreviewWindow(tk.Toplevel):
             self.show_cycle(self._cycle_history[-1]["cycle"])
 
     # ── large preview popup ───────────────────────────────────────
-    def _show_popup(self, path: Path):
+    @staticmethod
+    def _monitor_work_area(x: int, y: int) -> tuple[int, int, int, int]:
+        """(left, top, right, bottom) of the work area of the monitor holding
+        the point — so a pop-up never spills off its own screen."""
+        class _MI(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                        ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+        try:
+            u32 = ctypes.windll.user32
+            u32.MonitorFromPoint.restype = ctypes.c_void_p
+            hmon = u32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # DEFAULTTONEAREST
+            mi = _MI()
+            mi.cbSize = ctypes.sizeof(_MI)
+            if hmon and u32.GetMonitorInfoW(ctypes.c_void_p(hmon), ctypes.byref(mi)):
+                r = mi.rcWork
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        return 0, 0, 1920, 1080
+
+    def _show_popup(self, path: Path, anchor=None):
         self._hide_popup()
         try:
-            import numpy as np
             state = self._img_states.get(path)
-            img = Image.open(path)
+            settings = self._settings_for(state)
+            resample = self._resample_for(settings["palette"])
+            src = self._load_source(path)
             # Scale the hover preview off the size actually on screen, not off the
             # raw slider value, so it stays in step with the grid — and keep it
-            # on screen once the thumbnails themselves are already large.
+            # on screen once the thumbnails themselves are already large. Never
+            # enlarged past the file itself.
             popup_size = min(max(self._MIN_THUMB, self._thumb_size) * 3,
-                             int(self.winfo_screenheight() * 0.8))
-            img.thumbnail((popup_size, popup_size), Image.LANCZOS)
-            base_rgb, _ = self._render_tuned(img, **self._settings_for(state))
+                             int(self.winfo_screenheight() * 0.8),
+                             max(src.width, src.height))
+            key = (path, popup_size, resample)
+            img = self._popup_cache.get(key)
+            if img is None:
+                img = self._fit_to_box(src, popup_size, resample)
+                self._popup_cache[key] = img
+            base_rgb, _ = self._render_tuned(img, **settings)
             pm = ImageTk.PhotoImage(base_rgb)
         except Exception:
             return
 
+        # Beside the thumbnail, never under the pointer: a pop-up under the
+        # pointer takes the hover away from the thumbnail (<Leave>), closes, and
+        # the thumbnail opens it again — the flashing loop.
+        pw, ph = pm.width() + 4, pm.height() + 4
+        px, py = self.winfo_pointerx(), self.winfo_pointery()
+        if anchor is not None:
+            ax, ay = anchor.winfo_rootx(), anchor.winfo_rooty()
+            aw, ah = anchor.winfo_width(), anchor.winfo_height()
+        else:
+            ax, ay, aw, ah = px, py, 1, 1
+        left, top, right, bottom = self._monitor_work_area(px, py)
+        gap = 8
+        if ax + aw + gap + pw <= right:
+            x = ax + aw + gap                      # right of the thumbnail
+        elif ax - gap - pw >= left:
+            x = ax - gap - pw                      # left of it
+        else:
+            # No room at either side: the side with more space, still clear
+            # of the pointer.
+            x = left if (ax - left) > (right - ax - aw) else right - pw
+            if x <= px <= x + pw:
+                x = px + gap if px + gap + pw <= right else px - gap - pw
+        y = max(top, min(ay, bottom - ph))
+
+        # The geometry is set before Tk maps the window at idle, so it never
+        # shows at (0, 0). No withdraw()/deiconify(): on Windows deiconify
+        # activates the window and would take the keyboard focus.
         self._popup = tk.Toplevel(self)
         self._popup.overrideredirect(True)
         self._popup.attributes("-topmost", True)
         lbl = tk.Label(self._popup, image=pm, bd=2, relief="solid")
         lbl.image = pm
         lbl.pack()
-        x = self.winfo_pointerx() + 16
-        y = self.winfo_pointery() + 16
-        self._popup.geometry(f"+{x}+{y}")
+        self._popup.geometry(f"+{int(x)}+{int(y)}")
 
     def _hide_popup(self):
         if self._popup is not None:
@@ -2812,6 +3192,7 @@ class App(tk.Tk):
         except Exception:
             pass
         super().__init__()
+        install_wheel_guard(self)
         self.title("Screenshots")
         set_app_icon(self, str(get_app_dir() / "icon.ico"))
         self.geometry("1440x800")
@@ -2856,10 +3237,16 @@ class App(tk.Tk):
         self._auto_last_frame: dict[str, Path] = {}
         self._cam_folder_cache: tuple | None = None
         self._preview_enabled = tk.BooleanVar(value=True)
+        # Set when the user closes the auto-run preview: it then stays closed for
+        # the rest of that run, until the next Start or Preview being re-ticked.
+        self._auto_preview_closed_by_user = False
+        self._preview_enabled.trace_add(
+            "write", lambda *_: setattr(self, "_auto_preview_closed_by_user", False))
         self._notes_name_var = tk.StringVar(value="notes")
         self._label_settings: dict[str, dict] = {}
         self._cam_dir_cache: dict[str, list[tuple[int, str]]] = {}  # cam_dir -> [(ts_ns, name)]
         self._cam_dir_cache_time: dict[str, float] = {}  # cam_dir -> time.time()
+        self._cam_dir_cache_used: dict[str, float] = {}  # cam_dir -> last copy that read it
         self._cam_dir_cache_ttl: float = 5.0  # sekund
         self._cam_dir_cache_lock = threading.Lock()
         self._start_cache_refresh_worker()
@@ -2870,14 +3257,7 @@ class App(tk.Tk):
         self.all_screens_var = tk.BooleanVar(value=True)
 
         # NOVÉ
-        _station_layout_map = {
-            "L3-VIS01": "VIS-01",
-            "L3-VIS02": "VIS-02",
-            "L3-OPR1":  "OPR-01",
-            "L3-OPR2":  "OPR-02",
-            "L3-OPR3":  "OPR-03",
-        }
-        _default_layout = _station_layout_map.get(self._station_id, "VIS-01")
+        _default_layout = _station_layout_name(self._station_id) or "VIS-01"
         self.monitor_layout_var = tk.StringVar(value=_default_layout)
         self._layout_grid = None
 
@@ -2943,7 +3323,19 @@ class App(tk.Tk):
                 while True:
                     time.sleep(3)
                     try:
-                        folders = list(self._cam_dir_cache.keys())
+                        # Only folders a copy has used in the last hour: the
+                        # rest are past hours nobody is reading any more, and
+                        # re-listing them on the share every 3 s was pure load.
+                        now = time.time()
+                        with self._cam_dir_cache_lock:
+                            folders = list(self._cam_dir_cache.keys())
+                            stale = [k for k in folders
+                                     if now - self._cam_dir_cache_used.setdefault(k, now) > 3600]
+                            for k in stale:
+                                self._cam_dir_cache.pop(k, None)
+                                self._cam_dir_cache_time.pop(k, None)
+                                self._cam_dir_cache_used.pop(k, None)
+                        folders = [k for k in folders if k not in stale]
                         for cam_key in folders:
                             try:
                                 entries = []
@@ -2955,6 +3347,8 @@ class App(tk.Tk):
                                         if not m:
                                             continue
                                         entries.append((int(m.group(1)), entry.name))
+                                # Readers bisect these — same order as scan_camera_dir.
+                                entries.sort()
                                 with self._cam_dir_cache_lock:
                                     self._cam_dir_cache[cam_key] = entries
                                     self._cam_dir_cache_time[cam_key] = time.time()
@@ -3000,20 +3394,36 @@ class App(tk.Tk):
             return _out_dir / f"{fname}.txt"
 
         def _try_load():
+            dst = _get_dst()   # Tk variable read here, on the main thread
+
+            def _show(content):
+                try:
+                    txt.delete("1.0", "end")
+                    if content:
+                        txt.insert("1.0", content)
+                except tk.TclError:
+                    pass   # window closed meanwhile
+
             def _worker():
                 try:
-                    dst = _get_dst()
-                    if dst.exists():
-                        content = dst.read_text(encoding="utf-8")
-                        win.after(0, lambda: (txt.delete("1.0", "end"), txt.insert("1.0", content)))
-                    else:
-                        win.after(0, lambda: txt.delete("1.0", "end"))
+                    content = dst.read_text(encoding="utf-8") if dst.exists() else ""
+                    win.after(0, lambda: _show(content))
                 except Exception:
                     pass
             threading.Thread(target=_worker, daemon=True).start()
 
-        self._notes_name_var.trace_add("write", lambda *_: _try_load())
-        threading.Thread(target=lambda: _try_load(), daemon=True).start()
+        # Removed with the window — otherwise every Detail window ever opened
+        # keeps reloading on a rename.
+        _trace_id = self._notes_name_var.trace_add("write", lambda *_: _try_load())
+
+        def _drop_trace(event):
+            if event.widget is win:
+                try:
+                    self._notes_name_var.trace_remove("write", _trace_id)
+                except tk.TclError:
+                    pass
+        win.bind("<Destroy>", _drop_trace, add=True)
+        _try_load()
 
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill="x", pady=(8, 0))
@@ -3026,24 +3436,24 @@ class App(tk.Tk):
                 dst.write_text(content, encoding="utf-8")
                 self.log(f"[DETAIL] Saved -> {dst.name}")
             except Exception as e:
-                messagebox.showerror("Save error", str(e))
+                messagebox.showerror("Save error", str(e), parent=win)
 
         def _delete():
             dst = _get_dst()
             try:
                 if not dst.exists():
-                    messagebox.showinfo("Delete", "File does not exist.")
+                    messagebox.showinfo("Delete", "File does not exist.", parent=win)
                     return
             except Exception:
-                messagebox.showinfo("Delete", "File does not exist.")
+                messagebox.showinfo("Delete", "File does not exist.", parent=win)
                 return
-            if messagebox.askyesno("Delete", f"Delete {dst.name}?"):
+            if messagebox.askyesno("Delete", f"Delete {dst.name}?", parent=win):
                 try:
                     dst.unlink()
                     txt.delete("1.0", "end")
                     self.log(f"[DETAIL] Deleted -> {dst.name}")
                 except Exception as e:
-                    messagebox.showerror("Delete error", str(e))
+                    messagebox.showerror("Delete error", str(e), parent=win)
 
         ttk.Button(btn_row, text="Save", command=_save).pack(side="right")
         ttk.Button(btn_row, text="Delete file", command=_delete).pack(side="right", padx=(0, 8))
@@ -3198,12 +3608,17 @@ class App(tk.Tk):
         return s.startswith("\\\\") or s.startswith("//")
 
     def _cam_cell_px(self) -> int:
+        """Width of one camera cell — measured once; the names never change."""
+        cached = getattr(self, "_cam_cell_px_cached", None)
+        if cached:
+            return cached
         f = tkfont.nametofont("TkDefaultFont")
         max_label_px = 0
         for cams in CAM_CATEGORIES.values():
             for name in cams:
                 max_label_px = max(max_label_px, f.measure(name))
-        return 36 + max_label_px + 26
+        self._cam_cell_px_cached = 36 + max_label_px + 26
+        return self._cam_cell_px_cached
 
     def _right_min_width_for_cam_cols(self, cols: int = 4) -> int:
         cell = self._cam_cell_px()
@@ -3516,12 +3931,7 @@ class App(tk.Tk):
         w = self.cam_canvas.winfo_width()
         if w <= 80:
             return
-        f = tkfont.nametofont("TkDefaultFont")
-        max_label_px = 0
-        for cams in CAM_CATEGORIES.values():
-            for name in cams:
-                max_label_px = max(max_label_px, f.measure(name))
-        cell = 36 + max_label_px + 26
+        cell = self._cam_cell_px()
         cols = max(2, min(int(w // cell), 7))
         if cols != getattr(self, "_cam_cols", 4):
             self._cam_cols = cols
@@ -3797,6 +4207,9 @@ class App(tk.Tk):
         dlg.resizable(True, True)
         dlg.geometry("820x560+-4000+-4000" if offscreen else "820x560")
         if not offscreen:
+            # Kept above the main window: a modal grab on a window hidden behind
+            # it would make the whole program look frozen.
+            dlg.transient(self)
             dlg.grab_set()
 
         # one entry per camera — a few of them sit in two sections
@@ -4151,33 +4564,45 @@ class App(tk.Tk):
         self.after(IDENTIFY_MS, close_all)
 
     def _render_cameras(self):
+        """Show the cameras matching the search, `_cam_cols` per row.
+
+        The checkbuttons are made once and only re-gridded / re-enabled here:
+        this runs on every keystroke in the search box, on a column-count change
+        and on a source or layout switch, and rebuilding ~100 checkbuttons with
+        their tooltips each time was what made typing lag."""
         q = norm_query(self.cam_search_var.get())
         cols = getattr(self, "_cam_cols", 4)
         station = self._station_id
+        if not hasattr(self, "_cam_cbs"):
+            self._cam_cbs: dict[str, ttk.Checkbutton] = {}
+            self._cam_available: dict[str, bool] = {}
+            self._cam_grid_cols: dict[str, int] = {}
+            self._cam_visible_cats: tuple | None = None
 
+        visible_cats = []
         for cat, cams in CAM_CATEGORIES.items():
             sec = self._cam_sections.get(cat)
             grid = self._cam_grids.get(cat)
             if not sec or not grid:
                 continue
 
-            for child in grid.winfo_children():
-                child.destroy()
-
             visible = [c for c in cams if (not q or q in norm_query(c))]
-
+            if visible:
+                visible_cats.append(cat)
             if q and visible:
                 sec.set_expanded(True)
 
-            if not visible:
-                sec.pack_forget()
-                continue
-            else:
-                if not sec.winfo_ismapped():
-                    sec.pack(fill="x", pady=(0, 8))
+            # Columns beyond the current count lose their stretch, or an empty
+            # column would keep its share of the width after narrowing.
+            for c in range(max(cols, self._cam_grid_cols.get(cat, 0))):
+                grid.columnconfigure(c, weight=1 if c < cols else 0)
+            self._cam_grid_cols[cat] = cols
 
-            for c in range(cols):
-                grid.columnconfigure(c, weight=1)
+            shown = set(visible)
+            for cam in cams:
+                cb = self._cam_cbs.get(cam)
+                if cb is not None and cam not in shown:
+                    cb.grid_remove()
 
             for i, cam in enumerate(visible):
                 r = i // cols
@@ -4202,20 +4627,35 @@ class App(tk.Tk):
                             effective_station = _LAYOUT_TO_STATION.get(layout, station)
                         available = _cam_available_here(cam, effective_station)
 
-                cb = ttk.Checkbutton(grid, text=cam, variable=self.camera_vars[cam])
-                if not available:
-                    cb.state(["disabled"])
+                self._cam_available[cam] = available
+                cb = self._cam_cbs.get(cam)
+                if cb is None:
+                    cb = ttk.Checkbutton(grid, text=cam, variable=self.camera_vars[cam])
+                    self._cam_cbs[cam] = cb
+
+                    def _tip_text(cam_name=cam):
+                        if not self._cam_available.get(cam_name, True):
+                            stations = _cam_available_on_stations(cam_name)
+                            where = ", ".join(stations) if stations else "other station"
+                            return f"Available on: {where}"
+                        v = CAM_INFO.get(cam_name) or CAM_INFO.get(cpva_label(cam_name))
+                        return str(v) if v else ""
+
+                    ToolTip(cb, _tip_text)
+                cb.state(["!disabled"] if available else ["disabled"])
                 cb.grid(row=r, column=c, sticky="w", padx=(0, 18), pady=1)
 
-                def _tip_text(cam_name=cam, av=available):
-                    if not av:
-                        stations = _cam_available_on_stations(cam_name)
-                        where = ", ".join(stations) if stations else "other station"
-                        return f"Available on: {where}"
-                    v = CAM_INFO.get(cam_name) or CAM_INFO.get(cpva_label(cam_name))
-                    return str(v) if v else ""
-
-                ToolTip(cb, _tip_text)
+        # Sections are re-packed in their fixed order whenever the set on show
+        # changes — packing a returning one alone would put it at the end.
+        visible_cats = tuple(visible_cats)
+        if visible_cats != self._cam_visible_cats:
+            for cat in CAM_CATEGORIES:
+                sec = self._cam_sections.get(cat)
+                if sec is not None:
+                    sec.pack_forget()
+            for cat in visible_cats:
+                self._cam_sections[cat].pack(fill="x", pady=(0, 8))
+            self._cam_visible_cats = visible_cats
 
     def _planned_output_count(self, monitors_sel: list[int] | None, cams_sel: list[str]) -> int:
         if monitors_sel is None and not self.all_screens_var.get():
@@ -4407,6 +4847,15 @@ class App(tk.Tk):
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda _e: canvas.itemconfig(inner_id, width=canvas.winfo_width()))
 
+        def _labels_wheel(event):
+            first, last = canvas.yview()
+            if first <= 0.0 and last >= 1.0:
+                return  # everything fits — nothing to scroll
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+        # On the window: it receives the wheel from every row, including the
+        # Mode boxes, which only take the wheel themselves once clicked.
+        win.bind("<MouseWheel>", _labels_wheel)
+
         if not cams:
             ttk.Label(inner, text="No cameras selected.", foreground="gray").pack(pady=20)
             win.geometry("500x130")
@@ -4505,6 +4954,8 @@ class App(tk.Tk):
         """The single live preview window, created on first use."""
         if not self._preview_enabled.get():
             return None
+        if getattr(self, "_auto_preview_closed_by_user", False):
+            return None   # closed during this run — stays closed until the next Start
         win = self._auto_preview
         if win is not None:
             try:
@@ -4519,6 +4970,8 @@ class App(tk.Tk):
 
         def _on_close():
             self._auto_preview = None
+            if self._auto_copy_active:
+                self._auto_preview_closed_by_user = True
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_close)
         return win
@@ -4598,10 +5051,27 @@ class App(tk.Tk):
             self._start_auto_copy()
 
     def _auto_interval_s(self) -> int:
+        """The interval of the running run (fixed at Start, so editing the box
+        mid-run cannot shift the time grid); otherwise what the box says."""
+        p = self._auto_copy_params
+        if self._auto_copy_active and p and p.get("interval_s"):
+            return p["interval_s"]
         try:
             return max(AUTO_MIN_INTERVAL_S, int(self._auto_interval_var.get()))
         except Exception:
             return AUTO_MIN_INTERVAL_S
+
+    def _auto_max_cycles(self) -> int:
+        """Max cycles of the running run, or the box's value; 0 = no limit. An
+        empty or garbled box means no limit instead of an exception that would
+        silently end the run."""
+        p = self._auto_copy_params
+        if self._auto_copy_active and p and "max_cycles" in p:
+            return p["max_cycles"]
+        try:
+            return max(0, int(self._auto_cycles_var.get()))
+        except Exception:
+            return 0
 
     def _start_auto_copy(self):
         monitors_local = self._selected_monitors()
@@ -4611,10 +5081,14 @@ class App(tk.Tk):
         if not cams_local and monitors_local is None and not all_screens_local:
             messagebox.showwarning("Auto copy", "Select cameras or monitors.")
             return
-        if not self._get_dest():
+        dest = self._get_dest()   # creates the folder on the share — once, not twice
+        if not dest:
             return
 
         self._close_auto_preview()
+        self._auto_preview_closed_by_user = False   # a new run shows the preview again
+        interval_s = self._auto_interval_s()
+        max_cycles = self._auto_max_cycles()
         self._auto_copy_active = True
         self._auto_copy_count = 0
         self._auto_cycle_history = []
@@ -4630,7 +5104,9 @@ class App(tk.Tk):
             "source": source_mode,
             "custom_name": self.sanitize_folder_name(self.run_name_var.get()),
             "total": self._planned_output_count(monitors_local, cams_local),
-            "dest": self._get_dest(),
+            "dest": dest,
+            "interval_s": interval_s,
+            "max_cycles": max_cycles,
         }
         # Resolved once: the folder cannot change during a run, and creating it
         # per cycle would put a share write on the main thread every tick.
@@ -4644,8 +5120,7 @@ class App(tk.Tk):
         self._auto_t0_ns = time.time_ns()
         self._auto_t0_mono = time.monotonic()
         self._auto_btn.configure(text="■ Stop auto")
-        self.log(f"[AUTO] Started — every {self._auto_interval_s()}s, "
-                 f"max_cycles={self._auto_cycles_var.get()}")
+        self.log(f"[AUTO] Started — every {interval_s}s, max_cycles={max_cycles}")
         # Each run gets its own number, so the previous run's worker cannot
         # still be draining when Stop is followed straight away by Start.
         self._auto_run_id += 1
@@ -4709,7 +5184,7 @@ class App(tk.Tk):
     def _on_auto_tick(self, n: int):
         if not self._auto_copy_active or self._auto_copy_params is None:
             return
-        max_cycles = self._auto_cycles_var.get()
+        max_cycles = self._auto_max_cycles()
         if max_cycles > 0 and n >= max_cycles:
             self._auto_ticks_done = True
             self.log(f"[AUTO] All {max_cycles} cycles issued — finishing.")
@@ -4877,7 +5352,7 @@ class App(tk.Tk):
     def _start_live(self):
         cams_local = list(self._selected_cameras())
         if not cams_local:
-            messagebox.showwarning("Live", "Vyber alespoň jednu kameru.")
+            messagebox.showwarning("Live", "Select at least one camera.")
             return
         dest = self._get_dest()
         if not dest:
@@ -4886,7 +5361,7 @@ class App(tk.Tk):
         try:
             live_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            messagebox.showerror("Live", f"Nelze vytvořit složku Live:\n{e}")
+            messagebox.showerror("Live", f"Cannot create the Live folder:\n{e}")
             return
 
         self._live_active = True
@@ -4957,8 +5432,7 @@ class App(tk.Tk):
                 for cam in cams_local:
                     folder = cam_to_folder.get(cam)
                     if not folder:
-                        self.log(f"[LIVE] poll: {cam} folder was not found — camera will be skipped")
-                        continue
+                        continue   # already reported once at init; this loop runs every 80 ms
                     try:
                         with os.scandir(folder) as it:
                             for entry in it:
@@ -5038,6 +5512,8 @@ class App(tk.Tk):
         """Resolve and copy one camera's frame. Runs on a worker thread."""
         out: dict = {"cam": cam, "dst": None, "age_ns": None,
                      "problem": None, "src": None, "label_bump": False}
+        with self._cam_dir_cache_lock:
+            self._cam_dir_cache_used[str(cam_folder)] = time.time()   # keeps it refreshed
         src, age_ns = find_frame_at_or_before(
             cam_folder, target_ns, None,
             _cache=self._cam_dir_cache,

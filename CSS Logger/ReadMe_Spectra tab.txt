@@ -3,7 +3,7 @@ Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
-Detailed version: ReadMe_Spectra_Full.txt  ("Details" button)
+Detailed version: ReadMe_Spectra tab_Full.txt  ("Details" button)
 -----------------------------------------------------------------
 
 WHAT IT DOES
@@ -66,9 +66,19 @@ READING THE ARCHIVE, STEP BY STEP
   "Loading data" title to fold all three away once the data is in —
   the panel then has room for the list of spectra instead.
 
-  Then comes the list of what you have marked
-  ("Selected spectra"), whose heading carries "Expand all" and
-  "Clear all" — the two buttons that act on the whole list.
+  Then comes the dark blue "Spectra" block: the list of what you have
+  marked, with "Expand all" and "Clear all" above it — the two
+  buttons that act on the whole list — and a second "Analyze" right
+  under it, so you do not have to scroll back up after marking.
+
+  Each spectrum is named after what you searched by: the average of
+  every ticked signal in step 2 over its stretch, written with that
+  signal's Label, for example "SBW4 energy [J] 20.1 · GDD (Order 2)
+  24780". The same name is printed inside its shaded block in the top
+  graph, in the list, in the legend and in the export, so a curve
+  always leads back to the place it came from. Rename a Label or tick
+  a different signal and the names follow. With nothing ticked the
+  spectra are called "Spectrum 1", "Spectrum 2" ... as before.
 
   Everything that only changes how the result is DRAWN is gathered in
   one purple block at the very bottom, "Display settings" — the graph
@@ -79,10 +89,14 @@ READING THE ARCHIVE, STEP BY STEP
      Image Tools programs use. A plain click picks one day;
      Ctrl+click adds another day; Ctrl+Shift+click takes a run of
      days from your last click. Underneath, From and To set the hours
-     to load, 08:00 to 19:00 by default. As soon as a second day is
+     to load, 07:00 to 21:00 by default. As soon as a second day is
      picked, a table appears where each day can be given its own
      From and To — so "Monday morning and Wednesday afternoon" is one
      selection. Only the hours you chose are read from the archive.
+     Opened again, the calendar brings back your days: From and To
+     show the hours most of them share, a day with its own hours
+     keeps them, and the other days and any day added now follow a
+     new From/To.
 
      The top graph then shows those stretches placed side by side,
      with the time in between left out. A dashed line and a date
@@ -93,9 +107,11 @@ READING THE ARCHIVE, STEP BY STEP
      in the PV list to search by a different one. The tick box in
      front of each row says whether that signal is drawn in the
      graph at all, so a long list does not turn into a wall of
-     curves.
+     curves. In every "+ Add PV…" window, the Name column of the
+     table under the list is the label a picked signal will carry:
+     click it to type your own.
 
-     Card 3 is the spectrum itself. "Change..." picks the measured
+     Card 3 is the spectrum itself. "Change" picks the measured
      channel, and the "Unit" box beside it fills itself in from that
      channel's name — nanometres for a spectrometer, femtoseconds for
      the SPIDER time domain — so the graph is headed "Wavelength [nm]"
@@ -107,6 +123,22 @@ READING THE ARCHIVE, STEP BY STEP
      setting. If the numbers on the axis cannot be in the unit you
      typed — a wavelength that goes below zero — the line under the
      buttons says so, and the export says so too.
+
+     "X axis settings" on the same card chooses where the horizontal
+     axis comes from: the channel's own X, a copy of another PV
+     (optionally turned into a·x + b), a CSV / text file, or simply
+     the sample number. Each choice shows its own boxes right under
+     it. Changing it while Live is running does not stop Live: the
+     shots already collected are simply redrawn on the new axis.
+     Picking a different channel with "Change" does stop Live ("...
+     live stopped." in the line under the buttons); switch it on
+     again for the new channel.
+
+     The measured channel has to be a spectrum — a list of values per
+     shot. A channel that holds one number per shot, such as
+     L3-SBDP-SPIDER:FWHM_FL (the pulse duration), is not one: the
+     graph says so instead of staying empty. Add such a channel to
+     step 2 to follow it over time.
   3. Switch "Select" on in the toolbar above the graph and drag over
      the graph to mark a region. Repeat as often as you like. A drag
      that runs over one of the dashed day lines is split there, into
@@ -184,6 +216,9 @@ SHOT FILTER — "show me only the shots taken at GDD 24700"
   hold at once, so "GDD 24700 and TOD -98000" is two lines.
   A line you untick stays where it is, set up and doing nothing, so
   you can switch a condition on and off without typing it again.
+  Your custom PVs (the "Add custom" formulas of the CSS Logger tab)
+  can be picked too: they are the "ƒ" rows at the top of the search
+  list, and "Add custom" there opens the same editor.
 
   What it changes: everything. The average is built only from the
   shots that match, and so are the numbers in each region's details,
@@ -293,7 +328,8 @@ PER REGION
   the shot count there reads "37 of 892 (shot filter)", and the energy
   and dispersion lines say they are averages over the matching shots.
 
-  If you change the spectrum with "Change...", your marked regions
+  If you change the spectrum with "Change" (or its X axis with
+  "X axis settings"), your marked regions
   stay where they are and are simply worked out again for the new
   channel. You do not have to delete them and mark them a second
   time.

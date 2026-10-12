@@ -75,7 +75,8 @@ Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
 | Line | Method | Note |
 |------|--------|------|
 | L312 | `_build_ui()` | root selector, scrollable project list, detail panel, action buttons, local log |
-| L418 | `_render_project_buttons()` | grouped list Main / Side / Ignored + per-row version labels |
+| L418 | `_render_project_buttons()` | builds every row (Ignored too) + per-row version labels, once per project-set change |
+| — | `_layout_project_rows()` | re-grids the existing rows into Main / Side / Ignored (Group, Show ignored) — no rebuild |
 | L481/494 | `_update_focus_styles` / `_refresh_project_list_version_labels` | |
 | L500/527/602 | `_change_root` / `_open_set_paths` / `_reload_projects` | roots (config-backed when frozen) + rescan |
 | L622/646/660/663/672 | `_select_project` / `_on_group_changed` / `_on_project_check_clicked` / `_bind_next_version_trace` / `_on_next_version_edited` | selection, grouping, version override tracking |
@@ -172,7 +173,8 @@ Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
 | — | `_on_program_check_clicked(key)` | ticking a program pushes the tick onto its helpers and opens the list — one-way push, unticking a helper sticks. Helpers share `program_vars`, so Select all / new / Clear / `auto_deploy` need no special case. This is what fixed a built helper being reported `NOT copied — not selected in Copy Manager` |
 | L1252/1256/1270 | `_select_all_programs` / `_select_new_programs` / `_clear_programs` | |
 | **L1274** | `_on_fix()` | runs `_fix_archive_dir` + `_reunite_unknown_helpers` + `_normalize_version_folder_names` over the selected programs' archives |
-| L1365 | `_collect_icon_conflicts(...)` | one compare dialog per (program, version, dest) icon conflict |
+| L1365 | `_collect_icon_conflicts(...)` | = `_scan_icon_conflicts` (share stat, thread-safe) + `_resolve_icon_conflicts` (one compare dialog per conflict, UI thread) |
+| — | `_update_rows_in_place()` | after a copy / build: versions, status, last deployed per row; ticks stay |
 | L1431/1434/1439 | `_get_selected_programs` / `_get_selected_destination_roots` / `_set_busy` | |
 | L1443-1455 | `_progress_show` / `_progress_update` / `_progress_hide` | |
 | **L1460** | `_deploy_one_program(program_dir, version_name, destination_roots, live_log, icon_decisions)` | **core deploy** |

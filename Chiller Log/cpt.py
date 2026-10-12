@@ -109,7 +109,14 @@ def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
 APP_DIR      = get_app_dir()
 CONFIG_FILE  = APP_DIR / "cpva_explorer_config.json"
 HISTORICAL_DATA_FILE = APP_DIR / "historical_chiller_data.xlsx"
+# Share holding the archived camera frames. A PV whose value is a relative image
+# path is resolved against this; same root as CSS Logger uses.
+IMAGE_ROOT = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
 ARCHIVE_FILE = APP_DIR / "chiller_archive.csv"
+
+# The three moments of each day the archive stores a reading for.
+ARCHIVE_DAY_TIMES = [(9, 0), (13, 30), (18, 0)]
+
 ARCHIVE_COLUMNS = (
     ["datetime", "source"]
     + [f"ch{i}_flow" for i in range(1, 7)]
@@ -158,6 +165,7 @@ _SESSION.mount("https://", requests.adapters.HTTPAdapter(
 DEFAULT_CONFIG = {
     "time_from": "",
     "time_to": "",
+    "range_preset": "",
     "http_timeout": 10.0,
 }
 
@@ -477,22 +485,6 @@ def _resolve_image_path(value: str) -> str:
     return IMAGE_ROOT + "\\" + clean
 
 
-def _popup_geometry(widget: tk.Widget, width: int = 0, height: int = 0) -> str:
-    """
-    Return a geometry string '+x+y' that places a popup just below the given
-    widget, clamped to the screen. Works correctly on secondary monitors.
-    """
-    widget.update_idletasks()
-    x = widget.winfo_rootx()
-    y = widget.winfo_rooty() + widget.winfo_height() + 2
-    if width and height:
-        sw = widget.winfo_screenwidth()
-        sh = widget.winfo_screenheight()
-        x = min(x, sw - width - 4)
-        y = min(y, sh - height - 4)
-    return f"+{max(0, x)}+{max(0, y)}"
-
-
 # ---------------------------------------------------------------------------
 # GUI constants
 # ---------------------------------------------------------------------------
@@ -808,6 +800,11 @@ class CPVAExplorerApp:
         self._dt_from: datetime = cfg_from if cfg_from else now - timedelta(hours=1)
         self._dt_to:   datetime = cfg_to   if cfg_to   else now
 
+        # Which range button is in force ("all"/"1y"/"6m"/"1m"), or None when the
+        # window was typed by hand. An archive update re-applies this instead of
+        # jumping to a range the user did not choose.
+        self._range_preset: str | None = self.config.get("range_preset") or None
+
         self._build_ui()
         self._populate_ui()
         self._ensure_archive_exists()
@@ -951,6 +948,10 @@ class CPVAExplorerApp:
 
 
     def _set_display_range_preset(self, preset: str):
+        # Case-folded: a "1Y" from a caller must not silently fall through every
+        # branch and leave the window pinned to the old, pre-update range.
+        preset = preset.strip().lower()
+
         rows = self._load_archive_rows()
 
         if not rows:
@@ -981,13 +982,28 @@ class CPVAExplorerApp:
             self._dt_to = max_dt.replace(tzinfo=None)
             self._dt_from = (max_dt - timedelta(days=31)).replace(tzinfo=None)
 
+        else:
+            return
+
+        self._range_preset = preset
+
         self._refresh_time_info_labels()
 
         self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
         self.config["time_to"] = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
+        self.config["range_preset"] = preset
         save_config(self.config)
 
         self._refresh_archive_view()
+
+    def _reshow_after_archive_update(self):
+        # Re-apply whatever range button is in force, so "1M" stays a month and
+        # only stretches to the newest reading. A hand-typed window is left
+        # exactly as typed and merely redrawn.
+        if self._range_preset:
+            self._set_display_range_preset(self._range_preset)
+        else:
+            self._refresh_archive_view()
 
     def _load_archive_rows(self) -> list[dict]:
         if not ARCHIVE_FILE.exists():
@@ -2520,11 +2536,15 @@ class CPVAExplorerApp:
             self._dt_from = new_from
             self._dt_to = new_to
 
+            # A hand-typed window is nobody's preset any more.
+            self._range_preset = None
+
             self._refresh_time_info_labels()
             self._refresh_archive_view()
 
             self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
             self.config["time_to"] = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
+            self.config["range_preset"] = ""
             save_config(self.config)
 
             self.lbl_status.config(
@@ -2580,6 +2600,8 @@ class CPVAExplorerApp:
                 self._dt_from = dt
             else:
                 self._dt_to = dt
+            self._range_preset = None
+            self.config["range_preset"] = ""
             self._refresh_time_labels()
             self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
             self.config["time_to"]   = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
@@ -2652,7 +2674,7 @@ class CPVAExplorerApp:
     ):
         MINUTE_NS = 60 * 1_000_000_000
         CHECK_BEFORE_NS = 10 * MINUTE_NS
-        DAY_TIMES = [(9, 0), (13, 30), (18, 0)]
+        DAY_TIMES = ARCHIVE_DAY_TIMES
 
         # pump_samples is already sorted; binary-search it instead of walking it
         # from the start on every one of the ~2000 lookups a long update makes.
@@ -2791,8 +2813,12 @@ class CPVAExplorerApp:
 
         if not rows_by_ts:
             self._log("No new archive rows to append.")
+            # Still move the window onto the archive: without this the graph keeps
+            # whatever range it had and the click looks like it did nothing at all.
+            self.root.after(0, self._reshow_after_archive_update)
             self.root.after(0, lambda: self.lbl_status.config(
-                text="No new archive data found.",
+                text=f"Archive is up to date (readings are taken at "
+                     f"{', '.join(f'{h:02d}:{m:02d}' for h, m in ARCHIVE_DAY_TIMES)}).",
                 fg=COLOR_GRAY
             ))
             return
@@ -2835,10 +2861,7 @@ class CPVAExplorerApp:
 
         self._log(f"Archive update done. Appended rows: {len(append_rows)}")
 
-        self.root.after(
-            0,
-            lambda: self._set_display_range_preset("1Y")
-        )
+        self.root.after(0, self._reshow_after_archive_update)
         self.root.after(0, lambda: self.lbl_status.config(
             text=f"Archive update done. Added {len(append_rows)} rows.",
             fg=COLOR_GREEN

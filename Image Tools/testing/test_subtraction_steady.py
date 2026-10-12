@@ -188,6 +188,24 @@ def main() -> int:
           again == was, f"{again} vs {was}")
 
     test_toggling_subtraction_moves_nothing(v, app, items)
+    test_reference_frame_moves_nothing(v, app, items)
+
+    print("\nALL PASS" if not FAILURES else f"\n{len(FAILURES)} FAILURE(S)")
+    for f in FAILURES:
+        print(f"  - {f}")
+    return 1 if FAILURES else 0
+
+
+def _panel_snap(v):
+    """What must not move: the histogram box and the settings column under it."""
+    return {
+        "box": v._diff_hist_box.isVisible(),
+        "h": v._diff_hist_box.height(),
+        "cb_y": v.cb_subtract.mapTo(v, v.cb_subtract.rect().topLeft()).y(),
+        "line": v.lbl_diff_stats.text(),
+        "max": (float(v._diff_last_final[1]["max"])
+                if v._diff_last_final else None),
+    }
 
 
 def test_toggling_subtraction_moves_nothing(v, app, items):
@@ -198,14 +216,7 @@ def test_toggling_subtraction_moves_nothing(v, app, items):
     print("\nclicking Subtraction on and off")
 
     def snap():
-        return {
-            "box": v._diff_hist_box.isVisible(),
-            "h": v._diff_hist_box.height(),
-            "cb_y": v.cb_subtract.mapTo(v, v.cb_subtract.rect().topLeft()).y(),
-            "line": v.lbl_diff_stats.text(),
-            "max": (float(v._diff_last_final[1]["max"])
-                    if v._diff_last_final else None),
-        }
+        return _panel_snap(v)
 
     on = snap()
     print(f"  Subtraction ON : histogram {on['h']} px, checkbox at y={on['cb_y']}, "
@@ -245,10 +256,49 @@ def test_toggling_subtraction_moves_nothing(v, app, items):
     check("and reports the same numbers for the frame on screen",
           back["max"] == moved["max"], f"{moved['max']} -> {back['max']}")
 
-    print("\nALL PASS" if not FAILURES else f"\n{len(FAILURES)} FAILURE(S)")
-    for f in FAILURES:
-        print(f"  - {f}")
-    return 1 if FAILURES else 0
+
+def test_reference_frame_moves_nothing(v, app, items):
+    """Reported 24.09.2026: standing ON the reference frame and then stepping to any
+    other one moved the whole settings column.
+
+    The reference differs from itself by nothing, so the histogram had nothing to draw
+    and hid itself; the next frame brought it back and the INFO panel — which the
+    settings column hangs under — grew by its height. The picture now stays on screen
+    empty, so the panel is the same height on both frames."""
+    print("\nsitting on the reference frame, then stepping off it")
+    v.cb_subtract.setChecked(True)
+    settle(app, v)
+
+    v.current_idx = 0                                  # the reference itself
+    v._display_exact_index(0, items[0].ts_ns, update_slider=False)
+    settle(app, v)
+    ref = _panel_snap(v)
+    print(f"  on the reference: histogram {ref['h']} px, checkbox at y={ref['cb_y']}, "
+          f"{ref['line']!r}")
+    check("the histogram is there on the reference frame too", ref["box"], str(ref))
+    check("...and it says nothing differs", ref["max"] == 0.0, str(ref["max"]))
+
+    v.current_idx = 3
+    v._display_exact_index(3, items[3].ts_ns, update_slider=False)
+    settle(app, v)
+    other = _panel_snap(v)
+    print(f"  one frame on   : histogram {other['h']} px, checkbox at "
+          f"y={other['cb_y']}, {other['line']!r}")
+    check("stepping off the reference kept the histogram's height",
+          other["h"] == ref["h"], f"{ref['h']} -> {other['h']}")
+    check("and the settings column did not move a pixel",
+          other["cb_y"] == ref["cb_y"], f"{ref['cb_y']} -> {other['cb_y']}")
+    check("the numbers did follow the frame",
+          other["max"] not in (None, 0.0), str(other["max"]))
+
+    # …and back onto the reference: the same height again, not a third one.
+    v.current_idx = 0
+    v._display_exact_index(0, items[0].ts_ns, update_slider=False)
+    settle(app, v)
+    back = _panel_snap(v)
+    check("going back onto the reference moves nothing either",
+          back["h"] == ref["h"] and back["cb_y"] == ref["cb_y"],
+          f"{ref['h']}/{ref['cb_y']} -> {back['h']}/{back['cb_y']}")
 
 
 if __name__ == "__main__":

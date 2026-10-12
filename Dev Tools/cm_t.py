@@ -13,6 +13,10 @@ import sys
 import time
 import os
 
+# The log panes are shared with the Builder tab, so both write through the same
+# per-widget batching pump.
+from b_t import log_pump, place_dialog
+
 # ---------------- CONFIG ----------------
 # cm_t.py žije v L3-QoL-JanJan/Dev Tools/ po přesunu do gitu.
 # _app_dir() vrátí L3-QoL-JanJan/Dev Tools/  (frozen i source)
@@ -128,6 +132,53 @@ def find_helper_programs(program_dirs: list[Path]) -> dict[str, list[str]]:
     return out
 
 
+_HELPER_PARENTS: dict[str, str] | None = None   # helper name (lower) -> program folder name
+
+
+def _helper_parents(refresh: bool = False) -> dict[str, str]:
+    """Helper exe name (lower-cased) -> the program it is built from.
+
+    Read from the same build_config.json files as the builder's expander, so a
+    helper is known here the moment it is listed there.
+    """
+    global _HELPER_PARENTS
+    if _HELPER_PARENTS is None or refresh:
+        mapping: dict[str, str] = {}
+        try:
+            root = _programs_root()
+            dirs = [p for p in root.iterdir()
+                    if p.is_dir() and not p.name.startswith("_")]
+            taken = {p.name.lower() for p in dirs}
+            for parent, names in find_helper_programs(dirs).items():
+                for n in names:
+                    if n.lower() in taken:
+                        continue   # a helper that is also a program of its own
+                    mapping[n.lower()] = parent
+        except Exception:
+            pass
+        _HELPER_PARENTS = mapping
+    return _HELPER_PARENTS
+
+
+def dest_dir_for(dst_root: Path, program_name: str) -> Path:
+    """The folder a program gets on a destination share.
+
+    A helper exe is part of its program, not a program of its own, so it goes
+    INSIDE that program's folder (Software\\Diagnostic\\Diagnostic Webex
+    listener) instead of standing next to it in the top-level Software folder.
+    """
+    parent = _helper_parents().get(program_name.lower())
+    if parent and parent.lower() != program_name.lower():
+        return dst_root / parent / program_name
+    return dst_root / program_name
+
+
+def helper_dir_names(program_name: str) -> set[str]:
+    """Names of the helper subfolders that live inside this program's folder."""
+    return {n for n, parent in _helper_parents().items()
+            if parent.lower() == program_name.lower()}
+
+
 def _get_scratch_root() -> Path | None:
     cfg = _load_devtools_config()
     s = cfg.get("scratch")
@@ -225,6 +276,43 @@ def _merge_dir(src: Path, dst: Path) -> tuple[int, int, list[str]]:
             failed += 1
             errors.append(f"{rel}: {e}")
     return copied, failed, errors
+
+
+def _move_legacy_toplevel_folder(old_dir: Path, new_dir: Path, log, flog):
+    """Carry a helper's old top-level folder into its program's folder.
+
+    Helpers used to be deployed beside the program they belong to. When the new
+    place is still empty the whole folder is moved in one go; otherwise the old
+    one is merged in and then removed, so nothing is lost and nothing is left
+    standing in the top-level Software folder.
+    """
+    try:
+        if not old_dir.exists() or old_dir.resolve() == new_dir.resolve():
+            return
+    except OSError:
+        return
+    try:
+        if not new_dir.exists():
+            new_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_dir), str(new_dir))
+            log(f"[{new_dir.name}] Moved into {new_dir.parent.name}\\ (was in the top folder)")
+            flog("moved", str(old_dir), str(new_dir))
+            return
+        copied, failed, errors = _merge_dir(old_dir, new_dir)
+        log(f"[{new_dir.name}] Merged the old top-level folder in: "
+            f"{copied} file(s), {failed} failed")
+        for e in errors[:5]:
+            log(f"[{new_dir.name}]   {e}")
+        if failed == 0:
+            shutil.rmtree(old_dir, ignore_errors=True)
+            if old_dir.exists():
+                log(f"[{new_dir.name}] Old folder still in use — remove it by hand: {old_dir}")
+            else:
+                flog("removed", str(old_dir), "merged into " + str(new_dir))
+        else:
+            log(f"[{new_dir.name}] Old folder kept (some files could not be copied): {old_dir}")
+    except Exception as e:
+        log(f"[{new_dir.name}] Could not move the old folder {old_dir}: {e}")
 
 
 def _exe_version(p: Path) -> tuple[int, int, int]:
@@ -449,9 +537,9 @@ def show_icon_compare_dialog(parent, program_name: str, existing: Path, incoming
     result = {"replace": False}
 
     win = tk.Toplevel(parent)
+    win.withdraw()
     win.title(f"Icon conflict – {program_name}")
     win.resizable(False, False)
-    win.grab_set()
 
     try:
         img_existing = _load_ico_as_photoimage(existing, size=128)
@@ -502,6 +590,7 @@ def show_icon_compare_dialog(parent, program_name: str, existing: Path, incoming
     ttk.Button(btn_frame, text="Keep existing", width=14, command=on_skip).pack(side="left", padx=6)
     ttk.Button(btn_frame, text="Replace", width=14, command=on_replace).pack(side="left", padx=6)
 
+    place_dialog(win, parent)
     win.wait_window()
     return result["replace"]
 
@@ -943,6 +1032,9 @@ class DeployGUI(ttk.Frame):
 
         self.program_is_new: dict[Path, bool] = {}
         self.program_latest_version: dict[Path, str] = {}
+        # key -> (version combobox, status label, last-deployed label), so the
+        # rows can be updated in place instead of rebuilt.
+        self.row_widgets: dict[Path, tuple] = {}
 
         # Helper exes (a program's build_config.json -> extra_exes): they have a
         # dist folder of their own but no source folder, so they are shown
@@ -1047,9 +1139,9 @@ class DeployGUI(ttk.Frame):
         cfg = _load_devtools_config()
 
         win = tk.Toplevel(self)
+        win.withdraw()
         win.title("Set paths")
         win.resizable(False, False)
-        win.grab_set()
 
         ttk.Label(win, text="Configure shared paths for Dev Tools (Builder + Copy Manager).",
                   padding=(12, 10)).pack()
@@ -1073,7 +1165,7 @@ class DeployGUI(ttk.Frame):
 
         def _browse(key, var):
             cur = var.get() or str(Path.home())
-            chosen = filedialog.askdirectory(title="Select folder", initialdir=cur)
+            chosen = filedialog.askdirectory(title="Select folder", initialdir=cur, parent=win)
             if chosen:
                 var.set(chosen)
 
@@ -1089,9 +1181,10 @@ class DeployGUI(ttk.Frame):
             self.programs_root_lbl.configure(text=str(_programs_root()))
             self._build_dest_rows()
             self._load_programs()
-            messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
+            self._log("Paths saved to %APPDATA%\\DevTools\\config.json")
 
         ttk.Button(win, text="Save", command=on_save, padding=(16, 6)).pack(pady=(8, 12))
+        place_dialog(win, self)
 
     def _change_root(self):
         cur = str(_programs_root())
@@ -1222,6 +1315,7 @@ class DeployGUI(ttk.Frame):
         log_hsb.pack(side="bottom", fill="x")
         self.log.pack(side="left", fill="both", expand=True)
         self.log.configure(state="disabled")
+        log_pump(self.log, lambda: self._log_autoscroll)
         self.log.bind("<MouseWheel>", self._on_log_scroll)
         log_vsb.bind("<ButtonRelease-1>", self._on_log_scrollbar_release)
 
@@ -1274,6 +1368,83 @@ class DeployGUI(ttk.Frame):
         self._log(f"[auto_deploy] Spouštím deploy pro: {[p.name for p, _ in built_projects]}\n")
         self._on_copy(build_summary=build_summary, build_info=build_info)
 
+    def copy_one_after_build(self, program_name: str, version_name: str,
+                             roots: list[Path]) -> dict:
+        """Copy ONE freshly built program — called from the Builder's worker
+        thread right after that program's build, before the next one starts.
+
+        The build used to finish every program first and copy them all at the
+        end; now each program is out on the destinations as soon as it is built.
+        The icon comparison dialog still runs on the UI thread: the worker waits
+        for the answer. Returns the per-program record, the counters and the
+        file log, which copy_after_build_report() turns into the reports.
+        """
+        import threading as _th
+        program_dir = _dist_root() / program_name
+        jobs = [(program_dir, version_name)]
+        live = lambda msg: self.after(0, self._log, msg)
+        try:
+            found = self._scan_icon_conflicts(jobs, roots)
+        except Exception as e:
+            found = []
+            live(f"Icon check failed ({e}) — icons copied as usual")
+
+        decisions: dict[str, bool] = {}
+        if found:
+            answered = _th.Event()
+
+            def ask():
+                try:
+                    decisions.update(self._resolve_icon_conflicts(found))
+                finally:
+                    answered.set()
+            self.after(0, ask)
+            answered.wait()
+
+        try:
+            _lines, stats, file_log = self._deploy_one_program(
+                program_dir, version_name, roots,
+                live_log=live, icon_decisions=decisions)
+            self.state_deployed[program_name.lower()] = version_name
+            write_version_to_txt(program_name, version_name)
+            save_state(self.state_deployed)
+            return {"name": program_name, "version": version_name,
+                    "dest_ok": stats.get("dest_ok", 0), "error": None,
+                    "stats": dict(stats), "file_log": file_log}
+        except Exception as e:
+            live(f"[{program_name}] ERROR: {e}\n")
+            return {"name": program_name, "version": version_name,
+                    "dest_ok": 0, "error": str(e),
+                    "stats": {"program_failed": 1},
+                    "file_log": [f"  [failed  ]  {e}"]}
+
+    def copy_after_build_report(self, results: list[dict], roots: list[Path],
+                                copy_elapsed: float, build_summary: str,
+                                build_info: dict):
+        """The two end-of-run reports for a build where every program was
+        copied straight after its own build (UI thread)."""
+        from collections import defaultdict
+        total_stats = defaultdict(int)
+        detail_lines = []
+        for r in results:
+            for k, v in r["stats"].items():
+                total_stats[k] += v
+            detail_lines.append(f"\n  {r['name']}  {r['version']}")
+            detail_lines.extend(r["file_log"])
+        n_errors = sum(total_stats[k] for k in (
+            "exe_failed", "py_failed", "readme_failed", "extra_failed",
+            "icon_failed", "dest_unreachable", "program_failed"))
+        per_program = [{k: r[k] for k in ("name", "version", "dest_ok", "error")}
+                       for r in results]
+        if build_summary:
+            self._log(build_summary)
+        self._log(self._copy_summary(total_stats, per_program, len(results), roots,
+                                     copy_elapsed, n_errors, detail_lines),
+                  force_scroll=True)
+        self._log(self._overall_summary(per_program, roots, copy_elapsed,
+                                        n_errors, build_info), force_scroll=True)
+        self._update_rows_in_place()
+
     def _log(self, text: str, force_scroll: bool = False):
         target = self._external_log if self._external_log is not None else getattr(self, "log", None)
         # The Builder tab mirrors its own messages into this log, so the two
@@ -1300,26 +1471,11 @@ class DeployGUI(ttk.Frame):
                     builder._local_log_autoscroll = True
                 except Exception:
                     pass
-        for w, is_builder in ((target, False), (builder_log, True)):
-            if w is None:
-                continue
-            def _append(w=w, is_builder=is_builder):
-                try:
-                    w.configure(state="normal")
-                    w.insert("end", text + "\n")
-                    if is_builder:
-                        should_scroll = getattr(builder, "_local_log_autoscroll", True)
-                    else:
-                        should_scroll = self._log_autoscroll
-                    if should_scroll:
-                        w.see("end")
-                    w.configure(state="disabled")
-                except Exception:
-                    pass
-            try:
-                w.after(0, _append)
-            except Exception:
-                pass
+        # Batched: one pump per pane, shared with the Builder, so the lines
+        # keep their order and a long run does not queue one redraw per line.
+        for w in (target, builder_log):
+            if w is not None:
+                log_pump(w).write(text)
 
     def _clear_log(self):
         # Both panes show the same text, so Clear empties both.
@@ -1328,6 +1484,7 @@ class DeployGUI(ttk.Frame):
             if w is None:
                 continue
             try:
+                log_pump(w).discard_pending()
                 w.configure(state="normal")
                 w.delete("1.0", "end")
                 w.configure(state="disabled")
@@ -1371,6 +1528,7 @@ class DeployGUI(ttk.Frame):
         self.program_version_vars.clear()
         self.program_is_new.clear()
         self.program_latest_version.clear()
+        self.row_widgets.clear()
         self.helper_keys_by_parent.clear()
         self.helper_parent_dir.clear()
         self.helper_rows.clear()
@@ -1384,7 +1542,7 @@ class DeployGUI(ttk.Frame):
             return
 
         IGNORE = {"dist", "archive", "internal builder", "l3-qol-janjan", ".venv", ".vscode", ".git",
-                  "matlab", "icons", "extractor", "shift planner"}
+                  "matlab", "icons", "extractor", "shift planner", "time converter"}
         program_dirs = []
         for p in sorted(programs_root.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_dir():
@@ -1406,6 +1564,9 @@ class DeployGUI(ttk.Frame):
             parent: [n for n in names if n.lower() not in taken]
             for parent, names in find_helper_programs(program_dirs).items()
         }
+        # Same list, keyed the other way round — it decides where a helper is
+        # copied to (inside its program's folder) everywhere else in this file.
+        _helper_parents(refresh=True)
 
         col_names = [p.name for p in program_dirs]
         for names in helper_names_by_parent.values():
@@ -1494,19 +1655,67 @@ class DeployGUI(ttk.Frame):
         )
         cb.grid(row=0, column=3, sticky="w")
 
-        if not version_names:
-            ttk.Label(row, text="NEW", foreground="gray").grid(row=0, column=4, sticky="w")
-        elif is_new:
-            ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=4, sticky="w")
-        elif last_deployed:
-            ttk.Label(row, text="UTD", foreground="#cc0000").grid(row=0, column=4, sticky="w")
-        else:
-            ttk.Label(row, text="").grid(row=0, column=4, sticky="w")
-
-        ttk.Label(row, foreground="gray",
-                  text=f"last deployed: {last_deployed}" if last_deployed
-                       else "last deployed: (none)").grid(row=0, column=5, sticky="w")
+        status_lbl = ttk.Label(row)
+        status_lbl.grid(row=0, column=4, sticky="w")
+        deployed_lbl = ttk.Label(row, foreground="gray")
+        deployed_lbl.grid(row=0, column=5, sticky="w")
+        self.row_widgets[key] = (cb, status_lbl, deployed_lbl)
+        self._paint_row_status(key, bool(version_names), is_new, last_deployed)
         return row
+
+    @staticmethod
+    def _status_of(has_versions: bool, is_new: bool, last_deployed: str) -> tuple[str, str]:
+        if not has_versions:
+            return "NEW", "gray"
+        if is_new:
+            return "NEW", "green"
+        if last_deployed:
+            return "UTD", "#cc0000"
+        return "", "gray"
+
+    def _paint_row_status(self, key: Path, has_versions: bool, is_new: bool,
+                          last_deployed: str):
+        """Status + last-deployed text of one row; touches only what changed."""
+        trio = self.row_widgets.get(key)
+        if trio is None:
+            return
+        _cb, status_lbl, deployed_lbl = trio
+        text, colour = self._status_of(has_versions, is_new, last_deployed)
+        if status_lbl.cget("text") != text or str(status_lbl.cget("foreground")) != colour:
+            status_lbl.configure(text=text, foreground=colour)
+        dep = f"last deployed: {last_deployed}" if last_deployed else "last deployed: (none)"
+        if deployed_lbl.cget("text") != dep:
+            deployed_lbl.configure(text=dep)
+
+    def _update_rows_in_place(self):
+        """Bring every row up to date without rebuilding the list.
+
+        Used after a copy and after a build: a new version folder appears in
+        the Version list, NEW/UTD and "last deployed" follow the new state,
+        and the ticks and the scroll position stay where the user left them.
+        Refresh still rebuilds (it also finds new program folders).
+        """
+        self.state_deployed = load_state()
+        dist_root = _dist_root()
+        versions_map = read_versions_txt()
+        for key, (cb, _s, _d) in list(self.row_widgets.items()):
+            try:
+                names = [vf.name for vf in list_versions(dist_root / key.name)]
+                latest = names[0] if names else ""
+                if tuple(cb.cget("values") or ()) != tuple(names):
+                    cb.configure(values=names)
+                cb.configure(state="readonly" if names else "disabled")
+                var = self.program_version_vars.get(key)
+                if var is not None and var.get() not in names:
+                    var.set(latest)
+                self.program_latest_version[key] = latest
+                last_deployed = (versions_map.get(key.name, "")
+                                 or self.state_deployed.get(key.name.lower(), "")).strip()
+                is_new = bool(latest) and is_newer_version(latest, last_deployed)
+                self.program_is_new[key] = is_new
+                self._paint_row_status(key, bool(names), is_new, last_deployed)
+            except Exception:
+                continue
 
     def _on_program_check_clicked(self, key: Path):
         """Ticking a program takes its helpers with it — the usual case is a
@@ -1562,7 +1771,7 @@ class DeployGUI(ttk.Frame):
             else:
                 var.set(False)
         if not any_new:
-            messagebox.showinfo("NEW", "No NEW versions found.")
+            self._log("Select New: no NEW versions found.", force_scroll=True)
 
     def _clear_programs(self):
         for var in self.program_vars.values():
@@ -1587,12 +1796,20 @@ class DeployGUI(ttk.Frame):
                         self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
                         continue
 
-                    for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
-                        if not program_dir.is_dir():
+                    # Top-level program folders, plus the helper folders that now
+                    # live inside them (Diagnostic\Diagnostic Webex listener) —
+                    # a helper has its own exe and archive and needs the same fix.
+                    _dirs = []
+                    for _d in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
+                        if not _d.is_dir() or _d.name.lower() in ("archive", "dist"):
                             continue
-                        if program_dir.name.lower() in ("archive", "dist"):
-                            continue
+                        _dirs.append(_d)
+                        for _h in sorted(helper_dir_names(_d.name)):
+                            for _sub in _d.iterdir():
+                                if _sub.is_dir() and _sub.name.lower() == _h:
+                                    _dirs.append(_sub)
 
+                    for program_dir in _dirs:
                         program_name = program_dir.name
                         try:
                             # ── Archive old exes from main folder — keep only newest ─
@@ -1670,8 +1887,20 @@ class DeployGUI(ttk.Frame):
         Zobrazí porovnávací dialog pro každý konflikt.
         Vrací dict: klíč = "{program_name}|{dst_root}" -> True = nahradit, False = přeskočit.
         """
-        decisions: dict[str, bool] = {}
+        return self._resolve_icon_conflicts(
+            self._scan_icon_conflicts(jobs, destination_roots))
 
+    @staticmethod
+    def _scan_icon_conflicts(jobs, destination_roots) -> list[tuple]:
+        """The file part of the icon check — no Tk, safe to run in a thread.
+
+        Every destination is a share, and each exists()/stat() there costs
+        tens of milliseconds (seconds when a share is down); done on the UI
+        thread it froze the window before every copy.
+        Returns (program name, source icon, conflicting destination icon or
+        None, {dst_root: destination icon exists}) per program with an icon.
+        """
+        out = []
         for program_dir, version_name in jobs:
             if not version_name:
                 continue
@@ -1680,49 +1909,58 @@ class DeployGUI(ttk.Frame):
 
             # Najdi zdrojovou ikonu (stejná logika jako v _deploy_one_program)
             icon_src = None
-            for name in ("icon.ico", "Icon.ico", "icon.png", "Icon.png", "icon.gif", "Icon.gif"):
-                cand = version_folder / name
-                if cand.exists():
-                    icon_src = cand
-                    break
-            if icon_src is None:
+            for folder in (version_folder, program_dir):
                 for name in ("icon.ico", "Icon.ico", "icon.png", "Icon.png", "icon.gif", "Icon.gif"):
-                    cand = program_dir / name
+                    cand = folder / name
                     if cand.exists():
                         icon_src = cand
                         break
-            print(f"DEBUG [{program_dir.name}] icon_src={icon_src}", flush=True)              
+                if icon_src is not None:
+                    break
             if icon_src is None:
                 continue  # žádná ikona ke kopírování
 
-            # Zjisti jestli existuje konflikt v jakékoliv destinaci
+            try:
+                src_size = icon_src.stat().st_size
+            except OSError:
+                continue
             conflict_existing = None
+            dst_exists = {}
             for dst_root in destination_roots:
-                target_dir = dst_root / program_dir.name
-                dst_icon = target_dir / icon_src.name
-                if dst_icon.exists() and dst_icon.stat().st_size != icon_src.stat().st_size:
+                dst_icon = dest_dir_for(dst_root, program_dir.name) / icon_src.name
+                try:
+                    size = dst_icon.stat().st_size
+                    dst_exists[dst_root] = True
+                except OSError:
+                    dst_exists[dst_root] = False
+                    continue
+                if conflict_existing is None and size != src_size:
                     conflict_existing = dst_icon
-                    break
-            
-            for dst_root in destination_roots:
-                target_dir = dst_root / program_dir.name
-                dst_icon = target_dir / icon_src.name
-            if conflict_existing is not None:
-                replace = show_icon_compare_dialog(self, program_dir.name, conflict_existing, icon_src)
+            out.append((program_dir.name, icon_src, conflict_existing, dst_exists))
+        return out
+
+    def _resolve_icon_conflicts(self, scan: list[tuple]) -> dict[str, bool]:
+        """The dialog part of the icon check — UI thread only."""
+        decisions: dict[str, bool] = {}
+        # "Replace icons without asking" on the Builder tab: a differing icon
+        # is overwritten straight away instead of opening the compare dialog.
+        _builder = getattr(self, "_builder_ref", None)
+        _var = getattr(_builder, "replace_icons_var", None)
+        no_ask = bool(_var is not None and _var.get())
+        for name, icon_src, conflict_existing, dst_exists in scan:
+            if conflict_existing is not None and no_ask:
+                replace = True
+                self._log(f"[{name}] icon.ico differs — replaced without asking")
+            elif conflict_existing is not None:
+                replace = show_icon_compare_dialog(self, name, conflict_existing, icon_src)
             else:
                 replace = None  # žádný konflikt, rozhodne se per-destinace níže
-
-            for dst_root in destination_roots:
-                target_dir = dst_root / program_dir.name
-                dst_icon = target_dir / icon_src.name
+            for dst_root, exists in dst_exists.items():
                 if replace is not None:
-                    decisions[f"{program_dir.name}|{dst_root}"] = replace
-                elif not dst_icon.exists():
-                    decisions[f"{program_dir.name}|{dst_root}"] = True
+                    decisions[f"{name}|{dst_root}"] = replace
                 else:
-                    # stejná velikost -> přeskočit
-                    decisions[f"{program_dir.name}|{dst_root}"] = False
-
+                    # chybí -> kopírovat; stejná velikost -> přeskočit
+                    decisions[f"{name}|{dst_root}"] = not exists
         return decisions
 
     def _get_selected_programs(self) -> list[Path]:
@@ -1816,7 +2054,7 @@ class DeployGUI(ttk.Frame):
         if _helper_parent is not None:
             _readme_search_dirs.append(_helper_parent)
         for dst_root in destination_roots:
-            _readme_search_dirs.append(dst_root / program_name)
+            _readme_search_dirs.append(dest_dir_for(dst_root, program_name))
         for _d in _readme_search_dirs:
             try:
                 src_readme = find_readme_or_raise(_d, program_name)
@@ -1900,7 +2138,12 @@ class DeployGUI(ttk.Frame):
         ver = version_name
 
         for dst_root in destination_roots:
-            target_dir = dst_root / program_name
+            target_dir = dest_dir_for(dst_root, program_name)
+            # A helper used to be deployed next to its program in the top-level
+            # Software folder; now it goes inside it. Carry the old folder over
+            # once, so the archive and the ReadMe are not left behind.
+            if target_dir.parent != dst_root:
+                _move_legacy_toplevel_folder(dst_root / program_name, target_dir, log, flog)
             # Create the program folder if it doesn't exist yet (mkdir -p). Only a
             # genuinely unreachable destination (drive not mounted / network down)
             # fails here — then skip THIS destination and continue with the others,
@@ -1927,10 +2170,15 @@ class DeployGUI(ttk.Frame):
             # Asset folders are never deleted here, not even when neither the build
             # nor the source tree has them: the deployed app needs them, and a
             # deletion is the one thing nothing later puts back.
+            # Helper folders (Diagnostic/Diagnostic Webex listener) are deployed
+            # separately and are not part of this build, so they are kept too —
+            # otherwise every copy of the program would wipe its own helper.
+            _keep_helpers = helper_dir_names(program_name)
             for item in target_dir.iterdir():
                 if (item.is_dir()
                         and item.name not in ("_internal", "archive")
                         and item.name.lower() not in ASSET_DIR_NAMES
+                        and item.name.lower() not in _keep_helpers
                         and item.name not in incoming_dirs):
                     try:
                         shutil.rmtree(item)
@@ -2143,7 +2391,7 @@ class DeployGUI(ttk.Frame):
                         if _hp is not None:
                             search_dirs.append(_hp)
                         for dst_root in selected_roots:
-                            search_dirs.append(dst_root / program_dir.name)
+                            search_dirs.append(dest_dir_for(dst_root, program_dir.name))
                         for _d in search_dirs:
                             try:
                                 src_readme = find_readme_or_raise(_d, program_dir.name)
@@ -2171,7 +2419,7 @@ class DeployGUI(ttk.Frame):
                             except OSError:
                                 self.after(0, self._log, f"[{program_dir.name}] SKIP — not accessible: {dst_root}")
                                 continue
-                            target_dir = dst_root / program_dir.name
+                            target_dir = dest_dir_for(dst_root, program_dir.name)
                             target_dir.mkdir(parents=True, exist_ok=True)
                             for _doc, _label in ((src_readme, "ReadMe"),
                                                  (src_readme_full, "Details")):
@@ -2203,17 +2451,19 @@ class DeployGUI(ttk.Frame):
         def worker():
             import subprocess
             spec_file = builder_script.parent / "_internal_builder.spec"
+            # Frozen, sys.executable is Dev Tools itself, not Python.
+            py = "py" if getattr(sys, "frozen", False) else sys.executable
             if spec_file.exists():
                 # Use .spec — contains all collect-all libraries
                 cmd = [
-                    sys.executable, "-m", "PyInstaller",
+                    py, "-m", "PyInstaller",
                     "--noconfirm",
                     "--distpath", r"C:\Dev\dist",
                     str(spec_file),
                 ]
             else:
                 # Fallback: run __main__ block in the script itself
-                cmd = [sys.executable, str(builder_script)]
+                cmd = [py, str(builder_script)]
             self.after(0, self._log, f"CMD: {' '.join(cmd)}\n")
             try:
                 proc = subprocess.Popen(
@@ -2222,6 +2472,7 @@ class DeployGUI(ttk.Frame):
                     stderr=subprocess.STDOUT,
                     text=True,
                     cwd=str(builder_script.parent),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 for line in proc.stdout:
                     line = line.rstrip()
@@ -2526,11 +2777,9 @@ class DeployGUI(ttk.Frame):
         if build_summary is None and build_info is None:
             self._clear_log()
         self._log("Checking icon conflicts...\n")
-
-        icon_decisions = self._collect_icon_conflicts(jobs, selected_roots)
-
-        self._log("Starting deploy...\n")
         self._set_busy(True)
+        # Filled on the UI thread (the compare dialogs) before the worker starts.
+        icon_decisions: dict[str, bool] = {}
         start_time = time.perf_counter()
 
         def worker():
@@ -2604,13 +2853,35 @@ class DeployGUI(ttk.Frame):
                 self.after(0, lambda: self._log(overall, force_scroll=True))
             finally:
                 self.after(0, self._set_busy, False)
-                self.after(0, self._refresh)
+                # Status and "last deployed" change in place: a rebuild of the
+                # list flashed it and dropped every tick.
+                self.after(0, self._update_rows_in_place)
 
-        threading.Thread(target=worker, daemon=True).start()
+        def scan():
+            try:
+                found = self._scan_icon_conflicts(jobs, selected_roots)
+            except Exception as e:
+                found = []
+                self.after(0, self._log, f"Icon check failed ({e}) — icons copied as usual")
+            self.after(0, go, found)
+
+        def go(found):
+            nonlocal start_time
+            icon_decisions.update(self._resolve_icon_conflicts(found))
+            self._log("Starting deploy...\n")
+            start_time = time.perf_counter()
+            threading.Thread(target=worker, daemon=True).start()
+
+        threading.Thread(target=scan, daemon=True).start()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
+    try:
+        from dev_tools import install_combo_wheel_guard
+        install_combo_wheel_guard(root)
+    except Exception:
+        pass
     root.title("Copy Manager")
     set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.CopyManager")
     root.geometry("980x650")

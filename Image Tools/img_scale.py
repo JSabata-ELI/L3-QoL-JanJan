@@ -69,9 +69,9 @@ array divided by 4095 blows the whole frame out to white.
 
     WHAT STILL MAPS PER FRAME, ON PURPOSE
 
-The `Binary` (min..max) and `False Colors` (p0.5..p99.5) palettes, and any explicit
-Auto-stretch control. Both are deliberate and must stay: see `is_t.ADAPTIVE_PALETTES`
-and `stretch_u8` below.
+Only an explicit Auto-stretch control (see `stretch_u8` below). No palette does any more:
+`Binary` and `False Colors` were measured off the NI viewer and are absolute — see
+`is_t.NI_ABSOLUTE_PALETTES`.
 
 Pure numpy/PIL — no Qt, so every tab (`if_t`, `is_t`, `sf_t`, `wk_t`) can import it.
 """

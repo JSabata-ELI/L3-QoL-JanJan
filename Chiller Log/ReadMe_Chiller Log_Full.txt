@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (cpt.py, 3131 lines)
+Verified against source: 2026-10-05  (cpt.py, 3247 lines)
 -----------------------------------------------------------------
 Short version: ReadMe_Chiller Log.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -172,6 +172,10 @@ because it explains every gap in the graph.
 
     The From and To in use are always written next to the buttons.
 
+    Which button you pressed is remembered as well as the dates,
+    also across a restart, and the next update (section 8) applies
+    that button again. Typing in a Display Range clears it.
+
 5.3 ZOOMING
 
     Drag a rectangle on the graph to zoom into it. Press "Back" to
@@ -256,7 +260,13 @@ Press "Update archive".
      pump test, and appends what is left.
   5. A moment already present in the log is never written twice, so
      pressing the button again is harmless.
-  6. When it finishes, the display switches to the last year.
+  6. When it finishes, the graph is moved onto the archive. If one
+     of the buttons All, 1Y, 6M or 1M was the last thing used to
+     choose the period, that button is applied again, so it now
+     ends at the newest reading: 1M stays one month, just moved
+     forward. A period typed in with Display Range is left exactly
+     as it was and only redrawn. This happens even when nothing new
+     was found.
 
 The fetching runs in the background, so the window stays usable. The
 status line at the bottom and the Log tab both report progress.
@@ -272,17 +282,19 @@ status line at the bottom and the Log tab both report progress.
   historical_chiller_data.xlsx   the imported past, from 2018
                                  onwards. Read only when the log
                                  file is missing.
-  cpva_explorer_config.json      the remembered period and the
-                                 network timeout.
+  cpva_explorer_config.json      the remembered period (its From
+                                 and To, and which of All / 1Y /
+                                 6M / 1M chose it, if one did)
+                                 and the network timeout.
   allowed_pvs.json               empty and unused; a leftover.
   icon.ico                       the window icon.
 
 A QUIRK WORTH KNOWING: the settings file is only written if it
-already exists. On an installation where it was never created, the
-chosen period is not remembered between runs and every start opens
-on the default. If you want it remembered, create an empty
-cpva_explorer_config.json next to the program containing just {} and
-it will start saving.
+already exists. On an installation where it was never created,
+neither the chosen period nor the range button that chose it is
+remembered between runs, and every start opens on the default. If
+you want it remembered, create an empty cpva_explorer_config.json
+next to the program containing just {} and it will start saving.
 
 
 =================================================================
@@ -293,11 +305,19 @@ it will start saving.
       The log file is missing and so is the historical spreadsheet,
       or the spreadsheet could not be read. Restore either one.
 
-  "Archive is already up to date"
+  "Archive is already up to date."
       The newest row in the log is later than the present moment.
       Normally this means there is genuinely nothing new. It can
       also mean the computer's clock is behind — this facility's
       office machines have been known to run tens of seconds off.
+
+  "Archive is up to date (readings are taken at 09:00, 13:30,
+  18:00)."
+      The update ran, but no new reading has fallen due since the
+      last one in the log — the next one comes at the next of
+      those three times. The graph is still moved onto the archive,
+      as after any update (section 8, step 6). Older versions said
+      "No new archive data found." here.
 
   An update adds no rows
       Look at the Log tab. Either the pump was off for the whole

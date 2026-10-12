@@ -1,6 +1,6 @@
 # Dev Tools — STRUCTURE
 
-> Verified against source: 2026-08-19 · `dev_tools.py` 87 L · `b_t.py` 1495 L · `cm_t.py` 2129 L
+> Verified against source: 2026-10-06 (responsiveness section)
 
 User-facing documentation: `ReadMe Dev Tools.txt` (short, the Launcher's **ReadMe**
 button) and `ReadMe_Dev Tools_Full.txt` (detailed, the Launcher's **Details** button).
@@ -62,6 +62,21 @@ a build (`invalidate_version_cache()`, which also clears `_last_version_cache`).
 
 ---
 
+## Responsiveness rules (both tabs)
+
+| Rule | Where |
+|------|-------|
+| **Wheel never edits an unfocused combobox.** ttk's class binding `TCombobox <MouseWheel>` steps the value and runs before the list's `bind_all` scroll, so scrolling the Copy Manager list changed the version to copy, and a turn over Builder's Group re-grouped the project. `dev_tools._combo_wheel` replaces the class binding (`install_combo_wheel_guard(root)`, also in `cm_t`'s standalone `__main__`): focused box → `ttk::combobox::Scroll`; otherwise the first `tk.Canvas` ancestor scrolls. | `dev_tools.py` |
+| **No list rebuild on a parameter change.** Builder: `_render_project_buttons` builds rows for *all* projects (Ignored too) + the three section headers; `_layout_project_rows` only re-grids them — used by Group and *Show ignored*. `_on_build_finished` rebuilds only when the project / helper names changed, otherwise refreshes the labels. Copy Manager: `row_widgets[key] = (combo, status, last-deployed)`; `_update_rows_in_place()` re-lists versions and repaints status after a copy and after a build (ticks, chosen versions and scroll stay). Only **Refresh** / Change… / Set paths call `_load_programs()`. | `b_t.py`, `cm_t.py` |
+| **No console windows.** Every `py` / PyInstaller `Popen` passes `creationflags=NO_WINDOW` (`CREATE_NO_WINDOW`); PyInstaller's own children inherit the hidden console. Frozen, `sys.executable` is Dev Tools itself, so the internal-builder command uses `py`. | `b_t.py`, `cm_t.py` |
+| **Dialogs open in place.** `place_dialog(win, parent)` (in `b_t`, imported by `cm_t`): create, `withdraw()`, fill, then centre + `deiconify()` + `grab_set()`. Info-only boxes (*Paths saved*, *No NEW versions*) are log lines. | Set paths ×2, icon compare |
+| **No Tk from threads, no share I/O on the UI thread.** The missing-dist question is `_ensure_dist_root()` before the build thread starts. The icon check is split: `_scan_icon_conflicts` (stat on the shares, in a thread) → `_resolve_icon_conflicts` (dialogs, UI thread) → deploy worker. | `b_t.py`, `cm_t.py` |
+| **Batched log.** `TextLogPump` / `log_pump(widget)` in `b_t`: one pump per Text widget shared by both tabs (order kept), lines queued from any thread and written by one `after(40 ms)` callback — one insert, one `see`. Clear calls `discard_pending()`. | `b_t.py`, `cm_t.py` |
+
+Tests: `testing/test_ui_in_place.py` (withdrawn Tk root, nothing shown).
+
+---
+
 ## b_t.py — Builder
 
 ### Constants
@@ -91,8 +106,21 @@ a build (`invalidate_version_cache()`, which also clears `_last_version_cache`).
   `effective_next_version_for_project(name)` — auto-bumped version or the manual override
 - `sort_projects`, `_render_project_buttons` — list grouped Main / Side / Ignored
   (group per project persisted in `builder_settings.json`)
-- Build: `_build_selected()` → thread → `_build_one_project(p, ver)` per project →
-  `_on_build_finished(...)` → `on_build_done` callback → Copy Manager `auto_deploy`
+- Build order = click order: `_tick_order` records every tick (project or helper;
+  a project's tick queues its helpers right behind it), an untick moves the rest
+  up, Select all appends the unticked in list order. The place shows in a fixed
+  width=3 label left of the tick box (`_order_label`, `_order_vars`,
+  restyled with the row focus via `_order_labels`); the tick box text stays the
+  bare name. `_checked_in_tick_order()` gives the build queue.
+- Build: `_build_selected()` → thread → per program in tick order: build
+  (`_build_one_project` / `_build_one_helper`), then with "Copy after build" at
+  once `cm.copy_one_after_build(name, ver, roots)` before the next build starts
+  (icon compare dialog still on the UI thread; the worker waits — skipped,
+  icon replaced, when `replace_icons_var` "Replace icons without asking" is
+  ticked; read by `cm._resolve_icon_conflicts` via `_builder_ref`) →
+  `_on_build_finished(...)` → `cm.copy_after_build_report(...)` writes the copy
+  and overall reports. Destinations are read once, at the start. The old batch
+  path (`on_build_done` → `auto_deploy`) remains only when there is no `_cm_ref`.
 - `_build_internal_builder_sync()` — builds the internal-libs builder when needed
 - `_open_dist()`, `_open_readme(project_dir)` (creates one if missing), `_run_copy_manager()`
 - The log is shared with the Copy Manager (`log_widget`), plus a local log box
@@ -168,7 +196,7 @@ closed.
 | `helpers_by_parent` / `helpers_of(name)` | project name → helper specs |
 | `helper_checks` / `helper_next_labels` | **Kept outside the rows.** A tick that vanished when the list was rebuilt would be a tick the build silently ignores. |
 | `expanded_projects` + `helper_rows` + `_build_helper_row` | Helper rows are built together with their parent and only `grid_remove()`d while folded, so `_toggle_expanded` / `_apply_expanded` is a show/hide of one or two frames instead of a rebuild of the whole list (which cost a version lookup per row and made the list flash). Folded by default: most projects have no helpers and an always-open tree pushes the projects off the visible list. Projects without helpers get a spacer label so every tick box stays on the same left edge. |
-| `project_checks` | **Not rebuilt with the rows.** A tick is a selection the user made, so `_render_project_buttons` reuses the existing `BooleanVar` per name; only names that left `projects_sorted` are dropped, and a project whose row is not rendered (Ignored + *Show ignored* off) is unticked together with its helpers, so what builds is what is on screen. |
+| `project_checks` | **Not rebuilt with the rows.** A tick is a selection the user made, so `_render_project_buttons` reuses the existing `BooleanVar` per name; only names that left `projects_sorted` are dropped, and a project whose row is not shown by `_layout_project_rows` (Ignored + *Show ignored* off) is unticked together with its helpers, so what builds is what is on screen. |
 | `_select_helper(h)` + `_focused_name()` | A helper can be the focused program too: **Details** on a helper row fills the same panel with its name, its script as MAINPY and its own last/next version. `project_next_override` and `effective_next_version_for_project` are keyed by program name, and a helper's name *is* its dist folder, so editing **Next version** while a helper is focused sets the helper's version and nothing else. The Group combo is emptied and disabled (a helper follows its parent), and `_on_group_changed` guards on `selected_helper` so a stray event cannot re-group the parent. `_on_build_finished` re-focuses the helper it was showing. |
 | `_open_helper_readme(h)` | **ReadMe** on a helper row opens `ReadMe_<helper name>.txt` **from the parent's folder** — named after the helper, because that is what `Launcher/l.py::find_readme_or_none` looks for in the helper's own deployed folder. Offers to create it (UTF-8 BOM) when it is missing; `_build_one_helper` copies both the short and the `_Full` document into the version folder and logs which one is absent. |
 | `_on_project_clicked` | Row click, `<Button-1>` on the row frame and on the version label, and the **Details** button: focuses the project and opens its helpers. Ticking does the same (`_on_project_check_clicked` → `_toggle_expanded(open_it=tick)`), so the tick that was just pushed onto the helpers is visible. The arrow button still folds. |
@@ -183,8 +211,9 @@ Output is **`dist/<helper name>/vX.Y.Z/`** — the helper's *own* dist entry wit
 
 - a helper can be built without its parent, and a parent version folder holding
   only the helper would be "a version of the app that is not the app";
-- it therefore also shows up as its own row in the Copy Manager and deploys to
-  `<dst>/<helper name>/` like any other program.
+- it therefore also shows up as its own row in the Copy Manager and deploys like
+  any other program — but **into its parent's folder**,
+  `<dst>/<parent>/<helper name>/`, not beside it in the top-level Software folder.
 
 `--onefile`, unlike the projects' `--onedir`:
 
@@ -277,7 +306,8 @@ from the plain `Name vX.Y.Z.exe` filename.
   `_get_selected_programs`, `_get_selected_destination_roots`
 - Destinations: `_build_dest_rows`, `_reflow_dest_paths` / `_split_path_to_lines`
   (long UNC paths wrap instead of stretching the window)
-- Deploy: `_collect_icon_conflicts()` → `show_icon_compare_dialog` per conflict →
+- Deploy: `_scan_icon_conflicts()` (thread) → `_resolve_icon_conflicts()` →
+  `show_icon_compare_dialog` per conflict →
   `_deploy_one_program(...)` per program → state + `Versions.txt` update
   (`_on_copy`), with `_progress_show/_update/_hide` and `_set_busy`
 - `auto_deploy(built_projects, build_summary)` — called from the Builder: preselects
@@ -300,6 +330,8 @@ missing from this list entirely and `auto_deploy` reported it as
 | `find_helper_programs(program_dirs)` | module level, reads each folder's `build_config.json` → `extra_exes`, same source as the Builder's `find_helpers`, so nothing is registered twice and the list cannot go stale. A `str` entry counts as `{"script": …}`; a missing script is dropped |
 | dedupe against `program_dirs` | a helper whose name is also a program folder *is* that program — listed once, as itself |
 | `helper_keys_by_parent` / `helper_parent_dir` | parent name → helper row keys, and helper name → parent **source folder** (used by the ReadMe lookup) |
+| `_helper_parents()` / `dest_dir_for(dst_root, name)` / `helper_dir_names(name)` | module level, so every copy path agrees on where a program goes. A helper resolves to `<dst>/<parent>/<helper>`, everything else to `<dst>/<name>`. Cached; `_build_program_rows` refreshes it. `helper_dir_names` is what keeps the parent's own deploy from deleting the helper folder as a "leftover folder the new version does not bring" |
+| `_move_legacy_toplevel_folder(old, new, …)` | one-off migration run on each helper deploy: the folder left in the top Software folder by earlier publishes is `shutil.move`d into its new place, or merged in and removed when the new place already exists. A locked file leaves the old folder standing and says so, rather than losing anything |
 | `expanded_programs` + `helper_rows` + `expander_buttons` | rows are built with their parent and `grid_remove()`d while folded (hence `grid`, not `pack`: `pack_forget` would re-append the row at the end of the list). Folded by default; the open/closed state survives a **Refresh** |
 | `_on_program_check_clicked(key)` | ticking a program pushes the tick onto its helpers and opens the list so what went along is visible. **One-way push, not a lock** — unticking a helper afterwards sticks, which is how you publish only the app |
 | Select all / Select new / Clear / `_get_selected_programs` / `auto_deploy` | unchanged: helpers live in the same `program_vars`, so every one of them sees them without a special case |
@@ -307,12 +339,14 @@ missing from this list entirely and `auto_deploy` reported it as
 ### `_deploy_one_program()` steps
 1. Find the exe in the version folder, the ReadMe, the `.py` files, the icon and
    the extras (files **and folders**, `_internal` excluded)
-2. Per destination root: create `<dst>/<program>/`, archive the old exe/py into
+2. Per destination root: create `dest_dir_for(<dst>, <program>)` (a helper lands
+   inside its parent's folder), archive the old exe/py into
    `archive/vX.Y.Z/`, copy the new exe as `<program> <version>.exe`, copy the `.py`
    files, the extras, the ReadMe and the icon (a stale PNG is dropped when an ICO
    is copied; conflicts use the `icon_decisions` answers)
 3. Delete leftover folders on the destination that the new version does not bring
-   — except `_internal`, `archive`, and anything in `incoming_dirs`
+   — except `_internal`, `archive`, the asset folders, the program's helper
+   folders, and anything in `incoming_dirs`
 
 ### The two user documents
 A program has **two** user-facing docs and the Launcher has a button for each:

@@ -2,8 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19
-  (dev_tools.py 87 lines, b_t.py 1495, cm_t.py 2129)
+Verified against source: 2026-10-05
+  (dev_tools.py 117 lines, b_t.py 2045, cm_t.py 2721)
 -----------------------------------------------------------------
 Short version: ReadMe Dev Tools.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md  (and dev_tools_structure.md, older)
@@ -27,6 +27,9 @@ Two tabs, one shared log:
 They are separate on purpose: building is slow and local, publishing
 is fast and touches what everybody else uses. You will often build
 several times and publish once.
+
+The window opens maximised, so the long project lists and the log
+below them are visible at once.
 
 
 =================================================================
@@ -74,6 +77,16 @@ settings are the fallback that makes the built copy work.
     last number stepped up by one. Type over it when a change
     deserves a bigger step.
 
+    Changing a group, or switching "Show ignored", moves the rows in
+    place — the list is not redrawn and does not flicker.
+
+    THE MOUSE WHEEL never changes a drop-down list you have not clicked
+    into. Over Group here, or over a Version in the Copy Manager list,
+    the wheel scrolls the list underneath; only the box you clicked
+    into (it has the keyboard focus) steps its value with the wheel.
+    Scrolling the Copy Manager list used to change the version that
+    would be copied without anybody noticing.
+
 3.3 WHAT A BUILD PRODUCES
 
     A folder named after the version, containing:
@@ -97,7 +110,10 @@ settings are the fallback that makes the built copy work.
 
       THE ICON is copied as a real file next to the program because
       one of the window toolkits in use can only load an icon from a
-      path, not from inside a bundle.
+      path, not from inside a bundle. It is ALSO put inside the bundle
+      and baked into the program file itself, so the title bar, the
+      taskbar button and the .exe in Explorer all have it even when
+      the file beside the program cannot be read.
 
       THE RUNTIME FOLDERS are found and copied automatically, with no
       configuration. A program reads them from next to itself at the
@@ -140,9 +156,20 @@ settings are the fallback that makes the built copy work.
         marks synced files read-only and the build tool refuses to
         overwrite them.
 
+      - The build runs without a console window: its output goes to
+        the log only, so nothing flashes up or takes the keyboard
+        while a build runs.
+
       - Afterwards the built program is moved up one level into the
         version folder, renamed to include its version, and the new
         version is written into the shared version list on Scratch.
+
+      - Finally the built program file is checked for an icon of its
+        own. The log says "Icon: the exe carries its own icon" when it
+        does, and a Warning when it does not — then its taskbar button
+        would be a blank window. The usual cause is that icon.ico is
+        missing from the project folder. The same check runs for
+        helper programs.
 
 3.5 PER-PROJECT EXTRAS
 
@@ -210,6 +237,15 @@ settings are the fallback that makes the built copy work.
       the application. As a result a helper also appears as its own
       row in the Copy Manager and publishes like any other program.
 
+      Published INSIDE the application's folder, though: a helper
+      lands in Software\<Application>\<Helper>, not beside the
+      application in the top Software folder, because it is a part of
+      the application and not a program of its own. A helper still
+      standing in the top folder from an earlier publish is carried
+      into its new place the first time it is published again, with
+      its archive and its ReadMe. The Launcher lists the top folder
+      only, so a helper no longer gets a card there.
+
       As a single self-contained file, rather than a folder. Two
       folder-based builds side by side would each want their own
       support folder in the same place and would overwrite each
@@ -232,9 +268,32 @@ settings are the fallback that makes the built copy work.
 
 3.7 AFTER A BUILD
 
-    The window switches to the Copy Manager with the projects you
-    built already ticked, at the versions you built. The intended
-    flow is build, glance at the log, publish.
+    Programs build in the order you ticked them. Each ticked line
+    shows its place in the queue as a number left of the tick box,
+    e.g. "2."; the numbers stand in one column and have their own
+    space, so nothing in the line moves when one appears; unticking
+    one moves the ones behind it up, and ticking it again puts it at
+    the end. Ticking a project queues its helpers right behind it.
+    Select all keeps whatever you had ticked first and adds the rest
+    in list order; Clear empties the queue.
+
+    With "Copy after build" ticked, each program is copied to the
+    destinations ticked in the Copy Manager as soon as its own build
+    has finished — and only then does the next program start
+    building. So the first program you clicked is out on the shares
+    while the others are still building. A program whose build fails
+    is not copied; the queue carries on with the next one. The
+    destinations are read when you press BUILD selected, so change
+    them before, not during, the run. The build report, the copy
+    report and the overall report come at the end, as before. If no
+    destination is ticked, nothing is copied and the log says so.
+
+    With "Copy after build" off, the programs are only built.
+
+    "Replace icons without asking" (next to it, remembered between
+    runs): when a destination already has a different icon.ico, it
+    is overwritten straight away instead of showing the Icon
+    conflict window. This also applies to Copy in the Copy Manager.
 
 
 =================================================================
@@ -246,7 +305,14 @@ settings are the fallback that makes the built copy work.
     Every program in the build output, with its available versions
     and the version last published from this computer. Programs with
     something newer than what was published are highlighted, and
-    "Select new" ticks exactly those.
+    "Select new" ticks exactly those (when there are none, the log
+    says so).
+
+    After a copy, and after a build, the rows update in place: a new
+    version appears in its Version list and the status and "last
+    deployed" follow, while the ticks, the chosen versions and the
+    scroll position stay. Only Refresh rebuilds the list — use it when
+    a new program folder has appeared.
 
     "Last published" is remembered per computer, not per share. It
     answers "have I published this" rather than "is this the newest
@@ -280,6 +346,8 @@ settings are the fallback that makes the built copy work.
           the runtime folders the build brought along
           archive/
               vX.Y.Z/  the previous version, complete
+          <helper>/    a helper program of this one (section 3.6),
+                       laid out the same way, with its own archive
 
 4.3 THE ORDER OF OPERATIONS, AND THE THREE SAFETY RULES
 
@@ -306,7 +374,11 @@ settings are the fallback that makes the built copy work.
     the new version does bring. That last exception exists because
     the runtime folders (images, sounds) are exactly such folders,
     and without the exception a publish deleted them and the deployed
-    program came up without its alarm picture.
+    program came up without its alarm picture. A helper program's
+    sub-folder (Diagnostic\Diagnostic Webex listener) is kept for the
+    same kind of reason: the helper is published on its own, so it is
+    never part of the application's new version, and without this
+    exception every publish of the application wiped its own helper.
 
 4.4 WHERE THE DOCUMENTATION IS TAKEN FROM
 
@@ -382,6 +454,11 @@ settings are the fallback that makes the built copy work.
 
       - Duplicate copies and timestamped twins are removed, and the
         remaining file is renamed to the clean name.
+
+    All of this is done for every program folder on the destination
+    AND for the helper folders inside them (Diagnostic\Diagnostic
+    Webex listener): a helper has its own program file and its own
+    archive, so it needs the same repair.
 
 
 =================================================================

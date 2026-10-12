@@ -64,7 +64,7 @@ class ItemState:
     """The last thing known about one watched item."""
     __slots__ = ("state", "text", "value", "read_at", "latched", "fired",
                  "hint", "diff", "size_now", "err_said", "since",
-                 "answered_at")
+                 "answered_at", "picture")
 
     def __init__(self):
         self.state = C.STATE_UNKNOWN
@@ -86,6 +86,9 @@ class ItemState:
         self.hint = None
         self.diff = None
         self.size_now = None
+        # An area's last photograph (PIL image), kept for the Areas preview so
+        # that the tab never has to photograph the desktop on the GUI thread.
+        self.picture = None
         # (the sentence, when it was said) — see `WatchEngine._say_error`.
         self.err_said = None
 
@@ -122,7 +125,7 @@ class ItemState:
 
 class _PassSignals(QObject):
     values_done = Signal(int, object)      # generation, {item id: Reading}
-    areas_done = Signal(int, object)       # generation, {item id: (diff, err, size)}
+    areas_done = Signal(int, object)       # generation, {id: (diff, err, size, img)}
 
 
 def _read_values(reader, items, deadline_s):
@@ -138,8 +141,10 @@ def _read_values(reader, items, deadline_s):
 def _compare_areas(jobs):
     """One grab-and-compare pass. Runs on a worker thread; raises nothing.
 
-    `jobs` is [(item id, region, reference image)]; the answer is
-    {item id: (difference, error, size now)}.
+    `jobs` is [(item id, region, reference image or None)]; the answer is
+    {item id: (difference, error, size now, the picture now)}. A job without a
+    reference is photographed only, for the Areas preview — it costs nothing,
+    the one photograph is taken anyway.
 
     Grabbing on a worker thread was measured on 2026-09-16: a grab from a worker
     returns exactly the same rectangle as one from the GUI thread and leaves the
@@ -155,17 +160,17 @@ def _compare_areas(jobs):
     try:
         shots = S.grab_regions([region for _iid, region, _ref in jobs])
     except Exception as exc:            # a pass must never take the program down
-        return {iid: (None, f"could not be compared: {exc}", None)
+        return {iid: (None, f"could not be compared: {exc}", None, None)
                 for iid, _region, _ref in jobs}
     for (iid, _region, reference), (img, err) in zip(jobs, shots):
         try:
             if err is not None:
-                out[iid] = (None, err, None)
+                out[iid] = (None, err, None, None)
                 continue
             diff = S.picture_diff(img, reference) if reference is not None else None
-            out[iid] = (diff, None, img.size)
+            out[iid] = (diff, None, img.size, img)
         except Exception as exc:
-            out[iid] = (None, f"could not be compared: {exc}", None)
+            out[iid] = (None, f"could not be compared: {exc}", None, None)
     return out
 
 
@@ -189,6 +194,9 @@ class WatchEngine(QObject):
         self._states = {}
         self._watching = False
         self._closing = False
+        # Set by the Areas tab while it is on screen: areas that have no
+        # reference picture are then photographed too, for its preview.
+        self.preview_wanted = False
 
         # One reader for the life of the program: one thread pool, and one
         # memory of which look-back window answered for which channel.
@@ -466,6 +474,12 @@ class WatchEngine(QObject):
             st = self.state_of(iid)
             if not it.get("region") or not it.get("reference"):
                 st.state, st.text = C.judge_area(it, None)
+                if it.get("region") and self.preview_wanted:
+                    # Nothing to compare with, but the Areas preview is on
+                    # screen and wants to show what is there now.
+                    jobs.append((iid, list(it["region"]), None))
+                else:
+                    st.picture = None
                 continue
             # A copy of the rectangle, for the same reason the values are
             # snapshotted: an edit on the GUI thread must not change what the
@@ -485,11 +499,14 @@ class WatchEngine(QObject):
         if generation != self._area_gen:
             return
         now = time.monotonic()
-        for iid, (diff, err, size_now) in results.items():
+        for iid, (diff, err, size_now, picture) in results.items():
             it = self.item_by_id(iid)
             if it is None:
                 continue
             st = self.state_of(iid)
+            st.picture = picture
+            if not it.get("reference"):
+                continue                # photographed for the preview only
             ref = self._ref_cache.get(iid, (None, None))[1]
             size_ref = ref.size if ref is not None else None
             if err is None:

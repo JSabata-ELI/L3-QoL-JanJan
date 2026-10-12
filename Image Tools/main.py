@@ -9,17 +9,6 @@ if getattr(sys, "frozen", False):
     sys.path = [p for p in sys.path if "site-packages" not in p.lower()]
     if str(_internal) not in sys.path:
         sys.path.insert(0, str(_internal))
-    # DEBUG — zapiš sys.path do souboru
-    with open(Path(sys.executable).resolve().parent / "debug_syspath.txt", "w") as _f:
-        _f.write("\n".join(sys.path))
-    try:
-        import PIL
-        with open(Path(sys.executable).resolve().parent / "debug_pil.txt", "w") as _f:
-            _f.write(f"PIL location: {PIL.__file__}\n")
-            _f.write(f"PIL path: {PIL.__path__}\n")
-    except Exception as e:
-        with open(Path(sys.executable).resolve().parent / "debug_pil.txt", "w") as _f:
-            _f.write(f"PIL import error: {e}\n")
 
 from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton
 from PySide6.QtCore import Qt, QTimer
@@ -137,6 +126,15 @@ def install_wheel_guard(app):
 
         def eventFilter(self, obj, ev):
             t = ev.type()
+            if t == QEvent.Type.Polish and isinstance(obj, self._GUARDED):
+                # Spin boxes and drop-downs come with Qt's WheelFocus: the wheel
+                # notch ITSELF hands them the focus, with the same "mouse" reason
+                # a click gives, before this filter sees the notch -- so every
+                # field the pointer crossed counted as clicked and took the
+                # value change. Without WheelFocus only a click or Tab focuses.
+                if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                    obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
                 # Popup and menu reasons are left as they are: closing a drop-down
                 # hands the focus back, which must not undo the click that opened it.
@@ -208,6 +206,10 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         _wk = _load_module("workshop", "wk_t.py")
     except Exception as e:
         raise RuntimeError(f"wk_t.py error: {e}") from e
+    try:
+        _st = _load_module("slider_tabs", "slider_tabs.py")
+    except Exception as e:
+        raise RuntimeError(f"slider_tabs.py error: {e}") from e
     # One Moment is GONE, merged into the Image Finder (2026-09-04). Everything it
     # did lives there now: click the PV graph to pick moments — every click adds one
     # more, on any marked day — and the wall shows every picked camera at every
@@ -230,15 +232,23 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         pass
     win.setMinimumSize(800, 1000)
 
-    tabs = QTabWidget()
+    class _MainTabs(QTabWidget):
+        def paintEvent(self, _ev):
+            # In document mode all QTabWidget paints is a tab-bar base line under
+            # each corner widget — with the wide tab-row strip below that came out
+            # as a stray dark line over its left half. Nothing else is lost.
+            pass
+
+    tabs = _MainTabs()
     tabs.setTabPosition(QTabWidget.TabPosition.North)
     tabs.setDocumentMode(True)   # cleaner look, similar to VS Code tabs
 
     finder = ImageFinderWidget()
-    viewer = Viewer()
+    # The Image Slider tab holds layout tabs, one Viewer each (slider_tabs.py). The
+    # other tabs talk to it exactly as they talked to the single Viewer before.
+    viewer = _st.SliderTabs(Viewer)
     shot_finder = ShotFinderWidget()
     workshop = WorkshopWidget()
-    viewer.setWindowTitle("")    # title is handled by main window
 
     # The Finder's job is comparing ONE camera across MANY days — the transpose of the
     # Slider, which compares many cameras at one moment. The tab keeps the name the
@@ -261,25 +271,23 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     # instant side by side for every camera and every day. Nothing is copied — the
     # Finder looks the frames up itself (finder.open_moments).
     finder_idx = tabs.indexOf(finder)
-    viewer._finder_ref      = finder
-    viewer._finder_tab_idx  = finder_idx
-    viewer._tab_widget      = tabs
+    workshop_idx = tabs.indexOf(workshop)
+    viewer.inject(_finder_ref=finder, _finder_tab_idx=finder_idx, _tab_widget=tabs,
+                  _workshop_ref=workshop, _workshop_tab_idx=workshop_idx)
     shot_finder._finder_ref     = finder
     shot_finder._finder_tab_idx = finder_idx
 
     # Wire up Workshop — each tab gets a reference so it can send images
-    workshop_idx = tabs.indexOf(workshop)
     finder._workshop_ref      = workshop
     finder._workshop_tab_idx  = workshop_idx
     finder._tab_widget        = tabs
-    viewer._workshop_ref      = workshop
-    viewer._workshop_tab_idx  = workshop_idx
     shot_finder._workshop_ref     = workshop
     shot_finder._workshop_tab_idx = workshop_idx
     # "Send moment" / "Send + cameras": the Image Finder finds the shot, the Slider
     # is where it gets slid through (viewer.open_moment). This used to be One
     # Moment's handoff.
     finder._slider_tab_idx = tabs.indexOf(viewer)
+    shot_finder._slider_tab_idx = tabs.indexOf(viewer)
 
     # ...and the way back: "Show in Image Slider" opens the folder a Workshop frame
     # came from. Only the folder — the Slider browses files on the share, so an edited
@@ -298,7 +306,45 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         "QPushButton { background: #cc3300; color: #fff; font-weight: 700; "
         "padding: 3px 12px; border-radius: 3px; margin: 2px; }"
         "QPushButton:hover { background: #aa2200; }")
-    tabs.setCornerWidget(btn_stop_all, Qt.Corner.TopRightCorner)
+    # The tab row: main tabs | the Image Slider's layout tabs (only while the Slider
+    # is on screen) ... Stop All at the far right. QTabWidget gives a corner widget
+    # exactly its size hint, so the strip asks for the whole gap after the main tabs.
+    from PySide6.QtWidgets import QFrame, QHBoxLayout, QWidget
+    from PySide6.QtCore import QSize
+
+    class _TabRowStrip(QWidget):
+        def sizeHint(self):
+            # Exactly the gap — many layout tabs scroll inside it rather than
+            # squeezing the main tabs.
+            base = super().sizeHint()
+            bar = tabs.tabBar()
+            w = tabs.width() - bar.sizeHint().width() - 2
+            return QSize(max(self.minimumSizeHint().width(), w),
+                         max(base.height(), bar.sizeHint().height()))
+
+    strip = _TabRowStrip()
+    strip_lay = QHBoxLayout(strip)
+    strip_lay.setContentsMargins(6, 0, 0, 0)
+    strip_lay.setSpacing(6)
+    slider_box = QWidget()
+    slider_box_lay = QHBoxLayout(slider_box)
+    slider_box_lay.setContentsMargins(0, 0, 0, 0)
+    slider_box_lay.setSpacing(6)
+    sep = QFrame()
+    sep.setFixedSize(1, 18)
+    sep.setStyleSheet("background: #9aa6b6;")
+    slider_box_lay.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
+    strip_lay.addWidget(slider_box, 0, Qt.AlignmentFlag.AlignBottom)
+    strip_lay.addStretch(1)
+    strip_lay.addWidget(btn_stop_all, 0, Qt.AlignmentFlag.AlignVCenter)
+    tabs.setCornerWidget(strip, Qt.Corner.TopRightCorner)
+    viewer.move_chrome_into(slider_box_lay)
+
+    def _sync_tab_row(idx):
+        slider_box.setVisible(tabs.widget(idx) is viewer)
+        # The bold current tab changes the main bar's width: re-ask for the gap.
+        strip.updateGeometry()
+    _sync_tab_row(tabs.currentIndex())
 
     def _stop_all():
         try: finder.cancel_scan()
@@ -316,19 +362,15 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
 
     btn_stop_all.clicked.connect(_stop_all)
 
+    # Only the layout tab on screen works, and only while the Image Slider itself is
+    # the tab on screen. The first time it is shown, its current layout tab loads
+    # what it had before the restart — or opens the Time window dialog.
+    tabs.currentChanged.connect(
+        lambda idx: viewer.set_outer_visible(tabs.widget(idx) is viewer))
+    tabs.currentChanged.connect(_sync_tab_row)
+
     if folder_arg is not None:
         QTimer.singleShot(200, lambda: _open_folder_in_slider(viewer, tabs, folder_arg))
-    else:
-        # On first activation of the Image Slider tab, auto-open Time window dialog
-        # pre-set to online mode / current hour (fires only once).
-        _slider_auto_started = [False]
-
-        def _on_tab_changed(idx: int):
-            if idx == 1 and not _slider_auto_started[0]:
-                _slider_auto_started[0] = True
-                QTimer.singleShot(0, viewer.auto_start_online)
-
-        tabs.currentChanged.connect(_on_tab_changed)
 
     return win
 
@@ -336,8 +378,72 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
 def _open_folder_in_slider(viewer, tabs: QTabWidget, folder: Path):
     """Switch to Slider tab and load folder (called after startup)."""
     if folder.exists() and folder.is_dir():
-        tabs.setCurrentIndex(1)
         viewer.open_folder_path(folder)
+        tabs.setCurrentWidget(viewer)
+
+
+# ── crash log ─────────────────────────────────────────────────────────────────
+_CRASH_LOG_FH = None      # kept open for the whole run: faulthandler writes to the fd
+
+
+def install_crash_log() -> None:
+    """On a hard crash (access violation inside Qt), write the Python stack of
+    EVERY thread to %APPDATA%\\ELI_ImageTools\\crash.log.
+
+    These crashes leave no traceback and the Windows crash dump holds no heap, so
+    the dump alone cannot say which Python line was running — the crash of
+    5 Oct 2026 could only be narrowed down to "a worker thread freed a widget".
+    With this log the next one names the thread and the line."""
+    global _CRASH_LOG_FH
+    import faulthandler
+    import os
+    from datetime import datetime
+    try:
+        d = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "crash.log"
+        # Keep the log small: start over once it passes 1 MB.
+        mode = "w" if p.exists() and p.stat().st_size > 1_000_000 else "a"
+        fh = open(p, mode, encoding="utf-8")
+        fh.write(f"\n=== Image Tools {_detect_version()} started "
+                 f"{datetime.now():%Y-%m-%d %H:%M:%S} (pid {os.getpid()}) ===\n")
+        fh.flush()
+        faulthandler.enable(file=fh, all_threads=True)
+        _CRASH_LOG_FH = fh
+    except Exception:
+        pass
+
+
+# ── garbage collection on the GUI thread only ────────────────────────────────
+def install_gui_thread_gc(app) -> None:
+    """Run Python's cycle collector from a GUI-thread timer instead of letting it
+    fire wherever an allocation happens to cross the threshold.
+
+    Measured from the crash dump of 2 Oct 2026 (python.exe.17892.dmp): a plain
+    Python worker thread did an attribute assignment, the
+    allocation ran the collector, and the collector freed a cycle holding a
+    Python-owned widget tree with a table view inside. Its C++ destructor then
+    ran on the worker thread and crashed in QObject::disconnect. Any thread can
+    trigger an automatic collection, so the only safe place for it is here.
+
+    The thresholds mimic Python's own (700 / 10 / 10)."""
+    import gc
+    gc.disable()
+
+    def _tick():
+        c0, c1, c2 = gc.get_count()
+        if c2 >= 10:
+            gc.collect(2)
+        elif c1 >= 10:
+            gc.collect(1)
+        elif c0 >= 700:
+            gc.collect(0)
+
+    t = QTimer(app)
+    t.setInterval(250)
+    t.timeout.connect(_tick)
+    t.start()
+    app._gui_gc_timer = t
 
 
 # ── entry point ───────────────────────────────────────────────────────────────
@@ -349,10 +455,11 @@ def main():
     )
     args = ap.parse_args()
     folder_arg = Path(args.folder) if args.folder else None
+    install_crash_log()
 
     # Nastav AppUserModelID před vytvořením QApplication — Windows použije
     # toto ID pro groupování v taskbaru a zobrazení správné ikony.
-    # See _icon_app_id() for why the id carries a hash of the icon.
+    # See _icon_app_id() for why the id is new on every launch.
     _aumid = _icon_app_id("ELIBeamlines.ImageTools", _icon_file())
     if _aumid:
         try:
@@ -363,6 +470,7 @@ def main():
 
     app = QApplication.instance() or QApplication(sys.argv)
     install_wheel_guard(app)
+    install_gui_thread_gc(app)
 
     # Nastav ikonu na úrovni aplikace — platí pro taskbar i alt-tab
     _ico = _icon_file()

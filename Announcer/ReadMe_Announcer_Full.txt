@@ -172,7 +172,9 @@ Short version: ReadMe Announcer.txt  ("ReadMe" button)
                    L3-UTIL-CHL03-001:Temp. It tells you how many it
                    is showing out of how many matched.
     Read now       reads it from the archiver and says what it holds,
-                   so you can check the name is right before you save
+                   so you can check the name is right before you save.
+                   The button is grey while the answer is on its way;
+                   the rest of the program keeps working meanwhile
     the difference between two channels — the chiller case
     the four limits and the unit
     How it is read:
@@ -626,6 +628,29 @@ Short version: ReadMe Announcer.txt  ("ReadMe" button)
       once; it names them before it does anything. Before, picking
       more than one row greyed out every button, which looked like
       the program had lost the selection.
+
+  FASTER AND STEADIER, 6.10.2026:
+
+    - A change is applied where it is, straight away. Ticking a row,
+      typing a limit, a name or a sensitivity used to reload every
+      tab — rebuild both tables, re-read the pictures, the sounds and
+      the speakers, and photograph the screen. Now only that row is
+      written again.
+    - The window no longer stands still for a moment every couple of
+      seconds while screen areas are watched. Photographing an area
+      froze it for up to 0.4 s each time; it now takes a tenth of
+      the time and the window keeps moving.
+    - The Areas preview shows the picture the watch has just taken
+      instead of photographing the screen again by itself.
+    - "Read now" and "Find" no longer freeze the program while the
+      archiver answers. The button greys out until the answer is in.
+    - The mouse wheel never changes a number box or a drop-down you
+      have not clicked. Before, the wheel could change one just by
+      passing over it.
+    - Nothing pops up beside the circle while you are placing it.
+    - Pressing "Identify monitors" twice no longer makes the numbers
+      blink and vanish early.
+    - On the Alarm tab, picking a colour updates the shape preview.
 
   KNOWN, and left as it is on purpose:
 

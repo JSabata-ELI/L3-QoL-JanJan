@@ -62,7 +62,7 @@ IMPORTANT
     the range, or one of the old constants is missing, all three new
     values stay empty. A half-computed calibration would be worse
     than none.
-  - The (i) button repeats the short version of all this inside the
-    program.
+  - The "Info" button, next to Save, opens a window with a short
+    summary of all this inside the program.
 
 -----------------------------------------------------------------

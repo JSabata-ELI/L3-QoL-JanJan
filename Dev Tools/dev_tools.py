@@ -80,11 +80,49 @@ def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
         pass
 
 
+def _combo_wheel(event):
+    """Mouse wheel over a combobox.
+
+    ttk's own class binding steps the value on every wheel turn, and it runs
+    before the list's scroll handler. Scrolling the Copy Manager list over the
+    Version column therefore silently changed which version would be copied,
+    and a turn over Builder's Group moved the project to another group. The
+    value now changes only in the box the user clicked into (it has the
+    keyboard focus); anywhere else the turn scrolls the list underneath.
+    """
+    w = event.widget
+    try:
+        focused = w.focus_get() is w
+    except Exception:
+        focused = False
+    step = -1 if event.delta > 0 else 1
+    if focused and "disabled" not in w.state():
+        try:
+            w.tk.call("ttk::combobox::Scroll", str(w), step)
+        except tk.TclError:
+            pass
+        return "break"
+    parent = w.master
+    while parent is not None and not isinstance(parent, tk.Canvas):
+        parent = parent.master
+    if parent is not None:
+        try:
+            parent.yview_scroll(step, "units")
+        except tk.TclError:
+            pass
+    return "break"
+
+
+def install_combo_wheel_guard(root):
+    root.bind_class("TCombobox", "<MouseWheel>", _combo_wheel)
+
+
 def main():
     from b_t import BuilderUI
     from cm_t import DeployGUI
 
     root = tk.Tk()
+    install_combo_wheel_guard(root)
     root.title("Dev Tools")
     set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.DevTools")
     root.geometry("1180x820")

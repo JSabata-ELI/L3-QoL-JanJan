@@ -50,6 +50,9 @@ def test_page_moves_selection():
     side = dlg._sides["from"]
     side["tabs"].setCurrentIndex(0)             # Absolute Start
     cal = side["cal"]
+    # Switching from relative to absolute starts from the moment the span gave;
+    # whatever the clock then shows must survive the paging.
+    clock = side["time"].time()
 
     # What the ◀ button / month menu / year box all do underneath.
     cal.setCurrentPage(2026, 2)
@@ -65,7 +68,8 @@ def test_page_moves_selection():
           (got.year, got.month) == (2026, 2),
           f"start = {got:%Y-%m-%d %H:%M}")
 
-    check("clock boxes are kept", (got.hour, got.minute) == (14, 58),
+    check("clock boxes are kept",
+          (got.hour, got.minute) == (clock.hour(), clock.minute()),
           f"{got:%H:%M}")
 
     check("status line follows the page",
@@ -93,11 +97,37 @@ def test_day_31_clamped():
     dlg = app_main.TimeWindowDialog(None, now - timedelta(hours=1), now)
     side = dlg._sides["from"]
     side["tabs"].setCurrentIndex(0)
+    side["cal"].setSelectedDate(QDate(2026, 3, 31))
+    side["cal"].setCurrentPage(2026, 3)
+    _app.processEvents()
     side["cal"].setCurrentPage(2026, 2)         # February has no 31st
     _app.processEvents()
     sel = side["cal"].selectedDate()
     check("a short month clamps the day", sel.isValid() and sel.month() == 2,
           sel.toString("yyyy-MM-dd"))
+    dlg.deleteLater()
+
+
+def test_live_button():
+    now = datetime(2026, 9, 4, 15, 58, 0)
+    dlg = app_main.TimeWindowDialog(None, now - timedelta(days=2), now - timedelta(days=1))
+    for which in ("from", "to"):
+        dlg._sides[which]["tabs"].setCurrentIndex(0)    # both Absolute
+    check("an absolute end does not ask for Live", not dlg.wants_live())
+    dlg._on_live()
+    check("Live puts End on 'now'", dlg._lbl_end_status.text() == "now",
+          dlg._lbl_end_status.text())
+    check("Live puts Start one hour back",
+          dlg._lbl_start_status.text() == "- 1 hours", dlg._lbl_start_status.text())
+    check("Live asks for Live mode", dlg.wants_live())
+    # The user changes Start afterwards; Live stays asked for.
+    dlg._sides["from"]["rel"]["Hours"].setValue(6)
+    check("a changed Start keeps Live", dlg.wants_live()
+          and dlg._lbl_start_status.text() == "- 6 hours",
+          dlg._lbl_start_status.text())
+    # Moving End off "now" cancels it.
+    dlg._sides["to"]["rel"]["Minutes"].setValue(10)
+    check("an End before now drops Live", not dlg.wants_live())
     dlg.deleteLater()
 
 
@@ -115,6 +145,7 @@ def test_multi_day_picker_untouched():
 if __name__ == "__main__":
     test_page_moves_selection()
     test_day_31_clamped()
+    test_live_button()
     test_multi_day_picker_untouched()
     print()
     if _fails:

@@ -86,7 +86,9 @@ def read_clipboard() -> str:
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=30,
+            # Called from the windowed app: without this a console flashes.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return out.stdout or ""
     except Exception as exc:  # noqa: BLE001
         print(f"Could not read the clipboard: {exc}")

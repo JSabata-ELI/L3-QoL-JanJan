@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-26  (remote_launcher.py, 533 lines)
+Verified against source: 2026-10-05  (remote_launcher.py, 802 lines)
 -----------------------------------------------------------------
 Short version: ReadMe_Diagnostic Webex listener.txt ("ReadMe" button)
 Code map:      STRUCTURE.md  (in the Diagnostic folder)
@@ -39,7 +39,10 @@ Diagnostic is not.
                              -> Webex  (stored in monitor_config.json)
     Which space it listens in the space with "Listen for commands"
                              ticked — the first one, if several are
-    Who may command it        the "command allowlist" of e-mail
+    Canteen in that space    its "/food" box; unticked means /food
+                             answers "not available in this room" and
+                             no lunch reminder is posted
+    Who may command it       the "command allowlist" of e-mail
                               addresses; empty means everyone in the
                               space
     How often it looks        the command poll interval, in seconds
@@ -57,6 +60,8 @@ Diagnostic is not.
 
   /run                (also accepted: /rundiagnostic — the old name)
   /food [when]        (also accepted: /menu, /lunch)
+  /food order ...     order lunch, with a one-time code (section 5)
+  /food cancel ...    cancel lunch, with a one-time code (section 5)
 
   Only the first word has to be the command, so "/run please" or
   "/run." still work.
@@ -102,23 +107,31 @@ Diagnostic is not.
 
 5. WHAT /food DOES
 
-  It reads the menu Diagnostic saved earlier and writes it into the
-  chat. No sign-in to OKbase happens here, which is why the answer
-  arrives with Diagnostic closed — that is the whole point of the
-  saved copy.
+  Every /food signs in to OKbase with the sign-in saved in Diagnostic
+  and reads the menu there and then, so the answer is current — the
+  menu is still being edited during the morning. Only when that read
+  fails (portal down, sign-in expired, or a sign-in that does not
+  decrypt on this Windows account) does it answer from the copy
+  Diagnostic saved earlier, and it adds the reason underneath. Either
+  way the answer arrives with Diagnostic closed — that is the point.
 
-      /food                today
+      /food                today (after 14:30, the next serving day)
       /food week           this week; also "next week"
       /food tomorrow       also "yesterday", or a weekday: /food friday
       /food 27.8.          a date; also 2026-08-27
-      /food refresh        read OKbase again now (see below)
-      /food status         how many days are saved and how old they are.
-                           Answered honestly: this program cannot see
-                           whether the sign-in still works, so it says
-                           to ask again with Diagnostic open.
+      /food orders         what you have ordered from today on
+      /food refresh        the same live read, answered with today
+      /food status         how many days are known and when they were
+                           read. Answered honestly: this program cannot
+                           report the sign-in state, so it says to ask
+                           again with Diagnostic open.
 
   WHILE DIAGNOSTIC IS OPEN THIS PROGRAM SAYS NOTHING ABOUT /food and
   lets Diagnostic answer. Both replying would double every menu.
+
+  If the listening space has its "/food" box unticked (Diagnostic,
+  Settings -> Webex rooms), every /food is answered only with
+  "/food is not available in this room".
 
   The saved copy is looked for in the shared folder next to the shared
   PV list, and in %APPDATA%\Diagnostic. The newer of the two wins.
@@ -127,10 +140,39 @@ Diagnostic is not.
   day, or one that does not cover the day asked about, says so in the
   answer — it never shows another day's food instead.
 
-  /food refresh does try OKbase directly, and works only where the
-  saved sign-in decrypts, which means the same Windows account that
-  typed it into Diagnostic's Settings. Where it does not, the answer
-  is the saved menu plus the reason the fresh read failed.
+  The live read works only where the saved sign-in decrypts, which
+  means the same Windows account that typed it into Diagnostic's
+  Settings.
+
+  ORDERING AND CANCELLING LUNCH
+
+      /food order friday 1 pin:bakoli          main course 1
+      /food order friday soup 2 main 1 pin:severu
+      /food cancel friday pin:tumida           the whole day off
+      /food order friday                       shows Friday's list,
+                                               orders nothing
+
+  These work exactly as in Diagnostic, and with Diagnostic closed, so
+  nobody has to start the application just to order lunch:
+
+  - Who may ask: anybody allowed to command the bot (the command
+    allowlist). If Diagnostic's Settings -> Canteen menu -> "Restrict
+    ordering to" lists addresses, only those senders; empty (the
+    default) means anybody with a valid code.
+  - Every order or cancellation needs one of the one-time ordering
+    codes made in Diagnostic (Settings -> Canteen menu -> Ordering
+    codes), written as pin:<code>. No codes left means no order is
+    accepted at all.
+  - The menu is read live first, so the number you type is matched
+    against the list OKbase has right now, not an old copy.
+  - The code is used up only at the moment the change is saved. A day
+    that turns out to be closed, or a meal that is already ordered,
+    costs no code.
+  - After a successful change, when 10 or fewer codes are left, the
+    reply adds a line saying how many — make a new list in
+    Settings -> Canteen menu. The menu is then read again, so the
+    saved copy agrees with what was just done.
+  - /food order with no meal named changes nothing and needs no code.
 
   THIS PROGRAM ALSO KEEPS THE SIGN-IN ALIVE. While Diagnostic is
   closed, it says hello to OKbase every ten minutes and reads the
@@ -145,6 +187,37 @@ Diagnostic is not.
   only when its state CHANGES ("stopped working" / "works again") -
   a line every ten minutes would bury everything else.
 
+  AND IT SENDS THE MORNING LUNCH REMINDER. While Diagnostic is
+  closed, on working days (Monday to Friday) from the hour set in
+  Diagnostic's Settings -> Canteen menu -> "Lunch not ordered"
+  (08:00 by default), the first of those ten-minute turns reads this
+  week live from OKbase and looks at today:
+
+    no menu today (holiday)        nothing is sent
+    ordering already closed        nothing is sent
+    lunch already ordered          nothing is sent
+    open and nothing ordered       one message in the listening space:
+
+      🍽 @Jan you have no lunch ordered for today (Monday 5 Oct).
+      Ordering usually closes at 10:00 — send /food to see the menu.
+
+  The person mentioned is the "Mention" address in those settings,
+  or the Work account when that is empty. The reminder check goes
+  before the daily menu read, because it is the one with a deadline;
+  the menu read simply waits for the next turn.
+
+  Once today is decided, the date is written into
+  %APPDATA%\Diagnostic\okbase.json — the same file Diagnostic reads.
+  So there is at most one message a day, even if Diagnostic is opened
+  later that morning and takes the job over (or the listener is
+  restarted). A read that fails decides nothing: no message, and the
+  next turn tries again. The console gets one line per decision
+  ("lunch check for today: ...").
+
+  Nothing is checked when the canteen menu is switched off in
+  Diagnostic, when "Lunch not ordered" is unticked, or when the
+  listening space has its "/food" box unticked.
+
 
 6. THE ANSWERS AND WHAT THEY MEAN
 
@@ -155,6 +228,10 @@ Diagnostic is not.
   ℹ️ Already runs, but not tracking   send @Diagnostics /start (or press
                                       Start monitoring in the app)
   ⛔ Not allowed                      the sender is not on the allowlist
+  ⛔ (on /food order or cancel)       no or wrong ordering code, or the
+                                      sender is not in "Restrict
+                                      ordering to" — the reason is in
+                                      the message
   ❌ Could not be started             no build, no Python, or the launch
                                      itself failed — the reason is in
                                      the message

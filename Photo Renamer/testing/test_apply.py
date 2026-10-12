@@ -178,13 +178,14 @@ def test_locked_file_is_reported(folder: Path) -> None:
 
 
 def test_grid_columns() -> None:
-    print("the grid never puts more than six in a row")
+    print("always two in a row, three once the pane is wide enough")
     w = pr_t.PhotoRenamerWidget()
-    check(w.columns_for(640) == 6, "a half-window pane gives six")
-    check(w.columns_for(2000) == 6, "a very wide pane still gives six")
-    check(w.columns_for(430) == 4, "a narrower pane gives four")
-    check(w.columns_for(150) == 1, "a very narrow pane gives one")
-    check(w.columns_for(0) == 1, "no width still gives one, never zero")
+    check(w.columns_for(640) == 3, "a half-window pane gives three")
+    check(w.columns_for(600) == 3, "three from 600 px")
+    check(w.columns_for(599) == 2, "two just below 600 px")
+    check(w.columns_for(2000) == 3, "a very wide pane still gives three")
+    check(w.columns_for(240) == 2, "the narrowest pane still gives two")
+    check(w.columns_for(0) == 2, "no width still gives two")
     w.shutdown()
 
 

@@ -2,11 +2,12 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-20
-  (monitor_tab.py 7012 lines, alerting.py 1178, remote_launcher.py 491,
-   main.py 395, shared_pvs.py 364, bot_commands.py 297,
-   cpva_api.py 263, notify_provision.py 238, memstats.py 187,
-   operation_history_logic.py 128, secrets_util.py 70)
+Verified against source: 2026-10-05
+  (monitor_tab.py 10394 lines, okbase_menu.py 3090, bot_commands.py 1256,
+   alerting.py 1117, edge_cdp.py 992, chart_history.py 890,
+   remote_launcher.py 802, cpva_api.py 585, main.py 463,
+   shared_pvs.py 364, okbase_capture.py 248, notify_provision.py 238,
+   memstats.py 187, secrets_util.py 70)
 -----------------------------------------------------------------
 Short version: ReadMe_Diagnostic.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -14,8 +15,7 @@ Code map:      STRUCTURE.md
 
 PySide6 GUI for live monitoring and alerting on L3 beamline PVs. It reads values
 from the CPVA archive, shows them in a table and a graph, compares them against
-limits and sends alerts to Teams / Email / Webex. A second tab does long-term
-drift analysis on stored waveplate operations.
+limits and sends alerts to Teams / Email / Webex.
 
 ---
 
@@ -24,7 +24,6 @@ drift analysis on stored waveplate operations.
 | Tab | What it does |
 |-----|--------------|
 | **PV Monitor** | Live PV table + graph, thresholds, "not updating" check, alerting to Teams / Email / Webex, and a two-way Webex bot |
-| **History** | Detects >3 % deviation from a 30-day baseline per waveplate operation and saves a PNG per flagged waveplate |
 | **Log** | The PV Monitor's run log (the same widget, shown as its own tab) |
 
 The PV Monitor is the whole program in practice. The repository-building tabs
@@ -36,15 +35,13 @@ What replaced them:
 - CPVA fetching and the ramping repository → the **CSS Logger** program
 - the pulser image check → the **Pulser Monitor** program
 
-Two consequences worth knowing:
+`DataRepository\`, `RampingRepository\`, `builder_config.json` and
+`builder_state.json` are leftovers from that era. Nothing in this folder reads
+them any more.
 
-- `DataRepository\`, `RampingRepository\`, `builder_config.json` and
-  `builder_state.json` are leftovers from that era. Nothing in this folder reads
-  them any more.
-- **History cannot run as things stand.** It needs `MasterOperations.parquet`
-  next to the exe, and the module that used to write that file is gone. Without
-  the file the tab reports `MasterOperations.parquet not found` and stops. Either
-  bring a copy of the file along, or treat the tab as dormant.
+The History tab (waveplate drift analysis on `MasterOperations.parquet`) was
+removed on 2026-10-07: nothing had produced its input file since 2026-06-29, so
+it could only report the file missing.
 
 ---
 
@@ -52,7 +49,7 @@ Two consequences worth knowing:
 
 | File | What it is |
 |------|-----------|
-| `main.py` | Entry point and window. Builds the tabs, shows a splash, and records that it is running (`run_status.json` in `%APPDATA%\Diagnostic`, plus the legacy `diagnostic.lock`) so `remote_launcher.py` can tell whether the app is already up. pandas and matplotlib are imported **lazily** (`operation_history_logic` inside `HistoryTab._run`, `monitor_tab` inside `main()` after the splash) — on a cold file cache those imports cost tens of seconds, and this way the splash paints first. |
+| `main.py` | Entry point and window. Builds the tabs, shows a splash, and records that it is running (`run_status.json` in `%APPDATA%\Diagnostic`, plus the legacy `diagnostic.lock`) so `remote_launcher.py` can tell whether the app is already up. matplotlib is imported **lazily** (`monitor_tab` inside `main()` after the splash) — on a cold file cache that import costs tens of seconds, and this way the splash paints first. |
 | `monitor_tab.py` | The whole PV Monitor tab: PV table, live graph, threshold/condition editing, Settings, share publishing, alert dispatch, Webex commands. By far the largest module (~6.4 k lines) |
 | `alerting.py` | The alert state machine and the notification channels — Teams (`build_messagecard`), SMTP email, and `WebexNotifier` (send + two-way command listening). Also the Qt-free sample-series check `classify_trend` (reminder pacing), and the run-status file (`run_status_path` / `read_run_status` / `write_run_status`) that lets `remote_launcher.py` see from outside whether the app is up and tracking |
 | `cpva_api.py` | Thin CPVA REST client + `get_app_dir()` used to resolve every path |
@@ -62,7 +59,6 @@ Two consequences worth knowing:
 | `bot_commands.py` | Grammar of the chat commands — `,` between items, `;` before options, and the time/Y-range parsers. Qt-free on purpose so it can be tested alone |
 | `memstats.py` | Reads the Windows memory figures with `ctypes` (no extra package): this program's committed memory and working set, and the whole PC's commit charge against its limit. Feeds the status bar, the half-hourly log line and the listener's console — see "Memory on a long uptime" |
 | `remote_launcher.py` | Standalone Webex listener that starts the app on `/run` (see below). Built as its own program — `dist\Diagnostic Webex listener\` |
-| `operation_history_logic.py` | Long-term drift per waveplate, behind the History tab (see the note above about its missing input file) |
 | `test_alerting.py` | Offline tests for the alerting layer (`python test_alerting.py`) |
 | `test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict (a new reading arriving is the whole question — a steady number is asserted NOT to be a fault, so the chiller false alarms cannot come back), its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python test_monitor_frozen.py`) |
 | `test_rule_change_grace.py` | Offline tests for the hold that follows a change of the limits in force: when it opens, what it does to a half-built alert state, what the table and the bot say while it runs, and a regression test reproducing the end-of-shift chiller messages with the hold switched off (`python -m pytest test_rule_change_grace.py`) |
@@ -112,28 +108,10 @@ configuration
   notify_provision.dat    (in the build)   ← the notification channels
 ```
 
-The History tab is a separate, offline path:
-
-```
-MasterOperations.parquet ──► operation_history_logic.py ──► HistoryPlots/{waveplate}_{metric}.png
-```
-
 ---
 
 ### Module descriptions
 
-#### `operation_history_logic.py` — Operation History
-Reads `MasterOperations.parquet` and analyses long-term drift per waveplate position.
-
-- Metrics tracked: `sbw4_green`, `green_ptm1`, `ptm1_pap1`, `pcm2_green`, `sbw4_ptm1`
-- Baseline: 30-day rolling median.
-- Deviation threshold: > 3 % flags the point.
-- Output: PNG line plots saved to `HistoryPlots/{waveplate}_{metric}.png` for the 25 most common waveplates.
-
-Nothing in this folder produces its input file any more — see the note under
-Quick Overview.
-
----
 
 #### `monitor_tab.py` — PV Monitor
 Live monitoring and alerting — in practice the whole program.
@@ -268,6 +246,11 @@ broadcasting to N rooms) — no code change is needed, only settings in the GUI.
    - **Name** — any label
    - **Room ID** — the room's id (how to get it, below)
    - **On** — tick it to send alerts there
+   - **/food** — ticked by default. Untick it on the room that listens for
+     commands and that room hears nothing about the canteen: `/food` only answers
+     "not available in this room", `/help` leaves food out, `/status` drops the
+     canteen sign-in line and no morning lunch reminder is posted. The always-on
+     listener follows the same box.
    - **Listen for commands** — at most ONE room may have this ticked (the bot reads
      two-way commands from a single room)
 4. **Save**.
@@ -746,6 +729,8 @@ Settings → **Canteen menu (/food)**:
 | Ordering codes | the button hands you **100 one-time codes**, shown that once only, and says how many are still unused. Every order or cancellation has to carry one, written on the command as `pin:bakoli`; it then stops working. **No codes = no order is accepted at all.** Only fingerprints are stored, so the list can never be shown again or recovered from the file — copy it out or save it to a file and keep it on your phone. A new list replaces the old one, and neither that nor losing the list affects orders already placed |
 | Read after (hour) | the menu is read at most once a day, past this hour |
 | Keep sign-in alive (min) | how often the sign-in is touched so it does not expire from disuse — default 10 min. One tiny request each time. **This is what makes it last:** a web session dies of being unused, so without it the borrowed sign-in would be good for one server-side timeout (often half an hour) and would have to be redone every morning |
+| Lunch not ordered | on working days from this hour (default 08:00): if today has a menu, ordering is still open and nothing is ordered, the bot posts one message in the listen room that mentions you. Nothing on days without a menu or once ordering has closed; at most one message a day, whether the app or the listener is the one running |
+| Mention | the Webex address that message mentions — empty = the Work account |
 | OKbase address | leave empty for the default |
 | Read the menu now | signs in and reads with the fields as typed, without saving them |
 
@@ -783,12 +768,43 @@ old, or if it simply does not cover the day asked about, the reply says so —
 it never shows another day's food instead. `/food refresh` is the same live
 read, answered with today.
 
-One timer does two jobs, because they have nothing else in common: the **menu**
-is fetched at most once a calendar day, while the **sign-in** is touched on every
-tick (`okbase_keepalive_min`). A session that is used never times out, so the
-paste survives until the portal itself restarts. A rotated session id — and a
-brand new session minted by remember-me — is saved back over the stored one, so
-the next keepalive touches the session that is actually alive.
+One timer does three jobs, one per tick and in this order: the **lunch
+reminder** check (once a working day, see below), then the **menu** fetch (at
+most once a calendar day), and otherwise a plain touch of the **sign-in** (every
+tick, **Keep sign-in alive (min)**). The reminder goes first because it is the
+one with a deadline; the menu read simply waits for the next tick. Each of the
+three is a request on the same session, so each counts as a keepalive. A session
+that is used never times out, so the paste survives until the portal itself
+restarts. A rotated session id — and a brand new session minted by remember-me —
+is saved back over the stored one, so the next keepalive touches the session that
+is actually alive.
+
+**The morning lunch reminder.** On a working day (Monday–Friday), once the clock
+is past the hour set in **Lunch not ordered** (default 08:00), the next tick
+reads the current week live from OKbase — never the saved copy, so a lunch
+ordered in the browser five minutes ago is not nagged about — and decides
+today:
+
+- **no menu** for today (holiday, shutdown) — nothing is sent;
+- today **no longer takes orders** — nothing is sent;
+- today **is already ordered** — nothing is sent;
+- today is open and **nothing is ordered** — one message goes to the room with
+  **Listen for commands**, mentioning the **Mention** address (or the **Work
+  account** when that is empty):
+
+      🍽 @Jan you have no lunch ordered for today (Monday 5 Oct).
+      Ordering usually closes at 10:00 — send /food to see the menu.
+
+Whatever the verdict, the day is then recorded as decided in
+`%APPDATA%\Diagnostic\okbase.json`, so there is at most one message a day. It
+is kept on disk rather than in memory because the app and the always-on listener
+take turns and either may restart: whichever of them is running does the check,
+and the date in that file stops the other from sending a second message the same
+morning. A read that **fails** (portal down, sign-in refused, orders not
+reported) decides nothing — no message, the day is not recorded, and the next
+tick tries again. Nothing is checked at all when **Read the canteen menu from
+OKbase** is off, when **Lunch not ordered** is unticked, or when the listen room
+has its **/food** box unticked.
 
 **A dead session repairs itself.** Measured against the portal: with `JSESSIONID`
 deleted, and again with a dead one, a single GET of
@@ -958,6 +974,12 @@ always-on watcher can start it on request:
   each of them — so the watcher would miss a copy started the other way and open a
   second one. `diagnostic.lock` is still written and still read as a fallback, for a
   copy started by an older build.
+- **It also sends the morning lunch reminder** while the app is closed (see "The
+  morning lunch reminder" above). The check is the first job on its canteen timer;
+  once today is decided it writes the date into `%APPDATA%\Diagnostic\okbase.json`,
+  the same file the app reads, so if the app is started later that morning it
+  does not send the message a second time — and the other way round. Each
+  decision is one line in the listener's console ("lunch check for today: …").
 - On the first successful poll it only takes a baseline of the room, so an old
   backlog is never answered; a failed poll does not reset that baseline.
 - For autostart: `pythonw.exe "<path>\remote_launcher.py" --install-startup` drops a
@@ -977,6 +999,23 @@ While alerting is disarmed, the **State** cell keeps the real severity of the
 reading but is painted dark red and prefixed with `⏸` (e.g. `⏸ ok`), and the
 status bar reads `stopped (reading only)` — the value is true, nobody is watching
 it. A row whose **On** box is unchecked still shows `off` as before.
+
+### Edits take effect at once; the mouse wheel never changes a field by accident
+
+- Saving new limits (double-click a limit cell), saving the PV editor, or picking
+  a rule in a **Depends on** dropdown updates that PV's **State** cell, its limit
+  cells and the graph's limit lines immediately — not at the next poll. Only that
+  PV's row is redrawn; the rest of the table stays as it is. A new dependency PV's
+  own value still arrives with the next poll.
+- Number boxes, dropdowns and sliders react to the mouse wheel only after you
+  have **clicked** them, and only while the pointer stays on them. Scrolling over
+  a field you have not clicked (or have since moved away from) scrolls the table
+  or the page instead. This applies to every window of the program, the Settings
+  dialog and the PV editor included.
+- The Settings **Send test** buttons run in the background: the dialog stays
+  usable while a test waits on a slow server, and the result appears below.
+- The program's own startup splash never takes the keyboard focus and does not
+  sit on top of other programs.
 
 ### Conditional limits, and the grace after they change
 
@@ -1287,12 +1326,10 @@ leaves the group.
 
 ```
 PySide6      GUI framework
-pandas       data manipulation
 numpy        numerical operations
 matplotlib   plots
 requests     CPVA API calls
 urllib3      HTTP (SSL verification disabled for internal API)
-pyarrow      parquet I/O (via pandas)
 pywin32      win32crypt — DPAPI encryption of stored credentials
 ```
 

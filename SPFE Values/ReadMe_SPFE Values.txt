@@ -1,5 +1,10 @@
-SPFE VALUES
-===========
+SPFE Values — Short information
+Created by Jan Moucka, ELI Laser
+
+Bugs / suggestions: jan.moucka@eli-laser.eu
+-----------------------------------------------------------------
+Detailed version: ReadMe_SPFE Values_Full.txt
+-----------------------------------------------------------------
 
 The daily table of SPFE numbers, filled in by itself.
 
@@ -65,6 +70,17 @@ The table
   The columns are only as wide as what is in them, and the empty column on the
   right is there so the table still reaches its own frame. Make the window
   narrower and the table follows.
+
+  The table stays where you left it. Saving References, a finished "Fill
+  missing days" or a sync only recolour the cells that changed - the table does
+  not jump back to the top, and the cell you picked stays picked.
+
+  What you type is never turned away. A value, a campaign name or a value in an
+  empty column is saved even while the program is busy fetching; it simply waits
+  its turn.
+
+  The mouse wheel only scrolls. A number box (the year in the "Pick days"
+  calendar) changes with the wheel only after you have clicked into it.
 
 
 COLOURS IN THE TABLE
@@ -173,6 +189,9 @@ References
   either side. A number that wants a different one gets it in the last column
   of its own line. With only one edge set, the percentage is taken off that
   edge instead.
+
+  "Clear this line" empties the three boxes of the line the cursor is on, so
+  that number is no longer coloured. Nothing is stored until you press Save.
 
   The ranges are shared: they are written beside the log in the shared folder,
   so everybody's window colours the same values. The day on screen is recoloured

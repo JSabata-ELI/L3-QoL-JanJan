@@ -246,6 +246,31 @@ def test_the_preview_says_how_many_are_picked_rather_than_nothing():
     assert "3" in said, f"the preview says {said!r}"
 
 
+# ── the empty-table note does not outlive the empty table ───────────────────
+
+def test_the_empty_note_leaves_no_sentence_behind_the_tick():
+    """Reported 2026-10-08: under "All alarms" the "On" column held tick boxes
+    with a long sentence behind them and was stretched to that sentence.
+
+    The empty-table note is written into row 0, column 0 — the "On" cell. A
+    reload then REUSES that cell for the first real row's tick box, and as the
+    tick cell has no text of its own, nothing ever cleared the sentence.
+    """
+    for tab, fill in ((_tab(vl_t.ValuesTab), _reset_items),
+                      (_tab(ar_t.AreasTab), _reset_areas)):
+        name = type(tab).__name__
+        _win.items()[:] = []
+        _win.refresh_tabs()
+        _app.processEvents()
+        assert tab._table.item(0, 0).text(), f"{name}: no empty note to start"
+        fill()
+        on = tab._table.item(0, 0)
+        assert on.text() == "", f"{name}: 'On' still says {on.text()!r}"
+        assert tab._table.columnSpan(0, 0) == 1, f"{name}: row 0 still spanned"
+        assert tab._table.columnWidth(0) < 100, \
+            f"{name}: 'On' is {tab._table.columnWidth(0)} px wide"
+
+
 # ── the names in the question ───────────────────────────────────────────────
 
 def test_the_question_names_what_is_about_to_go():

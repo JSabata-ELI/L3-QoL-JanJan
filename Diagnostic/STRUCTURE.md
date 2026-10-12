@@ -5,7 +5,7 @@
 > `remote_launcher.py` 765 L · `cpva_api.py` 585 L · `bot_commands.py` 567 L ·
 > `main.py` 485 L · `shared_pvs.py` 364 L · `okbase_capture.py` 248 L ·
 > `notify_provision.py` 238 L · `memstats.py` 187 L ·
-> `operation_history_logic.py` 128 L · `secrets_util.py` 70 L ·
+> `secrets_util.py` 70 L ·
 > tests: `test_okbase_menu.py` 895 L · `testing/test_okbase_orders.py` 790 L ·
 > `test_monitor_frozen.py` 639 L · `test_alerting.py` 490 L ·
 > `test_edge_cdp.py` 340 L · `test_rule_change_grace.py` 332 L ·
@@ -25,7 +25,7 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 
 | Module | Role |
 |--------|------|
-| `main.py` | Entry point, window, splash, tabs, the run-status/lock files. **pandas and matplotlib are imported lazily** (`operation_history_logic` inside `HistoryTab._run`, `monitor_tab` inside `main()` after the splash) — on a cold file cache those imports cost tens of seconds, and this way the splash paints first. |
+| `main.py` | Entry point, window, splash, tabs, the run-status/lock files. **matplotlib is imported lazily** (`monitor_tab` inside `main()` after the splash) — on a cold file cache that import costs tens of seconds, and this way the splash paints first. |
 | `monitor_tab.py` | The whole PV Monitor: table, graph, threshold/condition editing, Settings, share publishing, alert dispatch, Webex commands. |
 | `alerting.py` | Alert state machine + the three notification channels; the Qt-free series check `classify_trend`; the run-status file. |
 | `cpva_api.py` | Thin CPVA REST client, and `get_app_dir()` — every path in the program resolves through it. Also the shared request scheduler (`cpva_run_chunks`), the halve-on-refusal fetch (`cpva_fetch_samples_piecewise`, which hands each piece over rather than collecting it) and the 32 MB ceiling on a single answer. **No numpy in here**: `remote_launcher.py` imports `get_app_dir` from it and is built as its own always-on exe. |
@@ -39,13 +39,11 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `okbase_capture.py` | The same job as the Settings buttons, from a shell: reads a "Copy as cURL" (or `--edge`) and saves the sign-in, ids and request template. A script, not part of the app — the fallback for when the app will not start. Its parsing now lives in `okbase_menu`. |
 | `memstats.py` | Windows memory figures via `ctypes` (no psutil): this process's **commit** and working set, and the PC's commit charge/limit. Used by the status line, the half-hourly log line and the listener's console. |
 | `remote_launcher.py` | Standalone always-on Webex listener that starts the app on `/run` and answers `/food` while the app is closed. Built as its own exe (`extra_exes` in `build_config.json`). |
-| `operation_history_logic.py` | The History tab's drift analysis. **Dormant** — see below. |
-
 ### Dormant / leftover
 
-- **History cannot run.** It needs `MasterOperations.parquet` next to the exe, and the
-  module that wrote that file was removed on 2026-06-29. Without the file the tab
-  reports it and stops.
+- The History tab (`operation_history_logic.py`, waveplate drift on
+  `MasterOperations.parquet`) was removed on 2026-10-07 — its input file had not
+  been produced since 2026-06-29.
 - `DataRepository/`, `RampingRepository/`, `builder_config.json`,
   `builder_state.json` — leftovers of the removed repository pipeline. Nothing in
   this folder reads them. The CPVA fetching and the ramping repository moved to **CSS
@@ -128,7 +126,10 @@ the credentials never sit in a readable JSON next to the exe.
    PV list — a half-written shared file would silently look like "no PVs configured".
 
 Publishing is debounced by `SHARED_WRITE_DEBOUNCE_MS` (2 s): `persist()` fires on
-every checkbox click and an SMB write costs tens to hundreds of ms.
+every checkbox click and an SMB write costs tens to hundreds of ms. The local
+`monitor_config.json` is debounced too, by `LOCAL_WRITE_DEBOUNCE_MS` (400 ms,
+`_flush_local_write`); `shutdown()` flushes it synchronously. `save_config` decodes
+the provisioning blob once per session (`_PROVISIONED_KEYS`).
 
 ---
 
@@ -282,7 +283,23 @@ editable box is hidden, and that summary is the only place a deployed user can r
 the mention rule.
 
 `_NoWheelMixin` + `_NoWheelSpinBox` / `_NoWheelDoubleSpinBox` / `_NoWheelComboBox`:
-the wheel must not change a control the pointer merely hovers over.
+the wheel must not change a control the pointer merely hovers over. The real gate
+is the app-wide `_WheelGuard` in `main.py` (`install_wheel_guard`, same rule as
+CSS Logger): a spin box / combo / slider answers the wheel only after a CLICK and
+only while the pointer stays on it; leaving it, losing focus (except to its own
+popup list) or hiding disarms it, and the notch goes to the scroll area behind.
+`hasFocus()` alone was not enough — a combo keeps focus after a pick, and a dialog
+hands its first field focus on opening.
+
+**Edits apply in place.** `_reevaluate_pv` (limits in force + State verdict, shared
+with `_on_poll`) runs at once after a limit edit, a PV edit or a "Depends on" pick;
+`_apply_pv_edit` then repaints only that PV's rows (`PVTableModel.refresh_pvs`),
+rebuilds only its dropdown (`_rebuild_dep_combo`) and calls `graph.refresh_data()`.
+`model.reset()` is kept for structural changes (name/group/subgroup, add, remove,
+collapse). `_refresh_dep_combos` only restyles a dropdown whose pinned state changed.
+`PVTableModel.data()` uses pre-resolved role/flag constants (`_R_*`, `_F_*`): PySide's
+short names (`Qt.DisplayRole`) cost ~2.5 µs per lookup, which made a whole-table
+repaint ~280 ms; now ~45 ms for 31 PVs.
 
 ### GraphPanel
 
@@ -969,6 +986,30 @@ calendar day. Whatever cookies the portal last handed out are saved back over th
 stored ones (`_remember_session` in the app, `_save_okbase_cookies` in the
 listener) — a revived session has a NEW id, and without saving it the next
 keepalive would keep poking a session that no longer exists.
+
+**Morning lunch reminder.** On a keepalive tick from `okbase_remind_hour`
+(default 8) on Mon–Fri, `okbase_menu.lunch_reminder_due` decides whether today
+still needs checking; if so, that tick runs `check_lunch_today` (a LIVE read of
+the current week, never the cache — a lunch ordered from the browser a minute
+ago must not be nagged about) instead of the fetch/ping. `lunch_verdict` says
+`send` only when today has a menu, its `stav` is open and the orders half was
+reported with nothing on today; `no_menu`, `closed` and `ordered` say nothing.
+A decided day is written to `okbase_remind_sent_day` in okbase.json — the app
+(`_menu_tick` → mode `"remind"` → `_on_lunch_verdict` → `_reply`) and the
+listener (`_menu_upkeep`, `webex.post_text`) both read it from disk, so a
+hand-over or a restart cannot send twice. A failed read marks nothing and the
+next tick retries. The message mentions `okbase_remind_email`, falling back to
+`okbase_account` (`<@personEmail:addr|Name>`; a mention only highlights in a
+group space). Covered by `testing/test_lunch_reminder.py`.
+
+**Canteen off per room.** Each `webex_rooms` row carries `food` (default True;
+the "/food" column of `WebexRoomsWidget`). `okbase_menu.food_in_listen_room`
+reads it from the listen row, and when it is False: `/food` answers
+`FOOD_OFF_HERE` (app `_handle_command`, listener main loop), `_cmd_help` and
+`_cmd_help_topic` leave food out, `_menu_signin_note` says nothing and
+`lunch_reminder_due` returns False — one check for both processes. The menu
+read itself still follows `okbase_enabled`. `webex_rooms` is provisioned, so a
+changed box needs a re-bake and rebuild. Covered by `testing/test_help_topics.py`.
 
 When the browser session finally lapses past the point the revive path can
 recover, a person re-pastes it (Settings, or `okbase_capture.py`) into the
@@ -1662,11 +1703,9 @@ python testing/bench_long_plot.py --days 180
 
 ```
 PySide6      GUI
-pandas       History tab only (lazy import)
 numpy        threshold learning, series maths
 matplotlib   the graph and the chat PNGs (lazy import)
 requests     CPVA + the three notification channels
 urllib3      HTTP (SSL verification off for the internal API)
-pyarrow      parquet, via pandas — History tab only
 pywin32      win32crypt / DPAPI (lazy; must be forced into the bundle)
 ```

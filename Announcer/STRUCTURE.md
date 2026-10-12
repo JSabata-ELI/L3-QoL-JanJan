@@ -300,9 +300,22 @@ Measured on this PC on 2026-09-16 with PySide6 6.11.1:
   areas did not fit in their half second — and it churned 120 MB a second. So
   `grab_regions(regions)` takes **one** photograph of the bounding box of all
   of them and crops each one out of it, and `_compare_areas` calls that once
-  per pass. The Areas tab's live preview has its own 1 Hz clock for the same
-  reason: it used to hang off `engine().changed`, which fires up to four times
-  a second, and it grabs on the GUI thread.
+  per pass.
+- **PIL's grab froze the window even from a worker thread.** It runs as one C
+  call that holds Python's lock: measured 2026-10-06 with a 10 ms timer, the
+  GUI thread stood still 250–420 ms on every area pass. `grab_rect` now uses
+  `_gdi_grab` — the same Windows calls PIL makes (screen DC, BitBlt with
+  CAPTUREBLT, per-monitor DPI awareness for the thread), made through ctypes,
+  which lets go of the lock, and copying only the asked-for rectangle: 41 ms
+  for two areas instead of 362, worst GUI delay 11 ms. Pixel for pixel the
+  same as PIL on all three monitors (one 4-pixel, 1-level difference in the
+  taskbar's acrylic). PIL stays as the fallback.
+- **The Areas preview photographs nothing.** It shows `ItemState.picture`, the
+  crop the area pass already took on its worker; while the tab is on screen
+  (`engine.preview_wanted`) areas without a reference are included in that one
+  photograph too. The reference is decoded and framed once per stored
+  picture. It used to call `grab_rect` on the GUI thread once a second and on
+  every selection change and every reload.
 - **A thumbnail needs its own edge drawn.** A watched rectangle is nearly always
   smaller than the box it is previewed in, and what is usually inside it is a
   white dialog — on a white label that is an invisible boundary, and the
@@ -582,6 +595,45 @@ hours at a time, or undefined behaviour one step away from being fatal:
   ever, while the log went on saying "written off". Separate single-thread
   pools are what the comment always claimed.
 
+### Responsiveness review, 2026-10-06
+
+Asked for: a change of any setting applies in place with no reload, no window
+flashes, and the wheel never changes a field that was not clicked.
+
+- **One item changed ≠ everything reloaded.** `main.item_changed(item)` writes
+  only the rows that show that item (`update_item` on the Watch, Values and
+  Areas tabs) and puts the lamp and the panel in step. It is what a tick, a
+  typed limit, name, message or sensitivity calls. `refresh_tabs()` is kept for
+  a changed SET of rows — add, remove, assign, another preset — and even then
+  the Alarm tab only re-says its places (`preset_changed`): it used to re-list
+  the image and sound folders, ask Windows for every speaker and decode the
+  picture on every tick anywhere. A Watch-tab double-click only opens the
+  row's own tab now; it used to reload and save as if something had changed.
+- **Alarm tab:** a number-box step writes the settings and nothing else; the
+  picture is re-drawn only for *What flashes*, *Shape* and the colour (the
+  colour picker did not re-draw it at all before).
+- **Archiver reads behind buttons run on a thread** (`vl_t._in_background`):
+  *Read now* and the channel list of *Find*. The answer comes back through a
+  dict polled by a timer the dialog owns — nothing Qt is touched from the
+  worker, so closing the dialog mid-read is harmless. The channel search waits
+  150 ms after the last key.
+- **The wheel guard really holds.** Qt gives a WheelFocus widget the focus, as
+  a *mouse* focus, before it delivers the notch — so every untouched field had
+  "earned" the wheel just in time to take it. Guarded widgets are switched to
+  StrongFocus when polished, and a mouse press (not only a FocusIn) earns the
+  wheel, because clicking the field a window handed its focus to sends no
+  FocusIn at all.
+- **Nothing pops up beside the circle while it is being placed**
+  (`HudWindow.is_placing`); the `!` mark and the sentences are shown and
+  `raise_()`d only when they appear, not on every pass; a sentence's
+  stylesheet is re-applied only when its colours change.
+- **Identify monitors** reuses its labels and one timer — a second press no
+  longer had its numbers taken away early by the first press's timer.
+- **The moving rainbows draw at `GRADIENT_INTERVAL_MS`** (~16 a second), not on
+  every 20 ms tick.
+- **Watch table:** only the cells that differ are written, and the columns are
+  re-measured only when a text or the bold changed.
+
 ### Still open, deliberately
 
 - **The alarm window is shaped, so a click in a transparent part of the picture
@@ -818,7 +870,8 @@ it lies about every colour in it.
 
 ```
 PySide6      the whole interface
-Pillow       ImageGrab (the screen), the picture difference, the alarm stencil
+Pillow       the screen picture (built from Windows' bitmap; ImageGrab as the
+             fallback), the picture difference, the alarm stencil
 ctypes       winmm, for the sound (stdlib)
 urllib/http  the archiver, through a keep-alive pool (stdlib, no requests here)
 winsound     the fallback beep (stdlib, Windows only)

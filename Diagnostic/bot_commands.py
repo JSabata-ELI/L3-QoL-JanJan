@@ -1041,8 +1041,8 @@ _HELP_CHANGE = (
     "reached the reply says the change is on that one PC only.\n"
     "- **I forget the question after 15 minutes**, and `/cancel` drops it. "
     "`/undo` puts the last change back.\n"
-    "- **Only while the app is open.** Unlike `/run` and `/food`, this one is "
-    "not answered by the always-on listener — it has no PV list to change."
+    "- **Only while the app is open.** Unlike `/run`, this one is not "
+    "answered by the always-on listener — it has no PV list to change."
 )
 
 _HELP_UNDO = (

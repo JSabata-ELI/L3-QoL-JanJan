@@ -88,9 +88,8 @@ RUNNING AN OLD VERSION
   there is Python on the computer.
 
   If a program is killed rather than closed, that swap can be left
-  half done. The Launcher then refuses to start it again and offers
-  to put it right, either at the next scan or straight away with the
-  broom button.
+  half done. The Launcher then refuses to start it again; the broom
+  button shows a count and puts it right when clicked.
 
 
 THE OTHER BUTTONS
@@ -98,8 +97,10 @@ THE OTHER BUTTONS
   Notes    the shared notes file on the current share.
   Gear     set your two office paths.
   Broom    tidy up: version files left in the wrong folder, and
-           programs stuck in a half-finished swap. Both checks also
-           run by themselves after every scan.
+           programs stuck in a half-finished swap. Every scan checks
+           for these; when it finds any, the button gets an orange
+           frame and a count, e.g. "Clean (3)". Nothing opens until
+           you click it.
 
 
 ONE RULE FOR DOCUMENTATION

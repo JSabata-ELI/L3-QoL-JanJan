@@ -15,6 +15,12 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 |------|-------------|
 | `main.py` | The application — PySide6 "CPVA Suite" (CSS Logger + Spectra in one window). Run with `python main.py`. |
 | `cpva_core.py` | Non-UI helpers: config/preset I/O, CPVA archiver HTTP, time / PV-name / image helpers. No GUI toolkit — shared by `main.py` and the tests. |
+| `cpva_cache.py` | `DayCache` — closed Prague days of archived signals, one `.npz` per signal per month on the scratch share (`<scratch>\Software\CPVA cache\<signal>\<YYYY-MM>.npz`). See "The day cache" under cpva_core. |
+| `logger_tabs.py` | `LoggerTabs` — the setting tabs: each one a `CSSLoggerWidget`, the bar placed in the main tab row, suspend/resume, `%APPDATA%\CSS Logger\logger_tabs.json`. See "Setting tabs" below. |
+| `testing/test_day_cache_and_tiles.py` | Offline: newest-step-first reading and the "complete back to" edge, at most `MAX_TILES` steps, the day cache (second load asks nothing for closed days, coarser days not served for finer requests, today and words never stored, two writers of one month), the bounded look-back (a refusing archiver, a cancel). |
+| `testing/test_logger_tabs.py` | Offline: first start = one tab named after its preset, "+" copies the tab on screen, only the tab on screen is awake (and none while Spectra is), a hidden Live tab polls at `HIDDEN_LIVE_POLL_MS`, showing it ticks at once, rename / close / restore / background build. |
+| `testing/bench_long_load.py` | Bench against the REAL archiver: one long load of a preset, a timeline of every partial picture and the end-of-load cost, a PNG of each picture into `testing/_out/`. Cache in a temp folder unless `CPVA_CACHE_DIR` is set. |
+| `testing/probe_logger_tabs_look.py` | Renders the main tab row with three setting tabs (and with Spectra on screen) into `testing/_out/logger_tabs_row*.png`. |
 | `sp_t.py` | The Spectra widget, embedded as the second tab of the suite. This folder is its only home — see the warning at the top of `main.py`. Its own docs: `STRUCTURE_Spectra_tab.md`, `ReadMe_Spectra tab.txt`, `ReadMe_Spectra tab_Full.txt`. |
 | `daypicker.py` | The shared day/time picker — **a verbatim copy; the master is `Image Tools/daypicker.py`**. It is here because the builder only bundles `.py` files from the program's own folder, and it is loaded by path (`_import_daypicker` in `sp_t.py`) rather than by `import daypicker`, which the builder's module-home check would refuse. It is also listed in `build_config.json` → `hidden_imports`, which compiles it into the exe without any import statement for that check to trip over — **`_internal` never survives the trip to the share, so the loose copy the builder puts there cannot be relied on** (see below). Change the master, then re-copy; `testing/test_daypicker_sync.py` fails while the two differ. |
 | `test_smoke.py` | Offline smoke test — headless (`QT_QPA_PLATFORM=offscreen`), network + dialogs mocked, clicks through every button/dialog; also covers custom-PV bindings (incl. the dialog's bindings table) and the Conditions filter. |
@@ -22,8 +28,20 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `testing/test_long_window_fetch.py` | Offline test of loading a long period: full coverage of 12 h / 48 h / a year against an archiver that refuses anything wider than six hours, night hours read, no signal dragged down by another, unique ascending samples, unread ranges reported, cancellation, monotone progress, newest-first order, and the widget-level three-day load. |
 | `testing/probe_x_axis_long.py` | Renders the time axis for six periods (1 h … 1 year) with the real Windows backend, measures the pixel gap between stamps, and saves a PNG of each into `testing/_out/`. |
 | `testing/test_export_table.py` | Offline test of the table export and the carry-forward: the shot grid ignores the channels written at their own pace, a held value crosses a slice, a word value survives into the file, the table's columns follow the graph, and a whole day exports without a duplicate row at a slice seam. |
+| `testing/test_live_selection.py` | Offline test of the live selection (dragged past the right edge → its end sits on and follows the newest sample, a selection inside the graph stays put, Clear ends it), the left-button-only statistics selector, and the Axis limits dialog (date/time fields, one entry per PV, Y lands in the PV's own Y min/max, the time range survives the replot). |
+| `testing/test_live_rebuild_clock.py` | Offline test of Live: a due tick with nothing new still merges what earlier ticks brought (and the custom PV follows), and a slower PV's late sample is kept without duplicates. |
+| `testing/test_custom_pv_vectorised.py` | Custom PVs over whole columns give exactly what the old per-row eval gave (missing source, word value, custom of a custom, `A if … else B`, 3-argument min/max, round, math, division by zero), are faster, and the live tail matches the next rebuild. |
+| `testing/test_last_good_shot.py` | Offline test of the last-good-shot hold: `_last_passing_moment` walks back over hours of laser-off, never answers with a sample after the period, gives up at the depth or on a dead archiver; a laser-off hour with the Conditions on draws flat lines at the last good shot's values with the yellow note naming it. |
+| `testing/probe_time_window_look.py` | Renders the Start/End dialog on both tabs (real fonts, nothing on screen) and checks the window size never changes. |
 | `testing/test_time_window_dialog.py` | Offline test of the Start/End picker: paging the calendar moves the selected day (a months-long period must not come back as the last hour), the status line follows, a short month clamps, and the multi-day picker keeps its own list. |
 | `testing/test_xy_live.py` | Offline test of the XY tab: a live tick grows the cloud without rebuilding the figure, a hidden tab is only marked and caught up on the way in, a condition thins it out (and the Table tab with it), and a right-drag zoom leaves Back and Forward usable. |
+| `testing/test_graph_focus_move_resize.py` | Offline test of the Graph tab's F11 window: frame only when windowed, a left press on the graph (also on a widget added later) moves it, the frame and corners resize, fullscreen does neither, docked back the graph's presses are left alone. |
+| `testing/test_styles_menu_and_drop_marker.py` | Offline test of the Styles menu and the column drop marker: Delete asks only after the menu has closed and removes the look, Load/Delete are greyed out with a reason when nothing is saved, the entry under the mouse is light blue, and dragging a heading shows the blue line on the landing edge. |
+| `testing/test_style_current_and_version.py` | Real-backend test (no focus taken): `_app_version()` reads the version from the exe name ("" from source), the "Loaded style:" line under Styles follows load / delete, escapes the name and is not kept between runs; saves `testing/_out/sidebar_style_current.png`. |
+| `testing/test_instant_changes_and_wheel.py` | Offline: PV-table look edits change the graph in place (same canvas, nothing queued, nothing read), sidebar Move / Remove without a read, zoom kept through a rebuild, the wheel over an unclicked drop-down / a tab bar / a calendar changes nothing. |
+| `testing/test_sidebar_names_conditions.py` | Offline: the wheel guard (unclicked field ignores the wheel, a click arms it, leaving disarms it), the fixed INFO line, Live beside Time window, PV list names / rename / move, every condition kind and the old forms, the Conditions window applying at once, PV Time asking for its own redraw, the bindings table keeping its scroll. |
+| `testing/probe_y_axis_columns.py` | Measures the gap between each Y-axis title and the column to its left (4 / 12 PVs, 9 / 11 / 14 pt) and saves crops into `testing/_out/`. |
+| `testing/probe_sidebar_conditions_look.py` | Renders (real Windows backend, no focus taken) the sidebar with a short and a very long INFO message, the Conditions window and the PV Time Plot from synthetic days. |
 | `testing/probe_graph_layout.py` | Renders the Graph tab with the real Windows backend: the opening graph/PV-list split and how many rows it shows, the Std / P-P percentages, and the cursor value boxes with the mouse at each edge. PNGs into `testing/_out/`. |
 | `testing/probe_export_dialog.py` | Renders the Export table dialog with the real Windows backend into `testing/_out/export_dialog.png` and measures it for pale text, empty labels and clipped names. |
 | `testing/probe_export_live.py` | End-to-end against the REAL archiver: loads a short window, prints how many rows each channel actually has a value in (so a held-only channel is visible as such), exports, and reads the file back. |
@@ -52,8 +70,45 @@ values over time, walks the archive, exports a shot table to CSV, draws graphs
 (Graph / XY / PV Time) and opens the camera images belonging to a row.
 
 `CPVASuiteWindow(QMainWindow)` hosts two tabs — **CSS Logger**
-(`CSSLoggerWidget`) and **Spectra** (`sp_t.SpectraWidget`) — restores its
-geometry and asks both children to stop their background work on close.
+(`logger_tabs.LoggerTabs`, a row of `CSSLoggerWidget` setting tabs) and
+**Spectra** (`sp_t.SpectraWidget`) — restores its geometry and asks both
+children to stop their background work on close. `_css_logger` is now a
+property: the first setting tab (it owns `cpva_explorer_config.json`). Spectra's
+custom-PV host calls go to `_logger_tabs.active()`.
+
+### Setting tabs (`logger_tabs.py`)
+Asked for 12.10.2026 ("like Image Tools": one tab per setting). The pattern is
+Image Tools' `slider_tabs.py`: `_TabArea` (bar + "+" right after the last tab,
+over a stack), `_TabPage` (holds `logger` once built, or the saved `state`),
+`LoggerTabs` (controller). The bar is moved into a corner strip of the main
+`QTabWidget` after a 1 px separator (`move_chrome_into`), shown only while the
+CSS Logger tab is current (`_sync_tab_row` in `CPVASuiteWindow._build_ui`, which
+also calls `set_outer_visible`).
+
+- **State.** `CSSLoggerWidget(tab_state=…)`; `export_tab_state()` = preset,
+  real PVs, master PV/multiple, conditions + on/off, `live` + `live_span_s`,
+  `time_from`/`time_to`. `_apply_tab_state` runs after `_populate_ui` (which
+  still loads the Operation preset first). `_maybe_autostart_live` follows a
+  saved `live: false` with a plain reload instead of starting Live. Per-user file
+  `%APPDATA%\CSS Logger\logger_tabs.json` (`CSS_LOGGER_TABS_FILE` overrides it —
+  every test that builds `CPVASuiteWindow` must set it), autosave 15 s + quit,
+  atomic. The config file still holds the shared things (graph options, styles,
+  display names) and is written by the first tab only.
+- **Activity.** `_apply_activity`: the current tab `resume()`s while the CSS
+  Logger is on screen, every other one `suspend()`s. `suspend` sets
+  `_suspended`: `_live_poll_ms` becomes ≥ `HIDDEN_LIVE_POLL_MS` (10 s, well
+  inside `_LIVE_TICK_LOOKBACK_NS`), `_on_incremental_finished` only merges
+  (graph and table clocks forced off, no axis scroll), the countdown stops,
+  `_on_load_partial` draws nothing. `resume` forces the next table + graph
+  rebuild and runs a live tick at once (if the timer is armed — a tick in
+  flight finishes into the forced rebuild), or redraws a non-live tab, and
+  re-reads `custom_pvs.json` when another tab changed it (mtime).
+- **Building.** The current tab is built at start; the others one by one
+  (`BACKGROUND_FIRST_MS`, then every `BACKGROUND_NEXT_MS`), suspended before
+  their 600 ms autostart, so they load in the background. "+" builds a copy of
+  the tab on screen. Close stops Live and bumps the load / live / export epochs.
+- **Archive load.** Every tab fetches on its own; `cpva_core._IN_FLIGHT` caps
+  the whole program at `MAX_REQUESTS_IN_FLIGHT` (24) concurrent requests.
 
 ### Tabs
 - **Graph** — one banded plot: every PV gets its own vertical band of a shared
@@ -72,16 +127,128 @@ geometry and asks both children to stop their background work on close.
 - **Log** — run log.
 
 ### Sidebar
-Time window dialog, presets (load/save/save-as/delete), PV list
-(Browse/Remove/Clear), **LOAD DATA**, **Live** toggle with countdown, Master PV /
-master-multiple filter, PV count, progress bar, **Stop loading** (shown only
-while a fetch runs).
+The scroll area is 310 px wide with its vertical scrollbar **always on**, so
+the inner width never changes with the content height. Top row: **📅 Time
+window** and **Live** side by side, equal width, `_TW_ROW_BTN_H` high; under
+them `_lbl_tw_from` / `_lbl_tw_to` / `_lbl_tw_live` — `_refresh_time_labels`, which in Live
+prints `now − _fmt_span(_live_window_span)`. `_do_auto_reload` recomputes the
+span and must refresh the labels with it, or they keep the span Live started
+with. Presets (load/save/save-as/delete): `_presets[0]` is the built-in
+`_BLANK_PRESET` (`"builtin": True`, no PVs), dropped from the file by
+`_store_presets`, refused by Save (→ Save as new) and Delete, never the startup
+choice in `_populate_ui` (`testing/test_blank_preset.py`). The preset file is
+shared by every station: `_read_presets_file` collapses duplicate names (later
+content, earlier place), Load re-reads it, and `_store_presets(name, preset)`
+re-reads, changes that one name and writes — never the in-memory list, which
+would undo other stations' saves. Save keeps keys it does not edit and writes
+master PV / multiple; Save as new on an existing name asks to overwrite
+(`testing/test_preset_save_load.py`). PV list
+(**+ Add PV** / **Custom PV** / Remove / bin — Custom PV is the only entry to
+the custom-PV dialog; Remove moves the selection to the next PV), PV count,
+Master PV / master-multiple filter, then:
+
+**PV list rows show the NAME, not the PV.** A real row's text is `_col_label(pv)`
+(Display Name → `_pv_display_names` → `shorten_pv_name`); the PV rides in
+`_PV_ROLE` and is the tooltip. **Always read a row through `_item_pv()` /
+`_real_pv_names()`, never `.text()`** — a row added as plain text (tests, old
+code) has no role and its text is the PV, which `_item_pv` also handles.
+Double-click / F2 renames (`_set_pv_display_name`); the right-click menu has
+Rename, Change PV (the old double-click: points the row at another archiver
+PV), Copy PV name(s), Move up / down (Ctrl+Up/Down — the order is the
+bands' order), Remove (Del). Move and Remove go through `_reshape_from_memory`
+(table rows, customs, graph rebuilt from the loaded samples, no archive read);
+it declines — and the caller reloads — while Live is on, during a load, or when
+the list holds a PV that was never loaded. A Display Name typed in the PV table goes through
+`_remember_display_names` too, so list, graph, table heading, XY / PV Time
+drop-downs and export all say the same. Names that differ from the automatic
+one persist in `config["pv_display_names"]`.
+
+`_lbl_status` is a `_SidebarText(max_lines=4)`: Ignored horizontal size policy
+(a 40-character PV name used to widen the whole sidebar), zero-width break
+points after `: _ - / .` (display only — `text()` returns what was set), a
+fixed height, "…" plus the full text as tooltip when longer. `_InfoLabel` is
+the same without the line limit, hidden while empty.
+
+| Section | Widgets |
+|---------|---------|
+| **INFO** | `_lbl_status` (the status line — it used to be a grey label under the whole window; same attribute, so every `setText` caller is unchanged), `_lbl_graph_info` (graph notes such as "Zoom/pan on…", formerly the grey text at the top right of the graph; an `_InfoLabel`, hidden while empty), `_lbl_cpv_info` (orange: every custom PV that cannot be computed, from `_cpv_short`, set in `_emit_custom_pv_diag`), progress bar, **Stop loading** |
+| **DATA FILTER** | Conditions, Limit crossings |
+| **GRAPH** | Reference lines, Graph settings, `_btn_graph_view` "View ▾", Clean graph, `_font_size_spin`, `_avg_target_spin` |
+| **SELECTION** | `_btn_clear_sel` |
+
+INFO lives in `_sidebar_info`, a holder UNDER the sidebar's scroll area (both
+in a fixed-width 310 px column built in `_build_ui`), so it is always on screen
+at the window's bottom edge; inside the scroll area it fell below the fold
+whenever the sidebar was taller than the window. New sections go into the
+scrolling part, before its final stretch.
+
+MASTER PV / FILTER also holds the dead-shot rule: `_chk_dead_shot`,
+`_dead_energy_edit`, `_dead_energy_spin` (see the statistics notes below).
+
+PV list order: drag (InternalMove; `rowsMoved` → `_on_pv_list_dropped`, which
+puts the ƒ rows back at the end) or Ctrl+Up/Down (`_move_selected_pvs`) both end
+in `_apply_pv_list_order`, which REPLACES the real-PV part of `_plot_order`
+when one exists — the PV-table drag order otherwise kept winning and moving a
+PV in the list did nothing to the graph. Ctrl+C `_copy_selected_pv_names`,
+Ctrl+V `_paste_pv_names` (split on whitespace / `,` / `;`, duplicates skipped,
+one reload).
+
+PV table refresh (`_refresh_axis_settings_tv`) updates cells in place: an item
+is re-created only when the cell changes kind (tagged with `UserRole + 41`:
+band / band_pad / blank / check / color / text); otherwise only differing
+text, flags, check state, colour or tooltip is written, with
+`setUpdatesEnabled(False)` and the scroll restored before painting. While a
+cell editor is open the refresh is postponed (`_retry_axis_settings_tv`, 200
+ms) so typed text is not lost.
+
+Range selection uses `_EdgeSpanSelector` (both the left-drag selection and the
+right-drag zoom): matplotlib's selector replaces an event outside the axes by
+the last one inside, so a drag past the edge stopped short of it. The subclass
+reads the position from the pixels, clips it to the plot and marks the event
+as in the axes, so the band lands exactly on the edge.
+
+Custom PV dialog: the Channel column of "Available channels" is editable for
+real PVs (`_on_channel_renamed` → `result_display_names`);
+`_open_custom_pv_dialog` applies each through `_set_pv_display_name`.
+
+PV Time Plot: `_pv_time_progress` (under the plot) is driven by
+`coverage_fn` of `cpva_fetch_many_adaptive` per day, forward only, hidden in
+`_pv_time_finish`.
+
+These were the row `_graph_ctrl_bar` above the graph, which is gone; the Graph
+tab starts with the grouped icon strip `_graph_strip` (the matplotlib toolbar
+behind it is hidden). The sidebar's PV TABLE section holds "Reset columns" and
+"Styles", which used to sit in an "Axis settings" row above the table. Built in `_build_sidebar`, which runs
+before `_build_graph_tab`, so anything the graph code reads from these widgets
+exists by then. `_GRAPH_STALE_NOTES` are the graph notes cleared once a graph
+is drawn (the cursor used to overwrite them).
+
+The full date and time under the cursor that the old top-right label showed is
+now in the time box under the axis whenever the view spans more than a day.
 
 ### Loading a long period
-A period is read newest first and **drawn as it arrives**: `_LoadSig.partial`
-carries a snapshot every ~1.5 s into `_on_load_partial`, which repaints the
-graph and the table without ending the load (it must never touch
-`_load_in_flight`, the progress bar or the summary). `_LoadSig.note` puts the
+A period is read newest step first (see "Adaptive fetch") and **drawn as it
+arrives**. The fetch threads' `chunk_fn` (`_on_chunk`) only decodes and APPENDS
+to `acc` under a short lock; a separate `_snapshotter` thread merges and sorts
+and emits `_LoadSig.partial` — never while the window is still drawing the last
+one (`gui_ready`), never sooner than `max(2 s, 3 × _partial_cost)` (what the
+last `_draw_load_partial` took), and not once coverage is ≥ 90 %. Measured
+12.10.2026: building the snapshot inside the fetch threads, under the lock,
+held up the whole pool (a 20 s load took 146 s), and back-to-back redraws
+starved the fetch of the GIL. `_on_load_partial` repaints the graph and the
+table without ending the load (it must never touch `_load_in_flight`, the
+progress bar or the summary). The grey "loading" span runs to
+`_loading_from_ns` = the fetch's `tile_fn` edge (complete for EVERY signal
+from there to the end), no longer an average over signals. A partial picture
+has no pre-window values yet (`_pre_window_vals = {}`, never the previous
+load's), so with Conditions on rows next to the grey part can be missing until
+the end. The bar is 0-95 % coverage, 96 decode, 100 done. The value before the
+window is hunted AFTER the read, only for signals whose first sample is after
+the start, with `LAST_BEFORE_DEADLINE_S` — it used to be unbounded and was the
+"stuck at 92 %" of 09.10.2026; hunting every signal beside the read instead
+slowed the archiver for the read itself. `_maybe_hunt_last_good` starts its
+thread on a `QTimer.singleShot(0)`, i.e. after the end-of-load draw (running
+alongside, it made that draw 11.5 s instead of 1.6 s). `_LoadSig.note` puts the
 fetch's own notes into the Log while it runs. There is no "this will be big,
 are you sure?" dialog — a year is a legitimate request, and the answer to "this
 is taking too long" is **Stop loading**, which bumps `_load_epoch` (the
@@ -124,6 +291,48 @@ versions (`np.minimum`, `np.round`, …) — the builtins fail on an array.
 Each finished day is handed over by `sig.partial` as it completes, so pressing
 Plot mid-read keeps every day already fetched and only asks for the rest.
 
+**The tab redraws on its own.** Y, mode, the days and every condition edit go
+to `_pv_time_request_plot` → `_pv_time_auto_timer` (400 ms collapse) →
+`_plot_pv_time`. A hidden tab only sets `_pv_time_stale`; `_on_main_tab_changed`
+catches up on the way in (and draws the first time the tab is opened —
+`_pv_time_auto_ready` stays False until then, so startup reads nothing). The
+button is now **Refresh**. X stamps are upright: daily = `date\nweekday`, every
+k-th written when they would collide; raw = `HH:MM\nMM-DD`, date only at midnight.
+
+### Conditions — one editor, two places
+`_ConditionEditor` is used by the Conditions window AND the PV Time Plot. A row:
+on/off · channel (shown by name, stored by PV) · kind (`_COND_KINDS`: Between,
+Target ± %, Target ± value, At least, At most, Outside) · one or two numbers ·
+"keeps N of M" (`count_fn`) · ✕. Edits emit `changed` after 350 ms; a bad number
+turns its box red and counts as empty.
+
+`_cond_normalize` turns any stored form into `{pv, enabled, kind, a, b, min,
+max, outside}`; **`min`/`max` are the effective bounds every filter reads**,
+and `outside` (kind "outside") inverts them. Every evaluator goes through
+`_cond_value_passes` (one number: `_row_matches_conditions` /
+`_condition_value_ok`, `_export_row_ok`, `_condition_count`) or
+`_cond_mask_passes` (arrays, NaN never passes: `_condition_mask` — its tables
+carry `outside` as a 6th field — and PV Time). Old `{pv, min, max}` loads as
+Between, the PV Time Plot's old `{target, tol}` as Target ± %.
+
+PV Time reads condition channels (any channel outside the shot basis) up to
+one merge gap AFTER the shot, the same look-ahead as `_condition_mask`;
+reading exactly at the shot took the previous shot's SBW4. Measured with
+`testing/probe_sbw4_offset.py`: SBW4 lands within 137 ms of PTM1 on ~99 % of
+shots. PV Time has its own "Apply conditions" (`_pv_time_cond_apply`, config
+`pv_time_conditions_on`) and "Copy from Graph conditions".
+
+Main view: `_conditions_all` (every row, saved to `config["conditions"]`) and
+`_conditions` (the switched-on ones — what filters; tests may still set it
+directly, `_conditions_view` then shows that). The window has only Close: each
+change goes straight to `_set_conditions` (table, graph, XY), counts from
+`_condition_count`. PV Time keeps its own rows (`_pv_time_cond_editor`, saved
+to `config["pv_time_conditions"]`); its counts come from the tally
+`_pv_time_day_values` builds while drawing. A row that is off AND has no
+numbers (a new row, or a saved empty one) switches itself on when a number is
+typed; a row with limits that was switched off by hand stays off. (A saved
+empty SBW4 row used to stay off forever, so its 0.15 J never filtered.)
+
 ### `_make_calendar(initial, follow_page=)` — the day must follow the month
 Paging the calendar (◀ ▶ / the month menu / the year box) does **not** move
 Qt's selected date. In a picker whose value *is* the one selected day that is a
@@ -164,20 +373,45 @@ The progress dialog is **non-modal** — an export can run for an hour and the
 rest of the program must stay usable. Only one runs at a time.
 
 ### Dialogs
-`TimeWindowDialog` (absolute + relative quick picks per side; `ends_at_now()`
-tells the caller whether the period follows the clock — the End side on its
-Relative tab with every box at zero. Without it, OK handed back two frozen
+`TimeWindowDialog` (CS-Studio layout: two panes, Start | End, each a
+`QTabWidget` `sd["tabs"]` — tab 0 "Absolute" = calendar + `QTimeEdit`
+`sd["time"]` + Now/00:00/12:00, tab 1 "Relative" = years…secs spin boxes in a
+3×2 grid, the `_PRESETS` quick spans (on Start: Start relative + End now; on
+End: End's own span), "Before now", Now. A relative pane keeps its hidden
+calendar on the moment its span gives. The window is `setFixedSize` from its
+size hint, so neither a tab switch nor a long status text resizes it — the old
+design folded the calendar away and the window jumped. `ends_at_now()` tells the caller whether the period follows the clock —
+the End side on Relative with every box at zero. Without it, OK handed back two frozen
 timestamps and "end = now, keep up" was indistinguishable from "end = now, stand
 still", so picking yesterday 08:00-12:00 while Live was on showed the last four
-hours instead. Same idea as `daypicker.DayTimePicker.is_online_mode()`),
+hours instead. Same idea as `daypicker.DayTimePicker.is_online_mode()`.
+The "Live" button (Absolute End only) → `_on_live()`: End Relative all-zero,
+Start Relative 1 h, sets `_live_requested`; `wants_live()` = requested AND still
+`ends_at_now()`, and `_open_time_window_dialog` then calls `_toggle_live_mode()`
+instead of a plain reload),
+`_GraphAxisLimitsDialog` (View ▾ → Axis limits: time From/To as
+`QDateTimeEdit` in Prague time, no styling of its own — a styled spin box loses
+its arrows; Y per PV picked from a combo with a colour swatch, kept per PV in
+`_edits` so several can be set before OK, empty box = follow the data. OK calls
+`_apply_axis_limits_dialog`, which writes `ymin`/`ymax` into `_pv_settings`
+(the PV table's own cells, so a replot keeps them — Spectra's
+`_AxisLimitsDialog` set one unnamed axis that the next `_band_ylim` overwrote),
+runs the full replot FIRST when Y changed, and only then puts the time range
+back on top with both views pushed onto the toolbar history; an untouched range
+comes back up to a second off from the whole-second boxes, hence the 1.5 s
+tolerance),
 `DatePickerDialog` + `_make_calendar` + `_WeekendDelegate` (house calendar style,
 Monday-first, red weekends), `PVBrowserDialog` (loads the channel list once, then
-filters locally), `_ExportTableDialog` (see **Table export**), `_ConditionsDialog` (min/max per PV; custom channels are
+filters locally), `_ExportTableDialog` (see **Table export**), `_ConditionsDialog` (see **Conditions** below; custom channels are
 offered too), `_RefLinesDialog` (per line: name, which signal it belongs to, Y,
 colour, style, width, reorder, delete, and a button that hands control back to
 the two-click placement in the graph — signalled by `pick_request`, which makes
 `_open_ref_lines_dialog` re-open the window afterwards), `_CustomPVDialog`,
 `_GraphSettingsDialog`.
+
+Rebuilt tables keep their scroll position (`_CustomPVDialog._restore_scroll_later`,
+which only undoes a jump to an end, never the user's own scroll): the bindings
+table, the formula list on ✕, the PV table and the PV list.
 
 `_CustomPVDialog` holds expressions over channel letters A, B, C… plus two
 mapping tables. The top one is the automatic letter assignment for the loaded
@@ -202,13 +436,21 @@ config simply picks up the defaults for keys it lacks.
 |-------|------|
 | Fonts (pt) | `font_size`, `tick_font_delta` (−1), `cursor_font_delta` |
 | Y axis columns (px) | `axis_gap_px`, `label_pad_px`, `outer_margin_px`, `show_axis_titles`, `y_ticks_max`, `y_minor_ticks` |
-| Time axis | `x_ticks_max`, `x_tick_seconds` (0 = automatic), `x_time_format` (`auto`/`hms`/`hm`) |
+| Time axis | `x_ticks_max` (12, was 8 — one rung finer on the round-step ladder: 1 h every 5 min, 1 day every 2 h; a stored 8 is moved to 12 once, marked by `config["x_ticks_default_12"]`), `x_tick_seconds` (0 = automatic), `x_time_format` (`auto`/`hms`/`hm`) |
 | Plot rect (figure fractions) | `margin_right`, `margin_top`, `margin_bottom`, `band_pad_frac` |
 | Cursor / performance | `cursor_value_boxes`, `cursor_boxes_max`, `line_markers` |
 
 `y_minor_ticks` is **off** by default: matplotlib builds a full Tick object
 (2 lines + 2 texts) per minor tick, which with a dozen stacked axes is ~400
 objects and the single largest cost of a redraw.
+
+Column spacing defaults are 5 / 0 / 4 px (gap / label pad / outer), measured
+and looked at with `testing/probe_y_axis_columns.py`: the title's capitals reach
+the edge of its text box, so a gap of 0 puts the neighbour's spine on the
+letters. The user asked for 2 px more air towards the neighbour and 1 px less
+towards the own numbers than the earlier 3 / 1. The old 6 / 5 / 8 written back
+into a config are moved once (`config["y_axis_tight_v1"]`), then 3 / 1 once
+more (`config["y_axis_spacing_v2"]`); hand-set values are kept.
 
 `label_pad_px` may be **negative**: the rotated tick numbers keep a couple of
 pixels of empty margin around their digits, so a small negative value pulls the
@@ -256,6 +498,40 @@ collects unresolved bindings, syntax errors and per-formula evaluation-failure
 counts into `_cpv_diag`; `_emit_custom_pv_diag` logs them and suppresses repeats,
 because the rebuild runs on every live refresh.
 
+**A letter is resolved through its binding only** — in `_cpv_plan`,
+`cpv_defs_for_spectra` and `_pv_time_resolve` alike. There is no fallback to the
+letter's place in today's list: that would read a different PV after every preset
+switch. An unbound letter leaves the custom PV empty with "X is not bound to a
+PV". A custom built on another custom is bound to that one's *name*, so
+`_CustomPVDialog._accept` carries a rename (`rec["orig_name"]` → new name) into
+every binding that named it. Pinned by `testing/test_custom_pv_stable_bindings.py`,
+which also checks every saved `custom_pvs.json` entry under every saved preset.
+
+### SBW4 is archived under two names
+`HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy` and `L3-SBW4-PM311:Energy` take turns with
+the laser configuration. The operator's rule (23.09.2026) is `read_order`:
+**HAPLS first**, whichever name is in the list; the other only where HAPLS holds
+nothing. It is applied INSIDE `_fetch_many_adaptive`, per Prague DAY: a two-name
+channel's tile is queued one day at a time (`_unit_requests`, keyed
+`(channel, tile, day)` in `by_name`); when every request of a day under one
+name is back, `_settle_tile` keeps it, or queues the whole day under the next
+name. Never per request — judging pieces separately mixed the names inside a
+day. "Holds nothing" is `_holds_nothing`: no sample inside the day, OR a
+thinned reply that is a grid the archiver invented (all `Interpolated`, one
+value, min == max) — measured 12.10.2026, that grid (144 points a day) hid
+the L3 name's real data for 12.-29.08.2026, and it was why the old after-pass
+(`_empty_day_ranges` on the result) never asked the L3 name. Every reply of a
+two-name channel goes through `_drop_after` (the trailing bracket sample can
+be weeks later); the other name's day keeps only its own samples; a day no name
+holds is filed empty. A refused name (HTTP 400) also moves the day to the next
+name. Both names in the list as separate channels: each is read as named. The
+whole-period `_decimated_is_suspect` check skips two-name channels (their empty
+days are empty on purpose). `cpva_fetch_last_before` hunts HAPLS first and keeps
+it when it is from the same day, else the newer of the two (`strict` refuses an
+invented answer). Spectra's `sp_t._cpva_fetch_chunked` reads `read_order` the
+same way. The rule's master copy is `Image Tools/cpva_client.py`
+(`channel_aliases`, `read_order`).
+
 The dialog shows edge gaps as percentages of the figure (what a user thinks in)
 while storing subplot fractions, live-applies on Apply, and can restore the
 defaults or whatever was in effect when it opened.
@@ -268,6 +544,12 @@ defaults or whatever was in effect when it opened.
 | `_LIVE_SLOW_SPAN_S` = 24 h | **not** a ceiling. There used to be a 12 h clamp (`_LIVE_MAX_INIT_SPAN_S`), which meant the graph quietly disagreed with the From/To it was captioned with. Live now uses the period as asked; above this span `_live_span_from_window()` says in the Log that every refresh re-reads and redraws the whole of it. What made the clamp unnecessary: Live only ever *starts* for a period that ends at "now" (see `TimeWindowDialog.ends_at_now()`) |
 | `_LIVE_TICK_LOOKBACK_NS` = 2 min | the hard bound on one tick's query range. `_live_last_ts` only advances when samples arrive, so on a quiet archiver `[last sample → now]` grew without limit and each 300 ms tick fanned out into (hours × PVs) 1-hour chunk requests. Kept ≤ `CHUNK_SIZE_NS`, so a tick is exactly one request per PV |
 | `_LIVE_TICK_OVERLAP_NS` = 30 s | an empty tick still moves `_live_last_ts` to `now −` this, so the next query stays small while the overlap covers archiver ingestion lag |
+| `_LIVE_LATE_ARRIVAL_NS` = 5 s | every tick queries from `_live_last_ts −` this, and the worker keeps, per PV, only samples newer than **that PV's own** last sample (`own_last`, captured on the GUI thread before the worker starts). The worker used to filter every PV by `start_ns` = the newest timestamp of ANY PV, so a slower channel's sample archived a moment after a faster channel's newer one was dropped for good — and a custom PV built on it held a stale value |
+| `_live_rows_stale` / the table clock | `_live_last_rebuild_ns` is restarted only by a rebuild that ran. It used to restart on every due tick, also one that brought nothing — that tick skipped the rebuild AND postponed the next, so with sparse channels customs (only recomputed by the rebuild) lagged many seconds. The rebuild now runs on a due tick whenever `_live_rows_stale` (data arrived since the last one), whatever the tick itself brought. Pinned by `testing/test_live_rebuild_clock.py` |
+| `_extend_custom_series_live` | on a graph tick without a table rebuild, appends each custom trace's newest stretch computed straight from its sources (their timestamps after the trace's last point, gap-merged like the rows, held values via `_held_column`, formula via `_cpv_eval_columns`). The next rebuild replaces the series with the row-based one. Live trimming is a `bisect` + `del` on the sorted list instead of a list comprehension per PV per tick |
+| `gc.set_threshold(50_000, 20, 10)` | at import. The default 700-allocation gen-0 threshold made the collector rescan the millions of sample tuples during every row build — measured 300 ms → 65 ms on a 60 000-row custom-PV compute next to a million samples. Gens 1/2 keep default ratios so matplotlib figure cycles are still collected |
+| `_cpv_eval_columns` / `_CPV_NP_ENV` | a formula evaluated once over whole columns (`abs/min/max/round/math` bound to numpy; `min`/`max` reduce so three arguments work). A formula numpy cannot take whole (`A if A > 0 else B`) falls back to per-element eval with `_CPV_SAFE_ENV`, same answers. `_compute_custom_pvs_in_rows` reads each source out of the rows once (that read, not the eval, is the cost) and keeps `_cpv_cols` for `_rebuild_custom_pvs`. Pinned against the old per-row loop by `testing/test_custom_pv_vectorised.py` |
+| partial-load handshake | `_on_load_partial` gets a `threading.Event` with each snapshot and sets it when drawn; the worker makes no new snapshot while it is clear. The 1.5 s wall-clock throttle alone let snapshots queue up behind a slow repaint |
 | `_MAX_TABLE_ROWS` = 5000 | only the newest rows are rendered; export/graph/XY always use the full `_table_rows` |
 | `_NON_SHOT_PV_HINTS` | name fragments of channels that are written at their own pace and must not mark shots in the export (`_export_shot_channels`) |
 | `_EXPORT_SLICE_NS` = 2 h | see **Table export** |
@@ -292,9 +574,28 @@ left edge, so the box is drawn by hand and the click area matches it),
 `_ComboBoxDelegate` (Style and Points cells; the list drops open on the first
 click so picking a style is one gesture),
 `_FlowLayout` (wrapping button rows), `_GraphPopupWindow` (F11 / Ctrl+F11
-floating graph window), `_WheelGuard` + `_install_wheel_guard()` (application
+floating graph window; windowed it has an 8 px frame that is the resize grip, and
+an APPLICATION-wide event filter turns any left press inside it into
+`startSystemMove` — per-child filters would miss the canvas rebuilt on each
+replot; removed again by `stop_watching()` on dock-back), `_WheelGuard` + `_install_wheel_guard()` (application
 wide filter: the mouse wheel only changes a spin box / drop-down / slider that
-has been clicked into; otherwise the scroll is passed to the panel underneath).
+has been **clicked and not left since**; otherwise the scroll is passed to the
+panel underneath. `hasFocus()` alone never worked: Qt's default `WheelFocus`
+gives these widgets focus from the wheel event itself, before any filter. So
+the guard switches them to `StrongFocus` on `Polish` and keeps an "armed"
+property set by a mouse press (also on a spin box's inner line edit) and
+cleared by Leave / FocusOut / Hide. `_NEVER` = QTabBar and every part of a
+QCalendarWidget: the wheel there always goes to the panel, never to the widget).
+
+**In-place PV-table edits.** `_on_axis_item_changed` sends Width / Style /
+Points / Size / Alpha / Y min / Y max / Autoscale / Smooth / Display Name to
+`_axis_cell_in_place` (`_restyle_pv_in_place`, `_rescale_pv_in_place`,
+`_resmooth_pv_in_place`, `_rename_on_graph_in_place`): artist setters +
+`draw_idle`, same canvas. Only Show, and Smooth switched on/off (adds or drops
+the faint raw line), fall back to `_apply_axis_settings` + full rebuild. A full
+rebuild keeps a user zoom: `_plot_graph` stores the xlim in `_keep_xlim`, the
+impl puts it back (with Home/Back history pushed) before the xlim callback is
+connected.
 
 ### CSSLoggerWidget — state (`_init_state`)
 Data: `_samples_by_pv`, `_table_rows` (+ `_table_rows_unfiltered`), `_pv_order` /
@@ -342,6 +643,83 @@ i.e. **absolute time**. It has to live in state and not only inside the
 and the stat cards), which is why the selected region and its numbers used to
 vanish on a reload, a font change or any axis-table edit. `_recompute_stats()`
 derives the numbers from it, so they also follow newly arrived live data.
+`_sel_live` — the selection was dragged out past the right-hand edge (within
+`max(8 px, 1 %)` of the visible xmax, because the `SpanSelector` freezes at the
+last position the mouse had inside the axes) while the view shows the newest
+data. `_follow_live_selection()`, called at the top of `_recompute_stats`, then
+puts the end ON the newest real sample (`_newest_sample_num()` — from
+`_samples_by_pv`, not `_graph_raw_np`, whose arrays are padded out to "now") and
+moves the selector band; the stats title says "end follows the newest point".
+With no sample after the start yet, the end follows the clock instead.
+`_sel_samples` / `_sel_pre` — a live selection's own untrimmed copy of the
+samples since its start (and each channel's value just before it, for the
+conditions). `_sel_sync()` copies new samples into it in the live tick BEFORE
+the window trim and on every `_recompute_stats`, so a live selection keeps
+counting after its start is older than `_live_window_span`. Any selection made
+while Live is on (fixed ones too) uses this copy; out of Live a fixed selection
+reads `_samples_by_pv` + `_pre_window_vals` directly. **Never `_graph_raw_np`**:
+that is the screen-thinned trace (bins whose edges move every live tick, plus
+held values from other channels' rows) and made N wander 709 → 710 → 709.
+Each card = the PV's own samples in the region, filtered by
+`_stats_keep_mask(ts, tables, sbp, pre)` = conditions (`_condition_mask`) +
+"Keep multiples of" (`_master_multiple_mask`, master read by `_held_at`) +
+the dead-shot rule (`_dead_shot_mask`). Min/max take `_minmax_by_pv` only
+without conditions. Every graph PV always gets a card — N 0 and dashes when
+the region has no shot.
+
+Dead shots: sidebar "Skip zero-energy shots at same waveplate" (config
+`dead_shot_skip`, default on; `dead_shot_energy_pv`, default SBW4 HAPLS name;
+`dead_shot_energy_max`, default 0.05). A sample is dead when the energy reading
+of its shot (newest energy sample ≤ t + merge gap and ≥ t − merge gap) is below
+the limit AND the master PV (waveplate) held at that energy sample equals its
+value at the previous energy sample. Statistics only — the graph still draws it.
+
+Pause restart (sidebar "Restart after pause >", config `sel_pause_restart` /
+`sel_pause_s`): shots = `_shot_times()` (condition-passing samples of the
+condition PVs, or without conditions the `_export_shot_channels` graph PVs, all
+through `_stats_keep_mask`); `_last_pause()` finds the newest gap longer than
+the set seconds. Live: `_sel_restart_after_pause()` moves `_sel_range`'s start.
+Fixed: `_fixed_restart_after_pause()` only moves the counting start and writes
+`_sel_fixed_restart_note` into the title — the band stays.
+
+Selection edges: `_on_span_select` → `_snap_sel_edges` puts an edge on the
+first shot after / last shot before a pause when let go within 8 px and no
+other shot lies between (pause = ≥ 2 s, ≥ 3 px and ≥ 3 × median shot spacing;
+evenly spaced data never snaps). Shots for this are `_all_shot_times_ns()` =
+(first, last) sample of each merge-gap group. Start / End boxes in the stats
+heading (`_sel_edge_edits`, filled by `_sync_sel_edge_edits`): typed time →
+`_on_sel_edge_typed`, -1 / +1 → `_step_sel_edge`, both via
+`_set_selection_edges`.
+
+Conditions: `_conditions` is the list that actually filters, already empty
+when the sidebar "Apply conditions" box (`_conditions_on`, config
+`conditions_enabled`) is off; `_conditions_all` keeps every row. Paths that read
+samples rather than `_table_rows` filter with `_condition_tables()` +
+`_condition_mask(ts, tables)` — each condition channel read at
+`t + SAMPLE_HOLD_MIN_GAP_MS`, like the row merge: `_update_graph_data` (live),
+`_pv_stats`, live selection stats. `_hold_to_window` replaces the pre-window
+value with the last good shot's (`_last_good_value`) when `_pre_window_ok()`
+fails; `_thin_trace` ignores `_minmax_by_pv` while conditions are on (the
+archiver's bin min/max covers rejected shots).
+
+Last good shot: after every load, live start and Conditions change,
+`_maybe_hunt_last_good()` checks `_seed_rejected()` and, if the Conditions
+reject the window's seed, runs `_last_passing_moment` (module level; condition
+channels only, raw, `_LAST_PASS_STEP_NS` = 6 h steps back to
+`_LAST_PASS_DEPTH_NS` = 14 days) in a thread, then reads every real PV at that
+moment with `cpva_fetch_last_before_many`. `_last_good` = {conds, before, ts,
+vals (custom PVs via `_customs_from`), hunting, failed}; `_lg_epoch` cancels a
+stale hunt. `_last_good_note()` puts the yellow note on the plot while the
+window has no rows of its own.
+
+Grid: `_apply_grids(pvs, axes)` draws the per-PV grids; the Grid column and
+"Hide all grids" call `_regrid_in_place()` — no `_plot_graph`, view kept. The
+Grid tick then rewrites only that column's tooltips (`_refresh_grid_tooltips`):
+a full `_refresh_axis_settings_tv` recomputed every PV's stats and re-sized the
+PV table, which resized and redrew the graph.
+Reset by a new drag and by `_clear_selection`. The statistics selector is
+`button=1`: without it matplotlib takes every button, so the right-drag zoom
+also started a selection.
 There is **no** `_zoom_history` / `_xy_zoom_history` any more: the view history
 belongs to the toolbars (Home / Back / Forward) and a second hand-kept one would
 drift out of step. `_on_zoom_select` pushes onto the toolbar's stack via
@@ -375,10 +753,13 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | build | `_build_ui`, `_build_sidebar`, `_build_graph_tab`, `_build_axis_settings_panel`, `_build_xy_tab`, `_build_pv_time_tab`, `_build_table_tab`, `_build_log_tab`, `_populate_ui` |
 | load | `_on_load_clicked(silent=)`, `_on_load_error`, `_on_load_finished` / `__on_load_finished_inner`, `_build_table_rows(samples, order, pre_vals=)` |
 | automatic loading | `_request_reload(delay_ms, reason)`, `_do_auto_reload`, `_finish_load`. **There is no LOAD DATA button.** Everything that changes what should be on screen calls `_request_reload`: PV added / removed / cleared / renamed, a new time window, a new preset. A burst collapses into one fetch via `_autoload_timer`; a request made while `_load_in_flight` sets `_reload_pending` and runs from `_finish_load`. Every load end path **must** call `_finish_load()` — including the "live was switched off meanwhile" early returns in `_on_live_init_error` / `_after_live_initial_load`, or the lock stays held and no automatic reload can ever start again |
-| graph | `_plot_graph` (+ `_schedule_replot`), `_plot_graph_impl`, `_update_graph_data`, `_band_ylim`, `_apply_x_ticks`, `_retick_from_current_xlim`, `_compute_x_ticks`, `_bottom_margin_floor`, `_keep_x_label_visible`, `_grid_style_for` / `_grid_style_name` / `_grid_style_index`, `_apply_font_size`, `_clear_graph`, `_clean_graph`, `_save_graph`, `_graph_popout` / `_restore_graph_from_popup`, `_install_graph_shortcuts` |
-| graph toolbar | `_install_graph_toolbar`, `_install_xy_toolbar`, `_sync_graph_interaction_mode`, `_adopt_toolbar_margins`, `_on_graph_view_home`, `_push_graph_view`, `_on_xy_rect_zoom_push`, `_open_graph_view_menu` |
+| graph | `_plot_graph` (+ `_schedule_replot`), `_plot_graph_impl`, `_update_graph_data`, `_band_ylim`, `_apply_x_ticks`, `_retick_from_current_xlim`, `_compute_x_ticks`, `_bottom_margin_floor`, `_keep_x_label_visible`, `_grid_style_for` / `_grid_style_name` / `_grid_style_index`, `_apply_font_size`, `_clear_graph`, `_clean_graph`, `_save_graph_image` / `_write_graph_image` / `_add_stats_table_to_figure` (stats drawn as figure text BELOW y=0, taken in by `bbox_inches="tight"`, removed again in `finally`), `_graph_popout` / `_restore_graph_from_popup`, `_install_graph_shortcuts` |
+| graph toolbar | `_build_graph_strip` (permanent grouped icon bar `_graph_strip`, buttons in `_gstrip_btns`, icons from module `_graph_icon` / `_GICON_RECIPES`), `_graph_tb_action` / `_graph_tb_trigger` (strip buttons fire the HIDDEN matplotlib toolbar's actions in `_graph_tb_holder`), `_sync_graph_strip`, `_on_graph_strip_mode`, `_install_graph_toolbar` (re-presses Pan/Zoom from `_graph_tb_mode_wanted` after a rebuild), `_install_xy_toolbar`, `_sync_graph_interaction_mode`, `_on_graph_view_home`, `_push_graph_view`, `_on_xy_rect_zoom_push`, `_open_graph_view_menu` |
+| loupe | `_set_loupe_on`, `_set_loupe_mag`, `_update_loupe` (called from `_process_mouse_move_impl`; hidden on `figure_leave_event`); class `_GraphLoupe` — child of `_graph_container`, mouse-transparent, own small Figure, shows ONE trace (`nearest_trace`: smallest vertical pixel distance at the mouse time), box = loupe size / magnification in screen pixels around the mouse mapped through that trace's own axis; rebuilt when the main figure or the chosen line changes |
+| margins | `_open_margins_dialog` → non-modal `_MarginsDialog` (label_pad_px, axis_gap_px, outer_margin_px, margins, band_pad_frac → `_apply_graph_opts` on every change). Replaces matplotlib's Subplots dialog |
+| PV table order | `_plot_order` (config `plot_order`), `_ordered_for_plot(pvs)` used by `_refresh_axis_settings_tv` and `_plot_graph_impl`; `_RowDragger` (hand-made row drag on `_axis_tv`'s viewport) → `_on_axis_rows_dropped`. The left PV list keeps its own order |
 | cursor | `_on_canvas_draw`, `_on_graph_mouse_move`, `_process_mouse_move(_impl)`, `_flush_cursor_table` |
-| stats / selection | `_on_span_select` (stores `_sel_range`, then delegates), `_recompute_stats`, `_restore_selection_band`, `_clear_selection`, `_drop_selection_if_outside`, `_make_stat_card`, `_copy_stats_text`, `_clear_stats`, `_on_zoom_select` |
+| stats / selection | `_on_span_select` (stores `_sel_range`, then delegates), `_recompute_stats`, `_restore_selection_band`, `_clear_selection`, `_drop_selection_if_outside`, `_make_stat_card`, `_copy_stats_text`, `_clear_stats`, `_on_zoom_select`, `_fit_stats_strip` (strip height = `_FlowLayout.heightForWidth` / `first_row_height`, capped at 45 % of the graph pane — but two rows of cards are always shown whole, up to 70 % (`rows_height(w, 2)`); re-run by `_ResizeHook` on the pane, and once more on a 0 ms timer whenever the strip was hidden, because cards measured before their first show lack their small fonts and measure too tall — the old empty band under them), `_set_stats_mode` (all / row / hide, config `stats_strip_mode`); `_stats_rows` = what the cards show, read by the image save. `_FlowLayout` wraps when `x + w > inner.x() + inner.width()` (a card ending exactly on the edge fits). Save: `_save_graph_image` proposes `CSS Logger <view start> to <end> (saved <now>).png`; `_write_graph_image` always adds `_add_header_to_figure` (period, save time, PV names in their colours, ABOVE y=1) and with a selection `_add_stats_table_to_figure` |
 | graph options | `_open_graph_settings_dialog`, `_apply_graph_opts`, `_avg_target_points`, `_on_avg_target_changed` |
 | live | `_toggle_live_mode`, `_live_span_from_window`, `_live_initial_load`, `_on_live_init_error`, `_after_live_initial_load`, `_live_tick`, `_on_incremental_finished`, `_schedule_live_tick`, `_live_countdown_tick`, `_live_poll_ms`, `_scroll_live_time_axis`, `_stop_live`, `_maybe_autostart_live` |
 | filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows`, `_no_rows_message` |
@@ -408,7 +789,10 @@ cells the user cannot type into (the PV name, the live cursor readout and the
 measured values); `_AXIS_HIDDEN_BY_DEFAULT` start switched off in the header's
 right-click menu; `_AXIS_ALWAYS_SHOWN` (pv, blank) can never be hidden. Divider
 rows paint every cell blue, not just the spanned first one, because a span
-follows its logical column wherever it has been dragged.
+follows its logical column wherever it has been dragged. While a heading is
+being dragged, `_HeaderDropMarker` (an event filter on the header viewport that
+never consumes an event) draws a 3 px blue line on the edge where the column
+will land, using Qt's own target rule from `QHeaderView::mouseMoveEvent`.
 
 `unit`/`last`/`min`/`max`/`mean`/`count` are measured, not stored: `_pv_stats`
 computes them from `_samples_by_pv` and caches on the sample count
@@ -429,7 +813,33 @@ visibility) as a named entry in `config["style_presets"]`, plus export/import to
 a JSON file the user picks. Nothing is stored automatically — `_pv_settings` and
 `_ref_lines` are still session-only by design.
 
+`_fill_styles_menu` traps: the Load / Delete sub-menus are built as
+`QMenu(title, menu)` and kept on `menu._style_submenus` — `menu.addMenu("Load")`
+returns a PySide wrapper that destroys the sub-menu when the function returns,
+which made Delete open nothing. Every entry that opens a dialog runs via
+`QTimer.singleShot(0, …)`, after the popup has released the mouse.
+
 ### Graph traps — read before touching the plot
+
+**The figure is laid out for the canvas's REAL size.** The px gaps of the Y
+columns (Margins and spacing) become fractions of the figure width, and
+matplotlib keeps fractions when the canvas stretches. The figure used to be
+built at `max(container − 8, 960)` px, so on any graph narrower than ~968 px
+every gap came out smaller than set ("spacing does not work"). Now it is the
+container size (960×480 only while the container is not laid out yet), kept
+in `_graph_layout_w`; `_keep_x_label_visible` (canvas `resize_event`)
+schedules one replot when the canvas width moves > 3 % away from it.
+"Gap inside band" also pads Autoscale'd PVs (`_band_ylim`, same screen size as
+a band's gap). The Graph settings dialog's fallbacks are
+`_GRAPH_OPTS_DEFAULTS`, not their own numbers.
+
+**Live with no shot yet must not rebuild every tick.** The live graph tick used
+to call `_plot_graph()` whenever `_graph_lines` was empty — i.e. on every tick
+before the first shot — which destroyed the selector under the mouse, so a
+selection could not be dragged until shots arrived. With nothing numeric yet
+it now only slides the time axis (`_scroll_live_time_axis`) and refreshes the
+stats; `_plot_graph_impl` also draws empty axes in Live when `_samples_by_pv`
+is still empty.
 
 **The time-axis stamps are a FIXED LIST, so they must be rebuilt after every
 change of the visible range.** `_apply_x_ticks` is the only place that installs
@@ -491,15 +901,16 @@ widget that changes the canvas height inherits this for free; anything that sets
 replot.** `_install_graph_toolbar` therefore tears the old one down and builds a
 new one into the permanent `_graph_tb_holder`. `_clear_graph` drops it with the
 canvas, or its buttons act on a destroyed figure. The holder is hidden and shown
-alongside `_graph_ctrl_bar` in the F11 pop-out.
+with the axis pane in the F11 pop-out. (There is no `_graph_ctrl_bar` any
+more — its controls are in the sidebar, see **Sidebar**.)
 
 **Toolbar icons: matplotlib tints them ONCE, AT CONSTRUCTION, and only when it
 thinks the palette is dark** — on a dark Windows theme they come out near-white
 and read as blank buttons, and fixing the palette afterwards does nothing. Build
 every matplotlib toolbar through `_make_mpl_toolbar`, which parents it to a
 light-palette host first. (Pulser Monitor and Image Tools carry the same helper
-for the same reason.) `_CustomToolbar`, `_TB_STYLE`, `_TB_HINTS` and
-`_AxisLimitsDialog` are imported from `sp_t` in this folder, which `main.py`
+for the same reason.) `_CustomToolbar`, `_TB_STYLE` and `_TB_HINTS`
+are imported from `sp_t` in this folder, which `main.py`
 already imports `SpectraWidget` from, so this adds no new coupling; the imports
 are wrapped so a change there degrades to the stock toolbar instead of breaking
 startup.
@@ -593,8 +1004,10 @@ and `SPFE Values/spfe_t.py`.
 | `cpva_fetch_many_adaptive(channels, start_ns, end_ns, count=…)` | **the one fetch.** Asks for as much time per request as the archiver will actually serve and halves only what it refuses, so any period loads — an hour, a year, a night. Returns `(results, errors, FetchReport)`. See "Adaptive fetch" below |
 | `cpva_fetch_samples_chunked(...)` | one channel through the adaptive fetch. No longer raises on a partial failure: it used to re-raise the first failing hour and throw the whole channel away |
 | `cpva_fetch_many_chunked(channels, …)` / `cpva_fetch_many_optimized(...)` | two-value shims over `cpva_fetch_many_adaptive` (raw / decimated), for callers that do not need the report. Both take `cancel_fn` — stopping a QTimer cannot stop a running pool, so "Stop Live" used to leave the whole queue hammering the archiver and holding the GIL; a cancelled pool drops everything it has not started (`_is_cancelled`) |
-| `cpva_fetch_last_before(channel, before_ns)` | carry-forward value before the window; scans expanding rings (`_LAST_BEFORE_STEPS_S`, up to ~30 days), each ring hunted newest-half-first by `_last_before_in_range` — one request when the ring is servable instead of one per hour (~1 100 requests per stale signal at the old fixed grid) |
-| `cpva_fetch_last_before_many(channels, before_ns, …)` | the same for many channels in one shared pool — a few stale PVs used to dominate the whole initial load; returns only channels that had a prior sample. Also `cancel_fn`-aware (the deepest ring scan is the longest single thing a load does) |
+| `cpva_fetch_last_before(channel, before_ns, deadline=)` | carry-forward value before the window; scans expanding rings (`_LAST_BEFORE_STEPS_S`, up to ~30 days), each ring hunted newest-half-first by `_last_before_in_range`. **Bounded** (`_HuntBudget`): a ring is halved only while longer than `_LAST_BEFORE_MIN_SPLIT_NS` (6 h), at most `LAST_BEFORE_MAX_REQUESTS` (12) per name, all within `LAST_BEFORE_DEADLINE_S` (20 s). It used to halve to one minute at up to 120 s a request — the "stuck at 92 %" of 09.10.2026 |
+| `cpva_fetch_last_before_many(channels, before_ns, …, deadline_s=)` | the same for many channels in one pool; returns only channels that had a prior sample. Waits with `wait(FIRST_COMPLETED, 0.25 s)` so a cancel or the deadline ends it at once, and abandons the pool (`shutdown(wait=False)`) — the old `with` block waited for every running hunt even after a cancel |
+| `read_order(ch)` / `channel_aliases(ch)` / `_holds_nothing` / `_drop_after` | the two-name rule (see "SBW4 is archived under two names") |
+| `_http_get_json` | every request passes `_IN_FLIGHT`, a program-wide semaphore of `MAX_REQUESTS_IN_FLIGHT` (24): several setting tabs loading at once share it |
 | `cpva_decode_value(sample)` | decodes a sample value (numeric / string / enum) |
 | `cpva_fetch_channels()` | full list of archiver channels |
 | `now_ns()` / `dt_to_ns()` / `ns_to_local_str()` / `_fmt_cursor_value()` | time + value formatting |
@@ -622,17 +1035,44 @@ and no log line. It is gone.
 | Piece | What it does |
 |-------|--------------|
 | `_SpanOracle` | per channel, the widest span known to work and the narrowest known to fail; `plan_span()` picks the next size. **One oracle per channel**: how many samples an hour holds is a property of the signal, so a shared one would drag a slow signal (a valve state) down to the fastest signal's size and turn a dozen requests into thousands. A shared oracle is also kept, consulted only until a channel has a success of its own |
-| the opening request | each channel starts with one `CHUNK_SIZE_NS` request at the **newest** end. It is what puts something on screen at once, and it deliberately does **not** feed the oracle — a tiny "known good" would make every later split fall back to an hour |
+| steps (`_load_tiles`) | the period is cut into whole Prague days, **newest first**; above `MAX_TILES` (16) days neighbouring days are grouped (from the newest end), so three months is 15 steps of 6 days. Measured 12.10.2026: one day per request cost 767 requests for three months of the Operation preset against 112 — the archiver's cost is per request. Steps are FED lazily (`_feed_tile`, whenever fewer than `max_workers` requests are out), every channel of a step before the next one, so a long load fills in a step at a time from the right and a cancel leaves little queued. `tile_fn(edge)` reports the newest-first prefix of complete steps (the grey area's edge). Within a step a channel's first request is the whole step (`_piece_for`: thinned or sparse), or what the oracle already knows works (raw dense: from `RAW_START_CHUNK_NS`) |
 | split, not recurse | a refused range is re-queued as *k* smaller ranges in the **same** pool. Recursing inside the worker (the `sp_t.py` pattern) would serialise a 30-day → 720-piece split in one thread while fifteen idle |
 | `_is_splittable_error` | only 413/414/5xx, a read timeout or a bad shape justify halving. A refused connection gets one retry and is then recorded — otherwise one unreachable archiver becomes half a million requests |
-| newest first | the plan is built from `end_ns` backwards, channels interleaved, so a long period fills the graph in from the present edge |
 | `count` sharing | the decimation target is split across the requests in proportion to their span (floor `MIN_CHUNK_COUNT`), so the total stays near the target instead of being multiplied by the request count |
 | merge | by sample **`time`**, not request order: an adaptively split child's anchor sample can predate its parent's start, and `cpva_fetch_last_before` needs the last element to be the newest. Duplicates (every request also returns the sample before its own start) are dropped |
-| `FetchReport` | `gaps` (per channel, the ranges that could **not** be read), `boundaries` (the request starts actually used — `_remove_fake_hour_boundary_rows` needs them), `requests`, `splits`, `cancelled`, `over_budget`, `decimated`, `elapsed_s` |
-| `progress_fn(done, total)` | `total` only ever **grows**: it starts at the plan size and grows when a request splits. `done` never falls, `done <= total`, and the last call is level. Emission is serialised (`emit_lock`) — snapshotting outside it let two threads report out of order and the bar jumped backwards |
+| `FetchReport` | `gaps` (per channel, the ranges that could **not** be read), `boundaries` (the request starts actually used — `_remove_fake_hour_boundary_rows` needs them), `requests`, `splits`, `cancelled`, `over_budget`, `decimated`, `elapsed_s`, `rechecked`, `cached` (channel-days served from the day cache) |
+| `progress_fn(done, total)` | `total` only ever **grows**: it starts at steps × channels and grows with every split, pre-split piece, extra day of a two-name channel or second-name request. `done` never falls, `done <= total`, and the last call is level. Emission is serialised (`emit_lock`) — snapshotting outside it let two threads report out of order and the bar jumped backwards |
 | `_timeout_for_span` | 1 h → 10 s, ≥ 12 h → 120 s (`CPVA_HTTP_TIMEOUT` … `CPVA_HTTP_TIMEOUT_LONG`). The `http_timeout` config key finally does something — `CSSLoggerWidget._http_timeout()` reads it as the **base** and the per-request value is derived from the span |
-| pre-flight | for periods over 4 h, one 1-minute request at the base timeout first, so an unreachable archiver is known in 10 s rather than after a 120 s hang. Only a failure that got **no HTTP reply at all** counts as dead — a 500 or a 404 means it is answering |
+| pre-flight | for periods over 4 h, one 1-minute request at the base timeout, so an unreachable archiver is known in 10 s rather than after a 120 s hang. It runs in its own thread BESIDE the density check and is joined before the first step is fed (on a busy archiver the two cost seconds each, one after the other). Only a failure that got **no HTTP reply at all** counts as dead — a 500 or a 404 means it is answering |
 | `FETCH_MAX_REQUESTS` | 20 000 per call, the backstop. Reported as `over_budget` |
+
+### The day cache (`cpva_cache.DayCache`)
+
+Asked for 12.10.2026 ("save the data somewhere the first time and read it from
+there"), location the user's choice: the scratch share, Software folder, own
+subfolder outside every program folder (a redeploy replaces the program folder;
+Image Tools can read the same files). `<scratch>\Software\CPVA cache\<signal>\
+<YYYY-MM>.npz`: per day `t` (int64), `v`, and for a thinned day `lo`/`hi`, plus a
+JSON block per day — `count` (points asked for that day, `None` = exactly as
+archived), `src` (the name(s) that answered), units, the day's bounds.
+
+| Rule | Why |
+|------|-----|
+| only whole Prague days ended > 1 h ago (`CLOSED_AFTER_NS`) | a closed day does not change; today is always read live |
+| only days read without a gap, never a channel that was re-checked or thinned after an overflow | a stored day is believed without asking |
+| served only when stored at least as fine (`count` ≥ asked / `COUNT_SLACK`, or exact) | a three-month load stores ~22 points a day; a week then asks for ~285 and must go to the archiver (the finer day replaces it) |
+| numbers only | a word or waveform channel is never stored |
+| per day within a step (`_from_cache` → hits + missing ranges) | the newest step holds today, so it is never wholly closed — measured: it was re-read in full every time |
+| `prefetch` reads the month files of the window in parallel before planning | the per-day look-ups never touch the share |
+| `flush_async` after the load, atomic tmp + `os.replace`, re-reading the month just before replacing it | a load never waits for the share; two stations saving one month keep each other's days |
+| root: frozen app → probe the share in a daemon thread (`SHARE_ROOTS`, 3 s), source run → OFF unless `CPVA_CACHE_DIR` | a test's fake archive must never land in the shared cache; the lab leg can take ~48 s to fail from the office |
+
+Measured 12.10.2026, three months of the Operation preset: 2.8 MB for 90 days ×
+8 signals; the second load asked the archiver 27 requests (today and the
+period's partial first day) instead of 242, 711 signal-days from the cache.
+`_channels_to_read_raw` also remembers each channel's probe for
+`DENSITY_MEMO_S` (30 min, `_DENSITY_MEMO`), so a reload or a tab switch does not
+probe again (tests clear it in their fake's `install`).
 
 Constants: `CHUNK_SIZE_NS` (1 h — still the unit for timeouts and the live
 tick), `MIN_CHUNK_NS` (1 min floor), `MAX_CHUNK_NS` (30 d, the widest single
@@ -662,7 +1102,7 @@ period":
 | Piece | What it does |
 |-------|--------------|
 | `_probe_density` / `_channels_to_read_raw` | **before anything else is asked for**, one raw request per channel over the newest hour (the middle hour decides if that one is empty). Under `VERIFY_DENSE_PER_HOUR` the channel is read exactly as archived for the whole period — thinning a motor position is not a saving, it is damage, and a sparse channel is cheap to read in full. Skipped for periods under 4 h |
-| the sparse channel's chunk size | `MAX_CHUNK_NS`, not `RAW_START_CHUNK_NS`: it is sparse, so ask for the lot. Raw mode's cautious 4 h would be 2190 requests over a year for a channel holding a dozen samples |
+| the sparse channel's chunk size | the whole step, not `RAW_START_CHUNK_NS`: it is sparse, so ask for the lot. Raw mode's cautious 4 h would be 2190 requests over a year for a channel holding a dozen samples |
 | `_decimated_is_suspect` | after the merge, a thinned series is rejected when it **never changes** (no bin reports `minimum != maximum`, no two values differ) or when it does not reach within `VERIFY_EDGE_FRACTION` of either end |
 | `_recheck_decimated` | probes those channels' density and re-reads the sparse ones raw. A dense channel whose series really is flat is a stuck meter — left alone, and said in the Log |
 | `VERIFY_MAX_SAMPLES` | both directions have the same cap: a re-read bigger than this is dropped, and a channel judged sparse from two quiet probe hours that turns out to hold more than this is thinned after all (one extra request). Holding a million sample dicts is worse than a coarse trace |

@@ -51,16 +51,29 @@ THE FOUR TABS
   Run Graph      every pulser's state over real time, with warm-up,
                  diodes-off and un-analysed stretches shaded.
 
+  "Viewing camera:" above the tabs picks which camera's results
+  they show. On the Pulser Map, "Heatmap:" picks what the colours
+  mean (Status, Dropouts, Faults, Trips, ...). A running scan is
+  stopped with "Stop" in the left panel or "Stop Scan" at the
+  bottom right of the window.
+
 
 THE FOUR THINGS A DARK PULSER CAN BE
 
   dropout   dark for a few frames and straight back. A flicker.
-  fault     dark for longer, the array kept running, and it came
-            back. Not working properly, but it does recover.
+  fault     dark for longer and the array kept running. It either
+            came back or was still dark when the window ended.
   trip      dark for longer and the array went down right after —
             this pulser took the array with it.
-  dead      it could not be brought back, judged over several
-            recovery attempts or a period of array running time.
+  dead      one of two things only:
+            - it stayed dark through several restarts of the
+              array ("Dead after (recoveries)"), or
+            - it never lit at all, and stayed dark for the
+              minutes set in "Never lit, dead after (min)".
+
+  A pulser that ran, went dark and simply stayed dark while nobody
+  restarted the array is a fault, not dead — nobody tried to bring
+  it back, so nothing was proven about it.
 
   A dead pulser that gets replaced still counts as having died that
   day, and is reported with both times. The count answers "how many

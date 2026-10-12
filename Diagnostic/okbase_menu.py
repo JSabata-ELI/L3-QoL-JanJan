@@ -503,6 +503,10 @@ OKBASE_KEYS = (
     # The unused single-use ordering codes, as one-way hashes (see
     # new_order_codes). Empty means no order is accepted at all.
     "okbase_order_codes",
+    # The morning "no lunch ordered" reminder (see lunch_reminder_due). The
+    # sent day is what keeps the app and the listener from both sending it.
+    "okbase_remind_enabled", "okbase_remind_hour", "okbase_remind_email",
+    "okbase_remind_sent_day",
 )
 
 
@@ -1699,6 +1703,144 @@ def refresh(settings: dict, now: Optional[datetime] = None,
         if problem:
             return cache, f"menu fetched, but saving it failed: {problem}"
     return cache, ""
+
+
+# ---------------------------------------------------------------------------
+# The morning "you have no lunch ordered" reminder
+# ---------------------------------------------------------------------------
+#
+# Once per working day, from `okbase_remind_hour`: if TODAY has a menu, still
+# takes orders and has nothing ordered, the bot posts one message that
+# mentions the person. No menu (holiday, shutdown) or a closed day says nothing.
+#
+# The day it was decided is kept in okbase.json, not in memory: the app and the
+# listener take turns, and either may restart, so only a value on disk stops a
+# second message the same morning. A read that FAILS decides nothing and the
+# next keepalive tick tries again.
+
+REMIND_HOUR_DEFAULT = 8
+REMIND_SEND, REMIND_ORDERED, REMIND_NO_MENU, REMIND_CLOSED = (
+    "send", "ordered", "no_menu", "closed")
+
+
+# ---------------------------------------------------------------------------
+# Which room the canteen belongs to
+# ---------------------------------------------------------------------------
+#
+# The bot reads commands from one room — the row with "Listen for commands" —
+# and every reply, the lunch reminder included, goes back there. A room shared
+# with people who have no business with the canteen gets its "/food" box
+# unticked in Settings → Webex rooms, and from then on the bot says nothing
+# about food in it: no menu, no reminder, no food lines in /help or /status.
+
+FOOD_OFF_HERE = "🍽 `/food` is not available in this room."
+
+
+def food_in_listen_room(settings: dict) -> bool:
+    """True when the room the bot listens in may hear about the canteen.
+
+    The listen row's "food" flag; a room list with no listen row, or a row
+    written before the flag existed, keeps /food — that is how it always was.
+    """
+    for r in settings.get("webex_rooms") or []:
+        if r.get("listen") and r.get("room_id"):
+            return bool(r.get("food", True))
+    return True
+
+
+def lunch_reminder_due(settings: dict, now: Optional[datetime] = None) -> bool:
+    """Is it time to check whether today's lunch is ordered?"""
+    now = now or datetime.now()
+    if not settings.get("okbase_enabled"):
+        return False
+    if not food_in_listen_room(settings):
+        return False
+    if not settings.get("okbase_remind_enabled", True):
+        return False
+    if now.weekday() >= 5:
+        return False
+    hour = settings.get("okbase_remind_hour", REMIND_HOUR_DEFAULT)
+    try:
+        hour = int(hour)
+    except (TypeError, ValueError):
+        hour = REMIND_HOUR_DEFAULT
+    if now.hour < hour:
+        return False
+    # From disk, not from `settings`: the other process may have decided
+    # today already.
+    sent = str(load_user_settings().get("okbase_remind_sent_day") or "")
+    return sent != now.date().isoformat()
+
+
+def check_lunch_today(settings: dict, now: Optional[datetime] = None,
+                      session_out: Optional[dict] = None) -> tuple[str, str]:
+    """Read this week live and say what today looks like.
+
+    Returns (verdict, error); verdict is one of the REMIND_* words, or "" with
+    an error when nothing could be decided. Always a fresh read — a lunch
+    ordered from the browser five minutes ago must not be nagged about.
+    """
+    now = now or datetime.now()
+    session, base, timeout, err = open_session(settings)
+    if session is None:
+        return "", err
+    if session_out is not None:
+        session_out["cookies"] = merged_cookie_header(
+            session, secrets_resolved_cookie(settings))
+    days, states, orders, _used, err = fetch_weeks_full(
+        session, week_monday(now.date()), 1, base, timeout,
+        settings.get("okbase_canteen_id") or None,
+        settings.get("okbase_filter") or None,
+        settings.get("okbase_user_id") or None)
+    if not days:
+        return "", err or "the portal returned no menu"
+    return lunch_verdict(now.date().isoformat(), days, states, orders)
+
+
+def lunch_verdict(today: str, days: dict, states: dict,
+                  orders: dict) -> tuple[str, str]:
+    """The decision itself, separate from the portal so it can be tested."""
+    if not days.get(today):
+        return REMIND_NO_MENU, ""
+    if states.get(today) != DAY_OPEN:
+        return REMIND_CLOSED, ""
+    if not orders:
+        # The orders half did not come back at all. "Nothing ordered" would be
+        # a guess, and a wrong one sends somebody to order a second lunch.
+        return "", "the portal did not report your orders"
+    order = orders.get(today)
+    if order is not None and order.ordered:
+        return REMIND_ORDERED, ""
+    return REMIND_SEND, ""
+
+
+def _mention_name(address: str) -> str:
+    """'jan.moucka@eli-laser.eu' -> 'Jan'."""
+    local = address.split("@", 1)[0]
+    first = re.split(r"[._\-]", local, maxsplit=1)[0]
+    return first[:1].upper() + first[1:] if first else address
+
+
+def lunch_reminder_text(settings: dict, now: Optional[datetime] = None) -> str:
+    """The message itself, with a mention when an address is known."""
+    now = now or datetime.now()
+    address = str(settings.get("okbase_remind_email") or "").strip() \
+        or str(settings.get("okbase_account") or "").strip()
+    who = f"<@personEmail:{address}|{_mention_name(address)}> " if address else ""
+    # Spelled out rather than %A/%b, which follow the PC's locale.
+    names = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday")
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+              "Oct", "Nov", "Dec")
+    day = f"{names[now.weekday()]} {now.day} {months[now.month - 1]}"
+    return (f"🍽 {who}you have no lunch ordered for today ({day}). "
+            f"Ordering usually closes at 10:00 — send `/food` to see the menu.")
+
+
+def mark_lunch_reminded(now: Optional[datetime] = None) -> str:
+    """Record that today has been decided. Returns "" or an error."""
+    day = (now or datetime.now()).date().isoformat()
+    return save_user_settings({"okbase_remind_sent_day": day})
 
 
 # ---------------------------------------------------------------------------

@@ -223,7 +223,7 @@ has the half-by-half map; `if_t.py`'s module docstring is the design spec.
 | (same block) | `PV_CUSTOM_CHANNELS`, `pv_channel_for()`, `pv_all_channels()` | PVs the user added with the picker's search box (name = channel). Module-level: `pv_text_for_ts` resolves names through it on the save worker thread. Every name→channel lookup goes through these two helpers |
 | L159 | `_PV_TODAY_CACHE_TTL` = 1.5, `PV_FETCH_MAX_WORKERS` = 4 | today's PV cache; panel fan-out cap so it cannot exhaust the shared cpva pool |
 | L467-469 | `GRADIENT_NAMES`, `GRADIENT_ID_DEFAULT` = 0, `GRADIENT_ID_GRAYSCALE` = 1 | palettes; `gradient_id` is a persisted positional index → append new palettes at the END of `GRADIENTS` |
-| (same block) | `_NI_BINARY_CYCLE` / `_ni_binary_rgb` / `_make_ni_binary_lut` (*Binary*), `_FALSE_COLORS_STOPS` (*False Colors*) | the two faint-detail palettes; mirrored in `if_t.py` and `sf_t.py` (`wk_t.py` borrows this module's tables instead). Binary is measured off the real NI viewer — 15 colours on absolute 1024-unit bands, black below the first — see STRUCTURE.md before changing it |
+| (same block) | `_NI_BINARY_CYCLE` / `_ni_binary_rgb` / `_make_ni_binary_lut` (*Binary*), `_make_ni_false_colors_lut` / `_ni_false_colors_rgb` (*False Colors*), `NI_ABSOLUTE_PALETTES` | the two palettes measured off the real NI viewer, both absolute and view-only; mirrored in `if_t.py` and `sf_t.py` (`wk_t.py` borrows this module's tables instead). Binary: 256 entries on `stored >> 8` (raw counts >> 4), 0 black, 255 white, 1..254 a 15-colour cycle. False Colors: 256 entries on `stored >> 8`, full backwards hue turn with 12-entry contour bands. See STRUCTURE.md before changing either |
 | L472-485 | `ONE_HOUR_NS`, `CIRCLE_*` | circle calibration |
 | L487-494 | `DEFAULT_OPEN_DIR/ROOT`, `DEFAULT_SAVE_DIR`, `IMAGES_ROOT_BASE` | paths |
 | L501/504 | `_REF_STATUS_STYLE`, `_REF_WARN_STYLE`, `_CHECKBOX_STYLE` | QSS |
@@ -358,8 +358,8 @@ has the half-by-half map; `if_t.py`'s module docstring is the design spec.
 | **L921** | `ShotFinderWidget` | the tab |
 | L1063 | `_build_ui` | full UI |
 | L1342 | `_setup_calendar` | **duplicate of the calendar factory** |
-| L1402-1541 | `_rebuild_pv_suggestions`, `_fetch_channel_list`, `_on_channels_loaded`, `_make_pv_dropdown`, `_populate_pv_dropdown`; `_split_query` / `_tokens_in_order` / `_rank_pv_match` = aliases of `cpva.*` | searchable channel dropdown (typed words AND-matched, in-order hits first); the ranking is shared with the Slider's PV picker |
-| L1600-1669 | `_on_pv_search_changed`, `_on_pv_dropdown_clicked`, `_best_pv_match`, `_on_pv_search_return`, `_register_col`, `_add_pv_col`, `_remove_pv_col`, `_make_remove_btn` | add / remove a PV column |
+| — | *gone 25.09.2026* — `_rebuild_pv_suggestions`, `_fetch_channel_list`, `_on_channels_loaded`, `_make_pv_dropdown`, `_populate_pv_dropdown`, `_on_pv_search_changed`, `_on_pv_dropdown_clicked`, `_best_pv_match`, `_on_pv_search_return`, `_register_col`, `_preset_for_channel`, `_add_pv_col` | this tab's own PV search. Replaced by `_open_pv_config` → `is_t.PvConfigDialog` (`show_limits=False, show_kind=False`), with `_name_for_col` / `_col_for_name` translating between this tab's column keys and the shared registry's names. See STRUCTURE.md. |
+| — | `_warm_channel_list`, `_open_pv_config`, `_remove_pv_col`, `_make_remove_btn` | open the shared picker; remove a PV from the list and from the picked set |
 | L1680/1695 | `_sync_pv_cfg_from_rows` / `_rebuild_pv_rows` | one row per picked PV: ticked = filter (target/tol), unticked = show only |
 | L1787-1816 | `_filter_cols`, `_show_cols`, `_get_criteria`, `_update_date_info`, `_build_energy_text` | |
 | L1833/1889 | `_on_selection_changed` / `_load_and_show_preview` | row → image + PV values + preview thread |
@@ -504,9 +504,9 @@ which are bound to this module itself.
   PVs and conditions, get the time regions of a day that satisfy them, then the frame
   nearest each region. `_make_mpl_toolbar` keeps the toolbar icons visible under the dark
   palette.
-- **sf_t**: PVs are added from a searchable archiver channel dropdown
-  (`_fetch_channel_list`, `_rank_pv_match`, `_tokens_in_order`); `IMG_MATCH_TOL_NS` bounds
-  how far a frame may sit from the matched shot; `EXTRA_COL_MATCH_TOL_S` is 30 s.
+- **sf_t**: PVs are picked in the Slider's own `PvConfigDialog` (`_open_pv_config`),
+  out of the shared registry; `IMG_MATCH_TOL_NS` bounds how far a frame may sit from
+  the matched shot; `EXTRA_COL_MATCH_TOL_S` is 30 s.
 
 ## CHANGES 2026-08-14 (Slider PV panel: latency + display honesty)
 Four separate causes behind one report ("energies lag ~1 s, throw `~`/`⟳` around,

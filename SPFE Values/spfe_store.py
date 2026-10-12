@@ -40,6 +40,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -51,6 +52,10 @@ from zoneinfo import ZoneInfo
 # Deliberately not imported from spfe_core: that module pulls in requests and
 # orjson, and the tests for this file must run on a bare interpreter.
 TZ_PRAGUE = ZoneInfo("Europe/Prague")
+
+# A stored day, as text. history_for compares these as strings, which is only
+# the same as comparing the dates when every one has exactly this shape.
+_ISO_DAY = re.compile(r"\d{4}-\d{2}-\d{2}$")
 
 
 def get_app_dir() -> Path:
@@ -546,15 +551,17 @@ def history_for(rows: list[dict], column: str, slot: str,
     two are genuinely different operating points -- comparing them would widen
     the spread until nothing ever looks wrong.
     """
+    # Compared as ISO text, not parsed: YYYY-MM-DD sorts like the date it is,
+    # and a strptime per skipped row made every table build walk the whole log
+    # through the slowest function in it.
+    cut = before.isoformat() if before is not None else None
     out: list[float] = []
     for r in reversed(rows):                    # newest first
         if r.get("slot") != slot:
             continue
-        if before is not None:
-            try:
-                if datetime.strptime(r.get("date", ""), "%Y-%m-%d").date() >= before:
-                    continue
-            except ValueError:
+        if cut is not None:
+            d = r.get("date", "")
+            if not (isinstance(d, str) and _ISO_DAY.match(d)) or d >= cut:
                 continue
         raw = r.get(column, "")
         if raw in ("", None):
@@ -1726,7 +1733,17 @@ class Store:
         # an edit being saved while a catch-up appends would drop the appended
         # record; the two must not overlap.
         self._io_lock = threading.RLock()
+        # The queue file of typed values has a lock of its own. The window
+        # writes it on the UI thread the moment a cell is committed; behind
+        # _io_lock it waited for whatever share or workbook write was running,
+        # and the window froze for seconds while somebody tabbed to the next
+        # cell.
+        self._pending_io = threading.Lock()
         self._deleted: set[str] | None = None       # tombstones, read once
+        # The campaign names as last read, so the window can show a day's name
+        # without reading the share on the UI thread. Filled by campaigns(),
+        # which only ever runs in background jobs once the share is known.
+        self._campaigns: dict | None = None
 
     def set_log(self, fn) -> None:
         self._log_fn = fn
@@ -1840,10 +1857,23 @@ class Store:
         if folder:
             entries = merge_day_map(
                 entries, read_json_map(folder / CAMPAIGNS_NAME, "days"))
+        self._campaigns = dict(entries)
         return entries
 
+    def campaigns_cached(self) -> dict:
+        """The campaign names as last read -- never touches the share.
+
+        Before anything has read them, the local copy alone: a small file on
+        this PC, so it is safe on the UI thread.
+        """
+        if self._campaigns is None:
+            self._campaigns = read_json_map(self.local_campaigns, "days")
+        return self._campaigns
+
     def campaign_for_day(self, day: date) -> tuple[str, bool]:
-        return campaign_for(self.campaigns(), day)
+        """For the window: from the cache, so stepping through days never
+        waits for the share."""
+        return campaign_for(self.campaigns_cached(), day)
 
     def set_campaign(self, day: date, name: str) -> SaveResult:
         """Name a day. An empty name is stored, not deleted -- that is how a
@@ -1860,6 +1890,7 @@ class Store:
                 res.problem = f"Could not save the campaign name: {exc}"
                 self._log(res.problem)
                 return res
+            self._campaigns = dict(entries)
 
             folder = self.share_folder
             if folder is None:
@@ -2163,42 +2194,49 @@ class Store:
     # three keep it queued until it lands, and are what makes closing the
     # program mid-save safe.
     def _remember_pending(self, edits: dict[str, dict[str, str]]) -> None:
-        try:
-            queued = read_json_map(self.local_pending, "edits")
-            for stamp, patch in edits.items():
-                queued.setdefault(stamp, {}).update(patch)
-            write_json_map(self.local_pending, "edits", queued)
-        except Exception:
-            pass
+        with self._pending_io:
+            try:
+                queued = read_json_map(self.local_pending, "edits")
+                for stamp, patch in edits.items():
+                    queued.setdefault(stamp, {}).update(patch)
+                write_json_map(self.local_pending, "edits", queued)
+            except Exception:
+                pass
 
     def _forget_pending(self, edits: dict[str, dict[str, str]]) -> None:
-        try:
-            queued = read_json_map(self.local_pending, "edits")
-            if not queued:
-                return
-            for stamp, patch in edits.items():
-                left = queued.get(stamp)
-                if left is None:
-                    continue
-                for column in patch:
-                    left.pop(column, None)
-                if not left:
-                    queued.pop(stamp, None)
-            write_json_map(self.local_pending, "edits", queued)
-        except Exception:
-            pass
+        """Drop what has landed. Only a column still holding the value that
+        was sent: the queue no longer waits for the share write, so a newer
+        value typed in the meantime may already stand in its place."""
+        with self._pending_io:
+            try:
+                queued = read_json_map(self.local_pending, "edits")
+                if not queued:
+                    return
+                for stamp, patch in edits.items():
+                    left = queued.get(stamp)
+                    if left is None:
+                        continue
+                    for column, value in patch.items():
+                        if left.get(column) == value:
+                            left.pop(column, None)
+                    if not left:
+                        queued.pop(stamp, None)
+                write_json_map(self.local_pending, "edits", queued)
+            except Exception:
+                pass
 
     def pending_edits(self) -> dict:
-        return read_json_map(self.local_pending, "edits")
+        with self._pending_io:
+            return read_json_map(self.local_pending, "edits")
 
     def queue_edits(self, edits: dict[str, dict[str, str]]) -> None:
         """Put edits on the queue before they are written anywhere.
 
         Called by the window the moment a cell is committed, so an edit
-        survives even a program that is closed a heartbeat later.
+        survives even a program that is closed a heartbeat later. Takes only
+        the queue's own lock: it must never wait for a share write.
         """
-        with self._io_lock:
-            self._remember_pending(edits)
+        self._remember_pending(edits)
 
     def sync(self) -> SaveResult:
         """Bring the share level with this PC. Used by Sync now and on start.
@@ -2272,6 +2310,7 @@ class Store:
                                 read_json_map(shared, "days"))
         if not entries:
             return
+        self._campaigns = dict(entries)
         for path in (self.local_campaigns, shared):
             try:
                 if read_json_map(path, "days") != entries:

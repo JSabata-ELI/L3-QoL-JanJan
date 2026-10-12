@@ -2,10 +2,11 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-09-23  (sp_t.py, daypicker.py)
+Verified against source: 2026-10-05
+  (sp_t.py 10414 lines, daypicker.py 1078)
 -----------------------------------------------------------------
-Short version: ReadMe_Spectra.txt  ("ReadMe" button)
-Code map:      STRUCTURE.md
+Short version: ReadMe_Spectra tab.txt  ("ReadMe" button)
+Code map:      STRUCTURE_Spectra_tab.md
 -----------------------------------------------------------------
 
 
@@ -18,11 +19,10 @@ By default that means the SPIDER spectrometer, but in practice any
 archived waveform can be used.
 
 It is not a program of its own. It is the second tab of CSS Logger,
-which is where you will find it, and it ships inside that build. The
-source file also runs on its own for development.
-
-There is deliberately no icon and no build setup in this folder for
-that reason.
+which is where you will find it, and it ships inside that build. Its
+files, these documents included, sit in the CSS Logger folder; it
+has no icon or build setup of its own. The source file also runs on
+its own for development.
 
 
 =================================================================
@@ -116,9 +116,9 @@ comparison — is a way of looking at those averages.
                          always be picked by hand.
 
     Under the calendar, From and To set which hours of the day are
-    loaded: 08:00 to 19:00 by default, or 08:00 to the next full hour
-    when the day is today. Only those hours are read from the archive,
-    so a day is no longer 24 hours of fetching.
+    loaded: 07:00 to 21:00 by default, or 07:00 to the next full hour
+    (at least 08:00) when the day is today. Only those hours are read
+    from the archive, so a day is no longer 24 hours of fetching.
 
     As soon as a second day is picked, a table appears below with one
     row per day, each with its own From and To. Changing the big
@@ -126,6 +126,15 @@ comparison — is a way of looking at those averages.
     hand; a row you did edit keeps what you gave it. So "Monday
     morning and Wednesday afternoon" is one selection, not two loads.
     Nothing takes effect until OK.
+
+    OPENING THE CALENDAR AGAIN brings back the days you loaded last
+    time, each with its own hours. From and To then show the window
+    most of those days share. A day that had hours of its own keeps
+    them, so a new From/To does not overwrite it; every other day
+    follows a new From/To. A day added now takes the restored From/To,
+    not the 07:00 to 21:00 default. Before, every restored day counted
+    as hand-edited, so a new From/To was ignored and the old hours were
+    loaded again.
 
     The stretches you picked are called windows in the rest of this
     document: one window per day.
@@ -243,6 +252,13 @@ comparison — is a way of looking at those averages.
     "+ Add PV..." for the full browser. The complete channel list is
     fetched once and then filtered locally, so typing is instant.
 
+    In the browser, click channels (Ctrl+click for several). Each one
+    you pick appears in the table under the list, headed "Name — click
+    a name to change it:", with its Name and Channel. The Name is the
+    label the signal will carry in the PV list; click it to type a
+    different one before "Add selected". An emptied name goes back to
+    the default.
+
     HOW THE SEARCH WORKS. Type words, separated by spaces (commas,
     semicolons and asterisks work as separators too). Every word has
     to appear somewhere in the channel name — so "l3 sbw4" finds a
@@ -359,6 +375,24 @@ comparison — is a way of looking at those averages.
     any channel in the archive, through the same search box as
     "+ Add PV..." — and "+ Add condition..." adds a line. Every ticked
     line has to hold at the same time.
+
+    CUSTOM PVs. The same search window also lists your custom PVs —
+    the formulas made with "Add custom" on the CSS Logger tab (for
+    example "Sum of Green [J] = F+H"). They are the "ƒ" rows at the
+    top of the list; with nothing typed in the search box all of them
+    are shown. "Add custom" in that window opens the very same editor
+    as on the CSS Logger tab, so a formula made in one place is in the
+    other too. A formula condition reads the PVs the formula is built
+    from at each shot and works out its value there. If a letter of
+    the formula has no PV behind it, the line says so in red and
+    filters nothing.
+
+    THE NAME. Under the channel list, "Name — click a name to change
+    it:" heads a table (Name / Channel) of the PVs you have picked and
+    the name each will carry — here on the condition's button. Click a
+    name to type a different one; an emptied name goes back to the
+    default. This is the same search window as every "+ Add PV…", so
+    the table is there too (see 3.5).
 
     A line you untick stays on the panel, set up and inert. That is
     deliberate: switching a condition off and on again should not mean
@@ -663,10 +697,10 @@ nothing to keep track of.
     says how many newer ones were left out. Painting a rejected shot
     red would defeat the filter, and dropping it silently would make a
     running laser look dead.
-  - RIGHT AFTER LIVE MODE IS SWITCHED ON a filter channel has not been polled yet.
-    Until its first read lands, the filter lets everything through and
-    the status line says "filter arming" — the alternative is a flash
-    of "nothing matched" at every start.
+  - RIGHT AFTER LIVE MODE IS SWITCHED ON a filter channel has not
+    been polled yet. Until its first read lands, the filter lets
+    everything through and the status line says "filter arming" —
+    the alternative is a flash of "nothing matched" at every start.
   - THE BUFFER IS NEVER EMPTIED by the filter. Switch it off and every
     shot is back.
 
@@ -678,26 +712,59 @@ nothing to keep track of.
 A spectrum needs two things: the intensity values, and the
 wavelengths they belong to. The archive does not always provide both.
 
-"Change..." in card 2 picks the intensity channel. Then:
+"Change" in card 3 picks the intensity channel. Then:
 
   - A channel whose name ends in _X or _Y is one half of a pair. The
-    wavelength axis is taken from the matching _X channel
-    automatically, and nothing more is asked.
+    X axis is taken from the matching _X channel automatically, and
+    nothing more is asked.
 
-  - Any other waveform usually has no _X twin. The program then asks
-    how to build the wavelength axis:
+  - Any other waveform usually has no _X twin. The program then opens
+    "X axis settings" and asks how to build the axis:
 
-      copy it from another channel
-      copy it from another channel and stretch it, as a straight-line
-        transform of the form  new = a x old + b
-      load it from a CSV or text file
+      copy it from another channel — the search box and the channel
+        list sit right under this choice; tick "Then apply a linear
+        transform" under the list to stretch it as
+        new = a x old + b
+      load it from a CSV or text file — the path and "Browse" sit
+        right under this choice
       use the plain sample number, 0, 1, 2, ... — honest about the
-        fact that there is no wavelength information
+        fact that there is no axis information
+
+    Only the boxes of the choice you picked are shown.
+
+"X axis settings" on card 3 opens the same window at any time, on the
+setting in force, so the axis can be changed without picking the
+spectrum channel again. When the channel has its own _X, that is
+offered there as the first choice. Live keeps running through the
+change: the collected shots stay, only the axis is read again, and
+From/To is fitted to it once more when "Auto-fit" is ticked.
+
+CHANGING THE CHANNEL ITSELF ("Change") WHILE LIVE IS RUNNING STOPS
+LIVE. The shots collected so far belong to the old channel, so they
+cannot simply be redrawn. The status line says "Spectrum PV changed
+to ... — live stopped."; switch "Live mode" on again to stream the new
+channel. Only the X axis change above keeps Live running.
+
+PICKING A NEW WINDOW WHILE LIVE restarts live on that window. Anything
+still on its way from the old window is thrown away, so no shot from
+the old window ever appears in the new one. Answering No to "This will
+take a while" leaves the running live session exactly as it was.
 
 Whatever is resolved is always shown under the card as the X and Y
 pair actually in use, so you can never be looking at a spectrum
 without knowing where its horizontal axis came from. The choice is
 remembered.
+
+ONE NUMBER PER SHOT IS NOT A SPECTRUM. Some channels hold a single
+value per shot — L3-SBDP-SPIDER:FWHM_FL, the Fourier-limited pulse
+duration, is one (checked on 30.9.2026: 60 shots in ten minutes, each
+one number, about 28 fs). The archive sends such a value as a list of
+one, and until 1.10.2026 the program took it for a spectrum of one
+point — which is drawn as nothing at all, so the graph stayed empty
+with no word of explanation, whatever X axis was chosen. Such a
+channel is now recognised: the status line and the graph say "...
+holds one number per shot, not a spectrum". To follow it over time,
+add it to the list in step 2 instead.
 
 A partly broken wavelength channel — one with gaps or nonsense in it
 — is repaired by fitting the good part and extending it, rather than
@@ -789,8 +856,9 @@ two panels read alike.
 The panel above it runs in the order you use it: "Live mode" and
 "Stop", then "Analyze" and "Export" (with "Average last N" beside them
 while live runs) and the progress bar under them, then the "Loading
-data" block holding the three numbered cards, then "Selected spectra"
-with everything you have marked, and the shot filter below it.
+data" block holding the three numbered cards, then the dark blue
+"Spectra" block with everything you have marked and a second
+"Analyze" right under the list, and the shot filter below it.
 
   Show                the four averaging methods from section 3.8,
                       or "Every spectrum" — no averaging, every
@@ -882,7 +950,7 @@ the room it needs is a fixed figure rather than a fraction of whatever
 is left.
 
 The divider between the two graphs is also left alone. Switching
-Switching live mode or hiding the search graph used to reset it to a built-in
+live mode or hiding the search graph used to reset it to a built-in
 ratio; now it comes back where you dragged it, and that position is
 remembered between sessions.
 
@@ -939,10 +1007,42 @@ One row per region. Each row has:
                   describing a tight family of curves or hiding two
                   different populations.
 
-The heading of the list carries the two buttons that act on the whole
-of it: "Expand all", which opens every region at once, and "Clear
-all", which empties the list. "Analyze" and "Export" are not here —
-they are at the very top of the panel (3.1).
+The list sits in its own dark blue block, "Spectra". Above the list
+are the two buttons that act on the whole of it: "Expand all", which
+opens every region at once, and "Clear all", which empties the list.
+Under the list is a second "Analyze", the same as the one at the very
+top of the panel (3.1) — it is there so that marking a region and
+analysing it does not mean scrolling back up. "Export" is only at the
+top.
+
+THE NAME OF A REGION. A region is named after what you searched by:
+the average, over the region's own stretch of time, of every signal
+ticked in step 2, each written with its Label from that list —
+
+    SBW4 energy [J] 20.1 · GDD (Order 2) 24780
+
+Values from 100 up are whole numbers, smaller ones keep three
+significant digits. A signal with no reading inside the stretch — a
+setting written once in the morning — counts with the last value
+before it, which is the value that was in force. The same name is
+printed inside the region's shaded block in the search graph (dark
+letters of the block's own colour on a white plate with a black rim,
+always horizontal: a name wider than its block gets one PV per line
+and may stick out past the block, and one that would cover a
+neighbour's name moves down below it), in this list (one PV per
+line), in the
+legend of the spectra graph and in the exported file. That is what
+ties a curve to the place it came from — "Spectrum 3" said nothing
+about which block it was. The title of the spectra graph names the
+spectrum PV the curves come from: "Averaged spectra of <PV> — Mean".
+
+The names follow the list in step 2: rename a Label, tick or untick a
+signal, and every name changes with it. Two regions that would read
+alike at three digits get more digits on the signal that really
+differs (26.72 and 26.68, not 26.7 twice). Only regions whose means
+agree even then get a number on the later one, "(2)". With nothing
+ticked, the regions fall back to "Spectrum 1", "Spectrum 2" ... A
+region kept from a day that is no longer loaded keeps the name it had.
 
 
 =================================================================

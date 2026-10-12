@@ -93,8 +93,8 @@ class PhotoRenamerWindow(QMainWindow):
             box = QMessageBox(self)
             box.setWindowTitle("Unsaved changes")
             box.setIcon(QMessageBox.Icon.Question)
-            box.setText("There are renames or deletions that have not been "
-                        "saved.\nClose anyway and throw them away?")
+            box.setText("There are renames, edits or deletions that have not "
+                        "been saved.\nClose anyway and throw them away?")
             box.setStyleSheet("QMessageBox { background: #f3f3f3; color: #111; }"
                               "QLabel { color: #111; }"
                               "QPushButton { padding: 5px 11px;"

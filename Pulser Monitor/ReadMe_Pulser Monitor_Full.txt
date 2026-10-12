@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (pulser_monitor.py, 6901 lines)
+Verified against source: 2026-10-05  (pulser_monitor.py, 7018 lines)
 -----------------------------------------------------------------
 Short version: ReadMe_Pulser Monitor.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -22,6 +22,11 @@ PySide6 GUI that scans the diode-array cameras over a chosen time window and rep
 | **Run Graph** | State of every pulser over real time — ON / OFF / no data, with warm-up, diodes-off and un-analysed stretches shaded across the full height. Outage starts are marked, the array's first and last full-power frame are labelled, each pulser's events are flagged on its own row, and hovering reads out the Prague time under the cursor (click to pin it) |
 
 Left panel: pick cameras, set the time window, edit the ROI boxes per camera, choose which time counts, tune detection, scan, export.
+
+- **Viewing camera:** — the drop-down above the tabs. After a scan it lists the scanned cameras and picks whose results the four tabs show.
+- **Heatmap:** — the drop-down under the Pulser Map. Picks what the cell colour means: `Status` (the default), `Dropouts`, `Faults`, `Trips`, `Caused trips`, `Total outages` or `Uptime %`.
+- **Set time window…** opens the *Time window* dialog: a calendar and an `Hour:` box under **Start point** and under **End point** (`Now` sets the end to the current day and hour). The end hour is taken to its last second, so 7 to 21 means 07:00:00-21:59:59.
+- **Scan** / **Stop** start and stop a scan. When the program runs on its own, a red **Stop Scan** button at the bottom right of the window does the same as **Stop**.
 
 Note the difference between the **time window** (which frames are read off the share) and **Analysed time** (which of them are judged). The window is what you ask for; the gate is what the laser was actually doing.
 
@@ -128,7 +133,7 @@ Judged **only while the array is running at full power**: never during warm-up, 
 | Term | Rule |
 |------|------|
 | **dropout** | Dark for no more than `Dropout up to` frames, then straight back. A flicker. Counted, never discarded — debouncing is off by default so single-frame flickers survive |
-| **fault** | Dark for longer, **the array kept running**, and it came back. "Not working as it should, but it does come back" |
+| **fault** | Dark for longer and **the array kept running**. Either it came back ("not working as it should, but it does come back"), or it was still dark when the window or the analysed time ended — a pulser nobody tried to restart stays a fault however long it is dark |
 | **trip** | Dark for longer and **the array went down within `Trip look-ahead` frames** of it going dark — this pulser took the array with it |
 | **dead** | Two routes, and only these two. Either it went dark and failed to light again across `Dead after (recoveries)` array recoveries — somebody tried to bring it back and it did not come — or it **never lit at all**: dark from the first judged frame and still dark after `Never lit, dead after` minutes of array-up time. A pulser that ran, went dark and then simply stayed dark while nobody ever restarted the array is a **fault**, however long it lasts: it was never asked to come back, so nothing was demonstrated about it |
 
@@ -169,7 +174,15 @@ Nothing about a pulser is judged **inside** a warm-up stretch. Warm-up must be f
 
 ### The ROI editor
 
-Opens on the bundled all-alive reference. Draw, move and resize boxes; `Load latest from share` fetches a current frame to compare against.
+Opened with **Edit <camera>…** in the left panel. Opens on the bundled all-alive reference. Draw, move and resize boxes; `Load latest from share` fetches a current frame to compare against, and `Load image…` opens any picture file to check the boxes against. Viewing an image never changes the stored reference levels.
+
+| Button | What it does |
+|--------|--------------|
+| `Name:` + `Rename` | Type a new name for the selected box and press Rename |
+| `Delete` | Removes the selected box (greyed until a box is selected) |
+| `Save configuration…` / `Load configuration…` | Write this camera's boxes and reference levels to a JSON file, or read them back |
+
+`Load configuration…` in the left panel, under the per-camera edit buttons, loads a saved file for all cameras at once and replaces the current boxes.
 
 Reference levels are only ever written by **`Capture reference...`**, which asks whether the loaded image is the all-alive or the warm-up reference. This is deliberate: the editor used to re-measure them from whatever image was on screen when OK was pressed, which quietly replaced the all-alive reference with a live frame, dead pulsers included. Boxes that were moved during the session are re-measured on OK, but only against a genuine reference.
 
@@ -202,6 +215,18 @@ Reference levels are only ever written by **`Capture reference...`**, which asks
 `Export all (folder)` writes, per camera: the full per-frame CSV (brightness, score and state per pulser, plus the frame's own state — `excluded` for a frame the gate left out), the event log, the trip log with its suspected cause, the warm-up windows, and PNGs of the map, run graph and statistics — plus one master CSV across all cameras and `pulser_analysed_time.csv`.
 
 That last file is what keeps the rest of the bundle readable months later: every other export is *per observed time*, and a trip log with two entries looks identical whether the window was watched throughout or two thirds of it was excluded. It records the window, the observed and excluded totals, which rules were applied, and every excluded span.
+
+Single exports, each for the camera picked in **Viewing camera:**. The buttons stay greyed, or answer "No data to export.", until a scan has run.
+
+| Button | Where | What it writes |
+|--------|-------|----------------|
+| `Export full CSV…` | left panel, Export | the per-frame CSV for this camera |
+| `Export map (PNG)…` | Pulser Map, under the map | a picture of the map as shown |
+| `Export dropouts (CSV)…` | Pulser Map, right side | the event list of the pulser you clicked ("Click a pulser first." otherwise) |
+| `Export stats (CSV)…` | Statistics | asks for a folder; writes the event log, the trip log and a PNG of the statistics |
+| `Export this camera CSV…` | All Data | the table for this camera |
+| `Export master CSV (all cameras)…` | All Data | the table for every scanned camera in one file |
+| `Export graph (PNG)…` | Run Graph | a picture of the run graph |
 
 ---
 

@@ -53,7 +53,13 @@ which one you are looking at:
       build output rather than as a deployed folder (see section 4).
 
 Selecting a source scans it and rebuilds the whole window. The active
-source is highlighted.
+source is highlighted. Everything else changes in place: moving a
+program to another group, opening or closing a group, a new version
+turning up, or acknowledging one only touches the cards involved —
+nothing is reloaded and the window does not flicker. The version list
+under the arrow button is read at the moment you open it, so it always
+shows what is on disk now. The mouse wheel only scrolls the program
+list, and only while the pointer is over the Launcher window.
 
 The two configurable paths are set with the gear button and stored
 per user, together with your acknowledged versions and any groups you
@@ -290,7 +296,9 @@ the list in the source.
       everybody writes into.
 
   Set paths (gear)
-      Your two office paths. Stored per user.
+      Your two office paths. Stored per user. The dialog says which
+      folder to pick for each; once a folder is chosen, that source is
+      selected and loaded straight away.
 
   Clean (broom)
       Two housekeeping checks, on demand:
@@ -306,8 +314,12 @@ the list in the source.
           and the plain name still wins in the version list;
         - programs left in a half-finished version swap — it offers
           to restore them.
-      Both checks also run by themselves shortly after every scan, so
-      the button is only needed when you want them immediately.
+      Every scan runs both checks in the background. When something is
+      found, the button gets an orange frame and a count ("Clean (3)")
+      and the status line says what it is. No window opens by itself —
+      a dialog that popped up after a scan used to take the keyboard
+      from whatever you were typing into. Click the button to see the
+      list and tidy up.
 
 
 =================================================================

@@ -87,7 +87,7 @@ FOOD_COMMANDS = ("/food", "/menu", "/lunch")
 POLL_FETCH_COUNT = 20
 
 # How long to wait for a launched app to report that it is tracking. A cold
-# start pays for importing PySide6, matplotlib and pandas off a cold file cache
+# start pays for importing PySide6 and matplotlib off a cold file cache
 # and can take the better part of a minute; the app answers as soon as it is up,
 # so this ceiling only decides when to stop hoping.
 READY_TIMEOUT_S = 240
@@ -268,9 +268,14 @@ def launch_diagnostic() -> "tuple[subprocess.Popen | None, str]":
     if why:
         print(f"[remote_launcher] {why}")
         return None, why
+    # A console python (the frozen fallback when no pythonw is on PATH) would
+    # open a console window beside the app; the app is windowed and needs none.
+    flags = 0
+    if runner.name.lower() != "pythonw.exe":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         p = subprocess.Popen([str(runner), str(script)],
-                             cwd=str(APP_DIR), env=env)
+                             cwd=str(APP_DIR), env=env, creationflags=flags)
         return p, f"source {script.name}"
     except OSError as e:
         print(f"[remote_launcher] cannot start {script}: {e}")
@@ -382,7 +387,7 @@ def _reload_okbase_settings(settings: dict) -> bool:
         disk.get("okbase_session_cookie") != before
 
 
-def _menu_upkeep(settings: dict, state: dict) -> None:
+def _menu_upkeep(settings: dict, state: dict, webex=None) -> None:
     """Keep the canteen sign-in alive, and read the menu once a day.
 
     This is why a pasted OKbase session does not have to be refilled by hand:
@@ -418,6 +423,22 @@ def _menu_upkeep(settings: dict, state: dict) -> None:
     today = datetime.now()
     due_fetch = (state.get("day") != today.date().isoformat()
                  and today.hour >= int(settings.get("okbase_refresh_hour", 6) or 0))
+
+    # The lunch reminder first — it has a deadline; the menu read waits a tick.
+    if (webex is not None
+            and state.get("lunch_day") != today.date().isoformat()
+            and okbase_menu.lunch_reminder_due(settings, today)):
+        out = {}
+        verdict, err = okbase_menu.check_lunch_today(settings, today, out)
+        _save_okbase_cookies(out.get("cookies", ""), settings)
+        _report_menu_state(state, not verdict, err)
+        if verdict:
+            state["lunch_day"] = today.date().isoformat()
+            okbase_menu.mark_lunch_reminded(today)
+            if verdict == okbase_menu.REMIND_SEND:
+                webex.post_text(okbase_menu.lunch_reminder_text(settings, today))
+            print(f"[remote_launcher] lunch check for today: {verdict}.")
+        return
 
     if due_fetch:
         out: dict = {}
@@ -526,6 +547,24 @@ def _fresh_cache(om, settings: dict) -> tuple[dict, str]:
     return om.load_cache(settings), err
 
 
+def _food_here(settings: dict) -> bool:
+    """False when the listen room has its "/food" box unticked (Settings →
+    Webex rooms). Same rule as the app's, so the two can never disagree."""
+    try:
+        import okbase_menu
+        return okbase_menu.food_in_listen_room(settings)
+    except Exception:  # noqa: BLE001 - an unreadable rule keeps the old behaviour
+        return True
+
+
+def _food_off_text() -> str:
+    try:
+        import okbase_menu
+        return okbase_menu.FOOD_OFF_HERE
+    except Exception:  # noqa: BLE001
+        return "🍽 `/food` is not available in this room."
+
+
 def _food_answer(args: str, settings: dict, email: str = "") -> str:
     """The /food reply, read from OKbase and falling back to the saved menu.
 
@@ -630,7 +669,7 @@ def main() -> None:
         try:
             # Its own try: a portal problem must never stop the listener from
             # answering /run, which is its real job.
-            _menu_upkeep(settings, menu_state)
+            _menu_upkeep(settings, menu_state, webex)
         except Exception as e:  # noqa: BLE001
             print(f"[remote_launcher] canteen upkeep error: {e}")
 
@@ -682,6 +721,9 @@ def main() -> None:
                 if is_food:
                     if is_app_running():
                         continue      # the app answers /food itself
+                    if not _food_here(settings):
+                        webex.post_text(_food_off_text())
+                        continue
                     # A sign-in pasted in a minute ago must not have to wait for
                     # the next keepalive before `/food refresh` can use it.
                     _reload_okbase_settings(settings)
@@ -741,7 +783,8 @@ def install_startup() -> None:
     ) % (lnk, target, arg, APP_DIR)
     try:
         lnk.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         print(f"[remote_launcher] autostart installed: {lnk}")
     except (OSError, subprocess.CalledProcessError) as e:
         print(f"[remote_launcher] could not install autostart: {e}")

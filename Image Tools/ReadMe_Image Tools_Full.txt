@@ -273,7 +273,7 @@ PVs
   - Click "PVs" to open the picker. It is the SAME picker the Image
     Slider has, over the same list of PVs: the presets, any archiver
     channel you search for or type in full, and your own formulas.
-    See "PV VALUES" under Image Slider for how it works.
+    See "PVs" under Image Slider for how it works.
   - What you add is shared with the Image Slider. What each tab
     remembers on its own is only WHICH of those PVs it shows.
   - The picked PVs are listed in the panel with their values for the
@@ -542,8 +542,8 @@ DISPLAY
     moves — the dark background stays where it is. It makes a dim frame
     readable and gives up the comparability above, so leave it off
     unless you need it.
-    The Binary and False Colors palettes always map per frame, whatever
-    this box says — that is how those two are meant to work.
+    Binary and False Colors are copies of the NI viewer's palettes: leave
+    this box off to see them as NI shows them.
   - Bri (Brightness, -255..+255, default 0): an offset added to every
     pixel — it lifts or darkens the whole frame, it does not spread it.
     Its Auto box sets THIS SLIDER for you too: the offset that puts the
@@ -575,6 +575,58 @@ TAB 2 — IMAGE SLIDER
 
 Browse and play back sequences of camera images frame by frame.
 Supports both offline (recorded) and online (live) modes.
+
+LAYOUT TABS
+  - The row of small tabs at the top of the Image Slider holds several
+    set-ups side by side (e.g. "Ghost tile", "Laser running"). Each tab
+    is a complete Image Slider: its own cameras, arrangement, time
+    window, live mode, settings and position.
+  - "+" (right after the last tab) adds a tab and opens the Time window
+    dialog in it. A new tab is named "Panel 1", "Panel 2", … (the first
+    free number); tabs still carrying the old automatic "Tab N" names are
+    renamed to Panel N on start, names you typed stay (05.10.2026).
+    × on a tab closes it; the last tab cannot be closed.
+    Double-click a tab's name to rename it (Enter or a click elsewhere
+    keeps the new name). Tabs can be dragged into another order.
+  - Only the tab on screen works. A hidden tab sleeps:
+      * no reads from the share, no drawing, no machine-value fetches,
+        no preview preload, no playback;
+      * in live mode it only notes the NAMES of new pictures as they
+        are written (the folder watch costs nothing while it waits);
+      * everything already loaded stays in memory.
+  - Clicking back to a tab carries on where it was left — the timeline
+    is never re-scanned:
+      * a live tab jumps at once to the newest pictures that arrived
+        while it slept, then one quick check of the folders picks up
+        anything the watch could not see (e.g. a new hour folder);
+      * a recorded tab is still on the same picture, with its preview
+        preload kept.
+  - Leaving the Image Slider for another of the main tabs puts the
+    current layout tab to sleep the same way.
+  - Memory: the preview preload can take up to 2 GB per tab. The tab
+    on screen and the one used just before it keep theirs; an older
+    hidden tab frees it and rebuilds it when opened again.
+  - F11 (focus mode) and Ctrl+F11 (watcher mode) act on the tab on
+    screen. Watcher mode also hides the layout tabs.
+  - Where the layout tabs are (05.10.2026): in the main tab row, right
+    after "Workshop" (a thin line separates them), with "+" after the
+    last one. They show only while the Image Slider is the main tab on
+    screen.
+  - Remembered on close (in %APPDATA%\ELI_ImageTools\slider_tabs.json):
+    the tab names and order, the tab that was open, and for each tab
+    its cameras, time window and the picture on screen. The camera
+    ARRANGEMENT comes back through the saved camera layouts as before.
+      * a live tab comes back live: this hour to the end of today;
+      * a recorded tab comes back on the same period and picture;
+      * a single folder opened by hand comes back as that folder;
+        pictures handed over by another tab (copied to a temporary
+        folder) do not come back — the tab returns empty.
+    A tab restored at start-up is only loaded the first time it is
+    opened, so tabs you do not look at cost nothing.
+  - "Send to Image Slider" from the Image Finder, the Shot Finder or
+    the Workshop always opens a NEW tab, named after the camera, the
+    folder or the moment. "Send moment" without cameras takes the
+    cameras of the tab that was open.
 
 LOADING IMAGES
   - Click "Settings" to open the time-window dialog: pick the day
@@ -638,11 +690,19 @@ LOADING IMAGES
     uses.
 
 PREVIEW PRELOAD
+  - The PRELOAD PREVIEW switch is in SOURCE, next to the Live mode
+    button: it is about where the frames come from — memory or the
+    share, one read per slider position — not about how a picture
+    looks, and it is the other half of the live/stored choice made on
+    that row.
   - With live mode off the whole loaded window is preloaded at low
     resolution in the background, so dragging the slider repaints
     from memory instead of reading the share frame by frame. The
     frame you stop on is then re-rendered at full resolution.
     Progress is shown next to the frame info and hides when done.
+  - Turn it off to keep all the share bandwidth for the frame you are
+    looking at; the slider then loads on demand and lags on stretches
+    it has not read yet.
   - A typical window (4 cameras, a few hours) is held completely, so
     every frame you drag across is shown. On much longer windows the
     preload samples evenly instead, and the sampling is visible: see
@@ -666,8 +726,15 @@ TIMESTAMP COLOURS (multi-camera tiles)
   time when a preloaded neighbour is being shown.
 
 PLAYBACK
-  - Scrub with the slider or use Play/Stop.
-  - The grey ◀ ▶ arrows move ONE IMAGE per click (← / → do the same).
+  - Scrub with the slider or use Play (triangle) / Stop (square). The
+    four buttons and the Speed box share one row; the buttons carry
+    drawn symbols only, hover one for its name.
+  - The time axis sits right under the slider(s) (06.10.2026): the
+    axis line first, its ticks hanging down, the hours under them and
+    the blue time of the frame on screen at the bottom, where it never
+    covers an hour.
+  - The two step buttons (triangle + bar) move ONE IMAGE per click
+    (← / → do the same).
     HOLD one down and it keeps going, faster the longer you hold it:
     two images a second for the first second, then three, then four,
     five from the third second, EIGHT from the fifth and TEN from the
@@ -687,13 +754,16 @@ PLAYBACK
     same playback speed.
   - Two play modes: discrete (frame-by-frame) or continuous
     (time-based interpolation).
-  - F11 — focus view: everything but the image is hidden, window
-    title bar included. The window is also cut down to the cameras
-    themselves: the space around and below the frames is not painted
-    at all, so you see through it and clicks there reach the program
-    behind. Drag any frame to move the focus window, drag the edge of
-    the camera block to resize it. Ctrl+F11 — watcher view:
-    edge-to-edge, for a wall display. ESC or the same key returns.
+  - F11 — focus view: every camera gets its own borderless window that
+    stays on top, and the main window goes down to the taskbar. Each
+    window is cut to its picture: the picture keeps the size it had,
+    and the grey band around it is taken away. Drag a picture to move
+    its window, drag the edge to resize it; when you let go, the
+    window is fitted to the picture again. The PV panel has a window
+    of its own and always stays above the camera windows, even right
+    after you click one. Ctrl+F11 — watcher view: edge-to-edge, for a
+    wall display; the PV panel stays above the cameras there too. ESC
+    or the same key returns.
 
 DISPLAY OPTIONS
   - WHICH CAMERAS A DISPLAY SETTING HITS (several cameras on screen):
@@ -719,19 +789,22 @@ DISPLAY OPTIONS
     camera is set to what you moved it to, so the "≠" goes away.
   - Color palette: Default, Grayscale, Gradient, Binary, False Colors,
     Rainbow, Hot, Black & White, Viridis, Plasma, Inferno, Jet, Turbo.
-    Binary and Rainbow are the NI Vision palettes of those names.
-    Binary was MEASURED against the real NI viewer (August 2026) and now
-    matches it: 15 colours — red, green, blue, yellow, magenta, cyan,
-    orange, rose, chartreuse, violet, azure, spring green, light red,
-    light green, light blue — repeating, with black below the first
-    band. One colour covers a fixed 1024 counts of the 16-bit scale, so
-    a colour boundary is always the same pixel value: the same colour
-    means the same intensity in every frame and on every camera, and you
-    can read a level off the picture. That also means Binary ignores
-    Brightness, Contrast and both Auto boxes — they are greyed out, the
-    same as on Default — because any stretch would move every pixel to a
-    different colour. A dim frame therefore shows only two or three
-    colours; that is not a fault, it is what a dim frame IS.
+    Binary, False Colors and Rainbow are the NI Vision palettes of those
+    names.
+    Binary was MEASURED against the real NI viewer (re-measured on 16
+    cameras in October 2026) and now matches it: 15 colours — red,
+    green, blue, yellow, magenta, cyan, orange, rose, chartreuse,
+    violet, azure, spring green, light red, light green, light blue —
+    repeating, black at 0 and white for a saturated pixel. The colour
+    changes every 16 camera counts (out of 4095), so the cycle repeats
+    17 times over the scale and a few counts of noise already change
+    the colour — the "confetti" look of the NI window. A colour boundary
+    is always the same pixel value: the same colour means the same
+    intensity in every frame and on every camera, and you can read a
+    level off the picture. That also means Binary ignores Brightness,
+    Contrast and both Auto boxes — they are greyed out, the same as on
+    Default — because any stretch would move every pixel to a different
+    colour.
     Because its colour changes with the value, Binary is also drawn
     without any smoothing: fitting the frame into the view picks whole
     pixels instead of averaging them, since the average of two cycle
@@ -739,9 +812,15 @@ DISPLAY OPTIONS
     into grey mush. Expect it to look grainy — that grain is the data.
     Rainbow goes blue to red with a wide green
     middle, black at 0 and white at 255.
-    False Colors is the dark blue → violet → pink → white ramp, crowded
-    at the bottom so faint detail keeps most of the range; it is spread
-    over the frame's own range, so it shows the signal even without Auto.
+    False Colors was MEASURED against the real NI viewer (October 2026)
+    and now matches it colour for colour: a whole spectrum from dark
+    magenta through blue, cyan, green, yellow and red to pink, with fine
+    lighter/darker contour bands (about 21 over the scale) that draw the
+    outline of a beam. The very bottom fades to dark, the top fades to
+    pale pink, a pixel at 0 is grey and a saturated pixel is white. Like
+    Binary it sits on the fixed 16-bit scale — the same colour is the
+    same intensity on every frame and camera — so it too ignores
+    Brightness, Contrast, Gamma and the Auto boxes (greyed out).
   - Brightness: additive offset, -255 to +255. Auto sets that same
     slider for you: the offset that puts the frame's dark background at
     0. It only shifts the picture, it never spreads it — on a dim frame
@@ -806,8 +885,9 @@ DISPLAY OPTIONS
     the difference statistics are shown next to it. The reference is
     named in a green "Ref:" strip under the camera name, and a
     warning appears if it no longer belongs to the loaded set.
-      · SET REF and REMOVE REF sit side by side under the checkbox.
-        Both act on the cameras selected at the moment you click,
+      · SET REF and REMOVE REF sit on the same row as the Subtraction
+        checkbox, so the switch and the thing it needs set are read
+        together. Both act on the cameras selected when you click,
         and offer to cover all of them when nothing is selected.
         Removing the reference leaves the Subtraction checkbox
         exactly as you set it; with no reference left, the panel says
@@ -851,6 +931,12 @@ DISPLAY OPTIONS
         checkbox included - jumped about 110 px up under the cursor.)
         They go away when the REFERENCE goes: Remove ref, a new
         reference, or a new scan.
+      · THE HISTOGRAM STAYS EVEN WHEN NOTHING DIFFERS. On the
+        reference frame itself the difference is zero everywhere, and
+        the picture is then drawn as an empty box with its 0-255 axis
+        rather than being taken away. Otherwise stepping off the
+        reference brought it back and the whole settings column slid
+        down by its height under the cursor.
       · The statistics say HOW MANY PIXELS ARE ABOVE THE BACKGROUND
         of the difference frame (the background being its darkest
         value, which on a difference is 0 and is printed only when it
@@ -956,12 +1042,20 @@ OVERLAYS
     alike; a circle and a box also show their white grab points, which
     are what you pull to resize them. "Remove selected" still takes every
     mark off at once.
+    Switching Draw on picks out the last mark of that shape on the camera
+    being drawn on, and Delete then really removes it. Corrected
+    02.10.2026: switching Draw off and on again left the last mark LOOKING
+    picked out while Delete did nothing — the Draw button had taken the
+    keyboard away from the picture.
   - Ticking a box no longer draws anything by itself — the picture stays
     as it is until you place a mark. It used to put a cross in the middle
     of the image, which also meant a save wrote an extra "annotated" file
     that was identical to the original.
+  - NO CAMERA MARKED. Draw is switched on for every camera, but
+    nothing appears until you click a picture: the mark is drawn on
+    that one camera, at the spot you clicked, and on no other.
   - SEVERAL CAMERAS AT ONCE. The Draw and Cal buttons work on the
-    cameras you have marked — on all of them if you have marked none.
+    cameras you have marked.
     Draw and one click puts the same mark on every marked camera at the
     same place in the picture: click the middle of one camera and it
     lands in the middle of the others too, whatever size their pictures
@@ -973,15 +1067,44 @@ OVERLAYS
     cannot find the shape on some of them, it names those cameras in one
     message. Marking a camera is done on its name bar; while Draw is
     switched on a click on the picture draws instead of marking.
-  - Overlay settings: configure size, opacity, and limits.
+  - TURNING A MARK. The picked-out mark has a knob above it — a white
+    disc with a dark turning arrow, on a stalk that starts at the edge
+    of the mark (it used to start at the centre and ran over a cross's
+    upper arm).
+    Drag it round to turn the mark about its centre; hold Shift for
+    steps of 15°. Crosses, circles (ellipses) and boxes all turn;
+    moving or resizing a turned mark keeps its angle, and a turned box
+    is resized along its own turned edges. The angle travels with the
+    mark to the other marked cameras and into every saved picture.
+  - "⚙ Overlay settings" (each shape has its own rows):
+      color, thickness (and the cross's size);
+      outline — "On", its colour (black by default) and width in px
+      on EACH side of the line. It is a rim under the line, so the
+      mark stays visible on a blown-out beam and on a black field. On
+      by default, 1 px. Drawn on screen and in every saved picture;
+      on a large saved frame it grows with the line;
+      angle — a list ("All crosses", "Cross 1", "Cross 2", …) picks
+      which mark turns, the box beside it gives the angle in degrees,
+      counter-clockwise. The marks turn while you type; Cancel puts
+      them back. While this window is open every mark on the pictures
+      carries a small white number tag — the same 1, 2, … as in these
+      lists — so you can see which mark "Cross 2" is.
+    "All marks angle" turns every cross, circle and box at once. The
+    turns act on the cameras the overlay controls act on, or on every
+    camera with "Apply to all cameras" ticked. Colours, thicknesses
+    and outline are REMEMBERED between runs, and a camera opened for
+    the first time draws its marks in that remembered look.
+  - Overlay settings for the PV panel: configure size, opacity, and
+    limits.
   - Overlays can be burned into exported images ("Save with overlay").
     With it ticked, the PV values are added as a white bar under the
     picture. Two things decide what appears there: the tick box itself,
     and the eye column in the PV values list — a PV switched to the
     crossed-out eye is left out. The bar goes into the extra file whose
     name ends with "_annotated", not into the file you name in the save
-    dialog. A value the archiver cannot deliver is written out as a
-    marker ("ERR" / "n/a"), so the bar is never quietly left off; if the
+    dialog. A value the archiver cannot deliver gets the same coloured
+    dot as on screen (red = not published yet, grey = no value, orange
+    = an earlier shot's number), so the bar is never quietly left off; if the
     bar itself cannot be drawn, the "Saved" box says so and the reason
     is written to image_tools_diag.log.
   - PDxM1 / PDxM2 diode cameras have a configurable measuring grid:
@@ -998,6 +1121,39 @@ OVERLAYS
   - Right-clicking a picture opens settings ONLY on those cameras: the
     diodes and PCW3_NF. Elsewhere there is nothing to set, so nothing
     opens. Right-click and DRAG still zooms on every camera.
+  - MIDDLE-CLICK a picture and that camera shows the whole frame
+    again. It undoes the zoom on the camera you clicked and on no
+    other one, whether that camera is selected or not — the "Reset
+    zoom" button still works on the selected ones together. A middle
+    click on a camera that is not zoomed does nothing, so it never
+    reloads a picture for no reason.
+  - MARKS STAY ON THE PICTURE WHEN YOU ZOOM (05.10.2026). A cross,
+    circle or box is stored as a place on the whole frame, not on
+    the screen: zoom in and it stays on the same sensor pixels and
+    grows with the picture; its shape is kept whatever shape the zoom
+    box had (a circle stays round, a square stays square); zoom out
+    or middle-click and it is exactly as drawn. A mark drawn while
+    zoomed lands on the pixel you clicked, and a click-made circle or
+    box gets the usual size on SCREEN. A saved picture — always the
+    whole frame — gets the mark where it was drawn. Before, a mark
+    kept its place on the screen, so zooming slid it off the beam and
+    stretched it with the zoom box.
+  - THE COUNTER at the top of INFO. One camera: frame on screen /
+    frames loaded. Several cameras: "12 / 340 merged · 1020 in total":
+      · merged = SHOTS. Frames of different cameras whose times fall
+        together are one shot — within half of the fastest camera's
+        usual frame gap, never more than 2 s — and two frames of
+        the same camera are never one shot. 12 is the shot on screen.
+      · in total = every frame of every camera loaded.
+    Before, the second number was the count of distinct time stamps,
+    so a shot the cameras stamped a few ms apart counted several
+    times. Corrected 05.10.2026: the cap was 0.5 s, but the cameras
+    stamp one shot up to 0.68 s apart (measured on 05.10, 8 cameras,
+    one frame per 5 s), so ~100 of 1084 shots were counted twice.
+  - Units: a unit typed as mm^2, cm^-1, fs^3 is SHOWN as mm², cm⁻¹,
+    fs³ — in the PV values list, the panel on the picture, the
+    graphs and the Shot Finder. The Unit box itself keeps showing
+    what you typed.
 
 MULTI-CAMERA LAYOUT
   - The arrangement is made in the "Camera" window, in the Layout
@@ -1139,25 +1295,185 @@ POINTING ANALYSIS
     there when you come back to it.
   - A camera with no frames inside the Set From / Set To range is
     skipped and named in the status line under the buttons.
-  - Fits a Gaussian to each frame to extract beam centroid (cx, cy)
-    and beam waist (w0 x h0).
-  - Thr: % of the peak a pixel must reach to count towards the
-    centroid. Default 90 % — the bright core only. Lower it if the
-    beam gets cut off, raise it if noise pulls the centroid.
+  - How the position is found, per frame: the background (median of
+    the four corners) is taken off, every pixel below Thr is ignored,
+    and the brightness-weighted centre of what is left is the beam
+    position, measured on the sensor (the centre of a 2048 px sensor
+    is pixel 1023.5). The graph shows every shot relative to the FIRST
+    (earliest) shot of the run: that one sits at 0, 0 and the dashed
+    lines cross there, so the cloud is the drift of the pointing, not
+    where the beam happens to sit on the chip. Changed 02.10.2026 —
+    the graph used to be relative to the sensor centre. "First" means
+    the first point still in the graph: delete it (Delete mode) and
+    the next one in time becomes 0, 0, every other point is measured
+    from it, and a zoom you set moves with it so the view stays on the
+    same points; Undo / Restore All bring the old zero back. σX / σY
+    do not depend on where the zero is. Before 05.10.2026 the zero
+    stayed on the deleted point. A small
+    copy of the frame is used only to FIND the beam; the position is
+    measured on the full-resolution pixels around it. Checked against
+    synthetic spots: correct to a few hundredths of a pixel (up to
+    ~0.2 px for a spot only 4 px wide, where the threshold edge itself
+    moves it).
+    Corrected 01.10.2026: every point used to sit half a pixel (up to
+    2 px on a large sensor) up and to the left, measuring on the small
+    copy cost about a quarter of a pixel, Thr 0 % gave no result at
+    all, and the status line promised a different number of analysed
+    frames than were analysed.
+  - While it runs, a progress bar under the buttons shows how far the
+    whole run has got (with several cameras: "Camera 2/4 · name").
+    Above ~6000 frames every n-th frame is analysed; hover the bar to
+    see which.
+  - Method (06.10.2026), remembered, each with its own Thr:
+      · Peak core — this program's own measurement, described below.
+      · Full-frame centroid (named "Kuba (MATLAB)" until 06.10.2026) —
+        the script pointing_stability_from_batch_of_files.m exactly: background = the brightest pixel of the
+        frame's first column, taken off the whole frame; every pixel
+        at or below Thr (in counts, default 100) set to 0; the rest
+        weighed with its FULL value over the whole frame. Zero of the
+        graph = the MEAN shot, as in plotting.m. The only thing
+        added: a frame with no beam gives no point (the script's
+        arithmetic puts such a frame hundreds of pixels off). Checked on
+        the C310 frames of 3 Sep 2026, 9–12 h: the same 1225 centroids as
+        the script's file to 0.00002 px, σX 1.938 µrad, σY 2.209 µrad.
+        Peak core gives σX 1.98, σY 2.17 µrad on the same frames.
+      Hovering a method in the list shows a one-line summary of it.
+  - Thr (Peak core): % of the peak a pixel must reach to count towards
+    the centroid. Default 90 % — the bright core only. Lower it if the
+    beam gets cut off, raise it if noise pulls the centroid. 0 % =
+    every pixel counts.
+  - How a frame is measured by Peak core (more exact since 05.10.2026):
+      · background and its noise from the four corners;
+      · a lone hot pixel or cosmic-ray hit (brighter than 3× every
+        pixel round it) is ignored, so it can neither win the peak
+        nor pull the centre;
+      · the beam window is the patch CONNECTED to the peak, not every
+        bright pixel anywhere on the frame;
+      · each pixel weighs by how far it stands ABOVE the threshold —
+        the old hard cut moved a small spot up to 0.2 px depending on
+        which edge pixels made it over the threshold (now under 0.05);
+      · the centre is then measured again on a window centred on the
+        first answer (±6σ of the spot, as ISO 11146), until it stops
+        moving. At 0 % the negative noise is kept too: clipping it
+        pulled a noisy frame tens of pixels towards the middle.
+  - EMPTY FRAMES are left out: a frame whose brightest spot is less
+    than 8× the corner noise above the background, or is a speck
+    rather than a spot, gives no point; so does a frame whose beam
+    is under 10 % of the run's typical beam (a glow, no shot). The
+    status line adds "N empty frames left out" and "N saturated" (the
+    beam hit 255 / 65535).
+  - ZERO = THE MEDIAN (05.10.2026): 0, 0 on the graph is the median X
+    and the median Y of all shots kept — where the beam sits most of
+    the time — not the first shot (the mean with Full-frame centroid).
+    Deleting points moves it; Undo and Restore All move it back.
+  - Optics button (05.10.2026): opens a window (it does not block the
+    rest of the program) with the camera type, a field for every term
+    and the equations, each with what one pixel comes to with the
+    numbers typed. Set PER CAMERA and remembered.
+      · Far field — the chip sits in the focus of the lens in front of
+        it (the C310). A spot on the chip is the focus of the beam, not
+        an image of it, so its shift is an ANGLE in disguise; the beam's
+        size does not show up there at all:
+            x [mm]   = px · pixel          (shift on the chip)
+            θ [µrad] = x · M / f            (angle at the experiment)
+      · Near field — the chip sees an image of the beam, M times its
+        size at the experiment (05.10.2026):
+            x [mm]   = px · pixel / M      (real shift at the experiment)
+        µrad is greyed out in Unit (an image has no pointing angle; the
+        graph moves to mm if it was on µrad) and f is hidden.
+    Pixel = sensor pixel size in µm, f = focal length of the lens in
+    front of the camera in mm, M = magnification from the measuring
+    point to the experiment, typed as a fraction (1/66) or a number
+    (0.01515). A camera never set up gets far field, 4.5 µm, 1/66 and
+    300 mm — the C310 values; "C310 defaults" puts them back. The window
+    shows the camera whose graph is on screen; a change redraws the
+    mm / µrad graph at once, nothing is measured again.
+  - Unit: px, mm or µrad. mm = px × Pixel for a far-field camera (the
+    shift on the chip, 0.0045 mm per pixel with the C310 values), px ×
+    Pixel ÷ M for a near-field one. µrad = mm × M ÷ f
+    (0.227 µrad per pixel). The Unit and Optics tooltips show the
+    current numbers. mm and µrad count Y UPWARDS (in px, Y grows
+    downwards like the picture).
+    Switching redraws the graph, the σ values and the axis labels
+    without measuring again, and keeps the zoom on the same part of
+    the cloud. The choice is remembered.
+  - View (05.10.2026), remembered:
+      · X–Y by time — the scatter + histograms (with Show Path beside
+        it), each point coloured by when it was measured, with the time
+        colour bar beside it (see below). The plain one-colour "X–Y"
+        view was removed on 06.10.2026; a remembered "X–Y" opens as
+        this one.
+      · X-Y drift (called "X, Y over shots" until 06.10.2026) — the X
+        deviation above and the Y deviation
+        below, against the shot number, with σ and the time span. Both
+        graphs have their own shot axis. Pale line = every shot; dark
+        line = the trend, a running median over ~5 % of the shots — a
+        slow drift is much smaller than the shot-to-shot noise and
+        only shows in the trend. Between the two graphs runs the SHOT
+        SLIDER (06.10.2026): a strip in the time colours, first shot
+        left, last right. Drag its round knob: the time and shot
+        number are shown beside it, a line runs through both graphs at
+        that shot, the X and the Y point are ringed, and the image
+        viewer follows to that frame. Moving through the frames in the
+        viewer moves the knob too. The strip is coloured by TIME but
+        laid out by SHOT, so a pause in the shooting shows as a step in
+        colour; a thin black line on the strip marks each such pause
+        (a gap over 5× the usual one and over 1.5 % of the run).
+      · 3D — X and Y across, shot number up, coloured by time. Drag to
+        turn it, right-drag to zoom; the time colour bar and its
+        slider work as on the beam path (a redraw keeps the turn).
+    Points can be clicked and deleted only in X–Y by time; the others
+    show the points that are left.
+  - Time colours (06.10.2026): every time colour — the points, the beam
+    path, 3D, the colour bars and the shot slider — runs as a rainbow,
+    dark blue (first shots) → cyan → green → yellow → dark red (last).
+    The old blue → grey-white → red faded into the white plot halfway.
   - Results shown as scatter + histogram panel with zoom/pan.
-  - Click any point in the scatter plot to jump to that frame.
-  - Show Path draws the beam trajectory coloured by time (blue =
-    start, red = end) with a colour bar beside it.
-  - The colour bar has a draggable time cursor: drag the white dot
-    along the bar and a green dot walks the beam path to where the
-    beam was at that moment, the time (HH:MM) is shown next to the
-    bar, and the image viewer follows to the matching frame. The
-    cursor snaps to real shots, so it never lands in a gap between
-    measurements.
+  - Click any point — in the scatter plot or on the beam path — to
+    open that frame. The point of the frame on screen is ringed in
+    red (with a dark rim, so it shows on the red points too) — on the
+    cloud and on the beam path / 3D points alike — also when you move
+    with the slider or the arrows. It is the only marker of the shot
+    on screen (the green dot is gone, 06.10.2026). The ring was made
+    smaller and thinner the same day, so it no longer hides the points
+    round it.
+    Corrected 01.10.2026: any step with the slider or the arrows used
+    to HIDE every point later than the frame on screen, so after one
+    step most of the cloud — and everything a click could hit — was
+    gone. Only Replay hides points now.
+  - Wheel zooms the plot under the cursor — the cloud OR the beam
+    path, each on its own; middle-drag pans it; double-click shows
+    all of it again. A zoom survives deleting points and Replay.
+  - "✕ Close graph" only hides the graph: the button then reads
+    "Open graph" and brings back the same graph, deleted points and
+    zoom included. The results are thrown away when you open OTHER
+    cameras (a camera that is still loaded keeps its graph), or
+    replaced by the next Run Analysis.
+  - With the graph open the cameras get about half the width, and
+    their tiles are arranged anew for it, so each camera's name and
+    time sit straight above its picture. With one camera the name and
+    time strip sits at the very top of the camera area, in the grey,
+    never on the picture (06.10.2026). Corrected 06.10.2026: the
+    arrangement for the full width was reused (tall thin tiles, the
+    picture far below its name).
+  - Show Path draws the beam trajectory coloured by time (dark blue =
+    start, dark red = end) with a colour bar beside it.
+  - The time colour bar (beam path, X–Y by time, 3D; 05.10.2026): on
+    its right 5 or 7 real times from the first shot (bottom) to the
+    last (top), HH:MM (HH:MM:SS for a run under 10 minutes); the date
+    is written above the bar. Drag the round knob ON the bar (a dark
+    triangle beside it until 06.10.2026 — it looked like a fixed
+    marker): the exact time (HH:MM:SS) is shown left of it, the
+    red ring jumps to that shot on the cloud and on the path / the 3D
+    points, and the image viewer follows to the matching frame; when
+    the viewer moves, the knob follows it. The cursor
+    snaps to real shots, so it never lands in a gap between
+    measurements. The graph is laid out so neither the knob's time
+    nor the tick labels ever sit on it, at any width.
   - If the analysis spans more than one day, a line crosses the
-    colour bar at every midnight and the date (MM-DD) is written next
-    to each day's part of the bar — the HH:MM readout alone would not
-    say which day it is.
+    colour bar at every midnight, the tick labels carry the day
+    (MM-DD HH:MM) wherever the day changes, and the knob's readout
+    adds the day on its own line.
   - Delete mode: click a point to delete just that one, or drag a
     rectangle to delete everything inside it. While it is switched on
     the button is red. Undo delete (or Ctrl+Z over the graph) takes
@@ -1174,6 +1490,41 @@ POINTING ANALYSIS
 SAVING
   - Save Image: current frame.
   - Save Range: all frames between Set From / Set To marks.
+  - Save Layout (several cameras only): every camera, placed as on
+    screen, in ONE PNG — the tiles as on screen (grey frame, dark grey
+    inside, the camera's name, timestamp and refresh dot above its
+    picture), the pictures with their marks (each camera in its own
+    mark style), and — with "PV overlay" ticked next to the button —
+    the PV values panel where it floats. A selected camera is saved
+    with the ordinary grey frame, not the blue selection frame. The
+    tick is remembered. The page is cut
+    to the area the tiles cover, with the grid's own dark grey between them, and drawn
+    larger than the screen when the frames have the pixels for it (up
+    to 4×, at most ~60 megapixels, never smaller than the screen). A
+    zoomed camera shows its zoomed part. Suggested name:
+    layout_<Prague date_time>.png.
+  - What "Save with overlay" and "Save original (unmodified)" do:
+      "Save with overlay" puts the PV values in, as a bar under the
+      picture. Drawn marks go in whenever they are shown, ticked or
+      not.
+      Whenever anything is burned in, Save Image writes TWO files: an
+      exact copy of the original under the name you chose, and
+      <name>_annotated.png with the marks / values. Both boxes ticked
+      = these two files.
+      "Save original" only matters with the Default palette and
+      nothing to burn in: ticked, a plain copy of the original is
+      saved; unticked, the save is skipped because the copy would be
+      identical. It has no effect on Save Range or the several-camera
+      saves.
+      Corrected 01.10.2026: a .png frame with marks but no PV values
+      gave the marked copy the SAME name as the original, so it
+      silently replaced it. It is now always <name>_annotated.png.
+  - After every save (Save Image, Save Range, Save Layout, ± frames,
+    the pointing plot, and the Image Finder / Shot Finder saves) the
+    "Saved" message has "Open" beside "OK". One file: Open opens it.
+    Several: a list of the saved files sits above the buttons, Open
+    opens the one picked (the message stays, so you can open more),
+    and "Open folder" shows the folder.
   - ±N frames: include N frames before and after each saved frame.
   - Optional: save metadata sidecar .txt file (PNG tEXt chunks).
   - The save dialog opens in a LOCAL folder the first time, then
@@ -1188,19 +1539,33 @@ TIMESTAMPS
   - Save Timestamp stores the current frame time.
   - Go to Saved jumps to the nearest matching frame in the current
     camera (useful for syncing across camera folders).
-  - "◀ 📌 Pin" / "📌 Pin ▶" (or Alt+← / Alt+→) step to the previous /
-    next SAVED TIMESTAMP, in time order. These are the amber buttons in
-    the Timestamps group — not the grey ◀ ▶ arrows in Playback, which
-    move ONE IMAGE at a time.
+  - The two amber "Pin" buttons, side by side ahead of Save Timestamp
+    (or Alt+← / Alt+→), step to the previous / next SAVED TIMESTAMP, in
+    time order. They carry an arrow and a red push-pin (the same pin as
+    on Save Timestamp; 05.10.2026 it replaced a map marker, which said
+    "map", not "picture") — not to be confused with the
+    grey step buttons (triangle + bar) in the playback row, which move
+    ONE IMAGE at a time.
     Stepping is relative to where the timeline currently sits, so it
     still works after scrubbing or playback, and it does not wrap around
     at the first/last pin (the status line says when you are there).
     The status line shows "📌 2/5", the frame it landed on, and the
     residual Δt to the saved moment.
 
-PV VALUES
-  - "Configure" opens the PV picker. It is one dialog for this tab
-    and for the Image Finder, over one list of PVs.
+PVs
+  - The group holds two buttons on one row: "Configure PVs" and
+    "Overlay settings". The "Refresh" button that used to sit beside
+    Configure is gone — the panel already asks the archiver again by
+    itself whenever a number is missing, and every minute even when
+    nothing has changed, so the button only repeated what was
+    happening anyway.
+  - "Configure PVs" opens the PV picker. It is one dialog for this
+    tab, for the Image Finder and for the Shot Finder, over one list
+    of PVs — a PV you add or rename in any of the three is the same
+    PV in the other two. The Shot Finder gets it without the Min and
+    Max columns and without "What it is": it judges a PV against the
+    value and tolerance typed on its own row, and every PV it can
+    read is an archiver channel.
   - THE PICKER READS AS TWO TABLES, ruled like a table with the
     column names once at the top of each: "On the picture" and
     "Read, not on the picture". A PV being in the list at all is what makes it
@@ -1294,8 +1659,43 @@ PV VALUES
     stays listed in the table with its number — hiding is about the
     picture, not about the reading. The burn-in follows the eye, so a
     saved file shows what the screen showed.
-  - The selection, the added PVs, their names, the formulas and the
-    eye state survive a restart
+  - SHOT COUNTER — the last row of the PV table, always there, and
+    shown on the PV panel over the picture (its eye works like a PV's).
+    In live mode it counts shots (rewritten 06.10.2026). It keeps
+    counting while another tab is open — another Slider layout tab,
+    Image Finder, Shot Finder or Workshop — and is the only thing a
+    hidden Image Slider tab still does: the pictures that arrive in the
+    meantime are counted, also across the change to a new hour folder.
+    A shot is a moment, not a file:
+      · The laser energy readings (PTM1, SBW4) decide. Each reading is
+        a laser pulse, and how often they come is the shot rate.
+      · An open camera adds a shot only where the energy readings have
+        a gap of whole missing shots (the archive drops one now and
+        then), exactly on the beat of that gap.
+      · A camera that takes pictures faster than the shots (3.3 Hz or
+        10 Hz beside 0.2 Hz shots), or keeps taking pictures after the
+        laser has stopped (several cameras do, at the same 5 s), adds
+        nothing — whichever camera is on screen.
+      · When the energies cannot be read at all, the cameras decide:
+        the shot rate is the one most cameras repeat at, and a moment
+        is a shot when at least half of the cameras on that rate saw it
+        (one camera alone: each of its pictures).
+    Checked against a real half hour (06.10.2026 12:30–13:00, 13
+    cameras): 176 of 176 shots, whichever camera was on screen.
+    Every camera writes its files with its own small delay; the counter
+    learns it, so two cameras seeing one shot never count it twice. A
+    late picture still belongs to its own shot.
+    Changing the camera on screen (310 → 312), reloading, Auto-follow
+    or the next day keep the number — it only goes up with a new shot.
+    When no shot comes for X seconds, the count starts again from zero,
+    but the panel keeps showing the old number until the next shot,
+    which then reads 1. Double-click the row to set X (10 s to start
+    with).
+    "⚙ Configure PVs" shows it in a table of its own, "Shot counter",
+    under the PV tables: Show, its Displayed name, and "Start again
+    from 1 after" (X). It cannot be removed.
+  - The selection, the added PVs, their names, the formulas, the
+    eye state and the shot counter's X survive a restart
     (%APPDATA%\ELI_ImageTools\slider_ui_state.json).
   - Values update in real time alongside image playback. A frame
     change refreshes the panel immediately; changes arriving faster
@@ -1319,7 +1719,7 @@ PV VALUES
     number: a new file is noticed within half a second and then takes
     a share read (0.13-0.16 s) to appear.
   - THE PANEL WAITS FOR THE ARCHIVER. When a value for the frame is
-    not published yet the panel says so ("no data yet") and keeps
+    not published yet the panel says so (a red dot) and keeps
     asking until it lands, which normally takes one or two retries;
     it gives up after 20 s, when "nothing was archived for this
     frame" is the true answer. While the answer is still expected —
@@ -1329,8 +1729,8 @@ PV VALUES
     became readable and the number appeared about 0.7 s later than it
     had to, on every single shot. Measured: 0.8 s before, 0.02 s
     after, for about half an extra request per shot.
-    Until then it goes on showing the last number it did read, and
-    labels it with how far back that shot was — "12.3 J (-28 s)".
+    Until then it goes on showing the last number it did read, with
+    the dot; the PV table's tooltip says how far back that shot was.
     Before this, that older number was shown with a quiet "(old)"
     and nothing ever re-asked, so with one frame per shot the panel
     stayed ONE SHOT BEHIND the picture for as long as you kept
@@ -1338,11 +1738,11 @@ PV VALUES
   - FASTER THAN ~1 SHOT/S the newest frame is always younger than
     that delay, so the panel deliberately steps back to the newest
     shot the archiver HAS published and shows THAT shot's real
-    numbers, labelled with the gap — "12.3 J (-0.6 s)". The numbers
+    numbers, with the orange dot (the gap is in the tooltip). The numbers
     skip a shot or two; the IMAGES never do. It only reaches 3 s
     back (the scale of the publication delay), so a value from a
     quiet stretch or an earlier run is never dragged in: those
-    frames wait and then read "n/a".
+    frames wait and then get the grey dot (no value).
   - IT KEEPS READING ALL DAY. The panel only ever has one archiver
     request open at a time. If that one request never came back
     (a connection that died quietly, the archiver going away for a
@@ -1400,54 +1800,47 @@ PV VALUES
   - A PICTURE BETWEEN TWO SHOTS still has no reading of its own — a
     camera free-running at 3.3 or 10 pictures a second while the
     laser fires every 5 s stores forty pictures per shot. Those show
-    the nearest reading greyed and labelled, "(-1.5 s)" or "(+4.1 s)"
-    — the sign says whether it was taken before or after the picture
-    — with the exact moment in the tooltip; and "n/a" when even that
-    is too far, with the reason in the tooltip too.
-  - How to read a value (side panel):
-      12.3 J          the shot's own archived value.
+    the nearest reading with the orange dot — the tooltip gives the
+    exact moment and whether it was taken before or after the picture;
+    and the grey dot when even that is too far, with the reason in
+    the tooltip too.
+  - HOW TO READ A VALUE — A DOT, NOT WORDS (05.10.2026). The panel over
+    the picture, the PV table in the side panel and a burned-in bar
+    show the number and, next to it, a coloured dot for its state:
+      12.3 J          (no dot) the shot's own archived value.
       ~12.3 J         approximate. Only the waveplate uses this now:
                       the motor was caught mid-move and the position
                       was snapped onto its 1000-count grid.
-      12.3 J (-0.6 s) this frame has no reading of its own, so the
-      12.3 J (-28 s)  nearest one is shown — the number in brackets
-      12.3 J (+4.1 s) is how far away it was taken, minus for before
-                      the picture and plus for after. Greyed; the
-                      tooltip names its exact time.
-      12.3 J          the same, when the age of the older reading is
-        (older shot)  not known (e.g. right after a restart).
-      no data yet     the archiver has not published this frame yet
-                      and the PV has no earlier value to show. It
-                      fills in by itself.
-      n/a             nothing archived near this frame at all — not
-                      within 0.3 s, and not within the wider reach
-                      described above either. The tooltip says how
-                      far the nearest reading is, so "n/a" can be
-                      told from a program that is not reading.
-      ERR             the archiver request failed; the next refresh
-                      retries it.
-      ...             first read, still in flight.
-  - The floating OVERLAY shows the numbers only. The status marks
-    sit on ONE LINE along the bottom edge instead, separated by "·".
-    They used to be stacked down the right-hand side, and that strip
-    — as wide as "no data yet", reserved whether or not anything was
-    lit — left a third of the panel empty next to every number:
-      ⟳               the numbers lag the displayed frame by more
-                      than 1 s — a read is on its way.
-      no data yet     the archiver has not published the displayed
-                      frame yet — the panel is waiting for it and
-                      the values fill themselves in.
-      older shot      at least one value was read for an EARLIER
-                      shot than the picture. Which one is in the
-                      side panel — the line only says that one is.
-    Hover the overlay and it explains every mark that is lit. The
-    marks are painted outside the layout and their line is reserved
-    whether or not they are lit, so they cannot resize or move the
-    overlay. As text in the rows they changed the line width every
-    time they toggled and the panel hopped once per refresh. On a
-    narrow overlay the marks are shortened with "…" rather than
-    wrapped onto a second line, which would grow the panel the
-    moment one lights up.
+      12.3 J  orange  a real reading, but of an EARLIER (or later) shot
+                      than the picture: this frame has none of its
+                      own, or the archiver has not published it yet
+                      and the last published shot is shown. The PV
+                      table's tooltip says when it was taken and how
+                      far from the picture ("2.5 s before").
+      red             not loaded yet: the first read is in flight, the
+                      archiver has not published this frame yet (it
+                      fills in by itself), or the numbers lag the
+                      frame by more than 1 s while a read is on its
+                      way. A number next to a red dot is the last one
+                      read, until the answer arrives.
+                      A PV the archive simply skipped for this shot
+                      while the other PVs have it (Back_Ref misses
+                      about one shot in ten, measured 06.10.2026)
+                      turns orange after 2 s instead of staying red
+                      until the next shot; if its reading still
+                      arrives, the dot goes away by itself.
+      grey            no value: nothing archived near this frame at
+                      all (the tooltip says how far the nearest
+                      reading is), or the archiver request failed
+                      (the next refresh retries it).
+    The words used before — "no data yet", "(older shot)", "(-28 s)",
+    "n/a", "ERR" and the "⟳" / "no data yet" line along the bottom of
+    the overlay — are gone: they changed the width of the panel, and a
+    word had to be read where a colour is seen. Every row of the
+    overlay keeps room for its dot whether it is lit or not, so a dot
+    appearing or going away never changes the overlay's size. Hover
+    the overlay, or any value in the PV table, for what the colours
+    mean.
   - Tooltips that explain a value (the ones above, and the greyed
     numbers in the side panel) now stay up for two minutes. Windows
     takes an ordinary tooltip away after about ten seconds and then
@@ -1467,11 +1860,11 @@ PV VALUES
     text needs cuts the text off — the font size above is what makes
     the numbers fit. The size is remembered, like the font and the
     colours.
-  - A value carried over as "(older shot)" / "(-28 s)" keeps that
-    flag when it is burned into a saved image, so the file cannot
-    claim a reading the panel did not. A frame saved sooner than the
-    archiver publishes its sample burns "no data yet" for that PV —
-    save it again later to get the number.
+  - A value carried over from another shot keeps its orange dot when
+    it is burned into a saved image, so the file cannot claim a
+    reading the panel did not. A frame saved sooner than the archiver
+    publishes its sample burns a red dot for that PV — save it again
+    later to get the number.
 
 ALARM LIMITS AND TRIPS
   - LIVE MODE ONLY. This watches the shots as they arrive; it is not a
@@ -1669,8 +2062,20 @@ WHAT IS SEARCHED
       a red cross    it was looked for and it is not there
       a grey dash    nobody has looked yet (you only pressed
                      "Load data")
+      an amber dash  nothing on that day was inside the tolerance,
+                     so no picture was looked for
     So you can watch the dashes turn into ticks instead of watching
     an empty table refill itself.
+  - A DAY WITH NOTHING IN RANGE IS SKIPPED. If no shot of that day
+    fell inside the tolerance, "Load images" does not go to the
+    network drive for it at all. Those rows used to be the slowest
+    of the whole search - a moment with no picture near it is looked
+    for in five folders per camera instead of one, and the table had
+    already said there was nothing there. The row stays in the list,
+    yellow, and says "nothing in range - closest shot - image not
+    searched", so it never pretends a picture was looked for and not
+    found. The count at the end says how many were skipped. Widen
+    the tolerance if you want those days searched.
   - The pictures of several days and cameras are looked for at the
     same time, not one after another, which is where most of the
     waiting used to go. A picture is also no longer opened and read
@@ -1702,12 +2107,24 @@ WHAT IS SEARCHED
     from the office, and the daily CSV files it also switched are no
     longer written. It could only ever be set wrong, so it is gone.
 
-SEARCH CRITERIA
-  - Choose one or more PV columns as search criteria:
-    SBW4, PTM1, PCM2, PCM4, PAP1, Back Ref, Waveplate.
-  - For each criterion: set target value, unit, and ±tolerance.
-  - Also show: select extra PV columns to annotate results without
-    using them as a search filter.
+PVs
+  - "Configure PVs" opens the picker. It is the Image Slider's own,
+    over one shared list of PVs, so a PV you add or rename here is
+    the same PV in the Slider and in the Image Finder. It comes up
+    without the Min and Max columns and without "What it is": here a
+    PV is judged against the value and the tolerance on its own row,
+    and everything this tab can read is an archiver channel.
+  - Every PV whose EYE is open gets a row under the button. Shut the
+    eye and the PV stays in the list for later but has no row here,
+    so it is neither searched on nor shown.
+  - On a row: tick it to SEARCH by it, and type the target value and
+    the ±tolerance beside it. Leave it unticked and its value is only
+    reported in the results and on the pictures.
+  - The value and the tolerance you type stay put when you open the
+    picker again to add another PV.
+  - Formulas cannot be searched for here — this tab reads channels
+    straight out of the archiver, so a computed row would be empty
+    every day. One is left out of the list and the Log says so.
 
 CAMERA SELECTION
   - "Cameras" opens the picker; search by name or number and
@@ -1761,15 +2178,15 @@ TECHNICAL NOTES
     number anywhere else; it no longer is. Nothing in this tab
     rewrites a reading - only Back Ref / PAP1 are shown in mJ, and
     the waveplate is snapped onto its own 1000-count grid.
-  - Any archiver PV can be added, not only the presets: type
-    fragments to search the channel list, or type a channel name in
-    full and take the "+ add ... as an archiver channel name" row
-    (Enter does the same). That also works when the channel list
-    cannot be downloaded.
+  - Any archiver PV can be added, not only the presets — the search
+    box is inside "Configure PVs". Type fragments to search the
+    channel list, or type a channel name in full and press Enter.
+    That also works when the channel list cannot be downloaded.
   - Right-click a PV row to rename it (a long channel name does not
     fit the panel or the picture), to copy its archiver channel
-    name, or to remove it. The picked PVs and their names survive a
-    restart.
+    name, or to remove it. The name is the shared one, so the Slider
+    and the Image Finder print that PV under it too. The picked PVs
+    and their names survive a restart.
   - Back Ref and PAP1 are displayed in mJ when < 1 J.
   - Clicking the Folder cell reveals the matched file in Explorer;
     double-clicking a row opens a window with every shot of that day
@@ -1843,7 +2260,8 @@ TECHNICAL NOTES
     slider for you — the gain that spreads the frame over its own
     p0.5..p99.5 window, with the dark background left where it is: dim
     frames become readable, result rows stop being comparable. Binary
-    and False Colors always map per frame regardless.
+    and False Colors are the NI viewer's palettes; leave Auto off to see
+    them as NI shows them.
   - Bri (Brightness, -255..+255, default 0): an offset added to every
     pixel. Its Auto box sets that slider too — the offset that puts the
     frame's dark background at 0. It only shifts; spreading is the
@@ -2773,6 +3191,15 @@ FOR WHOEVER WORKS ON THE CODE
     bench_live_dot.py        the live indicator turning red
     bench_pv_wait.py         the PV panel waiting for the archiver
     bench_pv_live_multi.py   the same with several cameras
+    bench_pv_dots_live.py    the PV dots in real live mode, logged
+                             (reads the real share and archiver)
+    test_shot_counter_sources.py  the shot counter's rules
+    test_shot_counter_replay.py   the shot counter on a real half
+                             hour of 13 cameras: every shot, nothing more
+    test_shot_counter_hidden_tab.py  the shot counter counting while
+                             its tab is out of sight
+    render_tickbar_compact.py  the sliders and the time axis, LOOKED at
+                             (needs a real screen, not offscreen)
     bench_master_sync.py     the sliders following the master
     test_hold_and_slave_free.py  a held frame arrow speeding up, and
                              a camera you moved yourself staying put

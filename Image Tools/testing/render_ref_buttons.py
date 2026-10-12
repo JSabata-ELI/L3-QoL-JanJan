@@ -2,10 +2,14 @@
 
     QT_QPA_PLATFORM=windows PYTHONIOENCODING=utf-8 python testing/render_ref_buttons.py
 
-Remove ref was added beside Set ref. The 275 px sidebar is the whole question: on one
-line with the checkbox the second label came out elided, so the pair sits on a row of
-its own, half the column each. This renders the real section under main.py's own
-stylesheet and prints, per button, whether its label fits the room it got.
+The 275 px sidebar is the whole question. All three now share ONE row (24.09.2026):
+the checkbox on the left and the two buttons filling what is left, in the small button
+style — at the normal button size "Remove ref" elided, which is why the pair used to
+need a line of its own. This renders the real section under main.py's own stylesheet
+and prints, per button, whether its label fits the room it got.
+
+Also checks the other half of the same move: Preload preview left the image settings
+and sits beside the Live mode button in Source.
 
 Writes ref_buttons.png (both live) and ref_buttons_off.png (Remove ref greyed out,
 which is how it sits until a reference is set) beside this file. The window is moved
@@ -83,15 +87,44 @@ def main() -> int:
     check("the two buttons are the same width",
           abs(v.btn_set_ref.width() - v.btn_remove_ref.width()) <= 1,
           f"{v.btn_set_ref.width()} vs {v.btn_remove_ref.width()}")
-    check("they are side by side on one row, under the checkbox",
-          v.btn_set_ref.y() == v.btn_remove_ref.y()
-          and v.btn_set_ref.y() > v.cb_subtract.y(),
-          f"set_ref y={v.btn_set_ref.y()}, remove y={v.btn_remove_ref.y()}, "
-          f"checkbox y={v.cb_subtract.y()}")
+    # ONE row for all three: the checkbox and both buttons overlap vertically, and the
+    # buttons start to the right of the checkbox. Centres rather than tops, because a
+    # small button is shorter than the checkbox beside it.
+    def mid(w):
+        return w.y() + w.height() // 2
+    check("checkbox and both buttons share one row",
+          abs(mid(v.btn_set_ref) - mid(v.cb_subtract)) <= 4
+          and abs(mid(v.btn_remove_ref) - mid(v.cb_subtract)) <= 4,
+          f"checkbox {v.cb_subtract.geometry()}, set {v.btn_set_ref.geometry()}, "
+          f"remove {v.btn_remove_ref.geometry()}")
+    check("the buttons are to the right of the checkbox",
+          v.btn_set_ref.x() >= v.cb_subtract.geometry().right()
+          and v.btn_remove_ref.x() >= v.btn_set_ref.geometry().right(),
+          f"checkbox right={v.cb_subtract.geometry().right()}, "
+          f"set x={v.btn_set_ref.x()}, remove x={v.btn_remove_ref.x()}")
     check("neither sticks out past the panel",
           v.btn_remove_ref.mapTo(box, box.rect().topLeft()).x() <= 0
           or v.btn_remove_ref.geometry().right() <= box.width(),
           f"right edge {v.btn_remove_ref.geometry().right()} of {box.width()}")
+
+    # Preload preview moved up into Source, on the Live mode row.
+    cbp = v.cb_preload_preview
+    live = v._btn_auto_follow
+    check("Preload preview sits beside the Live mode button",
+          cbp.parentWidget() is live.parentWidget()
+          and abs(mid(cbp) - mid(live)) <= 4
+          and cbp.x() >= live.geometry().right(),
+          f"live {live.geometry()}, preload {cbp.geometry()}")
+    fm_p = QFontMetrics(cbp.font())
+    need_p = fm_p.horizontalAdvance(cbp.text()) + 34      # indicator + spacing + padding
+    check("'Preload preview' is not cut off", need_p <= cbp.width(),
+          f"needs {need_p} px, has {cbp.width()} px")
+    src_box = live.parentWidget()
+    check("the Source row does not stick out past the panel",
+          cbp.geometry().right() <= src_box.width(),
+          f"right edge {cbp.geometry().right()} of {src_box.width()}")
+    src_box.grab().save(str(Path(__file__).resolve().parent / "source_row.png"))
+    print(f"  wrote source_row.png  ({src_box.width()}x{src_box.height()})")
 
     v.btn_remove_ref.setEnabled(True)
     app.processEvents()

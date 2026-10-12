@@ -23,6 +23,9 @@ import pathlib
 
 # Must be set before PySide6 is imported anywhere.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# The suite window saves its setting tabs; never over the user's own file.
+os.environ.setdefault("CSS_LOGGER_TABS_FILE", os.path.join(
+    tempfile.mkdtemp(prefix="css_logger_smoke_"), "logger_tabs.json"))
 
 _HERE = pathlib.Path(__file__).parent
 if str(_HERE) not in sys.path:
@@ -216,10 +219,18 @@ def test_every_button_handler():
         ("graph_view_home",    w._on_graph_view_home),
         ("retick",             w._retick_from_current_xlim),
         ("sync_zoom_mode",     w._sync_graph_interaction_mode),
-        ("adopt_margins",      w._adopt_toolbar_margins),
+        ("strip_back",         lambda: w._graph_tb_trigger("Back")),
+        ("strip_zoom",         lambda: (w._on_graph_strip_mode("zoom"),
+                                        w._on_graph_strip_mode("zoom"))),
+        ("margins_dialog",     lambda: (w._open_margins_dialog(),
+                                        w._margins_dlg.close())),
+        ("loupe_on_off",       lambda: (w._set_loupe_on(True), w._set_loupe_mag(20),
+                                        w._set_loupe_on(False))),
+        ("stats_mode",         lambda: (w._set_stats_mode("row"),
+                                        w._set_stats_mode("all"))),
         ("clear_selection",    w._clear_selection),
         ("clean_graph",        w._clean_graph),
-        ("save_graph",         w._save_graph),
+        ("save_graph",         lambda: w._save_graph_image(True)),
         ("plot_xy",            w._plot_xy),
         ("clear_xy",           w._clear_xy_plot),
         ("pv_time_add_cond",   w._pv_time_add_condition_row),
@@ -296,10 +307,13 @@ def test_dialog_accept_parsing():
     pvs = ["L3-TEST-A:Energy", "L3-TEST-B:Energy"]
 
     cond = app_main._ConditionsDialog([], pvs)
-    cond._add_row(pvs, {"pv": "L3-TEST-A:Energy", "min": "1.5", "max": "nonsense"})
-    cond._add_row(pvs, {"pv": "L3-TEST-B:Energy", "min": "", "max": ""})
-    cond._accept()
-    assert isinstance(cond.result_conditions, list)
+    rec = cond.editor.add_row({"pv": "L3-TEST-A:Energy", "min": 1.5, "max": None})
+    rec["b"].setText("nonsense")                 # a bad box is ignored, not raised
+    cond.editor.add_row({"pv": "L3-TEST-B:Energy", "min": None, "max": None})
+    cond._close()
+    res = cond.result_conditions
+    assert isinstance(res, list) and len(res) == 2, res
+    assert res[0]["min"] == 1.5 and res[0]["max"] is None, res[0]
 
     ref = app_main._RefLinesDialog([], ["L3-TEST-A:Energy"])
     ref._add_row({"label": "ok", "y": "3.14", "color": "#FF0000"})
@@ -495,11 +509,10 @@ def test_custom_pv_bindings_table():
         _app.processEvents()
 
 
-def test_remove_pv_leaves_nothing_selected():
-    """Remove must not leave the next channel highlighted.
-
-    Qt keeps the current row where it was, so the channel that moved up into the
-    freed place came out selected and a second Remove would have taken it too."""
+def test_remove_pv_picks_the_next_one():
+    """After Remove the PV that slid up into the freed place is the one picked,
+    so Remove can be pressed again to take the next one; removing the last row
+    picks the one above, and with no PV left nothing is picked."""
     _install_network_mock()
     _install_dialog_mocks()
     w = _new_widget()
@@ -509,13 +522,20 @@ def test_remove_pv_leaves_nothing_selected():
     _app.processEvents()
     assert w._real_pv_names() == ["L3-TEST-B:Energy", "L3-TEST-C:Energy"], \
         w._real_pv_names()
-    assert w._pv_list.selectedItems() == [], \
-        [i.text() for i in w._pv_list.selectedItems()]
-    assert w._pv_list.currentRow() == -1, w._pv_list.currentRow()
-    # A second Remove with nothing selected must take nothing.
+    picked = [w._item_pv(i) for i in w._pv_list.selectedItems()]
+    assert picked == ["L3-TEST-B:Energy"], picked
+    # The last row: the one above is picked instead.
+    w._pv_list.setCurrentRow(1)
     w._remove_selected_pvs()
-    assert w._real_pv_names() == ["L3-TEST-B:Energy", "L3-TEST-C:Energy"], \
-        w._real_pv_names()
+    picked = [w._item_pv(i) for i in w._pv_list.selectedItems()]
+    assert w._real_pv_names() == ["L3-TEST-B:Energy"], w._real_pv_names()
+    assert picked == ["L3-TEST-B:Energy"], picked
+    # The only PV: nothing left to pick, and another Remove takes nothing.
+    w._remove_selected_pvs()
+    assert w._real_pv_names() == [], w._real_pv_names()
+    assert w._pv_list.selectedItems() == []
+    w._remove_selected_pvs()
+    assert w._real_pv_names() == [], w._real_pv_names()
     w.close()
 
 
@@ -1104,12 +1124,20 @@ def test_no_load_button_and_changes_reload_on_their_own():
     _set_pvs(w, ["L3-TEST-A:Energy", "L3-TEST-B:Energy"])
     _load_and_wait(w)
 
-    # Removing a channel must ask for a reload on its own.
+    # Removing a channel updates everything on its own — from the data already
+    # loaded, so nothing is read again.
     w._reload_pending = False
     w._pv_list.setCurrentRow(0)
     w._remove_selected_pvs()
+    assert "L3-TEST-A:Energy" not in w._graph_pvs, \
+        "removing a channel did not update the graph"
+    assert not w._autoload_timer.isActive() and not w._reload_pending, \
+        "removing a channel read the archive again"
+    # Adding one has to read it.
+    w._pv_list.addItem("L3-TEST-C:Energy")
+    w._request_reload(reason="channel added")
     assert w._autoload_timer.isActive() or w._reload_pending, \
-        "removing a channel did not trigger a reload"
+        "adding a channel did not trigger a reload"
     assert _pump_until(lambda: not w._load_in_flight and not w._autoload_timer.isActive())
 
     # A burst of changes collapses into one fetch.

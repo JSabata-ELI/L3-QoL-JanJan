@@ -35,6 +35,7 @@ class FakeApp:
     def __init__(self, folders):
         self._cam_dir_cache = {}
         self._cam_dir_cache_time = {}
+        self._cam_dir_cache_used = {}
         self._cam_dir_cache_ttl = 5.0
         self._cam_dir_cache_lock = threading.Lock()
         self._label_settings = {}

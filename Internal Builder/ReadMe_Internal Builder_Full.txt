@@ -2,8 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19
-  (_internal_builder.py 169 lines, _internal_builder.spec)
+Verified against source: 2026-10-05
+  (_internal_builder.py 177 lines, _internal_builder.spec 102 lines)
 -----------------------------------------------------------------
 Short version: Readme Internal Builder.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -78,14 +78,20 @@ The imports are grouped:
       xlwt              old-style Excel writing
       tkcalendar        the date picker widget
       epics             live control-system values
-      win32com          talking to Outlook and other Windows apps
+      win32com,         talking to Outlook and other Windows apps
+      pythoncom
+      win32crypt        locking saved passwords (Diagnostic)
 
-The optional four are wrapped so that a machine without one of them
+The optional ones are wrapped so that a machine without one of them
 still produces a working bundle. The cost is silent: the bundle
 simply lacks that library, and the program that needed it fails
 later. If a deployed program complains about a missing library,
-check whether it is one of these four and whether the build machine
-had it installed.
+check whether it is one of these and whether the build machine had
+it installed.
+
+Note that the three Windows ones (win32com, pythoncom, win32crypt)
+share ONE try/except: if any of them is missing, the ones after it
+in that block are skipped too.
 
 
 =================================================================
@@ -124,21 +130,32 @@ had it installed.
 
 3.3 Through Dev Tools
 
-    Dev Tools -> Copy Manager -> "Build internal" drives the build
-    for you. The small settings file in this folder tells it to
-    collect Pillow fully and to force Pillow's sub-parts as required
-    imports, because Pillow is the one library the automatic
-    detection regularly gets wrong.
+    Dev Tools -> Builder tab: tick "Internal Builder" in the list
+    and press "BUILD selected". Dev Tools builds it from the .spec
+    file (3.1) whenever that file is present, so the numpy/scipy DLL
+    step is included. Only if the .spec file is missing does it fall
+    back to running the .py file (3.2).
+
+    This project skips the normal per-program build, so the small
+    build_config.json in this folder is not read on this route.
 
 
 =================================================================
 4. GETTING THE FOLDER TO THE OTHER PROGRAMS
 =================================================================
 
-  Preferred:  Dev Tools -> Copy Manager
-                "Build internal"   builds it
-                "Deploy internal"  copies it next to every program
-                                   on the share
+  Preferred:  Dev Tools
+                Builder tab, "BUILD selected" with
+                "Internal Builder" ticked          builds it
+                Copy Manager tab, "Deploy Libraries"
+                                   copies it next to every ticked
+                                   program on the share
+
+  "Deploy Libraries" takes the newest version of the built folder,
+  packs it into one zip, and unpacks it into each ticked program's
+  _internal folder. Files of the same size are skipped (except .pyd
+  files, which are always rewritten). Every file in the destination
+  that the shared folder does not have is DELETED — see section 6.
 
   Manual fallback:  Extractor. It unpacks a zip of the folder into
   program folders named in a hard-coded list, and that list is out
@@ -176,7 +193,7 @@ exercise almost everything in the folder between them.
   A deployed program will not start, "No module named ..."
       That library is not in the shared folder. Either the import is
       missing from this file, or the build machine did not have the
-      library installed (check the optional four in section 2).
+      library installed (check the optional ones in section 2).
 
       A library that is PURE PYTHON is not the shared folder's job:
       it is compiled into each program's own .exe. Only libraries

@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (s.py, 4569 lines)
+Verified against source: 2026-10-05  (s.py, 5472 lines)
 -----------------------------------------------------------------
 Short version: ReadMe Screenshots.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -80,7 +80,11 @@ from then on the same set is one button.
     to.
 
     The workstation is worked out from the computer's name — VIS-01,
-    VIS-02, OPR-01 to OPR-03 and so on. A camera that is not listed
+    VIS-02, OPR-01 to OPR-03 and so on — however that name happens to
+    be spelled: "L3-OPR3", "L3-OPR03", "L3OPR3" or "opr3.<domain>"
+    all count as OPR-03. The same answer also picks which workstation's
+    monitor arrangement the program starts with (VIS-01 when the name
+    fits none of them). A camera that is not listed
     for any workstation is allowed everywhere, on the assumption
     that the list is incomplete rather than that the camera does not
     exist.
@@ -160,6 +164,13 @@ counting through it. "Stop" ends an automatic run.
     the interval, and so on — measured from the start of the run, not
     from the end of the previous round. A round that takes longer than
     usual therefore does not push the ones after it.
+
+    The interval and "max cycles" are read once, when you press Start.
+    Changing either box during a run does nothing until the next
+    Start. An empty "max cycles" box means no limit.
+
+    Closing the live preview during a run keeps it closed until the
+    next Start (or until Preview is ticked again).
 
     Every round also WRITES DOWN the moment it belongs to, and that
     written-down moment is what the cameras are asked about. If the
@@ -372,9 +383,23 @@ appear in it as they are copied.
     changed the palette. It had not; the picture had been flattened
     to grey.)
 
-    "Grayscale" deliberately drops the colour. Everything after it —
-    Gradient, Hot, Viridis, Plasma, Inferno, Jet, Turbo — paints
-    false colours over the grey values.
+    "Grayscale" deliberately drops the colour. Everything after it
+    paints false colours over the grey values. The list is the same
+    as in Image Tools, and so are the colours: Gradient, Binary,
+    False Colors, Rainbow, Hot, Black and White, Viridis, Plasma,
+    Inferno, Jet, Turbo.
+
+    Binary and False Colors are copies of the NI viewer's palettes
+    and show an archive picture exactly as the NI window does: the
+    colour stands for a fixed camera level, the same on every picture
+    and every camera. Contrast, brightness, gamma and both Autos are
+    greyed out on these two, because changing them would make a
+    colour mean a different level. Binary changes colour every few
+    counts, so it looks grainy — that grain is the camera's noise,
+    the same as in the NI window. For the same reason a Binary
+    picture is shrunk or enlarged without smoothing (whole pixels
+    only): blending two neighbouring colours of the cycle would make
+    a third colour that stands for no level at all.
 
     NONE OF THIS CHANGES THE FILES. Adjusting the view is looking,
     not editing.
@@ -391,6 +416,15 @@ appear in it as they are copied.
               colour and thickness
       Undo, Clear drawing
       Apply / Revert
+
+    The 🔍 Zoom tool only magnifies the dragged area — it never sets
+    the crop. The crop is set with the right mouse button alone.
+    Drawings stay put when you zoom in and out, and the editor opens
+    again at the zoom you applied.
+
+    Everywhere in the program, the mouse wheel changes a drop-down
+    list or a number box only after you have clicked into it. Over a
+    box you have not clicked, the wheel just scrolls the page.
 
 6.4 WHAT SAVE ACTUALLY WRITES
 

@@ -44,6 +44,43 @@ _READ_WORDS = {"peak": "worst in the window",
 _FIRES_WORDS = {"show": "shows only", "alarm": "raises the alarm"}
 
 
+def _in_background(owner, work, then, poll_ms=100):
+    """Run `work()` on a thread; call `then(result, error)` on this one.
+
+    For the two archiver reads behind buttons here, which used to run on the
+    window's own thread and froze the whole program for as long as the archiver
+    took to answer — many seconds when it does not answer at all.
+
+    The answer comes back through a plain Python dict that a timer owned by
+    `owner` looks at. Nothing Qt is touched from the worker, so a dialog closed
+    while the read is still out costs nothing: its timer dies with it, and the
+    thread finishes into a dict nobody reads.
+    """
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["result"] = work()
+        except Exception as exc:
+            box["error"] = exc
+        box["done"] = True
+
+    threading.Thread(target=run, daemon=True).start()
+    timer = QTimer(owner)
+    timer.setInterval(poll_ms)
+
+    def check():
+        if not box.get("done"):
+            return
+        timer.stop()
+        timer.deleteLater()
+        then(box.get("result"), box.get("error"))
+
+    timer.timeout.connect(check)
+    timer.start()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Finding a channel by name
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +106,13 @@ class ChannelPicker(QDialog):
         lay.setSpacing(6)
         self._search = QLineEdit(preset)
         self._search.setPlaceholderText("a few words from the name — chl temp")
-        self._search.textChanged.connect(self._refilter)
+        # Searched a moment after the last key, not on every key: each search
+        # goes through ten thousand names and refills the list.
+        self._typing = QTimer(self)
+        self._typing.setSingleShot(True)
+        self._typing.setInterval(150)
+        self._typing.timeout.connect(self._refilter)
+        self._search.textChanged.connect(lambda _t: self._typing.start())
         lay.addWidget(self._search)
 
         self._count = QLabel("")
@@ -102,15 +145,18 @@ class ChannelPicker(QDialog):
 
     def _load(self):
         self._count.setText("Asking the archiver for the channel list…")
-        try:
-            self._names = A.fetch_channels(timeout=4.0)
-        except Exception as exc:
+        _in_background(self, lambda: A.fetch_channels(timeout=4.0),
+                       self._loaded)
+
+    def _loaded(self, names, exc):
+        if exc is not None:
             msg, hint = C.readable_pv_error("the channel list", exc)
             self._count.setText(msg)
             self._count.setToolTip(hint or "")
             self._empty_row("The channel list could not be read — "
                             "type the name by hand instead.")
             return
+        self._names = names or []
         self._refilter()
 
     def _empty_row(self, text):
@@ -144,6 +190,9 @@ class ChannelPicker(QDialog):
         self._list.setCurrentRow(0)
 
     def _accept(self):
+        if self._typing.isActive():         # Enter pressed right after typing
+            self._typing.stop()
+            self._refilter()
         row = self._list.currentItem()
         if row is None or not (row.flags() & Qt.ItemFlag.ItemIsEnabled):
             return
@@ -221,6 +270,7 @@ class ValueDialog(QDialog):
                             tip="Read this channel from the archiver and show "
                                 "what it holds for the last minute.")
         read_now.clicked.connect(self._read_now)
+        self._read_btn = read_now
         row = QHBoxLayout()
         row.addWidget(read_now)
         row.addWidget(self._read_out, stretch=1)
@@ -367,9 +417,20 @@ class ValueDialog(QDialog):
                          if self._diff_on.isChecked() else None)
         item["read"] = self._read.currentData()
         item["window_s"] = float(self._window.value())
-        # Synchronous on purpose: one read, four seconds at the very worst, and
-        # the operator pressed a button and is waiting for its answer.
-        reading = A.read_value(item, readable_error=C.readable_pv_error)
+        # On a thread. It used to be synchronous, on the belief that it could
+        # take four seconds at the very worst; a "newest value" search makes up
+        # to five requests in a row, and an archiver that does not answer kept
+        # the whole program frozen for far longer than that.
+        self._read_btn.setEnabled(False)
+        _in_background(
+            self, lambda: A.read_value(item, readable_error=C.readable_pv_error),
+            self._read_came)
+
+    def _read_came(self, reading, exc):
+        self._read_btn.setEnabled(True)
+        if exc is not None:
+            self._read_out.setText(f"The read failed: {exc}")
+            return
         if not reading.ok:
             self._read_out.setText(reading.error)
             self._read_out.setToolTip(reading.hint or "")
@@ -574,6 +635,11 @@ class ValuesTab(QWidget):
             flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             if col == _C_ON:
                 flags |= Qt.ItemFlag.ItemIsUserCheckable
+                # The tick cell has no text of its own, so nothing below writes
+                # it — and a reused cell may still hold the empty-table note
+                # sentence, which then sat behind the tick and made "On" as
+                # wide as that sentence.
+                cell.setText("")
             elif col in _LIMIT_COLS or col in _TEXT_COLS:
                 flags |= Qt.ItemFlag.ItemIsEditable
             cell.setFlags(flags)
@@ -665,8 +731,22 @@ class ValuesTab(QWidget):
             item[_TEXT_COLS[col]] = cell.text().strip()
         else:
             return
-        self._win.save_soon()
-        self._win.refresh_tabs()
+        self._win.item_changed(item)
+
+    def update_item(self, item):
+        """Write again the one row that shows this item — nothing else."""
+        if item.get("kind") != "value":
+            return
+        try:
+            row = self._shown_ids.index(int(item["id"]))
+        except (ValueError, AttributeError):
+            return
+        self._updating = True
+        try:
+            self._fill_row(row, item)
+        finally:
+            self._updating = False
+        self._fit.fit()
 
     def _on_double_click(self, index):
         # A limit cell opens for typing; anything else opens the editor.

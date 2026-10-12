@@ -147,8 +147,8 @@ def seed():
 def main():
     seed()
 
-    from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog, QVBoxLayout
     from spfe_t import SPFEValuesWidget
 
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -165,7 +165,15 @@ def main():
     app = QApplication(sys.argv)
     w = SPFEValuesWidget()
     w.resize(*size)
-    w.show()
+
+    def quiet(win):
+        """On screen, but never takes the keyboard focus away from whatever
+        the user is typing into."""
+        win.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        win.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+        return win
+
+    quiet(w).show()
 
     shots = []
     state = {"waited": 0}
@@ -189,20 +197,32 @@ def main():
         # are the windows the toolbar opens.
         grab(w, "")
 
-        w._open_view_day()
+        # Built and shown here rather than through the toolbar's _open_*
+        # methods: those raise and activate their window, which is right for
+        # a click and wrong for a test running while somebody types.
+        w._day_window = quiet(w._make_view_day_window())
+        w._refresh_day_list(force=True)
+        w._day_window.show()
         app.processEvents()
         grab(w._day_window, "_viewday")
         w._day_window.hide()
 
-        w._open_references()
+        w._refs_window = quiet(w._make_references_window())
+        w._fill_references()
+        w._refs_window.show()
         app.processEvents()
         grab(w._refs_window, "_references")
         w._refs_window.hide()
 
-        w._open_log()
+        # The log window has no builder of its own; the console inside it is
+        # the part worth looking at.
+        log = quiet(QDialog(w))
+        log.resize(900, 560)
+        QVBoxLayout(log).addWidget(w.txt_log)
+        log.show()
         app.processEvents()
-        grab(w._log_window, "_log")
-        w._log_window.hide()
+        grab(log, "_log")
+        log.hide()
 
         w.shutdown()
         app.quit()

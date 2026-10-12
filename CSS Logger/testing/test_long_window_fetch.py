@@ -107,6 +107,9 @@ class _Fake:
 
     def install(self):
         cpva_core.cpva_fetch_samples = self
+        # Each test is its own archive: a density remembered from another
+        # test's fake must not decide how this one is read.
+        cpva_core._DENSITY_MEMO.clear()
         return self
 
     def __call__(self, channel, start_ns, end_ns, timeout=10.0, count=None):
@@ -146,17 +149,18 @@ def _fetch(channels, span, limits, count=2000, **kw):
 def test_a_servable_period_costs_one_request():
     """No hunting when the archiver simply serves the period.
 
-    Three requests per signal, not one: the density probe that decides whether
+    Four requests per signal, not one: the density probe that decides whether
     thinning the signal is worth it at all, then the small opening request at
     the newest end, which is what puts something on screen immediately, then
-    the rest of the period. What must not happen is any SPLITTING.
+    the rest of the period in day-sized steps (FILL_STEPS, never under a day)
+    so the graph grows as it loads. What must not happen is any SPLITTING.
     """
     fake = _Fake({"A": 60 * DAY, "B": 60 * DAY}).install()
     res, err, rep, _p, _s, _e = _fetch(["A", "B"], 2 * DAY, fake.limits)
     check("no request is ever refused, so nothing is split",
           rep.splits == 0 and not err, f"{rep.splits} splits, err={list(err)}")
-    check("density probe, opening request and the rest, per signal",
-          rep.requests == 6, f"{rep.requests} requests")
+    check("density probe, opening request and two day-sized steps, per signal",
+          rep.requests == 8, f"{rep.requests} requests")
     check("both signals have data", all(res[c] for c in ("A", "B")))
 
 
@@ -193,11 +197,12 @@ def test_night_hours_are_read():
 def test_a_slow_signal_is_not_dragged_down():
     fake = _Fake({"SLOW": 60 * DAY, "FAST": HOUR}).install()
     res, err, rep, _p, _s, _e = _fetch(["SLOW", "FAST"], 2 * DAY, fake.limits)
-    # Three, not two: the density probe that decides whether this channel is
-    # worth thinning at all costs one request per signal (see
-    # test_thinned_series_is_checked.py).
-    check("the slow signal is never split (density probe + opening + the rest)",
-          fake.count_for("SLOW") == 3, f"{fake.count_for('SLOW')} requests")
+    # Four: the density probe that decides whether this channel is worth
+    # thinning at all (see test_thinned_series_is_checked.py), the opening
+    # request, and the two days in day-sized steps.
+    check("the slow signal is never split (density probe + opening + 2 steps)",
+          fake.count_for("SLOW") == 4,
+          f"{fake.count_for('SLOW')} requests")
     check("the fast signal is still read in full", not rep.gaps["FAST"],
           str(rep.gaps["FAST"][:2]))
     check("the fast signal did not need a request per minute",
@@ -263,6 +268,65 @@ def test_newest_is_read_first():
     check("the newest part of the period arrives first",
           len(seen) > 2 and seen[0] > seen[-1],
           f"{len(seen)} chunks, first={seen[0] if seen else None}")
+
+
+def test_a_steady_meter_over_two_months_is_thinned():
+    """~320 samples an hour is under the hourly "sparse" limit, but over two
+    months it is ~460 000 raw samples per signal. Measured 2026-09-30: eight
+    such energies were read raw and the PC ran out of memory. The judgement is
+    on the whole period now, so only the one-hour density probes go out raw."""
+    fake = _Fake({"E": 60 * DAY}, per_request=320).install()
+    res, err, rep, _p, _s, _e = _fetch(["E"], 60 * DAY, fake.limits, count=2000)
+    raw_wide = [c for c in fake.calls if c[3] is None and c[2] - c[1] > HOUR]
+    check("no request over an hour is sent raw", not raw_wide,
+          f"{len(raw_wide)} raw requests")
+    check("and the signal still has data", bool(res["E"]) and not err)
+
+
+class _DenseAfterAll(_Fake):
+    """Quiet in the probe hour, heavy everywhere else."""
+
+    def __call__(self, channel, start_ns, end_ns, timeout=10.0, count=None):
+        with self._lock:
+            self.calls.append((channel, int(start_ns), int(end_ns), count))
+        if count is None and end_ns - start_ns > HOUR:
+            n = 150_000
+        else:
+            n = 3 if count is None else min(int(count), 40)
+        step = max(1, (end_ns - start_ns) // n)
+        return [{"time": int(start_ns) + i * step, "value": float(i % 7),
+                 "quality": "Original", "metaData": {"units": ""}}
+                for i in range(n)]
+
+
+def test_a_sparse_signal_that_is_not_stops_being_read_raw_early():
+    """The raw read gives up as soon as it holds VERIFY_MAX_SAMPLES, instead of
+    reading the whole period first and throwing it away."""
+    fake = _DenseAfterAll({}).install()
+    res, err, rep, _p, _s, _e = _fetch(["X"], 30 * DAY, {}, count=2000,
+                                       max_workers=1)
+    heavy = [c for c in fake.calls if c[3] is None and c[2] - c[1] > HOUR]
+    need = cpva_core.VERIFY_MAX_SAMPLES // 150_000 + 1
+    check("the raw read stops once it is too big", len(heavy) <= need,
+          f"{len(heavy)} heavy raw requests (limit {need})")
+    check("the signal comes back thinned instead",
+          bool(res["X"]) and len(res["X"]) < cpva_core.VERIFY_MAX_SAMPLES,
+          f"{len(res['X'])} samples")
+
+
+def test_coverage_moves_with_time_read_and_ends_full():
+    fake = _Fake({"A": 6 * HOUR, "B": 3 * HOUR}).install()
+    cov, phases = [], []
+    _fetch(["A", "B"], 5 * DAY, fake.limits,
+           coverage_fn=cov.append, phase_fn=phases.append)
+    check("coverage never falls",
+          all(cov[i] <= cov[i + 1] for i in range(len(cov) - 1)))
+    check("coverage ends at the whole period", bool(cov) and cov[-1] == 1.0,
+          str(cov[-1] if cov else None))
+    check("coverage moves in many small steps, not a few jumps",
+          len(set(cov)) > 10, f"{len(set(cov))} distinct values")
+    check("the density check names itself",
+          any("densely" in p for p in phases), str(phases))
 
 
 # ── Widget-level test ───────────────────────────────────────────────────────
@@ -332,6 +396,176 @@ def test_three_day_load_in_the_widget():
     check("the status line does not claim an empty archive",
           "Nothing could be read" not in w._lbl_status.text(),
           w._lbl_status.text())
+    _teardown(w)
+
+
+def test_screen_thinning_keeps_the_spike():
+    """The graph used to average bins for the screen, which hid every spike."""
+    import numpy as np
+    ts = np.arange(10_000, dtype=np.float64) * 1e9
+    v = np.full(10_000, 1.0); v[4321] = 50.0
+    t2, m2, lo2, hi2 = app_main._downsample_arrays_envelope(ts, v, v.copy(), v.copy(), 100)
+    check("the thinned trace has the target size", t2.size == 100, str(t2.size))
+    check("the bin mean alone hides the spike", float(m2.max()) < 2.0, str(m2.max()))
+    check("the bin's high edge keeps it exactly", float(hi2.max()) == 50.0, str(hi2.max()))
+
+
+def test_minmax_is_read_from_the_archivers_samples():
+    raw = [{"time": 10, "value": [2.0], "minimum": [1.0], "maximum": [9.0]},
+           {"time": 20, "value": 3.0, "minimum": 3.0, "maximum": 3.0},
+           {"time": 30, "value": 4.0}]
+    mm = app_main._minmax_arrays(raw)
+    check("min/max come through the one-element lists", mm is not None
+          and list(mm[1]) == [1.0, 3.0, 4.0] and list(mm[2]) == [9.0, 3.0, 4.0],
+          str(mm))
+    check("a raw-only channel carries no envelope",
+          app_main._minmax_arrays([{"time": 1, "value": 2.0}]) is None)
+    import numpy as np
+    lo, hi = app_main._envelope_for(np.array([15.0, 25.0, 5.0]),
+                                    np.array([2.0, 3.0, 7.0]), mm)
+    check("a held value gets the envelope of the sample it is held from",
+          list(lo) == [1.0, 3.0, 7.0] and list(hi) == [9.0, 3.0, 7.0],
+          f"{list(lo)} {list(hi)}")
+
+
+class _FakeThinned(_Fake):
+    """Answers count= like the real archiver: interval means that carry the
+    interval's minimum and maximum. One spike of 500 hides in the middle."""
+
+    SPIKE_AT = 0.5
+
+    def spike_ns(self):
+        # Off any regular sample time (+7 ns), or de-duplication would keep
+        # the ordinary sample that shares its timestamp.
+        return (self.window[0] + int((self.window[1] - self.window[0]) * self.SPIKE_AT)
+                + 7)
+
+    def __call__(self, channel, start_ns, end_ns, timeout=10.0, count=None):
+        with self._lock:
+            self.calls.append((channel, int(start_ns), int(end_ns), count))
+        spike = self.spike_ns()
+        if not count or end_ns - start_ns <= HOUR:          # raw, like the archiver
+            # ~300 an hour, like the energy meters: too many to read a month raw.
+            n = max(2, int(300 * (end_ns - start_ns) / HOUR))
+            step = max(1, (end_ns - start_ns) // n)
+            out = [{"time": int(start_ns) + i * step, "value": 1.0,
+                    "quality": "Original", "metaData": {"units": "J"}} for i in range(n)]
+            if start_ns <= spike <= end_ns:
+                out.append({"time": spike, "value": 500.0, "quality": "Original",
+                            "metaData": {"units": "J"}})
+            return sorted(out, key=lambda s: s["time"])
+        n = max(2, min(int(count), 400))
+        step = max(1, (end_ns - start_ns) // n)
+        out = []
+        for i in range(n):
+            a = int(start_ns) + i * step
+            hit = a <= spike < a + step
+            out.append({"time": a, "value": 1.0 + (0.1 if hit else 0.0),
+                        "minimum": 1.0, "maximum": 500.0 if hit else 1.0,
+                        "quality": "Interpolated", "type": "minMaxDouble",
+                        "metaData": {"units": "J"}})
+        return out
+
+
+def test_a_long_load_draws_the_spike_and_zoom_reads_it_finer():
+    pvs = ["L3-TEST-E:Energy"]
+    w = _new_widget(pvs)
+    now = datetime.now()
+    w._dt_from, w._dt_to = now - timedelta(days=30), now
+    fake = _FakeThinned({}).install()
+    fake.window = (cpva_core.dt_to_ns(w._dt_from), cpva_core.dt_to_ns(w._dt_to))
+    w._on_load_clicked(silent=True)
+    _pump(60.0, cond=lambda: not w._load_in_flight)
+    check("the thinned trace gets a min–max band",
+          bool(w._graph_bands) and w._graph_bands[0] is not None)
+    lo, hi = w._graph_env[0]
+    _t, v = w._graph_raw[0]
+    check("the line (means) stays low", float(max(v)) < 2.0, str(max(v)))
+    check("the band reaches the spike", float(hi.max()) == 500.0, str(hi.max()))
+    y0, y1 = w._graph_axes[0].get_ylim()
+    check("the spike fits on screen", y1 >= 500.0, f"ylim {y0}..{y1}")
+    check("the axis table's Max is the real maximum",
+          w._pv_stats(pvs[0])["max"] == app_main._fmt_cursor_value(500.0),
+          w._pv_stats(pvs[0])["max"])
+
+    # Zoom to the hour around the spike: the archiver answers raw there.
+    import matplotlib.dates as mdates
+    spike = fake.spike_ns()
+    c = datetime.fromtimestamp(spike / 1e9, cpva_core.TZ_PRAGUE)
+    x0, x1 = c - timedelta(minutes=20), c + timedelta(minutes=20)
+    w._on_zoom_select(mdates.date2num(x0), mdates.date2num(x1))
+    _pump(15.0, cond=lambda: w._zoom_detail is not None and not w._detail_in_flight)
+    check("the zoomed range is read again", w._zoom_detail is not None)
+    t, v = w._graph_raw[0]
+    m = (t >= mdates.date2num(x0)) & (t <= mdates.date2num(x1))
+    check("zoomed in, the spike is a real point, not a band",
+          m.any() and float(v[m].max()) == 500.0,
+          str(float(v[m].max()) if m.any() else None))
+    check("an hour's zoom is asked for raw", fake.calls[-1][3] is None,
+          str(fake.calls[-1]))
+    check("the zoom itself is kept",
+          abs(w._graph_axes[0].get_xlim()[0] - mdates.date2num(x0)) < 1e-6)
+    _teardown(w)
+
+
+def test_crossing_episodes_from_raw_samples():
+    import numpy as np
+    ts = np.arange(10, dtype=np.float64) * 1e9
+    v = np.array([1, 1, 6, 8, 7, 1, 1, 9, 1, 1], dtype=np.float64)
+    eps = app_main._crossing_episodes(ts, v, 5.0, "above", 10e9)
+    check("two separate crossings", len(eps) == 2, str(eps))
+    if len(eps) == 2:
+        check("the first starts on the first sample over and ends on the first back",
+              eps[0]["start"] == 2e9 and eps[0]["end"] == 5e9, str(eps[0]))
+        check("its peak and when", eps[0]["peak"] == 8 and eps[0]["peak_at"] == 3e9,
+              str(eps[0]))
+        check("the second is one sample", eps[1]["samples"] == 1, str(eps[1]))
+    below = app_main._crossing_episodes(ts, v, 1.5, "below", 10e9)
+    check("below counts the other side", len(below) == 3
+          and below[-1]["end"] is None, str(below))
+    lo = v.copy(); hi = v.copy(); hi[0] = 9
+    cands = app_main._crossing_candidates(ts, lo, hi, 5.0, "above", 10e9)
+    check("candidate stretches come from the high edge, merged when touching",
+          cands == [(0, int(1e9)), (int(2e9), int(5e9)), (int(7e9), int(8e9))],
+          str(cands))
+
+
+def test_limit_crossings_find_the_hidden_spike_exactly():
+    pvs = ["L3-TEST-E:Energy"]
+    w = _new_widget(pvs)
+    now = datetime.now()
+    w._dt_from, w._dt_to = now - timedelta(days=30), now
+    fake = _FakeThinned({}).install()
+    fake.window = (cpva_core.dt_to_ns(w._dt_from), cpva_core.dt_to_ns(w._dt_to))
+    w._on_load_clicked(silent=True)
+    _pump(60.0, cond=lambda: not w._load_in_flight)
+    w._ref_lines = [{"label": "limit", "pv": pvs[0], "y": 100.0,
+                     "color": "#C62828", "style": "dashed", "width": 1.2,
+                     "crossing": "above"}]
+    shown = []
+    orig = app_main._LimitCrossingsDialog.show
+    app_main._LimitCrossingsDialog.show = lambda self: shown.append(self)
+    try:
+        w._open_limit_crossings()
+        # The window opens at the click, empty, and fills when the search ends.
+        check("the crossings window opens at the click", bool(shown))
+        _pump(20.0, cond=lambda: not getattr(w, "_cross_in_flight", False))
+    finally:
+        app_main._LimitCrossingsDialog.show = orig
+    rows = shown[0]._rows if shown else []
+    check("exactly one crossing", len(rows) == 1, str(rows))
+    if rows:
+        r = rows[0]
+        # Within a microsecond: times travel as float64, as in the graph.
+        check("found at the spike's own time, sample-exact",
+              r["exact"] and abs(r["start"] - fake.spike_ns()) < 1000
+              and abs(r["peak_at"] - fake.spike_ns()) < 1000, str(r))
+        check("with its real height", r["peak"] == 500.0, str(r["peak"]))
+        tv = shown[0]._tv
+        check("the table has the row and a readable header",
+              tv.rowCount() == 1 and tv.horizontalHeaderItem(0).text() == "Line")
+    for d in shown:
+        d.deleteLater()
     _teardown(w)
 
 

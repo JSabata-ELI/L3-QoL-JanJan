@@ -51,8 +51,9 @@ THE THREE TABS
 
   Data Archive   the same data as a table, one row per recorded
                  moment. Right-click a cell to copy it, a row to
-                 copy the whole row, or to delete a row. There is an
-                 export to a spreadsheet file.
+                 copy the whole row. ("Delete row" in that menu
+                 does nothing here.) There is an export to a
+                 spreadsheet file.
 
   Log           what the program did while fetching, in detail. This
                 is the tab to read when an update looks wrong.
@@ -65,6 +66,12 @@ UPDATING THE LOG
   what it found. Nothing already in the log is rewritten, so
   pressing it twice is harmless.
 
+  Afterwards the graph is redrawn: a period chosen with All, 1Y, 6M
+  or 1M is applied again, so it ends at the newest reading (1M
+  stays one month); a period you typed in is left as it was. When
+  nothing new was due, the status line says "Archive is up to date
+  (readings are taken at 09:00, 13:30, 18:00)."
+
   A long catch-up takes a while — the archiver has to be asked in
   one-hour pieces — and the Log tab shows the progress.
 
@@ -75,7 +82,8 @@ TWO THINGS TO KNOW
     (chiller_archive.csv). If it is missing, it is rebuilt from the
     historical spreadsheet in the same folder, which reaches back to
     2018.
-  - The chosen period is only remembered between runs if the small
+  - The chosen period — its dates and which of All / 1Y / 6M / 1M
+    chose it — is only remembered between runs if the small
     settings file next to the program already exists. Without it,
     every start opens on the same default.
 

@@ -55,10 +55,13 @@ _HEAD_BAND = ("#dde3ec", "#16202c")
 class WatchTab(QWidget):
     """The table and the log. Renders from the engine; decides nothing."""
 
-    def __init__(self, engine, on_edit=None, parent=None):
+    def __init__(self, engine, on_edit=None, on_open=None, parent=None):
         super().__init__(parent)
         self._engine = engine
+        # on_edit(item): a tick changed that item. on_open(item): the operator
+        # double-clicked it to change it on its own tab — nothing was changed.
         self._on_edit = on_edit
+        self._on_open = on_open
         self._updating = False
         # None, not []: an empty list is what the plan looks like when there is
         # nothing to watch, and then the first refresh would decide the table
@@ -296,7 +299,7 @@ class WatchTab(QWidget):
                 return
 
     def _repaint(self, plan):
-        """Write the cells that changed; says whether any did."""
+        """Write the cells that changed; says whether a width may have."""
         wrote = False
         self._updating = True
         try:
@@ -357,35 +360,53 @@ class WatchTab(QWidget):
         # cells rewritten twice a second, for ever, to say the same thing.
         stamp = (on, state, st.fired, ground, ink, tip,
                  tuple(sorted(texts.items())))
-        if getattr(self, "_painted", {}).get(row) == stamp:
+        before = getattr(self, "_painted", {}).get(row)
+        if before == stamp:
             return False
         self._painted[row] = stamp
+        old = before or (None,) * len(stamp)
+        old_texts = dict(old[6]) if old[6] is not None else {}
+        bold = state == C.STATE_TRIP
+        old_bold = None if before is None else old[1] == C.STATE_TRIP
+        # Only what differs from the last paint is written: with a noisy value
+        # the number is the one thing that moves, and every other call here is
+        # a repaint and a style repolish of its own.
+        colours = (ground, ink) != (old[3], old[4])
+        widths = bold != old_bold
 
         for col in range(len(_COLS)):
             cell = self._table.item(row, col)
             if cell is None:
                 continue
             if col == _C_ON:
-                cell.setCheckState(Qt.CheckState.Checked if on
-                                   else Qt.CheckState.Unchecked)
-            else:
+                if on != old[0]:
+                    cell.setCheckState(Qt.CheckState.Checked if on
+                                       else Qt.CheckState.Unchecked)
+            elif texts.get(col, "") != old_texts.get(col):
                 cell.setText(texts.get(col, ""))
+                widths = True
             # A background is set on EVERY cell of the row, or on none of them.
             # Set on one cell only, the band breaks and the row reads as two
             # different things.
-            if ground is None:
-                cell.setData(Qt.ItemDataRole.BackgroundRole, None)
-            else:
-                cell.setBackground(QColor(ground))
-            cell.setForeground(QColor(ink))
-            cell.setToolTip(tip)
-            font = cell.font()
-            font.setBold(state == C.STATE_TRIP)
-            cell.setFont(font)
-        # Numbers right-aligned so a column of them can be read down the column.
-        self._table.item(row, _C_READING).setTextAlignment(
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-        return True
+            if colours:
+                if ground is None:
+                    cell.setData(Qt.ItemDataRole.BackgroundRole, None)
+                else:
+                    cell.setBackground(QColor(ground))
+                cell.setForeground(QColor(ink))
+            if tip != old[5]:
+                cell.setToolTip(tip)
+            if bold != old_bold:
+                font = cell.font()
+                font.setBold(bold)
+                cell.setFont(font)
+        if before is None:
+            # Numbers right-aligned so a column of them can be read down it.
+            self._table.item(row, _C_READING).setTextAlignment(
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        # True only when a column may need another width; a colour or a
+        # tooltip changing is not a reason to measure every cell again.
+        return widths
 
     def _reading_text(self, item, st):
         if item.get("kind") == "area":
@@ -451,7 +472,7 @@ class WatchTab(QWidget):
             return
         item["on"] = cell.checkState() == Qt.CheckState.Checked
         if self._on_edit:
-            self._on_edit()
+            self._on_edit(item)
 
     def _on_double_click(self, index):
         cell = self._table.item(index.row(), _C_ON)
@@ -461,8 +482,19 @@ class WatchTab(QWidget):
         if iid is None:      # a heading line, or the "nothing here yet" note
             return
         item = self._engine.item_by_id(iid)
-        if item is not None and self._on_edit:
-            self._on_edit(item)
+        if item is not None and self._on_open:
+            self._on_open(item)
+
+    # ── asked for by the window ─────────────────────────────────────────────
+    def reload(self):
+        self._refresh()
+
+    def update_item(self, _item):
+        # The table already only writes what changed; a ticked row may also
+        # have to move to the "Not watched" block, which `_refresh` decides.
+        # Deferred: this is reached from the table's own itemChanged, and a
+        # move rebuilds the rows — the cell that is still emitting among them.
+        QTimer.singleShot(0, self._refresh)
 
     # ── the log ─────────────────────────────────────────────────────────────
     def log(self, message, hint=None):

@@ -137,9 +137,10 @@ def main() -> int:
     text, grey, tip = v._pv_row_value("PTM1")
     print(f"\n[free-running] 3.3 Hz camera, shots every 5 s — frame between shots")
     print(f"  claim window {v._pv_claim_window_ns() / 1e9:.2f} s   row {text!r}")
+    # 05.10.2026: the state is a dot (orange = another shot's, grey = none), not words.
     check("a frame between shots never shows a reading as its OWN",
-          "s)" in text or text.startswith(m.cpva.PV_TEXT_NOT_FOUND), f"text={text!r}")
-    check("and it is greyed either way", grey, f"grey={grey}")
+          grey in (m.PV_STATE_HELD, m.PV_STATE_NONE), f"text={text!r} state={grey!r}")
+    check("…and the tooltip says when it was read", bool(tip), f"tip={tip[:60]!r}")
 
     print("\nALL PASS" if not FAILURES else f"\n{len(FAILURES)} FAILURE(S)")
     for f in FAILURES:

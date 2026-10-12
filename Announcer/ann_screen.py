@@ -188,11 +188,109 @@ def place_on_screen(widget, x=None, y=None):
 # Grabbing and comparing
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SRCCOPY_CAPTUREBLT = 0x00CC0020 | 0x40000000
+_DPI_PER_MONITOR_AWARE = -3             # the context PIL's own grab uses
+
+
+def _gdi_grab(bbox):
+    """Exactly the physical rectangle `bbox`, straight from Windows, as RGB.
+
+    Why not `PIL.ImageGrab`: it photographs the WHOLE virtual desktop and crops
+    afterwards (269-360 ms here), and it does that inside one C call that holds
+    Python's lock the whole time — so although the watch grabs on a worker
+    thread, the program's window stood still for 250-420 ms on every pass
+    (measured 2026-10-06 with a 10 ms timer). Calls made through ctypes let go
+    of that lock, and only the asked-for rectangle is copied.
+
+    The same Windows calls PIL makes — the screen DC, BitBlt with CAPTUREBLT so
+    layered windows are in the picture, absolute virtual-desktop coordinates —
+    under per-monitor DPI awareness for this thread, so the pixels are physical
+    just as PIL's are. Raises on any failure; `grab_rect` falls back to PIL.
+    """
+    import ctypes
+    from ctypes import wintypes
+    from PIL import Image
+
+    x, y = bbox[0], bbox[1]
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    user32.GetDC.restype = wintypes.HDC
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int,
+                                             ctypes.c_int]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.HDC,
+                             ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT,
+                                wintypes.UINT, ctypes.c_void_p, ctypes.c_void_p,
+                                wintypes.UINT]
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+
+    class _BMIH(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD),
+                    ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD),
+                    ("biXPelsPerMeter", ctypes.c_long),
+                    ("biYPelsPerMeter", ctypes.c_long),
+                    ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    old_ctx = None
+    try:
+        set_ctx = user32.SetThreadDpiAwarenessContext
+        set_ctx.restype = ctypes.c_void_p
+        set_ctx.argtypes = [ctypes.c_void_p]
+        old_ctx = set_ctx(ctypes.c_void_p(_DPI_PER_MONITOR_AWARE))
+    except AttributeError:
+        set_ctx = None                  # older Windows: the process setting holds
+    screen = user32.GetDC(None)
+    mem = gdi32.CreateCompatibleDC(screen)
+    bmp = gdi32.CreateCompatibleBitmap(screen, w, h)
+    try:
+        if not screen or not mem or not bmp:
+            raise OSError("no screen device context")
+        old_bmp = gdi32.SelectObject(mem, bmp)
+        ok = gdi32.BitBlt(mem, 0, 0, w, h, screen, x, y, _SRCCOPY_CAPTUREBLT)
+        gdi32.SelectObject(mem, old_bmp)
+        if not ok:
+            raise OSError("BitBlt refused the copy (is the session locked?)")
+        head = _BMIH(ctypes.sizeof(_BMIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        # A BITMAPINFO is the header plus a colour table, which 32 bits has none
+        # of; room for one entry anyway.
+        info = ctypes.create_string_buffer(ctypes.sizeof(_BMIH) + 16)
+        ctypes.memmove(info, ctypes.byref(head), ctypes.sizeof(_BMIH))
+        if gdi32.GetDIBits(mem, bmp, 0, h, buf, info, 0) != h:
+            raise OSError("GetDIBits returned short")
+        return Image.frombuffer("RGB", (w, h), buf.raw, "raw", "BGRX", 0, 1)
+    finally:
+        if bmp:
+            gdi32.DeleteObject(bmp)
+        if mem:
+            gdi32.DeleteDC(mem)
+        if screen:
+            user32.ReleaseDC(None, screen)
+        if set_ctx is not None and old_ctx:
+            set_ctx(ctypes.c_void_p(old_ctx))
+
+
 def grab_rect(region):
     """A picture of one physical rectangle of the desktop: (image, error).
 
-    `all_screens=True` is not optional — without it PIL photographs the primary
-    monitor only, and every rectangle on another screen comes back wrong.
+    Taken by `_gdi_grab`, which neither photographs the whole desktop nor holds
+    Python's lock while it does it. PIL is the fallback, with
+    `all_screens=True` — without it PIL photographs the primary monitor only,
+    and every rectangle on another screen comes back wrong.
 
     Two things this cannot tell apart from a real change, both worth knowing:
     a LOCKED session photographs as the lock screen or as solid black, and a
@@ -202,10 +300,14 @@ def grab_rect(region):
     if not region:
         return None, "no rectangle"
     try:
-        from PIL import ImageGrab
         bbox = (int(region[0]), int(region[1]), int(region[2]), int(region[3]))
         if bbox[2] - bbox[0] < 1 or bbox[3] - bbox[1] < 1:
             return None, "rectangle has no area"
+        try:
+            return _gdi_grab(bbox), None
+        except Exception:
+            pass
+        from PIL import ImageGrab
         img = ImageGrab.grab(bbox=bbox, all_screens=True)
         return img, None
     except Exception as exc:
@@ -225,8 +327,11 @@ def grab_regions(regions):
     this PC 2026-09-17, 269 ms and a 30 MB buffer per call at 7040x1440. The
     watcher asked for that once per watched area, twice a second: four areas did
     not fit in the half second they had, and churned 120 MB a second doing it.
-    One photograph of the bounding box of all of them answers every one, and the
-    bounding box is what PIL was going to photograph anyway.
+    One photograph of the bounding box of all of them answers every one.
+
+    Since 2026-10-06 `grab_rect` copies only the asked-for rectangle (see
+    `_gdi_grab`): 41 ms for two areas instead of 362, and the window no longer
+    stands still while it happens.
     """
     regions = list(regions)
     if not regions:
@@ -652,13 +757,33 @@ class MonitorNumbers:
 
     def __init__(self):
         self._labels = []
+        # ONE clock, restarted by every press. It used to be a fresh singleShot
+        # per press, so a second press inside the 2.5 s had its numbers taken
+        # away early by the first press's timer.
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.SHOW_MS)
+        self._timer.timeout.connect(self.hide)
 
     def show(self):
-        self.hide()
-        for info in screens():
-            lbl = QLabel(None, Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint
-                         | Qt.WindowType.Tool)
+        infos = screens()
+        # Pressed again while they are up: the same labels are kept and only
+        # written again, rather than all thrown away and made anew — which
+        # made every number blink off and on.
+        if len(infos) != len(self._labels):
+            self.hide()
+        for n, info in enumerate(infos):
+            if n < len(self._labels):
+                lbl = self._labels[n]
+            else:
+                lbl = QLabel(None, Qt.WindowType.FramelessWindowHint
+                             | Qt.WindowType.WindowStaysOnTopHint
+                             | Qt.WindowType.Tool)
+                # A notice, not a window to type into: it never takes the
+                # keyboard away from whatever the operator is doing.
+                lbl.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating,
+                                 True)
+                self._labels.append(lbl)
             p = info.physical
             lbl.setText(f"Monitor {info.index + 1}\n{p.width()} x {p.height()}"
                         + ("\n(main)" if info.primary else ""))
@@ -675,12 +800,13 @@ class MonitorNumbers:
             lbl.move(g.x() + (g.width() - lbl.width()) // 2,
                      g.y() + (g.height() - lbl.height()) // 2)
             lbl.setWindowOpacity(0.9)
-            lbl.show()
-            lbl.raise_()
-            self._labels.append(lbl)
-        QTimer.singleShot(self.SHOW_MS, self.hide)
+            if not lbl.isVisible():
+                lbl.show()
+                lbl.raise_()
+        self._timer.start()
 
     def hide(self):
+        self._timer.stop()
         # `retire`, not `deleteLater`: these are parentless top-level labels and
         # this is the same drop-the-last-reference-too-early shape that was
         # measured out of the crash dumps. See `retire`.

@@ -14,9 +14,8 @@ WHAT IT DOES
   ask it questions from the Webex chat and it answers with numbers
   and graphs.
 
-  In practice the PV Monitor tab is the whole program. The History
-  tab is dormant: the file it needs is no longer produced by
-  anything.
+  The PV Monitor tab is the whole program; the Log tab shows its
+  run log.
 
 
 THE IMPORTANT DISTINCTION: READING VERSUS ALERTING
@@ -277,6 +276,10 @@ THE CANTEEN MENU
   gives the whole week, and /food tomorrow, /food friday or
   /food 27.8. a single day.
 
+  A room can have the canteen switched off: untick its "/food" box
+  in Settings -> Webex rooms. There /food only says it is not
+  available, /help leaves food out and no lunch reminder is posted.
+
   From 14:30 a plain /food shows the NEXT serving day instead of
   today - by then today's lunch is over and the useful question is
   what there is tomorrow. On a Friday afternoon that is Monday: it
@@ -365,6 +368,20 @@ SIGNING UP FOR LUNCH, AND OFF IT
       - Main courses: Sekana s bramborovou kasi - 147 Kc
 
       Nothing has been changed and no code was used.
+
+  LUNCH NOT ORDERED - the morning reminder
+
+  On working days from 08:00 the bot checks today's order. If today
+  has a menu, ordering is still open and you have nothing ordered,
+  it posts one message that mentions you:
+
+      🍽 @Jan you have no lunch ordered for today (Monday 5 Oct).
+      Ordering usually closes at 10:00 — send /food to see the menu.
+
+  Nothing is sent on days without a menu, once ordering has closed,
+  or when you have already ordered. One message a day at most.
+  Settings -> Canteen menu -> Lunch not ordered sets the hour or
+  switches it off; Mention is the address (empty = Work account).
 
   ONE-TIME CODES - why it works this way
 

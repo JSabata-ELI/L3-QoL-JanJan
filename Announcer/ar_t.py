@@ -377,7 +377,15 @@ class AreasTab(QWidget):
         self._dlg = None
         # id → the clock time its reference picture was last retaken, this run.
         self._snapped = {}
+        # What the preview shows now, so a tick that brings nothing new costs
+        # nothing: (item id, picture) / (item id, reference text) / colours.
+        self._pv_now_key = None
+        self._pv_ref_key = None
+        self._pv_style = None
         self._build()
+        # The saved rectangles are filled once here and then only by the
+        # buttons that change them — not on every reload of the rows.
+        self._refresh_presets()
         self.reload()
         # The preview has its OWN clock, and a slow one. It used to hang off
         # `engine().changed`, which fires up to four times a second — and each
@@ -389,6 +397,16 @@ class AreasTab(QWidget):
         self._pv_clock.setInterval(1000)
         self._pv_clock.timeout.connect(self._refresh_preview)
         self._pv_clock.start()
+
+    def showEvent(self, ev):
+        # On screen: the watch photographs the areas without a reference too,
+        # so the preview has something to show for them.
+        super().showEvent(ev)
+        self._win.engine().preview_wanted = True
+
+    def hideEvent(self, ev):
+        super().hideEvent(ev)
+        self._win.engine().preview_wanted = False
 
     # ── building ────────────────────────────────────────────────────────────
     def _build(self):
@@ -559,7 +577,6 @@ class AreasTab(QWidget):
         finally:
             self._updating = False
         self._fit.fit()
-        self._refresh_presets()
         self._on_selection()
 
     def _fill_row(self, row, item):
@@ -571,6 +588,11 @@ class AreasTab(QWidget):
             flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             if col == _C_ON:
                 flags |= Qt.ItemFlag.ItemIsUserCheckable
+                # The tick cell has no text of its own, so nothing below writes
+                # it — and a reused cell may still hold the empty-table note
+                # sentence, which then sat behind the tick and made "On" as
+                # wide as that sentence.
+                cell.setText("")
             elif col in (_C_NAME, _C_MSG, _C_THR):
                 flags |= Qt.ItemFlag.ItemIsEditable
             cell.setFlags(flags)
@@ -671,34 +693,52 @@ class AreasTab(QWidget):
             self._pv_ref.setPixmap(QPixmap())
             self._pv_ref.setText("")
             self._pv_state.setText("")
-            self._pv_state.setStyleSheet("")
+            if self._pv_style is not None:
+                self._pv_state.setStyleSheet("")
             self._pv_note.setText("")
+            self._pv_now_key = self._pv_ref_key = self._pv_style = None
             return
-        img, err = S.grab_rect(item.get("region"))
-        if img is None:
-            self._pv_now.setPixmap(QPixmap())
-            self._pv_now.setText(err or "nothing to show")
-        else:
-            self._pv_now.setText("")
-            self._pv_now.setPixmap(S.framed_pixmap(img, 400, 170))
-        ref = C.decode_reference(item.get("reference"))
-        if ref is None:
-            self._pv_ref.setPixmap(QPixmap())
-            self._pv_ref.setText("no reference picture — it cannot fire")
-        else:
-            self._pv_ref.setText("")
-            self._pv_ref.setPixmap(S.framed_pixmap(ref, 400, 170))
+        iid = int(item["id"])
+        st = self._win.engine().state_of(iid)
+        # The picture the watch itself took last — never a photograph of our
+        # own here: PIL grabs the WHOLE desktop and crops (269 ms, measured),
+        # and on this thread that froze the window once a second.
+        img = st.picture if item.get("region") else None
+        # Compared by identity: a PIL image's own == compares every pixel.
+        shown = self._pv_now_key
+        if shown is None or shown[0] != iid or shown[1] is not img:
+            self._pv_now_key = (iid, img)
+            if img is None:
+                self._pv_now.setPixmap(QPixmap())
+                self._pv_now.setText("no rectangle drawn yet"
+                                     if not item.get("region")
+                                     else "waiting for the first picture")
+            else:
+                self._pv_now.setText("")
+                self._pv_now.setPixmap(S.framed_pixmap(img, 400, 170))
+        # The reference is decoded and framed once per stored picture.
+        ref_key = (iid, item.get("reference"))
+        if ref_key != self._pv_ref_key:
+            self._pv_ref_key = ref_key
+            ref = C.decode_reference(item.get("reference"))
+            if ref is None:
+                self._pv_ref.setPixmap(QPixmap())
+                self._pv_ref.setText("no reference picture — it cannot fire")
+            else:
+                self._pv_ref.setText("")
+                self._pv_ref.setPixmap(S.framed_pixmap(ref, 400, 170))
 
-        st = self._win.engine().state_of(int(item["id"]))
         ground, ink = U.STATE_COLORS.get(st.state, U.STATE_COLORS["unknown"])
         thr = float(item.get("threshold", C.DEFAULT_THRESHOLD))
         live = "—" if st.diff is None else f"{st.diff:.2f}"
         self._pv_state.setText(f"difference now {live} · sensitivity {thr:.1f}\n"
                                f"{st.text}")
-        self._pv_state.setStyleSheet(
-            f"QLabel {{ background: {ground}; color: {ink};"
-            f" border: 1px solid {ink}; border-radius: 3px; padding: 4px 6px;"
-            f" font-weight: 600; }}")
+        if self._pv_style != (ground, ink):
+            self._pv_style = (ground, ink)
+            self._pv_state.setStyleSheet(
+                f"QLabel {{ background: {ground}; color: {ink};"
+                f" border: 1px solid {ink}; border-radius: 3px; padding: 4px 6px;"
+                f" font-weight: 600; }}")
         when = self._snapped.get(int(item["id"]))
         self._pv_note.setText(
             f"reference picture taken at {when}" if when else "")
@@ -727,8 +767,25 @@ class AreasTab(QWidget):
             self._updating = False
         else:
             return
-        self._win.save_soon()
-        self._win.refresh_tabs()
+        self._win.item_changed(item)
+
+    def update_item(self, item):
+        """Write again the one row that shows this item — nothing else."""
+        if item.get("kind") != "area":
+            return
+        for row, it in enumerate(self._areas()):
+            if int(it["id"]) == int(item["id"]):
+                break
+        else:
+            return
+        self._updating = True
+        try:
+            self._fill_row(row, item)
+        finally:
+            self._updating = False
+        self._fit.fit()
+        if self._selected() is item:
+            self._refresh_preview()
 
     # ── the buttons ─────────────────────────────────────────────────────────
     def _add(self):

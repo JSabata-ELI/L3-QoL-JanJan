@@ -2,11 +2,13 @@
 pr_t.py  --  Photo Renamer: the whole program, as one QWidget.
 
 Open a folder, look through the pictures in it (sub-folders included), rename them
-by double-clicking, cross out the ones that should go, then Save. Recover walks the
-pending changes and drops only the ones you pick.
+by double-clicking, cross out the ones that should go, mark them up in the panel on
+the right (circle, rectangle, arrow, pen, text, crop, rotate), then Save. Recover
+walks the pending changes and drops only the ones you pick.
 
 Nothing on disk is touched until Save. Recover therefore only ever throws away
-pending changes; once Save has run there is nothing left to undo.
+pending changes; once Save has run there is nothing left to undo -- except that an
+edited picture's untouched original is copied into "Original photos" first.
 
 Every colour in this file is stated. Windows here runs in dark mode, so anything
 left to the theme comes out black on black.
@@ -14,24 +16,27 @@ left to the theme comes out black on black.
 from __future__ import annotations
 
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import (QBuffer, QByteArray, QObject, QPoint, QPointF, QRect,
-                            QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer,
-                            Signal)
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QIcon, QImage,
-                           QImageReader, QPainter, QPainterPath, QPen, QPixmap,
-                           QPolygonF)
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog, QFileDialog,
-                               QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QMenu,
-                               QMessageBox, QPushButton, QScrollArea,
-                               QSizePolicy, QSplitter, QStyle,
+from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QObject, QPoint,
+                            QPointF, QRect, QRectF, QRunnable, QSize, Qt,
+                            QThreadPool, QTimer, Signal)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QFontMetricsF,
+                           QIcon, QImage, QImageReader, QImageWriter,
+                           QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
+                           QPolygonF, QShortcut, QTransform)
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
+                               QDialog, QFileDialog, QFrame, QGridLayout,
+                               QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMenu, QMessageBox, QPushButton,
+                               QScrollArea, QSizePolicy, QSplitter, QStyle,
                                QStyledItemDelegate, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -41,11 +46,17 @@ PICTURE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff",
 # Folders that never hold pictures worth showing.
 _SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode"}
 
-# The grid: at most six tiles in a row, fewer when they will not fit, and the
-# tiles stretch so a row is always filled edge to edge -- no empty strip on the
-# right. MIN_TILE_W is picked so that half of the default window gives six.
-MAX_COLUMNS = 6
-MIN_TILE_W = 100
+# Save copies the untouched original of every edited picture in here, at the top
+# of the opened folder, with the sub-folders mirrored inside. It is never listed
+# in the grid itself.
+ORIGINALS_DIR = "Original photos"
+
+# The grid: always two tiles in a row, three once the pane is wide enough for
+# three of MIN_TILE_W, and the tiles stretch so a row is always filled edge to
+# edge -- no empty strip on the right.
+MIN_COLUMNS = 2
+MAX_COLUMNS = 3
+MIN_TILE_W = 200
 _CARD_INSET = 2            # gap between two cards
 _CARD_PAD = 4              # inside the card, around the picture
 _NAME_H = 17               # exactly one line for the name, and nothing else
@@ -376,12 +387,132 @@ def _ico_undo(p: QPainter, c: QColor) -> None:
                               QPointF(7.6, 6.8)]))
 
 
+def _ico_pointer(p: QPainter, c: QColor) -> None:
+    # A mouse pointer: just look, draw nothing.
+    p.setPen(_ipen(c, 1.5))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPolygon(QPolygonF([QPointF(5.0, 2.6), QPointF(5.0, 16.0),
+                             QPointF(8.4, 12.8), QPointF(10.8, 17.6),
+                             QPointF(13.0, 16.6), QPointF(10.6, 11.8),
+                             QPointF(15.0, 11.6)]))
+
+
+def _ico_ellipse(p: QPainter, c: QColor) -> None:
+    p.setPen(_ipen(c, 2.0))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(QRectF(2.6, 4.4, 14.8, 11.2))
+
+
+def _ico_rect(p: QPainter, c: QColor) -> None:
+    p.setPen(_ipen(c, 2.0))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRect(QRectF(3.0, 5.0, 14.0, 10.0))
+
+
+def _ico_arrow(p: QPainter, c: QColor) -> None:
+    p.setPen(_ipen(c, 2.0))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawLine(QPointF(3.4, 16.6), QPointF(14.6, 5.4))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(c))
+    p.drawPolygon(QPolygonF([QPointF(17.2, 2.8), QPointF(15.8, 10.4),
+                             QPointF(9.6, 4.2)]))
+
+
+def _ico_pen(p: QPainter, c: QColor) -> None:
+    # A pencil lying on a slant, and the scribble it leaves.
+    p.setPen(_ipen(c, 1.7))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPolygon(QPolygonF([QPointF(13.4, 2.8), QPointF(17.2, 6.6),
+                             QPointF(8.0, 15.8), QPointF(3.6, 16.4),
+                             QPointF(4.2, 12.0)]))
+    p.drawLine(QPointF(11.4, 4.8), QPointF(15.2, 8.6))
+
+
+def _ico_text(p: QPainter, c: QColor) -> None:
+    # A capital T, drawn rather than typed.
+    p.setPen(_ipen(c, 2.2))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawLine(QPointF(4.0, 4.0), QPointF(16.0, 4.0))
+    p.drawLine(QPointF(10.0, 4.0), QPointF(10.0, 16.6))
+    p.drawLine(QPointF(7.4, 16.6), QPointF(12.6, 16.6))
+
+
+def _ico_crop(p: QPainter, c: QColor) -> None:
+    # The two crossing corner brackets of a crop tool.
+    p.setPen(_ipen(c, 1.9))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawPolyline(QPolygonF([QPointF(5.6, 2.0), QPointF(5.6, 14.4),
+                              QPointF(18.0, 14.4)]))
+    p.drawPolyline(QPolygonF([QPointF(2.0, 5.6), QPointF(14.4, 5.6),
+                              QPointF(14.4, 18.0)]))
+
+
+def _rotate_arrow(p: QPainter, c: QColor, clockwise: bool) -> None:
+    # Drawn as written, the head sits at the arc's start and the arrow turns
+    # anticlockwise; the clockwise one is its mirror image.
+    p.setPen(_ipen(c, 1.9))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    if clockwise:
+        p.translate(_ICON_BOX, 0.0)
+        p.scale(-1.0, 1.0)
+    path = QPainterPath()
+    path.arcMoveTo(QRectF(3.4, 4.0, 13.2, 13.2), 150.0)
+    path.arcTo(QRectF(3.4, 4.0, 13.2, 13.2), 150.0, -270.0)
+    p.drawPath(path)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(c))
+    p.drawPolygon(QPolygonF([QPointF(1.6, 5.6), QPointF(8.2, 4.0),
+                             QPointF(4.0, 10.6)]))
+
+
+def _ico_rot_left(p: QPainter, c: QColor) -> None:
+    _rotate_arrow(p, c, clockwise=False)
+
+
+def _ico_rot_right(p: QPainter, c: QColor) -> None:
+    _rotate_arrow(p, c, clockwise=True)
+
+
+def _ico_reset(p: QPainter, c: QColor) -> None:
+    # A photograph with a cross over it: throw every edit of it away.
+    p.setPen(_ipen(c, 1.6))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(2.0, 3.6, 13.0, 10.0), 1.4, 1.4)
+    p.setPen(_ipen(c, 2.0))
+    p.drawLine(QPointF(11.4, 10.8), QPointF(18.0, 17.4))
+    p.drawLine(QPointF(18.0, 10.8), QPointF(11.4, 17.4))
+
+
+def _line_width_recipe(width: float):
+    def draw(p: QPainter, c: QColor) -> None:
+        pen = QPen(c)
+        pen.setWidthF(width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPointF(3.6, 10.0), QPointF(16.4, 10.0))
+    return draw
+
+
 _ICON_RECIPES = {
     "folder": _ico_folder,
     "explorer": _ico_explorer,
     "picture": _ico_picture,
     "save": _ico_save,
     "undo": _ico_undo,
+    "view": _ico_pointer,
+    "ellipse": _ico_ellipse,
+    "rect": _ico_rect,
+    "arrow": _ico_arrow,
+    "pen": _ico_pen,
+    "text": _ico_text,
+    "crop": _ico_crop,
+    "rot_left": _ico_rot_left,
+    "rot_right": _ico_rot_right,
+    "reset": _ico_reset,
+    "width0": _line_width_recipe(1.4),
+    "width1": _line_width_recipe(3.0),
+    "width2": _line_width_recipe(5.4),
 }
 
 
@@ -441,6 +572,60 @@ def _btn(text: str, tip: str = "", icon: str = "", kind: str = "plain") -> QPush
     return b
 
 
+# The square icon-only buttons above the picture. A chosen tool keeps a blue
+# ground and a thick blue rim, so which one is active is never in doubt.
+_TOOL_BTN_PX = 25
+_TOOL_ICON_PX = 16
+_TOOL_QSS = (
+    "QPushButton { padding: 0px; border: 1px solid #b6b6b6; border-radius: 3px;"
+    " background: #efefef; color: #111; }"
+    "QPushButton:hover { background: #d9e8ff; }"
+    "QPushButton:pressed { background: #b9d0f5; }"
+    "QPushButton:checked { background: #cfe0f7; border: 2px solid #2f6fb5; }"
+    "QPushButton:disabled { background: #f4f4f4; border-color: #dcdcdc; }"
+)
+
+
+def _tool_btn(icon: QIcon, tip: str, checkable: bool = False) -> QPushButton:
+    b = QPushButton()
+    b.setStyleSheet(_TOOL_QSS)
+    b.setIcon(icon)
+    b.setIconSize(QSize(_TOOL_ICON_PX, _TOOL_ICON_PX))
+    b.setToolTip(tip)
+    b.setCheckable(checkable)
+    b.setFixedSize(_TOOL_BTN_PX, _TOOL_BTN_PX)
+    b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    return b
+
+
+def swatch_icon(colour: str) -> QIcon:
+    """A filled square of the colour with a dark rim, so white shows too."""
+    key = ("swatch", colour)
+    hit = _ICON_CACHE.get(key)
+    if hit is not None:
+        return hit
+    icon = QIcon()
+    for px in _ICON_SIZES:
+        for mode, fill, rim in ((QIcon.Mode.Normal, colour, "#2a2f36"),
+                                (QIcon.Mode.Disabled, "#e3e3e3", "#b8b8b8")):
+            pm = QPixmap(px, px)
+            pm.fill(Qt.GlobalColor.transparent)
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            q.scale(px / _ICON_BOX, px / _ICON_BOX)
+            q.setPen(QPen(QColor(rim), 1.4))
+            q.setBrush(QBrush(QColor(fill)))
+            q.drawRoundedRect(QRectF(2.6, 2.6, 14.8, 14.8), 2.0, 2.0)
+            q.end()
+            modes = ((QIcon.Mode.Normal, QIcon.Mode.Active, QIcon.Mode.Selected)
+                     if mode == QIcon.Mode.Normal else (mode,))
+            for m in modes:
+                icon.addPixmap(pm, m, QIcon.State.Off)
+                icon.addPixmap(pm, m, QIcon.State.On)
+    _ICON_CACHE[key] = icon
+    return icon
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Reading a picture
 # ─────────────────────────────────────────────────────────────────────────────
@@ -485,6 +670,12 @@ def load_scaled(path: Path, max_side: int) -> tuple[QImage, int, int]:
         img = r.read()
         if img.isNull():
             return QImage(), full_w, full_h
+        # size() is the stored size; a phone photo turned upright by its EXIF
+        # tag comes out the other way round. The edits are measured against the
+        # upright picture, so the full size must be too.
+        if (full_w and full_h and full_w != full_h
+                and (img.width() > img.height()) != (full_w > full_h)):
+            full_w, full_h = full_h, full_w
         return img, full_w or img.width(), full_h or img.height()
     except Exception:
         return QImage(), 0, 0
@@ -534,6 +725,187 @@ class _LoadTask(QRunnable):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Edits
+#
+#  An edit is kept as a list of steps, never as changed pixels. Every step holds
+#  its points in full-resolution pixels of the picture as it is at that step --
+#  after the rotations and crops before it. render_edits() replays the steps on
+#  any decode of the picture, so the preview, the grid tile and the file Save
+#  writes all come out of the same code: what is on screen is what is saved.
+# ─────────────────────────────────────────────────────────────────────────────
+EDIT_COLOURS = ("#e02020", "#ffd400", "#20a040", "#1e6fe0", "#111111", "#ffffff")
+
+# Line width and text height for the three thickness buttons, as a share of the
+# picture's longer side -- so a "medium" line looks the same on a phone photo and
+# on a camera frame, whatever the zoom on screen.
+_LINE_SHARE = (0.003, 0.006, 0.012)
+_TEXT_SHARE = (0.035, 0.05, 0.075)
+
+
+@dataclass
+class EditOp:
+    kind: str                   # ellipse, rect, arrow, pen, text, rotate, crop
+    pts: list = field(default_factory=list)   # [(x, y), ...] full-res pixels
+    colour: str = "#e02020"
+    width: float = 0.0          # line width, or text height, in full-res pixels
+    text: str = ""
+    turn: int = 0               # rotate: +1 clockwise, -1 anticlockwise
+
+
+def _crop_box(op: EditOp, cur_w: int, cur_h: int) -> QRect:
+    """The crop step's rectangle in whole pixels, kept inside the picture."""
+    (x0, y0), (x1, y1) = op.pts[0], op.pts[-1]
+    left = max(0, int(round(min(x0, x1))))
+    top = max(0, int(round(min(y0, y1))))
+    right = min(cur_w, int(round(max(x0, x1))))
+    bottom = min(cur_h, int(round(max(y0, y1))))
+    return QRect(left, top, max(0, right - left), max(0, bottom - top))
+
+
+def frame_after(full_w: int, full_h: int, ops: list[EditOp]) -> tuple[int, int]:
+    """Size in full-resolution pixels after every rotation and crop."""
+    w, h = full_w, full_h
+    for op in ops:
+        if op.kind == "rotate" and op.turn % 2:
+            w, h = h, w
+        elif op.kind == "crop":
+            box = _crop_box(op, w, h)
+            if box.width() > 0 and box.height() > 0:
+                w, h = box.width(), box.height()
+    return w, h
+
+
+def _halo_for(colour: str) -> QColor:
+    """Black around a light colour, white around a dark one."""
+    c = QColor(colour)
+    return QColor("#000000") if c.lightnessF() > 0.55 else QColor("#ffffff")
+
+
+def draw_op(p: QPainter, op: EditOp) -> None:
+    """Draw one marking step. The painter is already in full-res pixels."""
+    if not op.pts:
+        return
+    c = QColor(op.colour)
+    pen = QPen(c)
+    pen.setWidthF(max(0.5, op.width))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    a = QPointF(*op.pts[0])
+    b = QPointF(*op.pts[-1])
+    if op.kind == "ellipse":
+        p.drawEllipse(QRectF(a, b).normalized())
+    elif op.kind == "rect":
+        p.drawRect(QRectF(a, b).normalized())
+    elif op.kind == "arrow":
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        length = math.hypot(dx, dy)
+        if length < 0.5:
+            return
+        ux, uy = dx / length, dy / length
+        head = min(length * 0.6, max(op.width * 4.5, 6.0))
+        half = head * 0.5
+        base = QPointF(b.x() - ux * head, b.y() - uy * head)
+        # The shaft stops inside the head, so its round end never pokes out of
+        # the point.
+        p.drawLine(a, QPointF(b.x() - ux * head * 0.6, b.y() - uy * head * 0.6))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(c))
+        p.drawPolygon(QPolygonF([b,
+                                 QPointF(base.x() - uy * half, base.y() + ux * half),
+                                 QPointF(base.x() + uy * half, base.y() - ux * half)]))
+    elif op.kind == "pen":
+        if len(op.pts) == 1:
+            p.drawPoint(a)
+        else:
+            p.drawPolyline(QPolygonF([QPointF(*pt) for pt in op.pts]))
+    elif op.kind == "text" and op.text:
+        f = QFont("Segoe UI")
+        f.setBold(True)
+        f.setPixelSize(max(1, int(round(op.width))))
+        fm = QFontMetricsF(f)
+        path = QPainterPath()
+        path.addText(QPointF(a.x(), a.y() + fm.ascent()), f, op.text)
+        # A thin halo in the opposite brightness keeps the words readable on a
+        # busy photograph.
+        halo = QPen(_halo_for(op.colour))
+        halo.setWidthF(max(1.0, op.width * 0.12))
+        halo.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.strokePath(path, halo)
+        p.fillPath(path, QBrush(c))
+
+
+def render_edits(base: QImage, full_w: int, full_h: int,
+                 ops: list[EditOp]) -> QImage:
+    """Replay the edit steps on a decode of the picture, at whatever size.
+
+    base is the picture decoded at any scale; full_w x full_h is its real size,
+    the frame the steps' points are measured in.
+    """
+    if not ops or base.isNull() or full_w <= 0 or full_h <= 0:
+        return base
+    img = base.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    s = base.width() / float(full_w)
+    cur_w, cur_h = full_w, full_h
+    for op in ops:
+        if op.kind == "rotate":
+            if op.turn % 4:
+                img = img.transformed(QTransform().rotate(90.0 * op.turn))
+                if op.turn % 2:
+                    cur_w, cur_h = cur_h, cur_w
+        elif op.kind == "crop":
+            box = _crop_box(op, cur_w, cur_h)
+            if box.width() <= 0 or box.height() <= 0:
+                continue
+            r = QRect(int(round(box.left() * s)), int(round(box.top() * s)),
+                      max(1, int(round(box.width() * s))),
+                      max(1, int(round(box.height() * s)))) & img.rect()
+            img = img.copy(r)
+            cur_w, cur_h = box.width(), box.height()
+        else:
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            p.scale(s, s)
+            draw_op(p, op)
+            p.end()
+    return img
+
+
+_WRITABLE: set[str] = set()
+
+
+def can_write(suffix: str) -> bool:
+    """Whether an edited picture can be written back in its own format.
+
+    GIF is the usual no: Qt reads it but cannot write it.
+    """
+    if not _WRITABLE:
+        _WRITABLE.update(bytes(f).decode("ascii", "ignore").lower()
+                         for f in QImageWriter.supportedImageFormats())
+    return suffix.lower().lstrip(".") in _WRITABLE
+
+
+def encode_image(img: QImage, suffix: str) -> bytes | None:
+    """The picture as file bytes in the format its extension names."""
+    fmt = suffix.lower().lstrip(".")
+    if fmt in ("jpg", "jpeg", "bmp"):
+        img = img.convertToFormat(QImage.Format.Format_RGB32)
+    else:
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    writer = QImageWriter(buf, QByteArray(fmt.encode("ascii")))
+    if fmt in ("jpg", "jpeg", "webp"):
+        writer.setQuality(95)
+    ok = writer.write(img)
+    buf.close()
+    return bytes(ba.data()) if ok else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  What we know about one file
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
@@ -546,6 +918,8 @@ class Item:
     stem: str = ""              # the pending name, without the extension
     deleted: bool = False       # crossed out, to be removed by Save
     conflict: str = ""          # why this name cannot be used, "" when it can
+    edits: list = field(default_factory=list)   # pending EditOp steps
+    edit_rev: int = 0           # bumped on every change to edits, for caches
 
     def __post_init__(self):
         if not self.stem:
@@ -556,12 +930,22 @@ class Item:
         return self.stem != self.orig_stem
 
     @property
+    def edited(self) -> bool:
+        return bool(self.edits)
+
+    @property
     def new_name(self) -> str:
         return self.stem + self.suffix
 
     @property
     def orig_name(self) -> str:
         return self.orig_stem + self.suffix
+
+
+def _edited_line(it: Item) -> str:
+    n = len(it.edits)
+    return (f"edited - {n} step{'s' if n != 1 else ''}; Save keeps the original"
+            f" in \"{ORIGINALS_DIR}\"")
 
 
 def human_size(n: int) -> str:
@@ -607,6 +991,19 @@ def _draw_undo_badge(p: QPainter, r: QRect) -> None:
     p.translate(r.topLeft())
     p.scale(r.width() / _ICON_BOX, r.height() / _ICON_BOX)
     _ico_undo(p, QColor("#1a5c1a"))
+    p.restore()
+
+
+def _draw_edited_badge(p: QPainter, r: QRect) -> None:
+    """A pencil in a white disc: this picture has pending edits."""
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setBrush(QBrush(QColor("#ffffff")))
+    p.setPen(QPen(QColor("#5b3b8c"), 1.4))
+    p.drawEllipse(QRectF(r).adjusted(1.0, 1.0, -1.0, -1.0))
+    p.translate(QPointF(r.left() + r.width() * 0.18, r.top() + r.height() * 0.18))
+    p.scale(r.width() * 0.64 / _ICON_BOX, r.height() * 0.64 / _ICON_BOX)
+    _ico_pen(p, QColor("#5b3b8c"))
     p.restore()
 
 
@@ -714,6 +1111,10 @@ class _TileDelegate(QStyledItemDelegate):
             _draw_undo_badge(p, badge)
         else:
             _draw_cross_badge(p, badge)
+            if item.edited:
+                d = badge.width()
+                _draw_edited_badge(p, QRect(pic.left() + 4, pic.bottom() - d - 3,
+                                            d, d))
         p.restore()
 
     # ---- the inline name editor --------------------------------------------
@@ -846,7 +1247,301 @@ class _ThumbList(QListWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 #  The preview panel on the right
 # ─────────────────────────────────────────────────────────────────────────────
+class _TextEntry(QLineEdit):
+    """The box a Text click opens on the picture. Enter or a click elsewhere
+    keeps the words, Esc throws them away."""
+    commit = Signal(str)
+    cancel = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._done = False
+        self.setStyleSheet("QLineEdit { background: #ffffff; color: #111;"
+                           " border: 1px solid #2f6fb5; padding: 0px 3px; }")
+        self.returnPressed.connect(self._finish)
+
+    def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        self.commit.emit(self.text())
+
+    def keyPressEvent(self, e) -> None:            # noqa: N802
+        if e.key() == Qt.Key.Key_Escape:
+            self._done = True
+            self.cancel.emit()
+            return
+        super().keyPressEvent(e)
+
+    def focusOutEvent(self, e) -> None:            # noqa: N802
+        super().focusOutEvent(e)
+        self._finish()
+
+
+class _EditCanvas(QWidget):
+    """The picture in the preview panel, and the surface the tools draw on.
+
+    It shows a picture that already has its edits burnt in (render_edits), and
+    turns a mouse drag into one new EditOp, in full-resolution pixels of the
+    picture as it now is. While the drag is going on, the shape is drawn on top
+    with the same draw_op() that will draw it for good.
+    """
+    op_done = Signal(object)        # an EditOp
+    escape = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Expanding)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setMouseTracking(True)
+        self._img: QImage | None = None
+        self._frame = (0, 0)        # full-res size of the picture shown
+        self._message = ""
+        self._scaled: QPixmap | None = None
+        self._scaled_for: tuple = ()
+        self.tool = "view"
+        self.colour = EDIT_COLOURS[0]
+        self.level = 1
+        self.can_edit = False
+        self._live: EditOp | None = None
+        self._entry: _TextEntry | None = None
+
+    # ---- what is shown ------------------------------------------------------
+    def set_message(self, text: str) -> None:
+        self._close_entry()
+        self._img = None
+        self._scaled = None
+        self._live = None
+        self._message = text
+        self.update()
+
+    def set_picture(self, img: QImage, frame_w: int, frame_h: int) -> None:
+        self._img = img
+        self._frame = (frame_w, frame_h)
+        self._scaled = None
+        self._message = ""
+        self.update()
+
+    def has_picture(self) -> bool:
+        return self._img is not None and not self._img.isNull()
+
+    def set_tool(self, tool: str) -> None:
+        self._close_entry()
+        self._live = None
+        self.tool = tool
+        if tool == "view":
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif tool == "text":
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    # ---- geometry -----------------------------------------------------------
+    def view_rect(self) -> QRectF:
+        """Where the picture sits: as large as fits, centred, 2 px clear."""
+        fw, fh = self._frame
+        area = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        if fw <= 0 or fh <= 0 or area.width() <= 0 or area.height() <= 0:
+            return QRectF()
+        k = min(area.width() / fw, area.height() / fh)
+        w, h = fw * k, fh * k
+        return QRectF(area.left() + (area.width() - w) / 2,
+                      area.top() + (area.height() - h) / 2, w, h)
+
+    def _to_pic(self, pos: QPointF) -> tuple[float, float]:
+        vr = self.view_rect()
+        fw, fh = self._frame
+        x = (pos.x() - vr.left()) * fw / vr.width()
+        y = (pos.y() - vr.top()) * fh / vr.height()
+        return (min(max(x, 0.0), float(fw)), min(max(y, 0.0), float(fh)))
+
+    def _view_scale(self) -> float:
+        vr = self.view_rect()
+        return vr.width() / self._frame[0] if self._frame[0] else 1.0
+
+    def _longer(self) -> float:
+        return float(max(self._frame))
+
+    # ---- painting -----------------------------------------------------------
+    def paintEvent(self, event) -> None:           # noqa: N802
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#1e1e1e"))
+        p.setPen(QPen(QColor("#444444"), 1))
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        if not self.has_picture():
+            p.setPen(QPen(QColor("#cfcfcf")))
+            p.drawText(self.rect(), int(Qt.AlignmentFlag.AlignCenter),
+                       self._message)
+            p.end()
+            return
+        vr = self.view_rect()
+        dpr = self.devicePixelRatioF()
+        want = (int(vr.width() * dpr), int(vr.height() * dpr))
+        if self._scaled is None or self._scaled_for != want:
+            self._scaled = QPixmap.fromImage(self._img.scaled(
+                max(1, want[0]), max(1, want[1]),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+            self._scaled.setDevicePixelRatio(dpr)
+            self._scaled_for = want
+        p.drawPixmap(vr.topLeft(), self._scaled)
+
+        op = self._live
+        if op is not None:
+            k = self._view_scale()
+            if op.kind == "crop" and len(op.pts) >= 2:
+                box = _crop_box(op, *self._frame)
+                r = QRectF(vr.left() + box.left() * k, vr.top() + box.top() * k,
+                           box.width() * k, box.height() * k)
+                dim = QColor(0, 0, 0, 130)
+                p.fillRect(QRectF(vr.left(), vr.top(), vr.width(),
+                                  r.top() - vr.top()), dim)
+                p.fillRect(QRectF(vr.left(), r.bottom(), vr.width(),
+                                  vr.bottom() - r.bottom()), dim)
+                p.fillRect(QRectF(vr.left(), r.top(), r.left() - vr.left(),
+                                  r.height()), dim)
+                p.fillRect(QRectF(r.right(), r.top(), vr.right() - r.right(),
+                                  r.height()), dim)
+                pen = QPen(QColor("#ffffff"), 1.5, Qt.PenStyle.DashLine)
+                p.setPen(pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(r)
+            else:
+                p.save()
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                p.translate(vr.topLeft())
+                p.scale(k, k)
+                draw_op(p, op)
+                p.restore()
+        p.end()
+
+    def resizeEvent(self, e) -> None:              # noqa: N802
+        super().resizeEvent(e)
+        self._close_entry()
+
+    # ---- the mouse ----------------------------------------------------------
+    def mousePressEvent(self, e) -> None:          # noqa: N802
+        if (e.button() != Qt.MouseButton.LeftButton or self.tool == "view"
+                or not self.can_edit or not self.has_picture()):
+            super().mousePressEvent(e)
+            return
+        pos = e.position()
+        if not self.view_rect().contains(pos):
+            return
+        pt = self._to_pic(pos)
+        if self.tool == "text":
+            self._open_entry(pos, pt)
+            return
+        width = _LINE_SHARE[self.level] * self._longer()
+        if self.tool == "crop":
+            width = 0.0
+        pts = [pt] if self.tool == "pen" else [pt, pt]
+        self._live = EditOp(kind=self.tool, pts=pts, colour=self.colour,
+                            width=width)
+        self.update()
+
+    def mouseMoveEvent(self, e) -> None:           # noqa: N802
+        op = self._live
+        if op is None:
+            return
+        pt = self._to_pic(e.position())
+        if op.kind == "pen":
+            last = op.pts[-1]
+            k = self._view_scale()
+            # A new point only once the mouse has really moved, so a slow hand
+            # does not leave thousands of points behind.
+            if math.hypot((pt[0] - last[0]) * k, (pt[1] - last[1]) * k) >= 1.5:
+                op.pts.append(pt)
+        else:
+            op.pts[-1] = pt
+        self.update()
+
+    def mouseReleaseEvent(self, e) -> None:        # noqa: N802
+        op = self._live
+        if op is None or e.button() != Qt.MouseButton.LeftButton:
+            return
+        self._live = None
+        self.update()
+        k = self._view_scale()
+        (x0, y0), (x1, y1) = op.pts[0], op.pts[-1]
+        tiny = math.hypot((x1 - x0) * k, (y1 - y0) * k) < 4
+        if op.kind != "pen" and tiny:
+            return                  # a plain click is not a shape
+        if op.kind == "crop":
+            box = _crop_box(op, *self._frame)
+            if box.width() < 2 or box.height() < 2:
+                return
+        self.op_done.emit(op)
+
+    def keyPressEvent(self, e) -> None:            # noqa: N802
+        if e.key() == Qt.Key.Key_Escape:
+            if self._live is not None:
+                self._live = None
+                self.update()
+            else:
+                self.escape.emit()
+            return
+        super().keyPressEvent(e)
+
+    # ---- the text box -------------------------------------------------------
+    def _open_entry(self, pos: QPointF, pt: tuple[float, float]) -> None:
+        self._close_entry()
+        height = _TEXT_SHARE[self.level] * self._longer()
+        view_px = int(min(48, max(11, height * self._view_scale())))
+        entry = _TextEntry(self)
+        f = QFont("Segoe UI")
+        f.setBold(True)
+        f.setPixelSize(view_px)
+        entry.setFont(f)
+        entry.setFixedHeight(view_px + 8)
+        entry.setFixedWidth(max(120, min(360, self.width() - int(pos.x()) - 4)))
+        entry.move(int(pos.x()), int(pos.y()))
+        colour = self.colour
+
+        def done(text: str) -> None:
+            self._close_entry()
+            if text.strip():
+                self.op_done.emit(EditOp(kind="text", pts=[pt], colour=colour,
+                                         width=height, text=text.strip()))
+
+        entry.commit.connect(done)
+        entry.cancel.connect(self._close_entry)
+        self._entry = entry
+        entry.show()
+        entry.setFocus()
+
+    def _close_entry(self) -> None:
+        entry = self._entry
+        self._entry = None
+        if entry is not None:
+            entry._done = True
+            entry.hide()
+            entry.deleteLater()
+
+
 class _PreviewPanel(QWidget):
+    """The picture on the right, and the drawing tools that work on it.
+
+    The tools are icon-only squares in one row, handed out as `toolbar` for the
+    main widget to place in its top bar.
+    """
+    tool_changed = Signal(str)
+    rotate = Signal(int)
+    undo = Signal()
+    reset = Signal()
+
+    _TOOLS = (("view", "Just look - no drawing; the panel follows the mouse"),
+              ("ellipse", "Circle - drag around what to mark"),
+              ("rect", "Rectangle - drag around what to mark"),
+              ("arrow", "Arrow - drag from the tail to the point"),
+              ("pen", "Pen - draw freehand"),
+              ("text", "Text - click where the words should start, type,"
+                       " press Enter"),
+              ("crop", "Crop - drag the part of the picture to keep"))
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("QWidget { background: #f3f3f3; color: #111; }")
@@ -854,14 +1549,72 @@ class _PreviewPanel(QWidget):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
 
-        self._pic = QLabel()
-        self._pic.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._pic.setStyleSheet("QLabel { background: #1e1e1e;"
-                                " border: 1px solid #444; color: #cfcfcf; }")
-        self._pic.setMinimumHeight(200)
-        self._pic.setSizePolicy(QSizePolicy.Policy.Ignored,
-                                QSizePolicy.Policy.Expanding)
-        lay.addWidget(self._pic, 1)
+        # ---- the drawing tools: ONE row, in its own widget ----
+        # The panel builds it but does not hold it: the main widget puts it in
+        # the top bar beside Save, so it costs the picture no height at all.
+        self.toolbar = QWidget()
+        self.toolbar.setStyleSheet("QWidget { background: transparent; }")
+        tools = QHBoxLayout(self.toolbar)
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setSpacing(3)
+        style = tools
+        self._tool_group = QButtonGroup(self)
+        self._tool_group.setExclusive(True)
+        self._tool_btns: dict[str, QPushButton] = {}
+        for name, tip in self._TOOLS:
+            b = _tool_btn(action_icon(name), tip, checkable=True)
+            self._tool_group.addButton(b)
+            self._tool_btns[name] = b
+            b.clicked.connect(lambda _on=False, n=name: self.set_tool(n))
+            tools.addWidget(b)
+        tools.addSpacing(8)
+        self._btn_rot_l = _tool_btn(action_icon("rot_left"),
+                                    "Turn the picture a quarter to the left")
+        self._btn_rot_l.clicked.connect(lambda: self.rotate.emit(-1))
+        tools.addWidget(self._btn_rot_l)
+        self._btn_rot_r = _tool_btn(action_icon("rot_right"),
+                                    "Turn the picture a quarter to the right")
+        self._btn_rot_r.clicked.connect(lambda: self.rotate.emit(1))
+        tools.addWidget(self._btn_rot_r)
+        tools.addSpacing(8)
+
+        self._colour_group = QButtonGroup(self)
+        self._colour_group.setExclusive(True)
+        self._colour_btns: list[QPushButton] = []
+        names = ("red", "yellow", "green", "blue", "black", "white")
+        for colour, cname in zip(EDIT_COLOURS, names):
+            b = _tool_btn(swatch_icon(colour), f"Draw in {cname}", checkable=True)
+            self._colour_group.addButton(b)
+            self._colour_btns.append(b)
+            b.clicked.connect(lambda _on=False, c=colour: self._set_colour(c))
+            style.addWidget(b)
+        style.addSpacing(8)
+        self._width_group = QButtonGroup(self)
+        self._width_group.setExclusive(True)
+        self._width_btns: list[QPushButton] = []
+        for level, wname in enumerate(("Thin", "Medium", "Thick")):
+            b = _tool_btn(action_icon(f"width{level}"),
+                          f"{wname} lines and {wname.lower()} text",
+                          checkable=True)
+            self._width_group.addButton(b)
+            self._width_btns.append(b)
+            b.clicked.connect(lambda _on=False, lv=level: self._set_level(lv))
+            style.addWidget(b)
+        style.addSpacing(8)
+        self._btn_undo = _tool_btn(action_icon("undo"),
+                                   "Undo the last edit of this picture (Ctrl+Z)")
+        self._btn_undo.clicked.connect(self.undo.emit)
+        style.addWidget(self._btn_undo)
+        self._btn_reset = _tool_btn(action_icon("reset"),
+                                    "Throw away every edit of this picture")
+        self._btn_reset.clicked.connect(self.reset.emit)
+        style.addWidget(self._btn_reset)
+        self.toolbar.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                   QSizePolicy.Policy.Fixed)
+
+        self.canvas = _EditCanvas()
+        self.canvas.escape.connect(lambda: self.set_tool("view"))
+        lay.addWidget(self.canvas, 1)
 
         self._name = _ElidedLabel("")
         self._name.setStyleSheet("QLabel { color: #111; font-size: 13px;"
@@ -886,22 +1639,63 @@ class _PreviewPanel(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
-        self._full: QPixmap | None = None
         self._placeholder = "Move the mouse over a picture"
-        self._pic.setText(self._placeholder)
+        self.canvas.set_message(self._placeholder)
+        self._tool_btns["view"].setChecked(True)
+        self._colour_btns[0].setChecked(True)
+        self._width_btns[1].setChecked(True)
         self.set_enabled(False)
+        self.set_edit_state(False, False)
 
+    # ---- tools --------------------------------------------------------------
+    def tool(self) -> str:
+        return self.canvas.tool
+
+    def editing(self) -> bool:
+        """A drawing tool is chosen: the panel stays on its picture."""
+        return self.canvas.tool != "view"
+
+    def set_tool(self, name: str) -> None:
+        btn = self._tool_btns.get(name)
+        if btn is None:
+            return
+        btn.setChecked(True)
+        changed = name != self.canvas.tool
+        self.canvas.set_tool(name)
+        if changed:
+            self.tool_changed.emit(name)
+
+    def _set_colour(self, colour: str) -> None:
+        self.canvas.colour = colour
+
+    def _set_level(self, level: int) -> None:
+        self.canvas.level = level
+
+    def set_edit_state(self, can_edit: bool, has_edits: bool) -> None:
+        """Tools only for a picture that is shown and can be written back."""
+        for name, b in self._tool_btns.items():
+            if name != "view":
+                b.setEnabled(can_edit)
+        for b in (self._btn_rot_l, self._btn_rot_r, *self._colour_btns,
+                  *self._width_btns):
+            b.setEnabled(can_edit)
+        self._btn_undo.setEnabled(has_edits)
+        self._btn_reset.setEnabled(has_edits)
+        # The chosen tool stays chosen -- the next picture may take it again --
+        # but the canvas will not draw on this one.
+        self.canvas.can_edit = can_edit
+
+    # ---- what is shown ------------------------------------------------------
     def set_enabled(self, on: bool) -> None:
         self.btn_open.setEnabled(on)
         self.btn_reveal.setEnabled(on)
 
     def clear_all(self) -> None:
-        self._full = None
-        self._pic.setPixmap(QPixmap())
-        self._pic.setText(self._placeholder)
+        self.canvas.set_message(self._placeholder)
         self._name.setText("")
         self._info.setText("")
         self.set_enabled(False)
+        self.set_edit_state(False, False)
 
     def set_texts(self, name: str, lines: list[str]) -> None:
         self._name.setText(name)
@@ -909,32 +1703,13 @@ class _PreviewPanel(QWidget):
         self._info.setText("\n".join(lines))
 
     def set_loading(self) -> None:
-        self._full = None
-        self._pic.setPixmap(QPixmap())
-        self._pic.setText("loading")
+        self.canvas.set_message("loading")
 
-    def set_pixmap(self, pm: QPixmap | None) -> None:
-        self._full = pm
-        if pm is None or pm.isNull():
-            self._pic.setPixmap(QPixmap())
-            self._pic.setText("cannot be shown")
+    def set_picture(self, img: QImage | None, frame_w: int, frame_h: int) -> None:
+        if img is None or img.isNull() or frame_w <= 0 or frame_h <= 0:
+            self.canvas.set_message("cannot be shown")
             return
-        self._pic.setText("")
-        self._rescale()
-
-    def _rescale(self) -> None:
-        if self._full is None or self._full.isNull():
-            return
-        area = self._pic.size()
-        if area.width() < 8 or area.height() < 8:
-            return
-        self._pic.setPixmap(self._full.scaled(
-            area - QSize(4, 4), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
-
-    def resizeEvent(self, e) -> None:
-        super().resizeEvent(e)
-        self._rescale()
+        self.canvas.set_picture(img, frame_w, frame_h)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -972,7 +1747,7 @@ class _SavePreviewDialog(QDialog):
     """What Save is about to do -- shown before a single file is touched."""
 
     def __init__(self, rows: list[tuple[list[str], str]], n_rename: int,
-                 n_delete: int, parent=None):
+                 n_delete: int, parent=None, n_edit: int = 0):
         super().__init__(parent)
         self.setWindowTitle("Save - what will happen")
         self.setStyleSheet("QDialog { background: #ffffff; color: #111; }")
@@ -982,7 +1757,8 @@ class _SavePreviewDialog(QDialog):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
 
-        head = QLabel(f"{n_rename} to rename, {n_delete} to delete")
+        head = QLabel(f"{n_rename} to rename, {n_edit} edited, "
+                      f"{n_delete} to delete")
         head.setStyleSheet("QLabel { color: #16202c; font-size: 12px;"
                            " font-weight: 700; background: transparent; }")
         lay.addWidget(head)
@@ -1024,6 +1800,7 @@ class _RecoverDialog(QDialog):
         self.setStyleSheet("QDialog { background: #f3f3f3; color: #111; }")
         self.resize(660, 520)
         self._boxes: list[tuple[int, QCheckBox]] = []
+        self._kinds: list[str] = [kind for _row, kind, _text in changes]
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
@@ -1084,6 +1861,11 @@ class _RecoverDialog(QDialog):
     def selected_rows(self) -> list[int]:
         return [row for row, box in self._boxes if box.isChecked()]
 
+    def selected(self) -> list[tuple[int, str]]:
+        """(row, kind) for every ticked change."""
+        return [(row, kind) for (row, box), kind in zip(self._boxes, self._kinds)
+                if box.isChecked()]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  The program
@@ -1096,7 +1878,10 @@ class PhotoRenamerWidget(QWidget):
         self._items: list[Item] = []
         self._disk_names: dict[str, set[str]] = {}   # rel_dir -> every name in it
         self._thumbs: dict[tuple[str, int], QPixmap] = {}
-        self._previews: dict[str, QPixmap] = {}
+        # Tiles with their edits burnt in: (path, thumb width, edit_rev).
+        self._edit_thumbs: dict[tuple[str, int, int], QPixmap] = {}
+        # Kept as QImage, not QPixmap: the edits are painted onto a copy of it.
+        self._previews: dict[str, QImage] = {}
         self._pending: set[tuple[str, int]] = set()
         self._nat: dict[str, tuple[int, int]] = {}   # path -> full pixel size
         self._preview_path: Path | None = None
@@ -1104,8 +1889,8 @@ class PhotoRenamerWidget(QWidget):
 
         # The tile size, recomputed from the pane's width. Sensible values until
         # the first resize arrives.
-        self._tile_w = MIN_TILE_W
-        self._pic_h = int((MIN_TILE_W - 2 * _CARD_INSET - 2 * _CARD_PAD)
+        self._tile_w = MIN_TILE_W // 2
+        self._pic_h = int((MIN_TILE_W // 2 - 2 * _CARD_INSET - 2 * _CARD_PAD)
                           * _PIC_ASPECT)
         self._tile_h = self._pic_h + _NAME_H + 2 * _CARD_PAD + 2 * _CARD_INSET + 2
         self._relayout_depth = 0
@@ -1136,9 +1921,8 @@ class PhotoRenamerWidget(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(8)
 
-        # The top bar is three side-by-side blocks in a grid, with the outer two
-        # sharing the spare room equally: that is what puts the buttons in the
-        # middle instead of hard against the right edge. It lives in its own
+        # The top bar is three side-by-side blocks in a grid: the folder, then
+        # the buttons and the drawing tools, then the counts. It lives in its own
         # widget so its minimum width can be read off and made the window's
         # minimum -- which is what stops a small window from clipping a button.
         bar_host = QWidget()
@@ -1194,29 +1978,41 @@ class PhotoRenamerWidget(QWidget):
         self._chk_quick.setSizePolicy(QSizePolicy.Policy.Fixed,
                                       QSizePolicy.Policy.Fixed)
         mlay.addWidget(self._chk_quick)
+        # The drawing tools join this row once the preview panel exists.
+        self._mid_lay = mlay
 
         # ---- right: the counts ----
         # Separate short labels rather than one rich-text line: a rich-text
         # label cannot be shortened, and it would shove the buttons sideways
         # every time a number changed.
+        # Two short lines, not one long one: with the drawing tools in this bar
+        # a single line of counts would push the window's minimum width past
+        # what a screen offers.
         right = QWidget()
-        rlay = QHBoxLayout(right)
+        rlay = QGridLayout(right)
         rlay.setContentsMargins(0, 0, 0, 0)
-        rlay.setSpacing(10)
-        rlay.addStretch(1)
+        rlay.setHorizontalSpacing(10)
+        rlay.setVerticalSpacing(0)
         self._st_count = self._status_label("#16202c")
         self._st_ren = self._status_label("#1a4f9c")
+        self._st_edit = self._status_label("#5b3b8c")
         self._st_del = self._status_label("#8d1c12")
         self._st_bad = self._status_label("#b3200a", bold=True)
-        for lbl in (self._st_count, self._st_ren, self._st_del, self._st_bad):
-            rlay.addWidget(lbl)
+        right_edge = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        rlay.addWidget(self._st_count, 0, 0, right_edge)
+        rlay.addWidget(self._st_ren, 0, 1, right_edge)
+        rlay.addWidget(self._st_edit, 0, 2, right_edge)
+        rlay.addWidget(self._st_del, 1, 0, right_edge)
+        rlay.addWidget(self._st_bad, 1, 1, 1, 2, right_edge)
 
         bar.addWidget(left, 0, 0)
         bar.addWidget(mid, 0, 1)
         bar.addWidget(right, 0, 2)
+        # The folder name takes the spare room; the buttons, the tools and the
+        # counts keep their own width.
         bar.setColumnStretch(0, 1)
         bar.setColumnStretch(1, 0)
-        bar.setColumnStretch(2, 1)
+        bar.setColumnStretch(2, 0)
         self._bar_host = bar_host
         outer.addWidget(bar_host)
 
@@ -1233,11 +2029,23 @@ class PhotoRenamerWidget(QWidget):
 
         self._preview = _PreviewPanel()
         self._preview.setMinimumWidth(240)
+        self._mid_lay.addSpacing(14)
+        self._mid_lay.addWidget(self._preview.toolbar)
         self._preview.btn_open.clicked.connect(
             lambda: self.open_picture(self._list.currentRow()))
         self._preview.btn_reveal.clicked.connect(
             lambda: self.show_in_explorer(self._list.currentRow()))
+        self._preview.tool_changed.connect(self._on_tool_changed)
+        self._preview.canvas.op_done.connect(self.add_edit)
+        self._preview.rotate.connect(
+            lambda turn: self.add_edit(EditOp(kind="rotate", turn=turn)))
+        self._preview.undo.connect(self.undo_edit)
+        self._preview.reset.connect(self.reset_edits)
         split.addWidget(self._preview)
+
+        undo_key = QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self)
+        undo_key.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        undo_key.activated.connect(self.undo_edit)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 1)
 
@@ -1281,8 +2089,9 @@ class PhotoRenamerWidget(QWidget):
         if self._min_locked:
             return
         self._min_locked = True
-        counters = (self._st_count, self._st_ren, self._st_del, self._st_bad)
-        samples = ("9999 pictures", "999 renamed", "999 to delete",
+        counters = (self._st_count, self._st_ren, self._st_edit, self._st_del,
+                    self._st_bad)
+        samples = ("9999 pictures", "999 renamed", "999 edited", "999 to delete",
                    "999 names clash")
         was = [(lbl.text(), lbl.isVisible()) for lbl in counters]
         for lbl, text in zip(counters, samples):
@@ -1312,8 +2121,8 @@ class PhotoRenamerWidget(QWidget):
         return self._pic_h
 
     def columns_for(self, viewport_w: int) -> int:
-        """At most six in a row, fewer when they will not fit."""
-        return max(1, min(MAX_COLUMNS, viewport_w // MIN_TILE_W))
+        """Always two in a row; three once three tiles of MIN_TILE_W fit."""
+        return max(MIN_COLUMNS, min(MAX_COLUMNS, viewport_w // MIN_TILE_W))
 
     def grid_width(self) -> int:
         """The width the tiles are measured against.
@@ -1338,7 +2147,9 @@ class PhotoRenamerWidget(QWidget):
         if vw < 20:
             return
         cols = self.columns_for(vw)
-        tile_w = max(MIN_TILE_W, vw // cols)
+        # Never wider than the pane allows: a tile held at MIN_TILE_W in a
+        # narrow pane wraps the grid down to a single column.
+        tile_w = max(40, vw // cols)
         pic_h = int((tile_w - 2 * _CARD_INSET - 2 * _CARD_PAD) * _PIC_ASPECT)
         tile_h = pic_h + _NAME_H + 2 * _CARD_PAD + 2 * _CARD_INSET + 2
         if (tile_w, tile_h) == (self._tile_w, self._tile_h):
@@ -1381,6 +2192,7 @@ class PhotoRenamerWidget(QWidget):
         self._items = []
         self._disk_names = {}
         self._thumbs.clear()
+        self._edit_thumbs.clear()
         self._previews.clear()
         self._pending.clear()
         self._nat.clear()
@@ -1404,6 +2216,10 @@ class PhotoRenamerWidget(QWidget):
             except ValueError:
                 continue
             rel = "" if rel == "." else rel
+            if rel == "":
+                # The kept originals are not pictures to work on.
+                dirnames[:] = [d for d in dirnames
+                               if d.lower() != ORIGINALS_DIR.lower()]
             self._disk_names[rel] = {n.lower() for n in filenames}
             for name in filenames:
                 p = here / name
@@ -1444,6 +2260,8 @@ class PhotoRenamerWidget(QWidget):
         nat = self._nat.get(str(it.path))
         lines.append(f"{nat[0]} x {nat[1]} px, {human_size(it.size)}" if nat
                      else human_size(it.size))
+        if it.edited and not it.deleted:
+            lines.append(_edited_line(it))
         if it.deleted:
             lines.append("crossed out - Save will delete this file")
         if it.conflict:
@@ -1466,16 +2284,33 @@ class PhotoRenamerWidget(QWidget):
         key = str(item.path)
         want = bucket_for(max(1, pic_w))
         pm = self._thumbs.get((key, want))
-        if pm is not None:
+        if pm is None:
+            if (key, want) not in self._pending:
+                self._pending.add((key, want))
+                self._pool.start(_LoadTask(item.path, want, self._sink))
+            for b in _THUMB_BUCKETS:
+                pm = self._thumbs.get((key, b))
+                if pm is not None:
+                    break
+        if pm is None or pm.isNull() or not item.edited or item.deleted:
             return pm
-        if (key, want) not in self._pending:
-            self._pending.add((key, want))
-            self._pool.start(_LoadTask(item.path, want, self._sink))
-        for b in _THUMB_BUCKETS:
-            other = self._thumbs.get((key, b))
-            if other is not None:
-                return other
-        return None
+        return self._edited_thumb(item, pm)
+
+    def _edited_thumb(self, item: Item, pm: QPixmap) -> QPixmap:
+        """The tile with the picture's edits burnt in, cached per edit."""
+        key = str(item.path)
+        nat = self._nat.get(key)
+        if not nat:
+            return pm
+        ck = (key, pm.width(), item.edit_rev)
+        hit = self._edit_thumbs.get(ck)
+        if hit is None:
+            if len(self._edit_thumbs) > 400:
+                self._edit_thumbs.clear()
+            hit = QPixmap.fromImage(render_edits(pm.toImage(), nat[0], nat[1],
+                                                 item.edits))
+            self._edit_thumbs[ck] = hit
+        return hit
 
     def _queue_visible_thumbs(self) -> None:
         """Ask for the first screenful straight away; the rest arrive as the
@@ -1486,17 +2321,17 @@ class PhotoRenamerWidget(QWidget):
 
     def _on_loaded(self, key: str, max_side: int, img: QImage,
                    w: int, h: int) -> None:
-        pm = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
         if w > 0 and h > 0:
             self._nat[key] = (w, h)
         if max_side == _PREVIEW_SIDE:
             if len(self._previews) > _PREVIEW_CACHE_MAX:
                 self._previews.clear()
-            self._previews[key] = pm
+            self._previews[key] = img
             if self._preview_path is not None and str(self._preview_path) == key:
-                self._preview.set_pixmap(pm)
+                self._update_canvas()
                 self._refresh_preview_texts()
             return
+        pm = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
         self._pending.discard((key, max_side))
         if len(self._thumbs) > _THUMB_CACHE_MAX:
             self._thumbs.clear()
@@ -1506,6 +2341,10 @@ class PhotoRenamerWidget(QWidget):
     # ---- the preview panel --------------------------------------------------
     def _on_item_entered(self, li: QListWidgetItem) -> None:
         self._hover_row = self._list.row(li)
+        # While a drawing tool is chosen the panel stays on its picture; only a
+        # click on another tile moves it.
+        if self._preview.editing():
+            return
         self._show_row(self._hover_row, defer_picture=True)
 
     def _show_row(self, row: int, defer_picture: bool = False) -> None:
@@ -1517,30 +2356,65 @@ class PhotoRenamerWidget(QWidget):
         self._refresh_preview_texts()
 
         key = str(item.path)
-        cached = self._previews.get(key)
-        if cached is not None:
-            self._preview.set_pixmap(cached)
+        if key in self._previews:
+            self._update_canvas()
             return
+        self._preview.set_edit_state(False, item.edited)
         self._preview.set_loading()
         if defer_picture:
             self._hover_timer.start()
         else:
             self._load_hover_preview()
 
-    def _refresh_preview_texts(self) -> None:
+    def _shown_row(self) -> int:
+        """The row the preview panel is showing, -1 for none."""
         if self._preview_path is None:
+            return -1
+        for row, it in enumerate(self._items):
+            if it.path == self._preview_path:
+                return row
+        return -1
+
+    def _update_canvas(self) -> None:
+        """Put the shown picture, with its edits, into the panel."""
+        item = self.item_at(self._shown_row())
+        if item is None:
             return
-        item = next((it for it in self._items if it.path == self._preview_path),
-                    None)
+        key = str(item.path)
+        base = self._previews.get(key)
+        if base is None:
+            return
+        nat = self._nat.get(key)
+        if base.isNull() or not nat:
+            self._preview.set_picture(None, 0, 0)
+            self._preview.set_edit_state(False, item.edited)
+            return
+        fw, fh = frame_after(nat[0], nat[1], item.edits)
+        self._preview.set_picture(render_edits(base, nat[0], nat[1], item.edits),
+                                  fw, fh)
+        self._preview.set_edit_state(can_write(item.suffix) and not item.deleted,
+                                     item.edited)
+
+    def _refresh_preview_texts(self) -> None:
+        item = self.item_at(self._shown_row())
         if item is None:
             return
         nat = self._nat.get(str(item.path))
-        lines = [f"{nat[0]} x {nat[1]} px, {human_size(item.size)}" if nat
-                 else human_size(item.size)]
+        if nat and item.edited:
+            fw, fh = frame_after(nat[0], nat[1], item.edits)
+            size = f"{fw} x {fh} px (was {nat[0]} x {nat[1]})"
+            lines = [f"{size}, {human_size(item.size)}"]
+        else:
+            lines = [f"{nat[0]} x {nat[1]} px, {human_size(item.size)}" if nat
+                     else human_size(item.size)]
         if item.rel_dir:
             lines.append(f"sub-folder: {item.rel_dir}")
         if item.renamed:
             lines.append(f"was: {item.orig_name}")
+        if item.edited and not item.deleted:
+            lines.append(_edited_line(item))
+        if not can_write(item.suffix):
+            lines.append(f"{item.suffix} pictures cannot be saved after editing")
         if item.deleted:
             lines.append("crossed out - Save will delete this file")
         if item.conflict:
@@ -1617,12 +2491,59 @@ class PhotoRenamerWidget(QWidget):
             it.deleted = target
         self._recompute()
         self._list.viewport().update()
-        if self._list.currentRow() in rows:
+        if self._shown_row() in rows:
+            self._update_canvas()
             self._refresh_preview_texts()
+
+    # ---- picture edits ------------------------------------------------------
+    def _on_tool_changed(self, tool: str) -> None:
+        """Choosing a drawing tool pins the panel to the picture it shows -- and
+        makes that the current tile, so a click elsewhere is what moves it."""
+        if tool == "view":
+            return
+        row = self._shown_row()
+        if row >= 0 and row != self._list.currentRow():
+            self._list.setCurrentRow(row)
+
+    def _edits_changed(self, row: int) -> None:
+        it = self.item_at(row)
+        if it is None:
+            return
+        it.edit_rev += 1
+        self._recompute()
+        self._list.viewport().update()
+        if row == self._shown_row():
+            self._update_canvas()
+            self._refresh_preview_texts()
+
+    def add_edit(self, op: EditOp) -> None:
+        """One more step on the picture the panel shows."""
+        row = self._shown_row()
+        it = self.item_at(row)
+        if it is None or it.deleted or not can_write(it.suffix):
+            return
+        it.edits.append(op)
+        self._edits_changed(row)
+
+    def undo_edit(self) -> None:
+        row = self._shown_row()
+        it = self.item_at(row)
+        if it is None or not it.edits:
+            return
+        it.edits.pop()
+        self._edits_changed(row)
+
+    def reset_edits(self) -> None:
+        row = self._shown_row()
+        it = self.item_at(row)
+        if it is None or not it.edits:
+            return
+        it.edits.clear()
+        self._edits_changed(row)
 
     # ---- the pending state --------------------------------------------------
     def _pending_changes(self) -> bool:
-        return any(it.deleted or it.renamed for it in self._items)
+        return any(it.deleted or it.renamed or it.edited for it in self._items)
 
     @staticmethod
     def _name_problem(stem: str) -> str:
@@ -1682,6 +2603,7 @@ class PhotoRenamerWidget(QWidget):
     def _refresh_buttons(self) -> None:
         n_all = len(self._items)
         n_ren = sum(1 for it in self._items if it.renamed and not it.deleted)
+        n_edit = sum(1 for it in self._items if it.edited and not it.deleted)
         n_del = sum(1 for it in self._items if it.deleted)
         n_bad = sum(1 for it in self._items if it.conflict)
 
@@ -1689,18 +2611,23 @@ class PhotoRenamerWidget(QWidget):
         self._st_count.setVisible(n_all > 0)
         self._st_ren.setText(f"{n_ren} renamed")
         self._st_ren.setVisible(n_ren > 0)
+        self._st_edit.setText(f"{n_edit} edited")
+        self._st_edit.setVisible(n_edit > 0)
         self._st_del.setText(f"{n_del} to delete")
         self._st_del.setVisible(n_del > 0)
         self._st_bad.setText(f"{n_bad} name clashes" if n_bad == 1
                              else f"{n_bad} names clash")
         self._st_bad.setVisible(n_bad > 0)
 
-        pending = n_ren > 0 or n_del > 0
+        pending = n_ren > 0 or n_del > 0 or n_edit > 0
         self._btn_save.setEnabled(pending and n_bad == 0)
         self._btn_recover.setEnabled(pending)
         self._btn_explorer.setEnabled(self._root is not None)
-        self._btn_save.setToolTip("Fix the names marked in red first" if n_bad
-                                  else "Carry out the renames and the deletions")
+        self._btn_save.setToolTip(
+            "Fix the names marked in red first" if n_bad
+            else "Carry out the renames, the edits and the deletions.\n"
+                 f"The original of every edited picture is kept in "
+                 f"\"{ORIGINALS_DIR}\".")
 
     # ---- Recover ------------------------------------------------------------
     def _recover(self) -> None:
@@ -1709,46 +2636,62 @@ class PhotoRenamerWidget(QWidget):
             where = f"   [{it.rel_dir}]" if it.rel_dir else ""
             if it.deleted:
                 changes.append((row, "delete", f"delete:  {it.orig_name}{where}"))
-            elif it.renamed:
+                continue
+            if it.renamed:
                 changes.append((row, "rename",
                                 f"rename:  {it.orig_name}   →   "
                                 f"{it.new_name}{where}"))
+            if it.edited:
+                n = len(it.edits)
+                changes.append((row, "edit",
+                                f"edit:  {it.orig_name}   ({n} step"
+                                f"{'s' if n != 1 else ''}){where}"))
         if not changes:
             return
         dlg = _RecoverDialog(changes, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        for row in dlg.selected_rows():
+        for row, kind in dlg.selected():
             it = self.item_at(row)
             if it is None:
                 continue
-            it.deleted = False
-            it.stem = it.orig_stem
-            li = self._list.item(row)
-            if li is not None:
-                li.setText(it.orig_name)
+            if kind in ("delete", "rename"):
+                it.deleted = False
+                it.stem = it.orig_stem
+                li = self._list.item(row)
+                if li is not None:
+                    li.setText(it.orig_name)
+            if kind in ("delete", "edit") and it.edits:
+                it.edits.clear()
+                it.edit_rev += 1
         self._recompute()
         self._list.viewport().update()
+        self._update_canvas()
         self._refresh_preview_texts()
 
     # ---- Save ---------------------------------------------------------------
     def _save(self) -> None:
         renames = [it for it in self._items if it.renamed and not it.deleted]
+        edits = [it for it in self._items if it.edited and not it.deleted]
         deletes = [it for it in self._items if it.deleted]
-        if not renames and not deletes:
+        if not renames and not deletes and not edits:
             return
 
         if not self._chk_quick.isChecked():
             rows: list[tuple[list[str], str]] = []
+            for it in edits:
+                rows.append((["edit", it.rel_dir, it.orig_name,
+                              f"original kept in {ORIGINALS_DIR}"], ""))
             for it in renames:
                 rows.append((["rename", it.rel_dir, it.orig_name, it.new_name], ""))
             for it in deletes:
                 rows.append((["delete", it.rel_dir, it.orig_name, ""], "delete"))
-            dlg = _SavePreviewDialog(rows, len(renames), len(deletes), self)
+            dlg = _SavePreviewDialog(rows, len(renames), len(deletes), self,
+                                     n_edit=len(edits))
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
 
-        results = self._apply(renames, deletes)
+        results = self._apply(renames, deletes, edits)
         fails = [(cells, err) for cells, err in results if err]
         self._scan()
         # Nothing is said when it all worked; only a failure is worth a window.
@@ -1768,9 +2711,64 @@ class PhotoRenamerWidget(QWidget):
         box.setStyleSheet(_MSGBOX_QSS)
         box.exec()
 
-    def _apply(self, renames: list[Item],
-               deletes: list[Item]) -> list[tuple[tuple[str, str, str, str], str]]:
+    def _originals_target(self, it: Item) -> Path:
+        """Where the untouched original of an edited picture is copied.
+
+        Never over an existing file: a picture edited again in a later session
+        finds its first original already there, and gets "name (2)" beside it.
+        """
+        folder = self._root / ORIGINALS_DIR
+        if it.rel_dir:
+            folder = folder / Path(it.rel_dir)
+        target = folder / it.orig_name
+        n = 2
+        while target.exists():
+            target = folder / f"{it.orig_stem} ({n}){it.suffix}"
+            n += 1
+        return target
+
+    def _write_edit(self, it: Item) -> str:
+        """Keep the original, then write the edited picture over the file.
+
+        Returns "" when it worked, otherwise the reason. If the original could
+        not be kept, the picture is left exactly as it was.
+        """
+        img, w, h = load_scaled(it.path, 0)
+        if img.isNull() or w <= 0 or h <= 0:
+            return "the picture could not be read"
+        data = encode_image(render_edits(img, w, h, it.edits), it.suffix)
+        if data is None:
+            return f"{it.suffix} pictures cannot be written"
+
+        target = self._originals_target(it)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return f"no {ORIGINALS_DIR} folder: {exc.strerror or exc}"
+        err = _retry(lambda: shutil.copy2(it.path, target))
+        if err:
+            return f"original could not be kept, picture left unchanged: {err}"
+
+        tmp = it.path.parent / f".__pr_{os.getpid()}_edit{it.suffix}"
+        err = _retry(lambda: tmp.write_bytes(data))
+        if not err:
+            err = _retry(lambda: os.replace(tmp, it.path))
+        if err:
+            # Leave nothing behind: no temporary file, and no second copy of an
+            # original whose picture was never changed.
+            for leftover in (tmp, target):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return err
+
+    def _apply(self, renames: list[Item], deletes: list[Item],
+               edits: list[Item] = ()) -> list[tuple[tuple[str, str, str, str], str]]:
         """Carry out the changes. Returns (action, sub-folder, old, new), error.
+
+        Edits go first, while every file still has its old name; the original
+        is copied into ORIGINALS_DIR under that old name.
 
         Renames go through a temporary name first. Without that pass, swapping two
         names -- a.png becomes b.png while b.png becomes a.png -- fails on the
@@ -1788,6 +2786,12 @@ class PhotoRenamerWidget(QWidget):
 
         out: list[tuple[tuple[str, str, str, str], str]] = []
         staged: list[tuple[Item, Path]] = []
+
+        for it in edits:
+            if it.deleted or not it.edits:
+                continue
+            out.append((("edit", it.rel_dir, it.orig_name, ""),
+                        self._write_edit(it)))
 
         for n, it in enumerate(renames):
             tmp = it.path.parent / f".__pr_{os.getpid()}_{n}{it.suffix}"

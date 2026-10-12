@@ -322,6 +322,9 @@ class AlarmTab(QWidget):
             self._show_colour(s["colour"])
 
             names = AL.image_names()
+            # Remembered, so a change of any other field does not have to list
+            # the images folder again to know whether the box holds a real name.
+            self._have_images = bool(names)
             self._image.clear()
             if names:
                 self._image.addItems(names)
@@ -372,6 +375,10 @@ class AlarmTab(QWidget):
                 break
         self._device.blockSignals(False)
 
+    def preset_changed(self):
+        """Another preset was picked: only the two places belong to it."""
+        self._say_where()
+
     def _changed(self, *_a):
         if self._loading:
             return
@@ -380,7 +387,7 @@ class AlarmTab(QWidget):
         cfg["color_cycle"] = self._cycle.currentData()
         cfg["flash_interval"] = round(float(self._interval.value()), 2)
         cfg["flash_duration"] = round(float(self._duration.value()), 1)
-        if AL.image_names():
+        if getattr(self, "_have_images", False):
             cfg["image_file"] = self._image.currentText()
         cfg["sound_enabled"] = bool(self._sound_on.isChecked())
         cfg["sound_file"] = self._sound.currentText()
@@ -390,7 +397,10 @@ class AlarmTab(QWidget):
         device = self._device.currentText().split("  (not connected")[0]
         cfg["sound_device"] = device
         self._win.save_soon()
-        self._show_image()
+        # The picture is opened and re-drawn only when what it shows changed.
+        # Every step of a number box used to read the PNG from disk again.
+        if self.sender() in (self._mode, self._image):
+            self._show_image()
         self._sync_enabled()
 
     def _sync_enabled(self):
@@ -423,6 +433,8 @@ class AlarmTab(QWidget):
         if col.isValid():
             self._cfg["flash_color"] = col.name()
             self._show_colour(col.name())
+            # The shape is shown in the alarm's colour, so it follows the pick.
+            self._show_image()
             self._win.save_soon()
 
     def _show_image(self):

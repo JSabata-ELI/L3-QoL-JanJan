@@ -4,17 +4,15 @@ import os
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QPlainTextEdit, QProxyStyle, QStyle,
+    QApplication, QMainWindow, QTabWidget, QWidget, QLabel, QProxyStyle, QStyle,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtGui import QPalette, QColor
 
-# NOTE: pandas (via operation_history_logic) and matplotlib (via monitor_tab)
-# are the heavy part of startup — on a cold OS file cache their import can take
-# tens of seconds. They are imported lazily (operation_history_logic inside
-# HistoryTab._run; monitor_tab inside main() after the splash is shown) so the
-# window/splash paints before that cost is paid instead of after.
+# NOTE: matplotlib (via monitor_tab) is the heavy part of startup — on a cold
+# OS file cache its import can take tens of seconds. monitor_tab is imported
+# lazily inside main() after the splash is shown, so the window/splash paints
+# before that cost is paid instead of after.
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -37,7 +35,7 @@ LOCK_FILE = APP_DIR / "diagnostic.lock"
 
 def _acquire_lock():
     # Imported here, not at the top: this runs before the splash, and alerting
-    # pulls in requests. Same lazy-import rule as pandas/matplotlib above —
+    # pulls in requests. Same lazy-import rule as matplotlib above —
     # nothing that only matters later may delay the first painted pixel.
     import alerting
     try:
@@ -100,60 +98,6 @@ APP_STYLESHEET = """
     }
 """
 
-BUTTON_STYLE = """
-QPushButton {
-    background: #1565C0;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 6px 14px;
-    font-weight: bold;
-}
-QPushButton:hover { background: #0D47A1; }
-QPushButton:disabled { background: #bbb; color: #888; }
-"""
-
-STOP_BUTTON_STYLE = """
-QPushButton {
-    background: #c0392b;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 6px 14px;
-    font-weight: bold;
-}
-QPushButton:hover { background: #a93226; }
-QPushButton:disabled { background: #bbb; color: #888; }
-"""
-
-SECONDARY_STYLE = """
-QPushButton {
-    background: #e8e8e8;
-    color: #111;
-    border: 1px solid #bbb;
-    border-radius: 4px;
-    padding: 5px 12px;
-}
-QPushButton:hover { background: #d8e8ff; }
-"""
-
-LOG_STYLE = """
-QPlainTextEdit {
-    background: #ffffff;
-    color: #222;
-    font-family: Consolas, monospace;
-    font-size: 11px;
-    border: 1px solid #ccc;
-}
-"""
-
-
-def _btn(label, style=BUTTON_STYLE):
-    b = QPushButton(label)
-    b.setStyleSheet(style)
-    return b
-
-
 class ToolTipDelayStyle(QProxyStyle):
     """Show tooltips after a 0.5 s hover (Qt's default is ~0.7 s)."""
 
@@ -163,129 +107,101 @@ class ToolTipDelayStyle(QProxyStyle):
         return super().styleHint(hint, option, widget, returnData)
 
 
-class WorkerThread(QThread):
-    log = Signal(str)
-    finished = Signal()
-    error = Signal(str)
+class _WheelGuard(QObject):
+    """The mouse wheel must never change a number box, drop-down or slider just
+    because the pointer happens to be over it.
 
-    def __init__(self, fn):
-        super().__init__()
-        self._fn = fn
-        self._stop = False
+    A field answers the wheel only after it has been CLICKED, and only while
+    the pointer has stayed on it since. Otherwise the notch goes to the panel
+    behind it (the PV table, a settings page), which scrolls as expected.
 
-    def stop(self):
-        self._stop = True
+    "Has focus" alone was the old test and it never held: a combo keeps its
+    focus after a pick, so scrolling the PV table over a "Depends on" dropdown
+    used a minute ago changed it again; and a freshly opened dialog hands its
+    first field the focus, so that field answered the wheel before it was ever
+    touched. Same rule as CSS Logger's guard.
+    """
 
-    def is_stopped(self):
-        return self._stop
+    _ARMED = "_wheel_armed"
 
-    def run(self):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                       QAbstractSpinBox, QComboBox, QScrollBar)
+        self._targets = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        self._scrollbar = QScrollBar
+        self._scroll_area = QAbstractScrollArea
+
+    def _target_of(self, obj):
+        """The guarded field ``obj`` belongs to: itself, or the spin box /
+        combo whose inner line edit received the event."""
+        w = obj
+        for _ in range(3):
+            if w is None or not isinstance(w, QWidget):
+                return None
+            if isinstance(w, self._targets) and not isinstance(w, self._scrollbar):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def eventFilter(self, obj, ev):
+        """Every event in the program passes through here, so it must never
+        raise: an exception escaping a Python override leaves PySide in a
+        broken state and the process dies later (measured in Laser settings,
+        2026-09-17), and ``obj`` may be half torn down. A stray scroll is the
+        worst a swallowed error can cost."""
         try:
-            self._fn()
-            self.finished.emit()
-        except Exception as e:
-            self.error.emit(str(e))
+            return self._filter(obj, ev)
+        except Exception:
+            return False
+
+    def _filter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.Polish:
+            # Born WheelFocus: Qt would hand the field focus from the wheel
+            # itself, before this filter sees the notch.
+            if isinstance(obj, self._targets) and \
+                    obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            return False
+        if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+            tgt = self._target_of(obj)
+            if tgt is not None:
+                tgt.setProperty(self._ARMED, True)
+            return False
+        if t in (QEvent.Type.Leave, QEvent.Type.FocusOut, QEvent.Type.Hide):
+            # A combo's own list popping up takes the focus for a moment; that
+            # is still the click, so it keeps the field armed.
+            if t == QEvent.Type.FocusOut and \
+                    ev.reason() == Qt.FocusReason.PopupFocusReason:
+                return False
+            if isinstance(obj, self._targets) and obj.property(self._ARMED):
+                obj.setProperty(self._ARMED, False)
+            return False
+        if t != QEvent.Type.Wheel:
+            return False
+        tgt = self._target_of(obj)
+        if tgt is None:
+            return False
+        if tgt.property(self._ARMED) and tgt.hasFocus():
+            return False                    # clicked into it -> normal behaviour
+        w = tgt.parentWidget()
+        while w is not None:                # pass the scroll on to the panel
+            if isinstance(w, self._scroll_area):
+                QApplication.sendEvent(w.viewport(), ev)
+                break
+            w = w.parentWidget()
+        return True
 
 
-class LogWidget(QPlainTextEdit):
-    # Capped like monitor_tab's log: this window is meant to stay open for
-    # weeks, and an uncapped log grows for exactly as long.
-    MAX_LINES = 20000
-
-    def __init__(self):
-        super().__init__()
-        self.setReadOnly(True)
-        self.setStyleSheet(LOG_STYLE)
-        self.setMaximumBlockCount(self.MAX_LINES)
-
-    def append_line(self, text):
-        self.appendPlainText(text)
-        sb = self.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-
-# ===========================================================================
-# History
-# ===========================================================================
-
-class HistoryTab(QWidget):
-
-    def __init__(self):
-        super().__init__()
-        self._worker = None
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        top = QHBoxLayout()
-        self._btn_run = _btn("▶  Run History Analysis")
-        self._btn_run.setToolTip(
-            "Reads MasterOperations.parquet and compares each waveplate's recent "
-            "operations against its 30-day baseline. Flags any that drift more "
-            "than 3 % and writes a PNG plot per flagged waveplate into "
-            "HistoryPlots. Runs in the background — watch the log below.")
-        self._btn_stop = _btn("■  Stop", STOP_BUTTON_STYLE)
-        self._btn_stop.setEnabled(False)
-        self._btn_stop.setToolTip(
-            "Ask the running analysis to stop after its current step. "
-            "Enabled only while an analysis is in progress.")
-        self._btn_open = _btn("Open HistoryPlots", SECONDARY_STYLE)
-        self._btn_open.setToolTip(
-            "Open the HistoryPlots folder in Explorer to view the PNG plots "
-            "produced by the last analysis run.")
-        for b in [self._btn_run, self._btn_stop, self._btn_open]:
-            top.addWidget(b)
-        top.addStretch()
-        layout.addLayout(top)
-
-        info = QLabel(
-            "Analyzes MasterOperations.parquet.\n"
-            "Detects >3% deviations from 30-day baseline per waveplate. Saves PNG plots."
-        )
-        info.setStyleSheet("color:#888; font-size:11px;")
-        layout.addWidget(info)
-
-        self._log = LogWidget()
-        layout.addWidget(self._log)
-
-        self._btn_run.clicked.connect(self._run)
-        self._btn_stop.clicked.connect(self._stop)
-        self._btn_open.clicked.connect(
-            lambda: os.startfile(str(APP_DIR / "HistoryPlots")))
-
-    def _run(self):
-        self._log.clear()
-        self._btn_run.setEnabled(False)
-        self._btn_stop.setEnabled(True)
-
-        # Imported here, not at module load: this pulls in pandas, which is a
-        # large chunk of the cold-start import cost and is only needed once the
-        # user actually runs an analysis.
-        from operation_history_logic import OperationHistoryLogic
-        history = OperationHistoryLogic(APP_DIR)
-
-        def work():
-            history.run(
-                log_fn=self._log.append_line,
-                stop_flag=self._worker.is_stopped,
-            )
-
-        self._worker = WorkerThread(work)
-        self._worker.finished.connect(self._on_done)
-        self._worker.error.connect(lambda e: self._log.append_line(f"ERROR: {e}"))
-        self._worker.start()
-
-    def _stop(self):
-        if self._worker:
-            self._worker.stop()
-        self._btn_stop.setEnabled(False)
-
-    def _on_done(self):
-        self._btn_run.setEnabled(True)
-        self._btn_stop.setEnabled(False)
+def install_wheel_guard(app=None):
+    """Install _WheelGuard once for the whole application."""
+    app = app or QApplication.instance()
+    if app is None or getattr(app, "_wheel_guard", None) is not None:
+        return
+    guard = _WheelGuard(app)
+    app._wheel_guard = guard
+    app.installEventFilter(guard)
 
 
 # ===========================================================================
@@ -312,7 +228,6 @@ class MainWindow(QMainWindow):
         from monitor_tab import MonitorWidget
         self._monitor_tab = MonitorWidget()
         tabs.addTab(self._monitor_tab, "PV Monitor")
-        tabs.addTab(HistoryTab(), "History")
 
         # Log stays the last tab — add any new tabs above this line.
         tabs.addTab(self._monitor_tab.log, "Log")
@@ -433,16 +348,19 @@ def main():
     app.setStyle(ToolTipDelayStyle("Fusion"))
     app.setPalette(_light_palette())
     app.setStyleSheet(APP_STYLESHEET)
+    install_wheel_guard(app)
 
     # Cold-start feedback: building MainWindow imports matplotlib (and touches
     # a large compiled dependency tree that Windows may re-scan on a cold file
     # cache), which can take tens of seconds. Paint a splash first and force it
     # on screen with processEvents() so the user isn't staring at nothing while
     # that happens — only PySide6 is loaded at this point, so the splash is
-    # near-instant.
+    # near-instant. It never takes the keyboard focus and does not sit above
+    # other programs: the user may be typing elsewhere while this loads.
     splash = QLabel("Loading Diagnostics…")
     splash.setAlignment(Qt.AlignCenter)
-    splash.setWindowFlags(Qt.SplashScreen | Qt.WindowStaysOnTopHint)
+    splash.setWindowFlags(Qt.SplashScreen | Qt.WindowDoesNotAcceptFocus)
+    splash.setAttribute(Qt.WA_ShowWithoutActivating, True)
     splash.setFixedSize(360, 120)
     splash.setStyleSheet(
         "background:#f3f3f3; color:#1565C0; font-size:16px; font-weight:600; "

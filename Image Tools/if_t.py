@@ -117,7 +117,7 @@ import numpy as np
 from PIL import Image as PilImage
 
 from PySide6.QtCore import (Qt, QTimer, QDate, QRunnable, QThreadPool, QObject,
-                            Signal, QPointF, QRect, QSize, QLocale)
+                            Signal, QPointF, QRect, QSize, QLocale, QEvent)
 from PySide6.QtGui import (QColor, QTextCharFormat, QPixmap, QImage, QFont, QCursor,
                            QPainter, QPen, QPalette, QImageWriter,
                            QShortcut, QKeySequence)
@@ -1351,37 +1351,56 @@ def _make_stepped_lut(stops):
     return lut
 
 # NI Vision "Binary", measured off the real viewer — same table and same rule as in
-# is_t.py, where how it was measured is written down. 15 colours, black below the first
-# band, one colour per 1024 stored 16-bit units.
+# is_t.py, where how it was measured is written down. 256 entries on the absolute scale
+# (raw counts >> 4): entry 0 black, 255 white, 1..254 the 15-colour cycle — a new colour
+# every 16 counts.
 _NI_BINARY_CYCLE = [
     (255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
     (255,127,0), (255,0,127), (127,255,0), (127,0,255), (0,127,255), (0,255,127),
     (255,127,127), (127,255,127), (127,127,255),
 ]
-NI_BINARY_BAND = 1024
-_NI_BINARY_TABLE = np.array([(0, 0, 0)] + _NI_BINARY_CYCLE, dtype=np.uint8)
 
 def _make_ni_binary_lut():
-    """The NI Binary rule as a 256-entry LUT over the ABSOLUTE 8-bit scale.
+    """The NI Binary table as a 256-entry LUT over the ABSOLUTE 8-bit scale.
 
-    This tab renders from 8-bit images, so unlike the Image Slider it cannot take the
-    exact 16-bit path: one code is 257 stored units against a 1024-unit band, so a code
-    on a band edge can land one colour out."""
-    codes = np.arange(256, dtype=np.int64) * 257
-    band = codes // NI_BINARY_BAND
-    idx = np.where(band <= 0, 0, (band - 1) % 15 + 1)
-    return _NI_BINARY_TABLE[idx]
+    This tab renders from 8-bit images (code = stored / 257, NI uses stored >> 8), so
+    unlike the Image Slider a code can land one entry out."""
+    i = np.arange(256)
+    table = np.array([(0, 0, 0)] + _NI_BINARY_CYCLE, dtype=np.uint8)
+    lut = table[np.where(i == 0, 0, (i - 1) % 15 + 1)]
+    lut[255] = (255, 255, 255)
+    return lut
 
-# "False Colors" (same definition as in is_t.py): dark blue → violet → purple →
-# magenta → pink → white, with the stops crowded at the bottom so faint detail gets
-# most of the colour range. One colour family on purpose — a spectrum here only
-# duplicates Gradient / Jet / Turbo.
-_FALSE_COLORS_STOPS = [
-    (0.00, (0,0,0)), (0.03, (25,0,70)), (0.07, (45,0,120)), (0.12, (70,0,160)),
-    (0.20, (100,0,180)), (0.30, (130,5,185)), (0.42, (160,20,180)),
-    (0.55, (190,40,175)), (0.68, (215,70,170)), (0.80, (235,105,170)),
-    (0.90, (247,150,185)), (0.96, (252,200,215)), (1.00, (255,255,255)),
-]
+def _make_ni_false_colors_lut():
+    """NI Vision "False Colors", measured off the real viewer — same formula as
+    is_t._make_ni_false_colors_lut, where how it was measured is written down.
+
+    256 entries on the absolute scale: hue one full turn backwards (magenta → blue →
+    green → yellow → red → pink), lightness a 12-entry triangle (the contour bands),
+    fading to black below entry 50 and to white above 220; entry 0 grey, 252..254
+    greys, 255 white. This tab renders from 8-bit images (code = stored / 257, NI
+    uses stored >> 8), so a code can land one entry out."""
+    i = np.arange(256, dtype=np.float64)
+    hue = (321.0 - 1.3967 * i) % 360.0
+    light = 0.425 + 0.025 * (6.0 - np.abs(i % 12.0 - 6.0))
+    light -= 0.006 * np.clip(50.0 - i, 0.0, None)
+    light += (1.0 / 120.0) * np.clip(i - 220.0, 0.0, None)
+    light = np.clip(light, 0.0, 1.0)
+    chroma = 1.0 - np.abs(2.0 * light - 1.0)
+    hp = hue / 60.0
+    x = chroma * (1.0 - np.abs(hp % 2.0 - 1.0))
+    z = np.zeros_like(i)
+    seg = hp.astype(np.int64) % 6
+    r = np.choose(seg, [chroma, x, z, z, x, chroma])
+    g = np.choose(seg, [x, chroma, chroma, x, z, z])
+    b = np.choose(seg, [z, z, x, chroma, chroma, x])
+    m = light - chroma / 2.0
+    lut = np.rint(np.stack([r + m, g + m, b + m], 1) * 255.0).clip(0, 255).astype(np.uint8)
+    lut[0] = (58, 58, 58)
+    for k in (252, 253, 254):
+        lut[k] = (k, k, k)
+    lut[255] = (255, 255, 255)
+    return lut
 
 # "Rainbow" (same definition as in is_t.py): the NI Vision palette — blue to red with
 # a prominent green middle, 0 black and 255 white.
@@ -1396,7 +1415,7 @@ GRADIENTS = {
     "Grayscale":       None,
     "Gradient":        _make_lut([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
     "Binary":          _make_ni_binary_lut(),
-    "False Colors":    _make_lut(_FALSE_COLORS_STOPS),
+    "False Colors":    _make_ni_false_colors_lut(),
     "Rainbow":         _make_lut(_RAINBOW_STOPS),
     # Red / yellow lowered, pale yellow added, white kept at the top; see is_t.py.
     "Hot":             _make_lut([(0,(0,0,0)),(0.27,(255,0,0)),(0.53,(255,255,0)),(0.78,(255,255,190)),(1,(255,255,255))]),
@@ -1410,9 +1429,10 @@ GRADIENTS = {
 GRADIENT_NAMES = list(GRADIENTS.keys())
 
 # Palettes mapped onto the frame's own p0.5..p99.5 window instead of the absolute
-# 0..255 scale — see is_t.ADAPTIVE_PALETTES for why this one and no others.
-ADAPTIVE_PALETTES = frozenset({"False Colors"})
-# Cyclic palettes are ABSOLUTE: NI's Binary bands are fixed at 1024 stored units and do
+# 0..255 scale — empty since False Colors was measured as absolute; see
+# is_t.ADAPTIVE_PALETTES.
+ADAPTIVE_PALETTES: frozenset = frozenset()
+# Cyclic palettes are ABSOLUTE: NI's Binary bands are fixed at 16 raw counts and do
 # not follow the frame, so no stretch may run first (see is_t.CYCLIC_PALETTES).
 CYCLIC_PALETTES = frozenset({"Binary"})
 
@@ -2550,8 +2570,8 @@ class _EnergyLoadTask(QRunnable):
 
 class _LoadSignals(QObject):
     done      = Signal(list, dict, int)
-    not_found = Signal(object)
-    error     = Signal(str)
+    not_found = Signal(object, int)   # (target path, load generation)
+    error     = Signal(str, int)      # (message, load generation)
     log_msg   = Signal(str)
 
 class _CollectSignals(QObject):
@@ -2565,7 +2585,50 @@ class _LogSignals(QObject):
     msg = Signal(str)
 
 class _PreviewSignals(QObject):
-    ready = Signal(object, int)   # (QPixmap, gen)
+    ready = Signal(object, int)   # (QImage, gen)
+
+
+class _SwallowInput(QObject):
+    """Eats clicks, keys and wheel notches app-wide — the input a modal box would
+    have refused — while a progress box waits to be shown (see _exec_progress)."""
+    _EATEN = (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+              QEvent.Type.MouseButtonDblClick, QEvent.Type.KeyPress,
+              QEvent.Type.KeyRelease, QEvent.Type.Wheel)
+
+    def eventFilter(self, obj, ev):
+        return ev.type() in self._EATEN
+
+
+def _exec_progress(dlg: QDialog, delay_ms: int = 500) -> None:
+    """exec() for a progress box, without the flash.
+
+    A box opened for work that finishes in a moment was on screen for a fraction of a
+    second: a window blinking past with nothing readable on it. This one appears only
+    when the work is still running after `delay_ms`. Until then the same thing happens
+    as under exec() — a local event loop runs and the rest of the program takes no
+    input — just without a window. The work closes it with accept()/reject() exactly as
+    before (`finished` fires on a box that was never shown, too)."""
+    from PySide6.QtCore import QEventLoop
+    loop = QEventLoop()
+    state = {"done": False}
+
+    def _finished(_r):
+        state["done"] = True
+        loop.quit()
+    dlg.finished.connect(_finished)
+    app = QApplication.instance()
+    guard = _SwallowInput()
+    app.installEventFilter(guard)
+
+    def _show():
+        app.removeEventFilter(guard)
+        if not state["done"]:
+            dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dlg.show()
+    QTimer.singleShot(delay_ms, _show)
+    if not state["done"]:
+        loop.exec()
+    app.removeEventFilter(guard)
 
 
 class _TryAgainSignals(QObject):
@@ -2981,6 +3044,9 @@ class ImageFinderWidget(QWidget):
         self._preview_sig.ready.connect(self._on_preview_ready)
 
         self._preview_gen: int = 0
+        # (path, float pixels, PNG info, mode, full scale) of the frame last decoded
+        # for the preview — see _preview_show.
+        self._preview_decoded = None
         self._preview_paths: list = []
         self._preview_cam_names: list[str] = []  # per-file cam name (parallel to _preview_paths)
         self._preview_idx: int = 0
@@ -3510,7 +3576,8 @@ class ImageFinderWidget(QWidget):
             "comparable between frames and between cameras.\n"
             "ON: a dim frame becomes readable, but colours no longer mean the same "
             "intensity from frame to frame.\n"
-            "The Binary and False Colors palettes always map per frame, by design.")
+            "Binary and False Colors are copies of the NI viewer's palettes: leave "
+            "this OFF to see them as NI shows them.")
         self._cb_auto_stretch.toggled.connect(self._on_auto_stretch_toggled)
         row_con.addWidget(self._cb_auto_stretch)
         ll.addLayout(row_con)
@@ -3974,6 +4041,7 @@ class ImageFinderWidget(QWidget):
         self._segments = dlg.all_segments()
         self._selected_days = [daypicker.date_to_qdate(s.date) for s in self._segments]
         self._user_has_selected_day = True
+        self._quiet_load_gen = None
         self._status_dot.setStyleSheet("color: gray; font-size: 12px;")
         self._log(f"Time window: {len(self._segments)} day(s), "
                   f"{self._window_summary()}")
@@ -4313,10 +4381,14 @@ class ImageFinderWidget(QWidget):
         if on_wall:
             self._last_wall_tab = idx
             self._wall = wall
-            self._sync_wall_display()
+            # Switching tabs moves no slider, so the marked frames keep their own
+            # values; only the shared setting is carried over.
+            self._sync_wall_display(stamp_selection=False)
             # The reference day names a tile, and every tab holds a different set of
-            # them, so the list is rebuilt for the wall now on screen.
-            self._rebuild_baseline_combo(wall.cells())
+            # them, so the list is rebuilt for the wall now on screen — showing the
+            # reference that wall already has.
+            self._rebuild_baseline_combo(wall.cells(),
+                                         current=getattr(wall, "_baseline_idx", None))
         for w in (self._baseline_cb, self._btn_save_wall):
             w.setEnabled(on_wall)
         for w in self._overlay_widgets:
@@ -4528,7 +4600,7 @@ class ImageFinderWidget(QWidget):
         self._detail_tab_idx = self._view_tabs.addTab(det, self._DETAIL_TAB_TITLE)
         self._sync_detail_title()
 
-    def _rebuild_baseline_combo(self, cells: list):
+    def _rebuild_baseline_combo(self, cells: list, current: "int | None" = None):
         self._baseline_cb.blockSignals(True)
         self._baseline_cb.clear()
         self._baseline_cb.addItem("none", None)
@@ -4558,6 +4630,10 @@ class ImageFinderWidget(QWidget):
                 except Exception:
                     pass
             self._baseline_cb.addItem(txt, i)
+        if current is not None:
+            pos = self._baseline_cb.findData(current)
+            if pos >= 0:
+                self._baseline_cb.setCurrentIndex(pos)
         self._baseline_cb.blockSignals(False)
 
     def _on_baseline_changed(self, _idx: int):
@@ -4756,12 +4832,15 @@ class ImageFinderWidget(QWidget):
         # (`_sync_detail_tab` goes through `_preview_set_files`, which renders.)
         self._sync_detail_tab()
 
-    def _sync_wall_display(self):
+    def _sync_wall_display(self, stamp_selection: bool = True):
         """Push the display controls onto the walls.
 
         With nothing selected this is the shared setting every tile renders on — which
         is what keeps the days comparable. With frames selected the values become THOSE
-        frames' own, and they are marked as adjusted; see the note on _DayWall."""
+        frames' own, and they are marked as adjusted; see the note on _DayWall.
+
+        `stamp_selection=False` (a tab switch) pushes only the shared setting: no
+        control moved, so the marked frames must not be stamped "(adjusted)"."""
         if not hasattr(self, "_wall"):
             return
         auto, gamma, contrast, offset = self._bc_args()
@@ -4781,7 +4860,7 @@ class ImageFinderWidget(QWidget):
         self._wall_grad_shared = grad_shared
         for w in self._all_walls() or [self._wall]:
             w.set_display(grad_shared, *shared)
-            if sel:
+            if sel and stamp_selection:
                 w.apply_adjust(sel, contrast, offset, gamma)
 
     def _on_wall_tile_clicked(self, idx: int):
@@ -4974,7 +5053,10 @@ class ImageFinderWidget(QWidget):
         sig = self._try_sig
         sig.progress.connect(lambda _m, h: hour_lbl.setText(h))
 
+        found = {"path": None}
+
         def _on_cell(_cam, _date, real_h, path, line):
+            found["path"] = path
             if path:
                 self._try_hour[self._cell_identity(cell)] = real_h
                 self._replace_cell_frame(cell, Path(path))
@@ -4985,7 +5067,8 @@ class ImageFinderWidget(QWidget):
                 prog.accept()
             except Exception:
                 pass
-            if summary:
+            # A find shows itself — the tile changes. Only "nothing found" needs words.
+            if summary and not found["path"]:
                 QMessageBox.information(self, "Search again", "\n".join(summary))
 
         sig.cell_done.connect(_on_cell)
@@ -5025,7 +5108,7 @@ class ImageFinderWidget(QWidget):
             sig.finished.emit([line])
 
         threading.Thread(target=worker, daemon=True).start()
-        prog.exec()
+        _exec_progress(prog)
 
     def _wall_pick_from_folder(self, cell: dict):
         """Browse for any picture and put it in this tile."""
@@ -5191,7 +5274,8 @@ class ImageFinderWidget(QWidget):
                 str(p) for p in written)
         if failed:
             msg += ("\n\n" if msg else "") + "Failed:\n" + "\n".join(failed)
-        QMessageBox.information(self, title, msg or "Nothing was saved.")
+        _get_slider_module().show_saved_box(
+            self, title, msg or "Nothing was saved.", written)
 
     def _save_view_png(self, path: Path, chosen: list, written: list,
                        failed: list):
@@ -5325,10 +5409,11 @@ class ImageFinderWidget(QWidget):
         self._preview_idx = (self._preview_idx + 1) % len(self._preview_paths)
         self._preview_show()
 
-    def _on_preview_ready(self, pm: QPixmap, gen: int):
+    def _on_preview_ready(self, qimg: QImage, gen: int):
         """Slot called on main thread when background thread finishes loading."""
         if gen != self._preview_gen:
             return
+        pm = QPixmap.fromImage(qimg)
         energy_text = getattr(self, "_preview_energy_text", "")
         if energy_text:
             pm = self._paint_pv_bar(pm, energy_text)
@@ -5458,14 +5543,23 @@ class ImageFinderWidget(QWidget):
 
         def _load():
             try:
-                img = PilImage.open(path)
-                if img.mode in ("I", "I;16"):
-                    arr = np.array(img, dtype=np.float32)
+                # The frame last decoded is kept: every display control (palette,
+                # Contrast, Brightness, Gamma, the PV bar) re-renders the SAME frame,
+                # and reading it off the share again cost 130-160 ms per change.
+                hit = self._preview_decoded
+                if hit is not None and hit[0] == path:
+                    _p, arr, info, mode, full_scale = hit
                 else:
-                    arr = np.array(img.convert("L"), dtype=np.float32)
-                # The camera's reference range for a 16-bit frame, 255 for an 8-bit one —
-                # see img_scale.full_scale_for_pil.
-                full_scale = img_scale.full_scale_for_pil(path, img.info, img.mode)
+                    img = PilImage.open(path)
+                    if img.mode in ("I", "I;16"):
+                        arr = np.array(img, dtype=np.float32)
+                    else:
+                        arr = np.array(img.convert("L"), dtype=np.float32)
+                    # The camera's reference range for a 16-bit frame, 255 for an
+                    # 8-bit one — see img_scale.full_scale_for_pil.
+                    info, mode = dict(img.info), img.mode
+                    full_scale = img_scale.full_scale_for_pil(path, info, mode)
+                    self._preview_decoded = (path, arr, info, mode, full_scale)
                 # `bc_out` comes back with what the Auto passes actually applied, so
                 # the greyed-out sliders can be parked on it and Auto gamma costs no
                 # second median pass over the frame.
@@ -5475,7 +5569,7 @@ class ImageFinderWidget(QWidget):
                 # The note names what was APPLIED, so it reads Auto's numbers out of
                 # bc_out rather than the zeros the widgets hold while Auto is on.
                 self._preview_scale_note = _scale_note(
-                    img.info, arr, auto, full_scale, gamma, path, img.mode,
+                    info, arr, auto, full_scale, gamma, path, mode,
                     int(bc_out.get("contrast", contrast)),
                     int(bc_out.get("offset", offset)),
                     bc_out.get("gamma"))
@@ -5487,10 +5581,11 @@ class ImageFinderWidget(QWidget):
                     pil_img = PilImage.fromarray(arr8, "L").convert("RGB")
                 raw = bytes(pil_img.tobytes("raw", "RGB"))
                 w2, h2 = pil_img.size
-                qimg = QImage(raw, w2, h2, w2 * 3, QImage.Format.Format_RGB888)
-                pm = QPixmap.fromImage(qimg)
+                # A QImage, not a QPixmap: a pixmap may only be made on the GUI
+                # thread (_on_preview_ready converts it). copy() so it owns its pixels.
+                qimg = QImage(raw, w2, h2, w2 * 3, QImage.Format.Format_RGB888).copy()
                 # Emit Signal — guaranteed delivery on main thread
-                sig.ready.emit(pm, gen)
+                sig.ready.emit(qimg, gen)
             except Exception as _e:
                 import traceback as _tb
                 self._log_safe(f"PREVIEW ERROR: {_e}\n{_tb.format_exc()}")
@@ -5576,6 +5671,9 @@ class ImageFinderWidget(QWidget):
         d = self._primary_day()
         self._log(f"Auto-selecting today: {d.strftime('%d.%m.%Y')}")
         self._sync_time_summary()
+        # The load this schedules is the next generation; nobody clicked for it, so
+        # a failure is logged, not boxed (see _load_is_quiet).
+        self._quiet_load_gen = self._load_gen + 1
         self._schedule_autoload(150)
 
     def _on_gradient_changed(self, name: str):
@@ -6424,23 +6522,34 @@ class ImageFinderWidget(QWidget):
                                 pass
 
                 if not found_any_hour:
-                    _sig.not_found.emit(target_path)
+                    _sig.not_found.emit(target_path, current_gen)
                     return
 
                 subfolders = sorted(all_entries, key=lambda x: x.name.lower())
                 _sig.log_msg.emit(f"LOAD: scanned {len(eff_days)} day(s), found {len(subfolders)} cameras")
                 _sig.done.emit(subfolders, saved_sel, current_gen)
             except Exception as e:
-                _sig.error.emit(f"{type(e).__name__}: {e}")
+                _sig.error.emit(f"{type(e).__name__}: {e}", current_gen)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _load_is_quiet(self, gen: int) -> bool:
+        """True for the result of a load nobody asked for by hand: one superseded by a
+        newer load, or the automatic one at startup. Those go to the log only — a box
+        popping up over the window with no click behind it is exactly what must not
+        happen."""
+        return gen != self._load_gen or gen == getattr(self, "_quiet_load_gen", None)
 
-    def _on_load_not_found(self, target_path: Path):
+    def _on_load_not_found(self, target_path: Path, gen: int = -1):
+        if gen != -1 and gen != self._load_gen:
+            return
         self._drop_pushed_moments(f"no camera folders on {target_path}")
         if not self.isVisible():
             return
         self._log(f"Target folder not found: {target_path}")
+        if self._load_is_quiet(gen):
+            self._refresh_selected_table()
+            return
         resp = QMessageBox.question(
             self, "Not found",
             f"Folder does not exist:\n{target_path}\n\n"
@@ -6452,11 +6561,15 @@ class ImageFinderWidget(QWidget):
         if resp == QMessageBox.StandardButton.Yes:
             self._open_pv_region_search()
 
-    def _on_load_error(self, err: str):
+    def _on_load_error(self, err: str, gen: int = -1):
+        if gen != -1 and gen != self._load_gen:
+            return
         self._drop_pushed_moments(f"the day scan failed ({err})")
         if not self.isVisible():
             return
         self._log(f"ERROR: {err}")
+        if self._load_is_quiet(gen):
+            return
         QMessageBox.critical(self, "Error", err)
 
     def _on_load_done(self, subfolders: list[Path], saved_sel: dict[str, int], gen: int):
@@ -8140,7 +8253,7 @@ class ImageFinderWidget(QWidget):
             sig.done.emit(out, gen)
 
         threading.Thread(target=worker, daemon=True).start()
-        dlg.exec()
+        _exec_progress(dlg)
 
     def _run_condition_search(self, cfg: dict, condition: dict):
         """PV-condition search: find ONE moment, then take it from every camera.
@@ -8286,6 +8399,9 @@ class ImageFinderWidget(QWidget):
                 pass
 
         def on_signal(data: dict):
+            # The final result always closes the box, even with the tab off screen.
+            if "_final" in data:
+                prog_dlg.accept()
             if not self.isVisible():
                 return
             if "_log" in data:
@@ -8293,7 +8409,6 @@ class ImageFinderWidget(QWidget):
             if "_progress" in data:
                 prog_bar.setValue(data["_progress"])
                 prog_lbl.setText(data["_label"]); return
-            prog_dlg.accept()
             results = data.get("_final") or {}
             fail = data.get("_fail")
             if fail is not None or not results:
@@ -8327,7 +8442,7 @@ class ImageFinderWidget(QWidget):
 
         _sig.done.connect(on_signal)
         threading.Thread(target=worker, daemon=True).start()
-        prog_dlg.exec()
+        _exec_progress(prog_dlg)
 
     def _report_condition_failure(self, fail: dict, cond_text: str):
         """Say WHICH of the three ways it failed. "Not found" would read as "the
@@ -8568,6 +8683,10 @@ class ImageFinderWidget(QWidget):
                 pass
 
         def on_signal(data: dict):
+            # The final result always closes the box, even with the tab off screen —
+            # returning first left it open for good.
+            if "_final" in data:
+                prog_dlg.accept()
             if not self.isVisible():
                 return
             if "_log" in data:
@@ -8577,7 +8696,6 @@ class ImageFinderWidget(QWidget):
                 prog_bar.setValue(data["_progress"])
                 prog_lbl.setText(data["_label"])
                 return
-            prog_dlg.accept()
             results = data["_final"]
             total_found = sum(1 for v in results.values()
                               for _, _, p, _, _ in v if p is not None)
@@ -8621,7 +8739,7 @@ class ImageFinderWidget(QWidget):
 
         _sig.done.connect(on_signal)
         threading.Thread(target=worker, daemon=True).start()
-        prog_dlg.exec()
+        _exec_progress(prog_dlg)
 
     # ── COLLECT JOBS ──────────────────────────────────────────────────────────
     def _snapshot_collect_jobs(self) -> list[tuple[Path, int]]:
@@ -9348,7 +9466,9 @@ class ImageFinderWidget(QWidget):
 
         def on_save_done(payload: list):
             self._set_busy(False)
-            QMessageBox.information(self, title, payload[0] if payload else "Done")
+            _get_slider_module().show_saved_box(
+                self, title, payload[0] if payload else "Done",
+                payload[1] if len(payload) > 1 else [])
 
         _sig.done.connect(on_save_done)
         self._set_busy(True)
@@ -9357,6 +9477,7 @@ class ImageFinderWidget(QWidget):
                   f"in background…")
 
         def worker():
+            written: list = []
             try:
                 render = {
                     "grad_name": grad_name, "auto": auto, "gamma": gamma,
@@ -9364,6 +9485,7 @@ class ImageFinderWidget(QWidget):
                     "sel_cols": sel_cols, "pv_bar": opts["pv_bar"],
                     "energy": (self._save_energy_map(frames, sel_cols)
                                if opts["pv_bar"] else {}),
+                    "written": written,   # every file written, for Open in the Saved box
                 }
                 if mode == "each":
                     msg = self._save_frames_each(frames, dest_path,
@@ -9380,7 +9502,7 @@ class ImageFinderWidget(QWidget):
                                f"{traceback.format_exc()}")
                 msg = f"Nothing was saved.\n{type(e).__name__}: {e}"
             try:
-                _sig.done.emit([msg])
+                _sig.done.emit([msg, [str(p) for p in written]])
             except RuntimeError:
                 pass          # widget already destroyed
 
@@ -9543,6 +9665,7 @@ class ImageFinderWidget(QWidget):
                         except Exception: pass
                 else:
                     shutil.copy2(src, dst)
+                render.setdefault("written", []).append(dst)
                 copied += 1
             except Exception as e:
                 self._log_safe(f"SAVE ERROR: {src} -> {type(e).__name__}: {e}")
@@ -9653,6 +9776,7 @@ class ImageFinderWidget(QWidget):
                                      self._save_sheet_heading(frames))
         dest.parent.mkdir(parents=True, exist_ok=True)
         img.save(dest)
+        render.setdefault("written", []).append(dest)
         return (f"Saved {len(frames)} frame(s) on one picture:\n{dest}\n"
                 f"- {img.width} × {img.height} px")
 
@@ -9675,6 +9799,7 @@ class ImageFinderWidget(QWidget):
                 head = f"{cam}   ·   {self._save_sheet_heading(by_cam[cam])}"
                 self._save_sheet_image(by_cam[cam], render, head).save(out)
                 written.append(out)
+                render.setdefault("written", []).append(out)
             except Exception as e:
                 failed.append(f"{cam}: {type(e).__name__}: {e}")
         msg = f"Saved {len(written)} picture(s), one per camera, to:\n{dest}"
@@ -9720,6 +9845,7 @@ class ImageFinderWidget(QWidget):
         pages[0].save(dest, "PDF", save_all=True, append_images=pages[1:],
                       resolution=200.0,
                       title=f"Image Finder — {len(pages)} frame(s)")
+        render.setdefault("written", []).append(dest)
         return f"Saved {len(pages)} frame(s) as {len(pages)} page(s):\n{dest}"
 
     # ── INFO ──────────────────────────────────────────────────────────────────
@@ -9968,15 +10094,19 @@ class ImageFinderWidget(QWidget):
             dest = QFileDialog.getExistingDirectory(win, "Select folder for both results")
             if not dest: return
             dest_path = Path(dest)
+            both = []
             for diff_raw, brightness, label in (
                 (diff_ab_raw, bright_ab[0], "A-B"),
                 (diff_ba_raw, bright_ba[0], "B-A"),
             ):
                 d    = np.clip(diff_raw, 0, None); mx = float(d.max()) or 1.0
                 arr8 = np.clip(d / mx * 255.0 * brightness, 0, 255).astype(np.uint8)
-                PilImage.fromarray(arr8).save(dest_path / f"diff_{label}_{stem_a}_vs_{stem_b}.png")
+                out = dest_path / f"diff_{label}_{stem_a}_vs_{stem_b}.png"
+                PilImage.fromarray(arr8).save(out)
+                both.append(out)
                 self._log(f"SAVED {label}: {dest_path}")
-            QMessageBox.information(win, "Saved", f"Both saved to:\n{dest_path}")
+            _get_slider_module().show_saved_box(
+                win, "Saved", f"Both saved to:\n{dest_path}", both)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(QPushButton("Save A\u2212B", clicked=lambda: save_png(diff_ab_raw, bright_ab[0], "A-B")))
@@ -11591,7 +11721,10 @@ class PVRegionSearchDialog(QDialog):
         if got is None:
             name = self._registry_name_for(channel)
             unit = self._local_unit.get(channel)
-            if unit is None:
+            if unit is not None:
+                # Typed here as `mm^2`, shown as `mm²` like everywhere else.
+                unit = _get_slider_module().unit_text(unit)
+            else:
                 unit = ""
                 try:
                     if name:
@@ -11920,7 +12053,8 @@ class PVRegionSearchDialog(QDialog):
             if _is_derived_key(ch):
                 e_ch.setText(_derived_name(ch) + "   (formula)")
                 e_lbl.setText(keep_label or it_row.text())
-                e_unit.setText(self._pv_meta_for(ch).get("unit") or "")
+                # The typed form (`mm^2`), not the screen one: this box is edited.
+                e_unit.setText(sl.pv_units_typed(_derived_name(ch)) or "")
                 note.setText(
                     "A formula, not a channel: it is computed from other PVs. Its "
                     "sources and its expression are set in the Image Slider's "
@@ -11931,7 +12065,7 @@ class PVRegionSearchDialog(QDialog):
             if name:
                 e_lbl.setText(keep_label or sl.pv_label_for(name))
                 e_unit.setText(self._local_unit.get(ch)
-                               or sl.pv_units_for(name) or "")
+                               or sl.pv_units_typed(name) or "")
                 try:
                     lo, hi = sl.pv_limits_for(name)
                 except Exception:
@@ -13797,7 +13931,8 @@ class _DayWall(QWidget):
             if grad is not None:
                 cur["grad"] = str(grad)
             self._shared.adj[p] = cur
-        self._pix.clear()
+        # No _pix.clear(): each cached tile carries its own adjustment key (see
+        # _tile_pixmap), so only the tiles whose values changed are rendered again.
         self.update()
 
     def apply_gradient(self, paths, grad: str):
@@ -13813,7 +13948,7 @@ class _DayWall(QWidget):
             cur = dict(self._shared.adj.get(p) or {})
             cur["grad"] = str(grad)
             self._shared.adj[p] = cur
-        self._pix.clear()
+        # Only the changed tiles re-render — see apply_adjust.
         self.update()
 
     def rotate(self, paths, delta: int):
@@ -15170,6 +15305,15 @@ def install_wheel_guard(app):
 
         def eventFilter(self, obj, ev):
             t = ev.type()
+            if t == QEvent.Type.Polish and isinstance(obj, self._GUARDED):
+                # Spin boxes and drop-downs come with Qt's WheelFocus: the wheel
+                # notch ITSELF hands them the focus, with the same "mouse" reason
+                # a click gives, before this filter sees the notch -- so every
+                # field the pointer crossed counted as clicked and took the
+                # value change. Without WheelFocus only a click or Tab focuses.
+                if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                    obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
                 # Popup and menu reasons are left as they are: closing a drop-down
                 # hands the focus back, which must not undo the click that opened it.

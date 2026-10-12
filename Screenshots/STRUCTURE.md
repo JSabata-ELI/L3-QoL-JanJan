@@ -196,6 +196,17 @@ midtone curve with the ends pinned — never mixed up.
   its contrast/brightness/gamma move. (Previously colour survived only while
   every control sat at its default, so ticking Auto contrast looked like it was
   also changing the palette.)
+- **Palettes are Image Tools' palettes**: `_PALETTES` is is_t `GRADIENTS` in the same
+  order ("Original" for "Default") and every table is identical —
+  `testing/test_palettes_match_image_tools.py` reads is_t.py and fails on any drift.
+  *Binary* and *False Colors* (`_NI_PALETTES`) are the NI viewer's palettes measured in
+  Image Tools (its STRUCTURE.md has the derivation): indexed by raw camera counts >> 4
+  (`_ni_entry` — raw = stored × (2**bits − 1) / 65535, bits from the frame's `MaxValue`),
+  view-only (the tone controls are skipped and greyed out, `_sync_tone_enable` and the
+  zoom window's `_sync_auto_enable`), and *Binary* is resized NEAREST
+  (`_resample_for`, `_PIXEL_EXACT_PALETTES`) because averaging two cycle colours makes
+  a third, unrelated one. On real archive frames the render is pixel-for-pixel the
+  Image Slider's. When a palette changes in Image Tools, change it here too.
 - `_settings_for(state)` — an image's own settings if it was edited in the zoom
   window, otherwise the toolbar's; `gamma` defaults to 1.0 so states saved before
   gamma existed stay valid.

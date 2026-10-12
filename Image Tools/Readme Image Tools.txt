@@ -150,6 +150,30 @@ THE FOUR TABS
     grid does, including the ones whose file happens to land while
     the selected camera's own picture is still being read.
 
+    LAYOUT TABS
+    The row of small tabs at the top of the Image Slider holds several
+    set-ups at once — "Ghost tile" in one, "Laser running" in another —
+    each with its own cameras, arrangement, time window and live mode.
+    "+" adds a tab (named Panel 1, Panel 2, …), × closes one,
+    double-click a tab's name to rename it.
+
+    Only the tab you are looking at does any work. The others sleep:
+    nothing is read from the share, nothing is drawn, no machine values
+    are fetched. Click back and it carries on where you left it, with
+    nothing reloaded — a live tab jumps straight to the newest pictures
+    that arrived while it slept, a recorded one is still on the same
+    picture. Going to another of the five main tabs puts the Image
+    Slider to sleep the same way.
+
+    The tabs are remembered when Image Tools closes: names, cameras,
+    arrangement and time window. A live tab comes back live, on the
+    current hour. A recorded one comes back on the same period and the
+    same picture.
+
+    Anything sent here from the Image Finder, the Shot Finder or the
+    Workshop opens in a NEW tab, so the set-ups you already have are
+    not touched.
+
     The ◀ ▶ arrows move one image per click; hold one down and it
     speeds up — two images a second, then three, four, five, eight
     after five seconds and ten after eight. With several cameras, the
@@ -167,6 +191,14 @@ THE FOUR TABS
     previous shot's numbers. While it is waiting it keeps asking at
     a steady pace instead of backing off, so the numbers land with
     the picture rather than a beat after it.
+
+    A coloured dot next to a value says what state it is in — on the
+    panel over the picture, in the PV table and in a saved picture:
+    red = not loaded yet (it fills itself in), grey = no value
+    (nothing archived near this frame, or it could not be read),
+    orange = the number belongs to an earlier shot than the picture.
+    No dot = this frame's own reading. Hover the value in the PV
+    table for the details (how much earlier, and why).
 
     LIMITS AND TRIPS — LIVE MODE ONLY
     Any of those values can be given a limit. Open "Select PV
@@ -218,6 +250,21 @@ THE FOUR TABS
     it stays that size whatever the numbers do. All of it is
     remembered for the next time.
 
+    SHOT COUNTER. The last row of the PV table counts shots in live
+    mode, and the panel over the picture shows it too. Each shot counts
+    once, when the camera on screen, another open camera at the same
+    rate, or a laser energy reading saw it — so a picture missing from
+    the archive does not make it skip a shot. Changing the camera keeps
+    the number; it only goes up with a new shot. After X seconds
+    without a shot the count starts again from zero — the old number
+    stays on screen until the next shot, which reads 1. Double-click
+    the row to set X (10 s to start with).
+
+    The PV panel always stays above the cameras, also in focus view
+    (F11) and watcher view (Ctrl+F11). In focus view every camera
+    window is cut to its picture, so no grey band is left around it;
+    the picture keeps its size.
+
     With several cameras open, the program sizes their windows so
     that even the smallest picture comes out as large as the screen
     allows, and then, among the arrangements that are as good as that,
@@ -267,7 +314,18 @@ THE FOUR TABS
     shape you have switched on, so the others are never in the way.
     With several cameras marked, every mark lands on all of them at
     the same place in each picture, and Delete takes it off all of
-    them.
+    them. With no camera marked, nothing appears until you click a
+    picture, and the mark then goes on that one camera only, where
+    you clicked.
+
+    A picked mark has a round knob with a turning arrow above it:
+    drag the knob to turn the mark (hold Shift for steps of 15°).
+    "Overlay settings" turns them by number too — pick one mark or
+    "All …" from the list under each shape, or turn every mark at
+    once with "All marks angle". Each shape can also have an
+    outline: a thin rim (black unless you choose otherwise) along
+    both sides of the line, so it stays visible on a bright beam
+    and on a dark background alike. The look is remembered.
 
     PCW3_NF shows the permanent reference square that is set on the
     camera itself. The camera screen draws it, but it is not part of
@@ -275,7 +333,73 @@ THE FOUR TABS
     the picture to switch it off or to nudge its edges. The diodes
     have their measuring grid behind the same right click; on every
     other camera a right click opens nothing, and right-click-drag
-    still zooms everywhere.
+    still zooms everywhere. A MIDDLE click puts the camera you
+    clicked back to the whole frame, that one camera only. The marks
+    belong to the picture, not to the screen: zoom in and they stay
+    on the same spot of the beam, growing with it, and keep their
+    shape (a circle stays round); zoom out and they are back exactly
+    as drawn.
+
+    THE COUNTER at the top of INFO. With one camera: the frame on
+    screen / frames loaded. With several: "12 / 340 merged · 1020 in
+    total" — the shot on screen / shots (frames of the cameras taken
+    at the same moment count as ONE shot, even when the cameras stamp
+    it up to a second or two apart), then every frame of every camera.
+
+    Units typed as mm^2 or cm^-1 are shown as mm² and cm⁻¹
+    everywhere; the Unit box keeps what you typed.
+
+    SAVING. "Save Image" writes the frame on screen. When something
+    is burned in — the marks, or the PV values with "Save with
+    overlay" ticked — you get TWO files: the untouched original and
+    <name>_annotated.png beside it. With several cameras, "Save
+    Layout" writes all of them into ONE picture, looking as on the
+    screen: the tiles with their frames, camera names, times and
+    marks. Tick "PV overlay" next to it to include the PV values
+    panel. After every save the message has "Open" next to "OK";
+    when several files were saved, pick the one to open from the
+    list above the buttons ("Open folder" shows the folder).
+
+    POINTING ANALYSIS measures where the beam centre is on every frame
+    and plots how far it is from the MEDIAN of all shots, which sits
+    at 0, 0. Frames with no beam on them (only the background, or a
+    faint glow) are left out. Deleting points moves the median (Undo
+    puts it back). The status line says how many were left out and how
+    many were saturated. A progress bar shows how far the run has got
+    (its tooltip counts the frames analysed so far).
+    Choose px (sensor pixels), mm or µrad (angle at the experiment,
+    Y up) under "Unit". The "Optics" button opens a window where each
+    camera is set as Far field or Near field, with Pixel, M and f.
+    Far field (the chip sits in the focus of a lens, like the C310):
+    mm = px · pixel is the shift ON THE CHIP, and θ = x · M / f the
+    angle. Near field (the chip sees an image of the beam): mm = px ·
+    pixel / M is the real shift at the experiment; µrad is greyed out.
+    Set per camera and remembered (a new camera starts at the C310
+    values: far field, 4.5 µm, 1/66, 300 mm = 0.0045 mm and 0.227 µrad
+    per pixel; "C310 defaults" puts them back). "Method" picks Peak
+    core (this program's own: only the spot above Thr % of its peak
+    is weighed, zero = the median shot) or Full-frame centroid — the
+    MATLAB script exactly (whole frame, pixels above Thr counts at their
+    full value, zero = the mean shot; same numbers as the script's file
+    on the C310 run of 3 Sep 2026). "View" picks X–Y by time (with a
+    time colour bar), X-Y drift (the X and Y deviation against the shot
+    number, each graph with its shot axis, pale = every shot, dark
+    line = the trend, a running median that shows a slow drift through
+    the shot-to-shot noise; drag the round knob of the shot slider
+    between them to walk through the shots — the frame opens and both
+    points are ringed; a black line on the slider marks a pause in the
+    shooting) or 3D (X, Y and shot number; drag to turn).
+    Time is coloured as a rainbow, dark blue (first) to dark red
+    (last). The colour bar beside the beam path, X–Y by time and 3D
+    shows real times (the day too over several days); drag the
+    round knob on it to walk through the shots — the exact time is
+    shown beside it and the frame opens. Every switch redraws without
+    measuring again. Click a point — on the cloud or on the beam path
+    — to open that frame; the frame on screen is ringed in red. The
+    wheel zooms either plot,
+    double-click shows all of it again. "Close graph" only hides the
+    graph — "Open graph" brings it back as you left it — until you
+    open other cameras.
 
   SHOT FINDER
     Give a value and a tolerance — an energy, a waveplate angle —
@@ -294,6 +418,13 @@ THE FOUR TABS
     tab is offered in the other. The times open on 07:00 to 21:00,
     the shift rather than the whole calendar day.
 
+    Under "PVs" one button, "Configure PVs", opens the same picker
+    the Image Slider uses, so a PV you add or rename in one tab is
+    the same PV in the other. Every PV whose eye is open gets a row
+    under the button: tick the row to search by it, and type the
+    value and the tolerance beside it; leave it unticked to only
+    see its value in the results.
+
     Then two buttons: "Load data" reads only the numbers and says
     how many shots fall inside the band - no pictures, so it is
     quick even over a month - and "Load images" fetches the picture
@@ -302,6 +433,13 @@ THE FOUR TABS
     on screen stay where they are, and the "Image" column beside the
     date fills in - a green tick where the picture is there, a red
     cross where it is not, a grey dash where nobody has looked yet.
+
+    A day where nothing fell inside the tolerance is skipped: no
+    picture is looked for on it. Those days used to be the slowest
+    of the whole search, and the table had already said there was
+    nothing there. The row stays in the list, yellow, and says
+    "image not searched" instead of pretending a picture was
+    looked for and not found. Widen the tolerance to search them.
 
     Double-click a day in the results and a window opens with every
     matching shot of that day, and a graph beside it showing the

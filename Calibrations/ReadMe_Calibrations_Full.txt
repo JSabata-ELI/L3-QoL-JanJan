@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (cal.py, 1055 lines)
+Verified against source: 2026-10-05  (cal.py, 1109 lines)
 -----------------------------------------------------------------
 Short version: Readme_calibrations.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -33,6 +33,11 @@ What it explicitly does NOT do:
   - It does not write the new constants anywhere. It shows them; you
     enter them into the control system yourself.
   - It does not remember anything between runs.
+
+The "Info" button at the top, next to Save, opens a window titled
+Info with a short summary of how the program works: devices, range,
+fit, the two switches and saving. It changes nothing; "Close" shuts
+it.
 
 
 =================================================================

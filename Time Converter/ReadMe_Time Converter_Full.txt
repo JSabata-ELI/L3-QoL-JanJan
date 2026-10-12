@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (tc.py, 592 lines)
+Verified against source: 2026-10-05  (tc.py, 626 lines)
 -----------------------------------------------------------------
 Short version: Readme Time Converter.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

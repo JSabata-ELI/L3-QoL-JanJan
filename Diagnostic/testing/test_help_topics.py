@@ -178,6 +178,59 @@ def test_tagging_has_a_page_of_its_own_with_the_real_name():
     assert page == _win()._cmd_help_topic("tag")
 
 
+# ---------------------------------------------------------------------------
+# A room with the canteen switched off (Settings → Webex rooms, "/food")
+# ---------------------------------------------------------------------------
+
+def _rooms(*rows):
+    return {"webex_rooms": [dict(r) for r in rows]}
+
+
+LISTEN_ON = {"room_id": "A", "listen": True, "enabled": True}
+LISTEN_OFF = {"room_id": "A", "listen": True, "enabled": True, "food": False}
+
+
+def test_the_food_rule_defaults_to_on():
+    assert om.food_in_listen_room({})
+    assert om.food_in_listen_room(_rooms(LISTEN_ON))          # row older than the flag
+    assert om.food_in_listen_room(_rooms(
+        {"room_id": "B", "listen": False, "food": False}, LISTEN_ON))
+    assert not om.food_in_listen_room(_rooms(LISTEN_OFF))
+    # A listen tick on a row with no room id is not a room.
+    assert om.food_in_listen_room(_rooms(
+        {"room_id": "", "listen": True, "food": False}))
+
+
+def _win_food_off():
+    win = _win()
+    win.settings.update(_rooms(LISTEN_OFF))
+    return win
+
+
+def test_a_food_off_room_hears_nothing_about_food():
+    win = _win_food_off()
+    sheet = win._cmd_help()
+    assert "food" not in sheet.lower(), sheet
+    for word in ("food", "menu", "lunch"):
+        assert win._cmd_help_topic(word) == om.FOOD_OFF_HERE
+    assert "food" not in win._cmd_help_topic("banana").lower()
+    for topic in bc.help_topics():
+        assert "/food" not in bc.command_help(topic), topic
+
+
+def test_a_food_off_room_still_gets_the_rest_of_help():
+    sheet = _win_food_off()._cmd_help()
+    for cmd in ("/status", "/plot", "/change", "/run"):
+        assert cmd in sheet, cmd
+
+
+def test_no_lunch_reminder_in_a_food_off_room():
+    from datetime import datetime
+    monday_9 = datetime(2026, 10, 5, 9, 0)
+    on = {"okbase_enabled": True, **_rooms(LISTEN_OFF)}
+    assert not om.lunch_reminder_due(on, monday_9)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

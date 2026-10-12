@@ -755,13 +755,19 @@ class DayTimePicker(QDialog):
         self._days = sorted({s.date for s in segs})
         self._anchor = self._days[-1]
         self._per_day = {s.date: (s.h_from, s.m_from, s.h_to, s.m_to) for s in segs}
-        # A day whose window differs from the global From/To was given its own
-        # times last time round; keep it pinned so a From/To change here does not
-        # silently overwrite what the user set before.
+        # From/To first take the restored window — the one most days share (a
+        # single day's own window). Comparing against the fields BEFORE that
+        # compared against the 07:00–21:00 default, which pinned every restored
+        # day: the Spectra tab then ignored any new From/To and loaded the old
+        # hours again. A day whose window still differs was given its own times
+        # last time round; it stays pinned so From/To does not overwrite it.
+        wins = [self._per_day[d] for d in self._days]
+        glob = max(wins, key=wins.count)
+        self._show_times(glob)
         glob = self.selected_times()
         self._pinned = {d for d, w in self._per_day.items() if w != glob}
-        if len(self._days) == 1:
-            self._show_times(self._per_day[self._days[0]])
+        # The restored window is a chosen one: a day added now follows it.
+        self._global_touched = True
 
     # ── calendar interaction ──────────────────────────────────────────────────
     def _gate(self) -> "set[int]":

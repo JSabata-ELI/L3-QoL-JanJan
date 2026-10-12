@@ -1,8 +1,13 @@
-SPFE VALUES - DETAILED DESCRIPTION
-=================================
+SPFE Values — Detailed information
+Created by Jan Moucka, ELI Laser
 
-The short version is in ReadMe_SPFE Values.txt. This file explains why the
-program behaves the way it does, and what to do when it does not.
+Bugs / suggestions: jan.moucka@eli-laser.eu
+-----------------------------------------------------------------
+Short version: ReadMe_SPFE Values.txt
+-----------------------------------------------------------------
+
+This file explains why the program behaves the way it does, and what to do
+when it does not.
 
 
 1. WHAT IT REPLACES
@@ -58,6 +63,11 @@ empty tables. Setting weekdays_only to false in the config brings them back
 everywhere, buttons included - and a day picked by hand, in "Pick days" or in
 "View day", is always shown and always filled in, weekend or not, because
 somebody deliberately clicked on it.
+
+"Today", beside "View day", jumps straight back to today's date. In the View day
+window, pick a day in the list and press "Show this day in the table" to bring
+that day to the main page; the window closes. "Close" leaves the main page as it
+was.
 
 The recording times themselves are on screen, in the column headings: "Morning
 (09:00)" and "At the end (18:00)". The value under such a heading is the last
@@ -144,6 +154,10 @@ recorded. The References button opens a window with one line per number:
                       window, which is 5 % and is stored in spfe_config.json as
                       warn_pct.
 
+"Clear this line", at the bottom left of the window, empties the three boxes of
+the line the cursor is on. Like everything else in the window it is only stored
+when you press Save; Cancel closes the window and keeps the stored ranges.
+
 The three verdicts, and what they look like:
 
   outside the range   red cell, the number in WHITE with a black outline round
@@ -168,6 +182,9 @@ The ranges live beside the log, local copy first and then the share, and are
 merged number by number exactly as the campaign names are: a range set on the
 lab PC and one set here are two lines of the same table, and the newer wins only
 where they collide. Nobody can wipe somebody else's line by saving their own.
+
+Saving the window recolours the table on the spot. The cells are not rebuilt,
+so the table stays scrolled where it was and the picked cell stays picked.
 
 The workbook echoes the verdict: an out-of-range cell is filled red with white
 bold text, a near-edge cell yellow with black, and the reason is in the cell's
@@ -200,6 +217,12 @@ worth knowing:
     the old text back would be the one way to actually lose it.
   - Closing the program mid-typing is safe. The open cell is committed, the
     queue is written to disk, and the next start sends it.
+  - Typing never waits for the share. The next cell can be typed while the
+    last one is still being written to the shared log and the workbook; it
+    joins the queue at once.
+  - Nothing you type is ever refused because the program is busy. A value in
+    an empty column and a campaign name wait their turn while "Fill missing
+    days" or the start-up is running, then are written in the order typed.
 
 A quantity made of several numbers - BA1Loop4 is X and Y, the XPW loops are X,
 Y and SUM - is ONE LINE with the numbers SIDE BY SIDE, each in a cell of its
@@ -242,7 +265,16 @@ press Morning or At the end, which overwrites it. Nothing in this program can
 undo a delete.
 
 The campaign box in the grey strip works the same way: type a name, leave the
-box, and it is saved for that day and carried on to the days after it.
+box, and it is saved for that day and carried on to the days after it. Stepping
+from day to day shows each day's name from memory - the shared list is read in
+the background at start-up, at Sync now and after each save - so Previous and
+Next never wait for the share.
+
+The mouse wheel only scrolls. The one number box in the program - the year in
+the "Pick days" calendar - changes with the wheel only after you have clicked
+into it, and only while the pointer stays on it. No window opens by itself: if
+a scheduled moment comes round and the PV names are missing, the status line
+and the Log say so instead of a message box.
 
 
 7. THE FILES
@@ -384,6 +416,9 @@ costs one check of a machine that is known to be there.
 
 If neither answers, the program says so in the "Shared folder" box and keeps
 working on this PC alone.
+
+"Open folder" in the same box opens the shared folder in Explorer. It stays
+greyed until one of the two names has answered, and while a fetch is running.
 
 To force a particular folder - a test folder, or a different share - put its
 path into "share_root" in spfe_config.json.

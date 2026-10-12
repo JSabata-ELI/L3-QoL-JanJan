@@ -14,13 +14,83 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QMainWindow
+from PySide6.QtWidgets import (
+    QAbstractScrollArea, QAbstractSpinBox, QApplication, QComboBox,
+    QMainWindow, QSlider, QWidget,
+)
 
 from spfe_t import SPFEValuesWidget
 
 _APP_ID_PREFIX = "ELI.SPFEValues"
+
+
+class _WheelGuard(QObject):
+    """The mouse wheel must never change a number box or a drop-down just
+    because the pointer happens to hover over it.
+
+    The same guard as CSS Logger's (CSS Logger/main.py), so the widget behaves
+    the same standalone and once it is a tab there. A field reacts to the
+    wheel only after it has been clicked, and only while the pointer has
+    stayed on it since; otherwise the scroll goes to the panel underneath.
+
+    Every such field is switched from Qt's WheelFocus to StrongFocus when it
+    is polished: with WheelFocus the wheel itself focuses the field before
+    any filter sees the event, so "has focus" alone proves nothing.
+    """
+
+    _TARGETS = (QAbstractSpinBox, QComboBox, QSlider)
+    _ARMED = "_wheel_armed"
+
+    def _target_of(self, obj):
+        """The guarded field `obj` belongs to -- itself, or the spin box /
+        combo whose inner line edit received the event."""
+        w = obj
+        for _ in range(3):
+            if w is None or not isinstance(w, QWidget):
+                return None
+            if isinstance(w, self._TARGETS):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.Polish:
+            if isinstance(obj, self._TARGETS) and \
+                    obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            return False
+        if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+            tgt = self._target_of(obj)
+            if tgt is not None:
+                tgt.setProperty(self._ARMED, True)
+            return False
+        if t in (QEvent.Type.Leave, QEvent.Type.FocusOut, QEvent.Type.Hide):
+            if isinstance(obj, self._TARGETS) and obj.property(self._ARMED):
+                obj.setProperty(self._ARMED, False)
+            return False
+        if t != QEvent.Type.Wheel or not isinstance(obj, self._TARGETS):
+            return False
+        if obj.property(self._ARMED) and obj.hasFocus():
+            return False                    # clicked into it -> normal behaviour
+        w = obj.parentWidget()
+        while w is not None:                # pass the scroll on to the panel
+            if isinstance(w, QAbstractScrollArea):
+                QApplication.sendEvent(w.viewport(), ev)
+                break
+            w = w.parentWidget()
+        return True
+
+
+def install_wheel_guard(app: QApplication) -> _WheelGuard:
+    """Install the guard on the whole application. Kept on the app object as
+    well, so it is not collected while the program runs."""
+    guard = _WheelGuard(app)
+    app.installEventFilter(guard)
+    app._spfe_wheel_guard = guard
+    return guard
 
 
 def _app_dir() -> Path:
@@ -99,6 +169,7 @@ def main() -> int:
             pass
 
     app = QApplication(sys.argv)
+    install_wheel_guard(app)
     icon = _icon_file()
     if icon is not None:
         app.setWindowIcon(QIcon(str(icon)))

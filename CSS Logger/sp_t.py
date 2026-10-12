@@ -46,7 +46,7 @@ from PySide6.QtCore import (Qt, QObject, QTimer, Signal,
                             QRect, QPoint, QEvent, QLocale)
 from PySide6.QtGui import (QAction, QColor, QCursor, QIcon, QPalette,
                            QShortcut, QKeySequence, QGuiApplication,
-                           QPainter, QPen, QDoubleValidator, QFontMetrics)
+                           QPainter, QPen, QDoubleValidator, QFont, QFontMetrics)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QCheckBox, QGroupBox, QScrollArea, QSizePolicy, QButtonGroup,
@@ -67,7 +67,8 @@ import matplotlib.colors as _mpl_colors
 import matplotlib.dates as mdates
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import FixedLocator, FuncFormatter
-from matplotlib.transforms import blended_transform_factory
+from matplotlib.transforms import Affine2D, blended_transform_factory
+from matplotlib.text import Text as _MplText
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
@@ -284,6 +285,66 @@ QCheckBox::indicator {
 QCheckBox::indicator:hover  { border-color: #1565C0; background: #e8f0fe; }
 QCheckBox::indicator:checked { border-color: #1565C0; background: #1565C0; }
 """
+
+# A Spectra dialog in the program's own look, every colour stated. Without it a
+# tick box and the radio buttons take the PC's dark theme: the box itself is
+# never drawn, only a white tick when it is on — off, there is nothing to see.
+# Scoped by objectName (_paint_dialog) so it beats the application stylesheet.
+_DIALOG_NAME = "spectraDialog"
+_DIALOG_CSS = f"""
+QDialog#{_DIALOG_NAME} {{ background: #f3f3f3; color: #111; }}
+QDialog#{_DIALOG_NAME} QLabel {{ background: transparent; color: #111; }}
+QDialog#{_DIALOG_NAME} QCheckBox, QDialog#{_DIALOG_NAME} QRadioButton {{
+    spacing: 7px; padding: 2px 2px; font-weight: 600; color: #111;
+    background: transparent; }}
+QDialog#{_DIALOG_NAME} QCheckBox::indicator {{ width: 16px; height: 16px;
+    border: 2px solid #4a4a4a; border-radius: 3px; background: #fff; }}
+QDialog#{_DIALOG_NAME} QRadioButton::indicator {{ width: 14px; height: 14px;
+    border: 2px solid #4a4a4a; border-radius: 9px; background: #fff; }}
+QDialog#{_DIALOG_NAME} QCheckBox::indicator:hover,
+QDialog#{_DIALOG_NAME} QRadioButton::indicator:hover {{
+    border-color: #1565C0; background: #e8f0fe; }}
+QDialog#{_DIALOG_NAME} QCheckBox::indicator:checked {{
+    border-color: #1565C0; background: #1565C0; }}
+QDialog#{_DIALOG_NAME} QRadioButton::indicator:checked {{
+    border: 2px solid #1565C0; background: qradialgradient(cx:0.5, cy:0.5,
+    radius:0.5, fx:0.5, fy:0.5, stop:0 #1565C0, stop:0.55 #1565C0,
+    stop:0.65 #fff, stop:1 #fff); }}
+QDialog#{_DIALOG_NAME} QCheckBox:disabled,
+QDialog#{_DIALOG_NAME} QRadioButton:disabled {{ color: #9a9a9a; }}
+QDialog#{_DIALOG_NAME} QCheckBox::indicator:disabled,
+QDialog#{_DIALOG_NAME} QRadioButton::indicator:disabled {{
+    border-color: #c9c9c9; background: #f0f0f0; }}
+QDialog#{_DIALOG_NAME} QLineEdit {{
+    background: #fff; color: #111; border: 1px solid #b4b4b4;
+    border-radius: 3px; padding: 3px 5px;
+    selection-background-color: #1565C0; selection-color: #fff; }}
+QDialog#{_DIALOG_NAME} QLineEdit:focus {{ border-color: #1565C0; }}
+/* Spin boxes are left to the app: a border set here drops their arrows. */
+QDialog#{_DIALOG_NAME} QAbstractSpinBox {{ background: #fff; color: #111; }}
+QDialog#{_DIALOG_NAME} QListWidget {{
+    background: #fff; color: #111; border: 1px solid #b4b4b4; border-radius: 3px; }}
+QDialog#{_DIALOG_NAME} QListWidget::item {{ padding: 2px 4px; color: #111; }}
+QDialog#{_DIALOG_NAME} QListWidget::item:hover {{ background: #e8f0fe; color: #111; }}
+QDialog#{_DIALOG_NAME} QListWidget::item:selected {{
+    background: #1565C0; color: #fff; }}
+QDialog#{_DIALOG_NAME} QPushButton {{
+    background: #f4f4f4; color: #111; border: 1px solid #b4b4b4;
+    border-radius: 3px; padding: 5px 12px; }}
+QDialog#{_DIALOG_NAME} QPushButton:hover {{ background: #e8f0fe; }}
+QDialog#{_DIALOG_NAME} QPushButton:disabled {{ color: #9a9a9a; border-color: #d0d0d0; }}
+"""
+
+# The blue note box of the Export dialog — the house look for an explanation.
+_NOTE_STYLE = ("background:#e8f0fe; border:1px solid #90CAF9; border-radius:4px; "
+               "padding:6px; font-size:11px; color:#0D47A1;")
+
+
+def _paint_dialog(dlg: QDialog) -> None:
+    """Give a Spectra dialog the program's own look (see _DIALOG_CSS)."""
+    dlg.setObjectName(_DIALOG_NAME)
+    dlg.setStyleSheet(_DIALOG_CSS)
+
 
 _GROUP_STYLE = """
 QGroupBox {
@@ -626,6 +687,11 @@ _FILTER_ALARM  = "#B71C1C"
 # inside it (_STEP_COLORS). Its body is that colour washed out to near white
 # (_shade 1.93), so the pale cards stay readable on top of it.
 _LOAD_ACCENT = "#455A64"
+
+# The "Spectra" block — the list of selected spectra and its own Analyze. Deep
+# indigo: none of the purple settings, the teal filter, the blue-grey loading
+# roof, the step-card colours or the region colours (_REGION_COLORS).
+_SPECTRA_ACCENT = "#283593"
 _FILTER_EDIT_OK = (
     "QLineEdit { font-size: 11px; padding: 2px 4px; color: #111; "
     "background: #ffffff; border: 1px solid #b4b4b4; border-radius: 3px; }"
@@ -788,18 +854,21 @@ class _CustomToolbar(NavigationToolbar2QT):
     subplot_params_changed = Signal()
 
     def configure_subplots(self):
-        super().configure_subplots()
-        QTimer.singleShot(0, self._patch_subplots_dialog)
+        # Build and patch the dialog BEFORE it is shown: removing the button
+        # after show() made the dialog visibly jump to a new size.
+        if getattr(self, "_subplot_dialog", None) is None:
+            from matplotlib.backends.backend_qt import SubplotToolQt
+            dlg = SubplotToolQt(self.canvas.figure, self.canvas.parent())
+            self._subplot_dialog = dlg
+            self.canvas.mpl_connect("close_event", lambda e: dlg.reject())
+            self._patch_subplots_dialog(dlg)
+        dlg = self._subplot_dialog
+        dlg.update_from_current_subplotpars()
+        dlg.setModal(True)
+        dlg.show()
+        return dlg
 
-    def _patch_subplots_dialog(self):
-        dlg = getattr(self, "_subplot_dialog", None)
-        if dlg is None:
-            for w in QApplication.topLevelWidgets():
-                if isinstance(w, QDialog) and w.isVisible():
-                    dlg = w
-                    break
-        if dlg is None:
-            return
+    def _patch_subplots_dialog(self, dlg):
         for btn in dlg.findChildren(QPushButton):
             if btn.text().strip() == "Export values":
                 btn.setParent(None)
@@ -882,7 +951,35 @@ def _cpva_fetch_split(channel: str, start_ns: int, end_ns: int) -> list:
 
 
 def _cpva_fetch_chunked(channel: str, start_ns: int, end_ns: int) -> list:
-    """Same samples as _cpva_fetch, fetched in 1-hour pieces."""
+    """Same samples as _cpva_fetch, fetched in 1-hour pieces.
+
+    A channel archived under two names (SBW4) gets the same rule as the CSS
+    Logger tab (cpva_core.read_order): read under the HAPLS name first, then
+    every Prague day holding nothing under it is read under the L3 name, and
+    those samples are returned as the asked channel's."""
+    from cpva_core import read_order, _empty_day_ranges
+    names = read_order(channel)
+    samples = _cpva_fetch_chunked_one(names[0], start_ns, end_ns)
+    if len(names) == 1:
+        return samples
+    if samples and names[0] != channel:
+        _last_fetch_error.pop(channel, None)
+    got = []
+    for alt in names[1:]:
+        for lo, hi in _empty_day_ranges(samples + got, start_ns, end_ns):
+            try:
+                part = _cpva_fetch_chunked_one(alt, lo, hi)
+            except Exception:
+                continue
+            got.extend(s for s in part if lo <= (s.get("time") or 0) < hi)
+    if not got:
+        return samples
+    _last_fetch_error.pop(channel, None)       # a name answered for it
+    return sorted(samples + got, key=lambda s: s.get("time") or 0)
+
+
+def _cpva_fetch_chunked_one(channel: str, start_ns: int, end_ns: int) -> list:
+    """:func:`_cpva_fetch_chunked` for exactly the name given."""
     _last_fetch_error.pop(channel, None)
     bounds = []
     cs = start_ns
@@ -929,17 +1026,119 @@ def _fetch_waveforms(channel: str, start_ns: int, end_ns: int) -> list[tuple[int
         _last_fetch_error[channel] = str(exc)
         return []
     result = []
+    one_number = 0
     for s in samples:
         t = s.get("time")
         v = s.get("value")
         if isinstance(v, list) and v:
             try:
                 arr = np.array(v, dtype=float)
-                if t is not None:
-                    result.append((int(t), arr))
             except (ValueError, TypeError):
-                pass
+                continue
+            # The archiver wraps a plain number as a one-element list, so a
+            # scalar channel (L3-SBDP-SPIDER:FWHM_FL, measured: 60 samples of
+            # [28.0] in ten minutes) used to pass as a one-point "spectrum" — a
+            # line of one point, which matplotlib draws as nothing at all.
+            if arr.size < 2:
+                one_number += 1
+                continue
+            if t is not None:
+                result.append((int(t), arr))
+    if one_number:
+        _one_number_hits[channel] = one_number
+    else:
+        _one_number_hits.pop(channel, None)
     return result
+
+
+_one_number_hits: dict = {}   # channel -> one-number samples its last fetch dropped
+
+
+def _fmt_name_value(v: float, extra: int = 0) -> str:
+    """A Search-by mean as it reads in a spectrum's name: whole numbers from
+    100 up (GDD 24780, not 24779.6), three significant digits below (20.1 J).
+    `extra` adds digits when two spectra would otherwise read the same."""
+    if abs(v) >= 100:
+        return f"{v:.{extra}f}"
+    if v == 0:
+        return "0"
+    return f"{v:.{3 + extra}g}"
+
+
+_NAME_EXTRA_MAX = 4   # past this, two means count as the same set point
+
+
+class _NamePlateText(_MplText):
+    """A text whose plate hugs the letters, the same gap on all four sides.
+
+    Matplotlib sizes a text's plate from the font's full line height and the
+    advance of the last letter, so the gap came out 1 px on the left and 4 on
+    the right, and a line without a descender sat high above an empty strip.
+    Here the plate is fitted to the ink itself: every line is laid out by
+    FreeType exactly as the Agg renderer will draw it (same rounding), and
+    the plate is that box plus the boxstyle's own pad. Any other renderer
+    gets matplotlib's plate."""
+
+    _INK = 24   # coverage (of 255) that counts as a letter, not a faint fringe
+    _PAD = 0.3  # the boxstyle's pad, in font sizes — keep equal to "round,pad=0.3"
+
+    def _ink_box(self, renderer):
+        """(x0, y0, x1, y1) of the ink in display pixels, or None."""
+        if not hasattr(renderer, "_prepare_font") or self.get_rotation():
+            return None
+        from matplotlib.backends.backend_agg import get_hinting_flag
+        _, info, _ = self._get_layout(renderer)
+        posx, posy = self.get_transform().transform(
+            (float(self.convert_xunits(self._x)), float(self.convert_yunits(self._y))))
+        _, canvash = renderer.get_canvas_width_height()
+        box = None
+        for line, _, lx, ly in info:
+            if not line.strip():
+                continue
+            font = renderer._prepare_font(self._fontproperties)
+            font.set_text(line, 0, flags=get_hinting_flag())
+            font.draw_glyphs_to_bitmap(antialiased=self._antialiased)
+            img = np.asarray(font.get_image())
+            d = font.get_descent() / 64.0
+            xo, yo = (v / 64.0 for v in font.get_bitmap_offset())
+            gx = round(posx + lx + xo)
+            # Agg's draw_text_image puts the bitmap's BOTTOM at y + 1 (top-down).
+            gy = round(canvash - (posy + ly) + yo + d) + 1 - img.shape[0]
+            rows = np.where((img >= self._INK).any(axis=1))[0]
+            cols = np.where((img >= self._INK).any(axis=0))[0]
+            if not rows.size:
+                continue
+            # top-down rows -> bottom-up display y
+            b = (gx + cols[0], canvash - (gy + rows[-1] + 1),
+                 gx + cols[-1] + 1, canvash - (gy + rows[0]))
+            box = b if box is None else (min(box[0], b[0]), min(box[1], b[1]),
+                                         max(box[2], b[2]), max(box[3], b[3]))
+        return box
+
+    def update_bbox_position_size(self, renderer):
+        box = None
+        if self._bbox_patch:
+            try:
+                box = self._ink_box(renderer)
+            except Exception:
+                box = None
+        if box is None:
+            return super().update_bbox_position_size(renderer)
+        x0, y0, x1, y1 = box
+        self._bbox_patch.set_bounds(0.0, 0.0, x1 - x0, y1 - y0)
+        self._bbox_patch.set_transform(Affine2D().translate(x0, y0))
+        # The ink box lies on whole pixels; a pad of a whole pixel plus a half
+        # puts the rim in the middle of one pixel column, so it is crisp and
+        # the gap is the same on every side instead of 2 here, 3 there.
+        gap = max(1, round(renderer.points_to_pixels(self.get_size()) * self._PAD))
+        self._bbox_patch.set_mutation_scale((gap + 0.5) / self._PAD)
+
+
+def _not_a_spectrum_msg(channel: str) -> str:
+    """The sentence for a spectrum PV that turned out to hold one number per shot."""
+    return (f"{channel} holds one number per shot, not a spectrum. Pick a "
+            f"spectrum in step 3, or add it to step 2 Search by to follow it "
+            f"over time.")
 
 
 _cpva_channel_cache: list = []   # module-level cache shared between dialogs
@@ -1834,18 +2033,146 @@ def _bg(fn) -> None:
 
 
 # ── PvSearchDialog ────────────────────────────────────────────────────────────
-class PvSearchDialog(QDialog):
-    """Load all CPVA channel names once, then filter locally as the user types."""
+# A custom PV (a CSS Logger formula) travels through the shot filter under this
+# prefix, so it can never collide with an archiver channel of the same name.
+CPV_PREFIX = "ƒ "
 
-    def __init__(self, parent=None):
+_PICK_TABLE_CSS = (
+    "QTableWidget{background:#ffffff;color:#111;gridline-color:#d8d8d8;"
+    "border:1px solid #b4b4b4;}"
+    "QTableWidget::item{color:#111;}"
+    "QHeaderView::section{background:#e4e4e4;color:#111;font-weight:600;"
+    "padding:3px 6px;border:0;border-right:1px solid #c8c8c8;"
+    "border-bottom:1px solid #c8c8c8;}"
+)
+
+_NAME_EDITOR_CSS = (
+    "QLineEdit{background:#ffffff;color:#111;border:1px solid #1565C0;"
+    "border-radius:0;padding:0 4px;margin:0;min-width:0;"
+    "selection-background-color:#1565C0;selection-color:#ffffff;}"
+)
+
+
+class _LeftTextButton(QPushButton):
+    """A flat push button whose text of several lines is aligned to the left.
+
+    QPushButton lays a multi-line text out as a centred block — a stylesheet
+    text-align only moves the block — so the second line of a spectrum's name
+    sat off-centre under the first. The text lives in a label inside instead;
+    the button keeps the click, the cursor and the hover.
+
+    A line wider than the button is never cut: the text size gives way, down
+    to _MIN_PX. The size goes on the label's OWN stylesheet, which beats the
+    font-size the row sets on the button."""
+
+    _BASE_PX = 12      # the size _apply_visibility_style gives the name
+    _MIN_PX  = 8
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._lbl = QLabel(text, self)
+        self._lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._fit_px = self._BASE_PX
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 2, 0, 2)
+        lay.addWidget(self._lbl)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+    def setText(self, text: str):
+        self._lbl.setText(text)
+        self._fit_text()
+        self.updateGeometry()
+
+    def _fit_text(self):
+        room = self.width() - 6
+        if room <= 0:
+            return
+        # Polished first, or the font is the plain one and not the row's bold.
+        self._lbl.ensurePolished()
+        f = QFont(self._lbl.font())
+        px = self._BASE_PX
+        while px > self._MIN_PX:
+            f.setPixelSize(px)
+            fm = QFontMetrics(f)
+            if max(fm.horizontalAdvance(s) for s in self._lbl.text().split("\n")) <= room:
+                break
+            px -= 1
+        if px != self._fit_px:
+            self._fit_px = px
+            self._lbl.setStyleSheet("" if px == self._BASE_PX
+                                    else f"QLabel {{ font-size: {px}px; }}")
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit_text()
+
+    def _set_hover(self, on: bool):
+        self._lbl.setProperty("hover", "true" if on else "false")
+        self._lbl.style().unpolish(self._lbl)
+        self._lbl.style().polish(self._lbl)
+
+    def enterEvent(self, ev):
+        self._set_hover(True)
+        super().enterEvent(ev)
+
+    def leaveEvent(self, ev):
+        self._set_hover(False)
+        super().leaveEvent(ev)
+
+    def text(self) -> str:
+        return self._lbl.text()
+
+    def sizeHint(self):
+        return self.layout().sizeHint()
+
+    def minimumSizeHint(self):
+        # Narrow enough for the row: a long name shrinks its text instead of
+        # pushing the eye and the ✕ out of the panel.
+        m = self.layout().minimumSize()
+        m.setWidth(min(m.width(), 60))
+        return m
+
+
+class _NameCellDelegate(QStyledItemDelegate):
+    """The editor of a Name cell: a framed white box lying exactly on the cell.
+
+    Without it the editor takes the program-wide line-edit style — no
+    background, its own minimum width — and the typed name runs over the
+    Channel column next to it, which reads as anything but an editable cell."""
+
+    def createEditor(self, parent, option, index):
+        ed = QLineEdit(parent)
+        ed.setFrame(False)
+        ed.setMinimumWidth(0)
+        ed.setStyleSheet(_NAME_EDITOR_CSS)
+        return ed
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+
+class PvSearchDialog(QDialog):
+    """Load all CPVA channel names once, then filter locally as the user types.
+
+    With `custom_defs` (a callable giving the CSS Logger tab's formulas) the
+    list also offers those custom PVs, and `open_editor` adds the "Add custom"
+    button that opens the very same editor as on the CSS Logger tab."""
+
+    def __init__(self, parent=None, custom_defs=None, open_editor=None):
         super().__init__(parent)
         self.setWindowTitle("Add PV")
-        self.setMinimumSize(520, 460)
+        self.setMinimumSize(600, 480)
         self._added: list = []
         # Name typed for a channel, kept while the selection changes so a name is
         # not lost by clicking one more channel.
         self._names: dict = {}
         self._all_channels: list = list(_cpva_channel_cache)
+        self._custom_defs = custom_defs
+        self._open_editor = open_editor
+        self._cpvs: list = []
+        self._reload_cpvs()
         self._build_ui()
         if self._all_channels:
             self._lbl_status.setText(
@@ -1853,6 +2180,24 @@ class PvSearchDialog(QDialog):
             )
         else:
             self._kick_load()
+        self._filter(self._edit.text())      # the custom PVs show before any typing
+
+    def _reload_cpvs(self):
+        self._cpvs = []
+        if self._custom_defs is None:
+            return
+        try:
+            self._cpvs = list(self._custom_defs() or [])
+        except Exception:
+            self._cpvs = []
+
+    @staticmethod
+    def _cpv_tip(d: dict) -> str:
+        lines = [f"Custom PV (from the CSS Logger tab):  {d['name']} = {d['expr']}"]
+        lines += [f"  {lt} = {src}" for lt, src in d.get("srcs") or []]
+        if d.get("problem"):
+            lines.append(f"Cannot be computed: {d['problem']}.")
+        return "\n".join(lines)
 
     def _build_ui(self):
         lay = QVBoxLayout(self)
@@ -1870,25 +2215,47 @@ class PvSearchDialog(QDialog):
         self._lst.setAlternatingRowColors(False)
         self._lst.itemSelectionChanged.connect(self._sync_picked)
         lay.addWidget(self._lst, stretch=1)
+        note_row = QHBoxLayout()
         note = QLabel("Click to select (Ctrl+click for multiple), then click Add.")
         note.setStyleSheet("font-size: 10px; color: #555;")
-        lay.addWidget(note)
+        note_row.addWidget(note, stretch=1)
+        if self._open_editor is not None:
+            btn_cpv = QPushButton("Add custom")
+            btn_cpv.setToolTip(
+                "Make or change a custom PV — a formula over other PVs, e.g. F+H.\n"
+                "The same list as on the CSS Logger tab: what you make here is "
+                "there too. The custom PVs are the ƒ rows of this list.")
+            btn_cpv.setStyleSheet(
+                "QPushButton { font-size: 11px; padding: 3px 10px; color: #111; "
+                "border: 1px solid #b4b4b4; border-radius: 3px; background: #f4f4f4; }"
+                "QPushButton:hover { background: #e8f0fe; }")
+            btn_cpv.clicked.connect(self._on_edit_custom)
+            note_row.addWidget(btn_cpv)
+        lay.addLayout(note_row)
 
-        # ── Chosen channels, with the name they will carry in the PV list ──
-        lay.addWidget(QLabel("Name in the PV list — click a name to change it:"))
+        # ── Chosen channels, with the name they will carry ──
+        lay.addWidget(QLabel("Name — click a name to change it:"))
         self._tbl_pick = QTableWidget(0, 2)
         self._tbl_pick.setHorizontalHeaderLabels(["Name", "Channel"])
         self._tbl_pick.verticalHeader().setVisible(False)
-        self._tbl_pick.setMaximumHeight(130)
-        self._tbl_pick.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._tbl_pick.verticalHeader().setDefaultSectionSize(
+            QFontMetrics(self.font()).height() + 10)
+        self._tbl_pick.setMaximumHeight(140)
+        self._tbl_pick.setStyleSheet(_PICK_TABLE_CSS)
+        # Cut at the left: the end of a channel name is the part that tells two
+        # channels apart (…DIAG2:Energy / …DIAG2:EnergyWF).
+        self._tbl_pick.setTextElideMode(Qt.TextElideMode.ElideLeft)
+        self._tbl_pick.setWordWrap(False)
         self._tbl_pick.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._tbl_pick.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # One click opens the name for typing — a double-click-only cell reads as
         # a read-only column.
         self._tbl_pick.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
+        self._tbl_pick.setItemDelegateForColumn(0, _NameCellDelegate(self._tbl_pick))
         _ph = self._tbl_pick.horizontalHeader()
-        _ph.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        _ph.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._tbl_pick.setColumnWidth(0, 150)
+        # The name gets every pixel the channel does not need.
+        _ph.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        _ph.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self._tbl_pick.itemChanged.connect(self._on_name_edited)
         lay.addWidget(self._tbl_pick)
         self._sync_picked()
@@ -1925,37 +2292,102 @@ class PvSearchDialog(QDialog):
         self._filter(self._edit.text())
 
     def _filter(self, text: str):
+        """Fill the list: the matching custom PVs first, then archiver channels.
+
+        Custom PVs are few, so with nothing typed all of them are listed — they
+        are found by looking, not only by remembering their names."""
+        picked = set(self._picked_channels())
+        self._lst.blockSignals(True)
         self._lst.clear()
-        if not text.strip() or not self._all_channels:
-            return
-        matches = _pv_search(self._all_channels, text)
-        for ch in matches[:300]:
-            self._lst.addItem(ch)
-        extra = f" (showing top 300)" if len(matches) > 300 else ""
-        self._lbl_status.setText(
-            f"{len(matches)} match(es){extra}." if matches else "No matches."
-        )
+        if self._cpvs:
+            names = [d["name"] for d in self._cpvs]
+            shown = _pv_search(names, text) if text.strip() else names
+            by_name = {d["name"]: d for d in self._cpvs}
+            for nm in shown:
+                d = by_name[nm]
+                it = QListWidgetItem(f"{CPV_PREFIX}{nm}    = {d['expr']}")
+                it.setData(Qt.ItemDataRole.UserRole, CPV_PREFIX + nm)
+                it.setToolTip(self._cpv_tip(d))
+                if d.get("problem"):
+                    it.setForeground(QColor("#B71C1C"))
+                self._lst.addItem(it)
+                it.setSelected(CPV_PREFIX + nm in picked)
+        if text.strip() and self._all_channels:
+            matches = _pv_search(self._all_channels, text)
+            for ch in matches[:300]:
+                it = QListWidgetItem(ch)
+                it.setData(Qt.ItemDataRole.UserRole, ch)
+                self._lst.addItem(it)
+                it.setSelected(ch in picked)
+            extra = f" (showing top 300)" if len(matches) > 300 else ""
+            self._lbl_status.setText(
+                f"{len(matches)} match(es){extra}." if matches else "No matches."
+            )
+        self._lst.blockSignals(False)
+        self._sync_picked()
 
     def _picked_channels(self) -> list:
-        return [it.text() for it in self._lst.selectedItems()]
+        return [it.data(Qt.ItemDataRole.UserRole) or it.text()
+                for it in self._lst.selectedItems()]
+
+    def _on_edit_custom(self):
+        if self._open_editor is None:
+            return
+        try:
+            changed = self._open_editor(self)
+        except Exception as exc:
+            QMessageBox.warning(self, "Add custom", str(exc))
+            return
+        if changed:
+            self._reload_cpvs()
+            self._filter(self._edit.text())
 
     def _sync_picked(self):
         """Mirror the list selection into the name table, keeping typed names."""
         chans = self._picked_channels()
+        by_key = {CPV_PREFIX + d["name"]: d for d in self._cpvs}
         self._tbl_pick.blockSignals(True)
         self._tbl_pick.setRowCount(0)
-        for ch in chans:
+        for key in chans:
+            d = by_key.get(key)
+            default = d["name"] if d else key
             r = self._tbl_pick.rowCount()
             self._tbl_pick.insertRow(r)
-            name = QTableWidgetItem(self._names.get(ch, ch))
-            name.setToolTip("Click to type the name you want to see in the PV list.")
-            chan = QTableWidgetItem(ch)
+            name = QTableWidgetItem(self._names.get(key, default))
+            name.setToolTip("Click to type the name you want to see.")
+            chan = QTableWidgetItem(f"{CPV_PREFIX}{d['expr']}" if d else key)
+            chan.setData(Qt.ItemDataRole.UserRole, key)
+            chan.setData(Qt.ItemDataRole.UserRole + 1, default)
             chan.setFlags(chan.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            chan.setToolTip(ch)
+            # Read-only: a shade lighter than the name the user can type into.
+            chan.setForeground(QColor("#555555"))
+            chan.setToolTip(self._cpv_tip(d) if d else key)
             self._tbl_pick.setItem(r, 0, name)
             self._tbl_pick.setItem(r, 1, chan)
         self._tbl_pick.blockSignals(False)
         self._tbl_pick.setVisible(bool(chans))
+        self._fit_pick_columns()
+
+    def _fit_pick_columns(self):
+        """Channel column as wide as its text, but never more than 45 % of the
+        table — the name column (stretching) gets everything else."""
+        tbl = getattr(self, "_tbl_pick", None)
+        if tbl is None or tbl.rowCount() == 0:
+            return
+        fm = QFontMetrics(tbl.font())
+        want = max(fm.horizontalAdvance(tbl.item(r, 1).text())
+                   for r in range(tbl.rowCount()) if tbl.item(r, 1)) + 18
+        head = fm.horizontalAdvance("Channel") + 24
+        cap = int(tbl.viewport().width() * 0.45)
+        tbl.setColumnWidth(1, max(head, min(want, cap)))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit_pick_columns()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        self._fit_pick_columns()
 
     def _on_name_edited(self, item: QTableWidgetItem):
         if item.column() != 0:
@@ -1963,22 +2395,24 @@ class PvSearchDialog(QDialog):
         chan_item = self._tbl_pick.item(item.row(), 1)
         if chan_item is None:
             return
+        key = chan_item.data(Qt.ItemDataRole.UserRole)
         text = item.text().strip()
-        # An emptied name falls back to the channel itself rather than an unnamed
+        # An emptied name falls back to the default one rather than an unnamed
         # row that no legend could label.
         if not text:
-            text = chan_item.text()
+            text = chan_item.data(Qt.ItemDataRole.UserRole + 1) or key
             self._tbl_pick.blockSignals(True)
             item.setText(text)
             self._tbl_pick.blockSignals(False)
-        self._names[chan_item.text()] = text
+        self._names[key] = text
 
     def _on_add(self):
         chans = self._picked_channels()
         if not chans:
             QMessageBox.information(self, "Add PV", "Select at least one channel from the list.")
             return
-        self._added = [(self._names.get(ch, ch), ch) for ch in chans]
+        defaults = {CPV_PREFIX + d["name"]: d["name"] for d in self._cpvs}
+        self._added = [(self._names.get(ch, defaults.get(ch, ch)), ch) for ch in chans]
         self.accept()
 
     def added_pvs(self) -> list:
@@ -1988,92 +2422,150 @@ class PvSearchDialog(QDialog):
 
 # ── XAxisSourceDialog ───────────────────────────────────────────────────────--
 class XAxisSourceDialog(QDialog):
-    """Ask how to build the wavelength (X) axis for a spectrum PV that has no
-    matching _X channel: copy from another PV, copy + linear transform, or use
-    the plain sample index."""
+    """X axis settings: how the horizontal axis of the spectrum graph is built —
+    the channel's own _X, a copy of another PV (optionally a·x + b), a CSV file,
+    or the plain sample index.
 
-    def __init__(self, base_pv: str, parent=None):
+    It is not always a wavelength (the SPIDER time domain is in fs), so nothing
+    here says "wavelength". Each choice carries its own controls directly under
+    it, and only the chosen one's are shown: the old layout listed the four
+    choices first and the PV list and the equation far below them, where nobody
+    connected them with the option they belonged to.
+
+    Returns the same dicts as always ({"mode": "native" | "pv" | "linear" |
+    "csv" | "index", …}), so settings saved by older builds stay valid."""
+
+    _INDENT = 22
+
+    def __init__(self, base_pv: str, parent=None, current: "dict | None" = None,
+                 native_x: "str | None" = None, unit: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Wavelength axis")
-        self.setMinimumSize(460, 420)
+        self.setWindowTitle("X axis settings")
+        _paint_dialog(self)
+        self.setMinimumWidth(480)
         self._all_channels: list = list(_cpva_channel_cache)
         self._result: dict | None = None
-        self._build_ui(base_pv)
+        self._native_x = native_x
+        cur = dict(current or {})
+        self._want_src = str(cur.get("source_pv") or "")
+        self._build_ui(base_pv, unit)
+        self._preselect(cur)
         if self._all_channels:
             self._lbl_status.setText(f"{len(self._all_channels)} channels. Type to filter.")
+            if self._want_src:
+                self._filter(self._edit.text())
         else:
             self._kick_load()
 
-    def _build_ui(self, base_pv: str):
+    @staticmethod
+    def _ink(lbl: QLabel, extra: str = "") -> QLabel:
+        lbl.setStyleSheet(f"color: #111; background: transparent; border: none; {extra}")
+        return lbl
+
+    def _indented(self, lay: QVBoxLayout) -> QWidget:
+        """A box of controls that belongs to the option right above it."""
+        box = QWidget()
+        inner = QVBoxLayout(box)
+        inner.setContentsMargins(self._INDENT, 0, 0, 6)
+        inner.setSpacing(4)
+        lay.addWidget(box)
+        return box
+
+    def _build_ui(self, base_pv: str, unit: str):
         lay = QVBoxLayout(self)
-        lay.setSpacing(6)
-        info = QLabel(
-            f"<b>{base_pv}</b> has no matching <b>_X</b> channel in the archive.<br>"
-            "Choose how to build the wavelength axis:"
-        )
+        lay.setSpacing(4)
+        if self._native_x:
+            head = f"How is the X axis of <b>{base_pv}</b> built?"
+        else:
+            head = (f"<b>{base_pv}</b> has no matching <b>_X</b> channel in the "
+                    "archive.<br>How is its X axis built?")
+        info = QLabel(head)
+        info.setStyleSheet(_NOTE_STYLE + " font-size:12px;")
         info.setWordWrap(True)
         lay.addWidget(info)
+        lay.addSpacing(6)
 
         self._grp = QButtonGroup(self)
-        self._rb_pv     = QRadioButton("Copy X axis from another PV")
-        self._rb_linear = QRadioButton("Copy from a PV, then apply a linear transform")
-        self._rb_csv    = QRadioButton("Load X axis from a CSV / text file")
-        self._rb_index  = QRadioButton("Use the sample index (0, 1, 2 …)")
-        self._rb_pv.setChecked(True)
-        for rb in (self._rb_pv, self._rb_linear, self._rb_csv, self._rb_index):
-            self._grp.addButton(rb)
-            lay.addWidget(rb)
-            rb.toggled.connect(self._sync_enabled)
 
-        # CSV file picker (mode 'csv')
-        row_csv = QHBoxLayout()
-        row_csv.addSpacing(20)
-        self._edit_csv = QLineEdit()
-        self._edit_csv.setPlaceholderText("Path to a .csv / .txt wavelength file…")
-        row_csv.addWidget(self._edit_csv, stretch=1)
-        self._btn_browse = QPushButton("Browse…")
-        self._btn_browse.clicked.connect(self._browse_csv)
-        row_csv.addWidget(self._btn_browse)
-        lay.addLayout(row_csv)
-        note_csv = QLabel(
-            "Decimals lost on export (e.g. each nm repeated 3–4×) are rebuilt "
-            "automatically into an increasing axis."
-        )
-        note_csv.setWordWrap(True)
-        note_csv.setStyleSheet("color: #888; font-size: 10px; margin-left: 20px;")
-        lay.addWidget(note_csv)
+        # ── its own _X channel (only when there is one) ──
+        self._rb_native = QRadioButton(
+            f"Use its own X channel  ({self._native_x})" if self._native_x
+            else "Use its own X channel")
+        self._rb_native.setVisible(bool(self._native_x))
+        self._grp.addButton(self._rb_native)
+        lay.addWidget(self._rb_native)
 
-        # linear transform spins
-        row_lin = QHBoxLayout()
-        row_lin.addSpacing(20)
-        row_lin.addWidget(QLabel("x' ="))
+        # ── copy from another PV (+ optional linear transform) ──
+        self._rb_pv = QRadioButton("Copy the X axis from another PV")
+        self._grp.addButton(self._rb_pv)
+        lay.addWidget(self._rb_pv)
+        self._box_pv = self._indented(lay)
+        bl = self._box_pv.layout()
+        self._edit = QLineEdit()
+        self._edit.setPlaceholderText('search _X channels  (e.g. "spider specdomain x")')
+        self._edit.textEdited.connect(self._filter)
+        bl.addWidget(self._edit)
+        self._lbl_status = self._ink(QLabel("Loading channels from CPVA…"),
+                                     "font-size: 10px; color: #555;")
+        bl.addWidget(self._lbl_status)
+        self._lst = QListWidget()
+        self._lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._lst.setMinimumHeight(170)
+        bl.addWidget(self._lst)
+        self._chk_linear = QCheckBox("Then apply a linear transform")
+        self._chk_linear.toggled.connect(self._sync_enabled)
+        bl.addWidget(self._chk_linear)
+        self._row_lin = QWidget()
+        rl = QHBoxLayout(self._row_lin)
+        rl.setContentsMargins(self._INDENT, 0, 0, 0)
+        rl.setSpacing(4)
+        rl.addWidget(self._ink(QLabel("x' =")))
         self._sb_scale = QDoubleSpinBox()
         self._sb_scale.setRange(-1e6, 1e6)
         self._sb_scale.setDecimals(6)
         self._sb_scale.setValue(1.0)
-        row_lin.addWidget(self._sb_scale)
-        row_lin.addWidget(QLabel("· x +"))
+        rl.addWidget(self._sb_scale)
+        rl.addWidget(self._ink(QLabel("· x +")))
         self._sb_offset = QDoubleSpinBox()
         self._sb_offset.setRange(-1e6, 1e6)
         self._sb_offset.setDecimals(6)
         self._sb_offset.setValue(0.0)
-        row_lin.addWidget(self._sb_offset)
-        row_lin.addWidget(QLabel("nm"))
-        row_lin.addStretch(1)
-        lay.addLayout(row_lin)
+        rl.addWidget(self._sb_offset)
+        if unit:
+            rl.addWidget(self._ink(QLabel(unit)))
+        rl.addStretch(1)
+        bl.addWidget(self._row_lin)
 
-        # channel picker (shared by 'pv' and 'linear')
-        self._edit = QLineEdit()
-        self._edit.setPlaceholderText('search _X channels…  (e.g. "l3 sbw4")')
-        self._edit.textEdited.connect(self._filter)
-        lay.addWidget(self._edit)
-        self._lbl_status = QLabel("Loading channels from CPVA…")
-        self._lbl_status.setStyleSheet("color: #666; font-size: 10px;")
-        lay.addWidget(self._lbl_status)
-        self._lst = QListWidget()
-        self._lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        lay.addWidget(self._lst, stretch=1)
+        # ── CSV / text file ──
+        self._rb_csv = QRadioButton("Load the X axis from a CSV / text file")
+        self._grp.addButton(self._rb_csv)
+        lay.addWidget(self._rb_csv)
+        self._box_csv = self._indented(lay)
+        cl = self._box_csv.layout()
+        row_csv = QHBoxLayout()
+        row_csv.setSpacing(4)
+        self._edit_csv = QLineEdit()
+        self._edit_csv.setPlaceholderText("Path to a .csv / .txt file with the X values")
+        row_csv.addWidget(self._edit_csv, stretch=1)
+        self._btn_browse = QPushButton("Browse")
+        self._btn_browse.clicked.connect(self._browse_csv)
+        row_csv.addWidget(self._btn_browse)
+        cl.addLayout(row_csv)
+        note_csv = self._ink(QLabel(
+            "Decimals lost on export (e.g. each value repeated 3–4×) are rebuilt "
+            "automatically into an increasing axis."), "font-size: 10px; color: #555;")
+        note_csv.setWordWrap(True)
+        cl.addWidget(note_csv)
 
+        # ── sample index ──
+        self._rb_index = QRadioButton("Use the sample index (0, 1, 2 …)")
+        self._grp.addButton(self._rb_index)
+        lay.addWidget(self._rb_index)
+
+        for rb in (self._rb_native, self._rb_pv, self._rb_csv, self._rb_index):
+            rb.toggled.connect(self._sync_enabled)
+
+        lay.addStretch(1)
         row = QHBoxLayout()
         btn_ok = QPushButton("OK")
         btn_ok.setStyleSheet(_BTN_PRIMARY)
@@ -2084,18 +2576,31 @@ class XAxisSourceDialog(QDialog):
         row.addWidget(btn_ok)
         row.addWidget(btn_cancel)
         lay.addLayout(row)
+
+    def _preselect(self, cur: dict):
+        """Open on the setting in force, not on a default."""
+        mode = cur.get("mode") or ("native" if self._native_x else "pv")
+        if mode == "native" and not self._native_x:
+            mode = "pv"
+        {"native": self._rb_native, "pv": self._rb_pv, "linear": self._rb_pv,
+         "csv": self._rb_csv, "index": self._rb_index}.get(
+            mode, self._rb_pv).setChecked(True)
+        self._chk_linear.setChecked(mode == "linear")
+        if mode == "linear":
+            self._sb_scale.setValue(float(cur.get("scale", 1.0)))
+            self._sb_offset.setValue(float(cur.get("offset", 0.0)))
+        if self._want_src:
+            self._edit.setText(self._want_src)
+        if cur.get("csv_path"):
+            self._edit_csv.setText(str(cur["csv_path"]))
         self._sync_enabled()
 
     def _sync_enabled(self, *_):
-        need_pv = self._rb_pv.isChecked() or self._rb_linear.isChecked()
-        self._edit.setEnabled(need_pv)
-        self._lst.setEnabled(need_pv)
-        lin = self._rb_linear.isChecked()
-        self._sb_scale.setEnabled(lin)
-        self._sb_offset.setEnabled(lin)
-        csv = self._rb_csv.isChecked()
-        self._edit_csv.setEnabled(csv)
-        self._btn_browse.setEnabled(csv)
+        # Only the chosen option's own controls are on show.
+        self._box_pv.setVisible(self._rb_pv.isChecked())
+        self._row_lin.setVisible(self._chk_linear.isChecked())
+        self._box_csv.setVisible(self._rb_csv.isChecked())
+        self.adjustSize()
 
     def _browse_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2134,12 +2639,18 @@ class XAxisSourceDialog(QDialog):
         matches = _pv_search(self._all_channels, text)
         for ch in matches[:300]:
             self._lst.addItem(ch)
+            if ch == self._want_src:
+                self._lst.setCurrentRow(self._lst.count() - 1)
         extra = " (top 300)" if len(matches) > 300 else ""
         self._lbl_status.setText(
             f"{len(matches)} match(es){extra}." if matches else "No matches."
         )
 
     def _on_ok(self):
+        if self._rb_native.isChecked() and self._native_x:
+            self._result = {"mode": "native"}
+            self.accept()
+            return
         if self._rb_index.isChecked():
             self._result = {"mode": "index"}
             self.accept()
@@ -2147,12 +2658,12 @@ class XAxisSourceDialog(QDialog):
         if self._rb_csv.isChecked():
             path = self._edit_csv.text().strip()
             if not path or not os.path.isfile(path):
-                QMessageBox.information(self, "Wavelength axis",
+                QMessageBox.information(self, "X axis settings",
                                         "Pick a valid CSV / text file first.")
                 return
             arr = _load_x_csv(path)
             if arr is None or arr.size == 0:
-                QMessageBox.warning(self, "Wavelength axis",
+                QMessageBox.warning(self, "X axis settings",
                                     "No numbers could be read from that file.")
                 return
             self._result = {"mode": "csv", "csv_path": path}
@@ -2160,11 +2671,11 @@ class XAxisSourceDialog(QDialog):
             return
         items = self._lst.selectedItems()
         if not items:
-            QMessageBox.information(self, "Wavelength axis",
+            QMessageBox.information(self, "X axis settings",
                                     "Pick a source channel from the list first.")
             return
         src = items[0].text()
-        if self._rb_linear.isChecked():
+        if self._chk_linear.isChecked():
             self._result = {"mode": "linear", "source_pv": src,
                             "scale": float(self._sb_scale.value()),
                             "offset": float(self._sb_offset.value())}
@@ -2789,6 +3300,7 @@ class SpectraWidget(QWidget):
         self._bot_user_xlim:    tuple | None             = None
         self._bot_user_ylim:    tuple | None             = None
         self._live              = False
+        self._live_gen          = 0       # bumped per live session; stale ticks are dropped
         self._live_buf:         deque                    = deque(maxlen=LIVE_BUF_MAX)
         self._live_start_ns:    int                      = 0
         self._live_last_ns:     int                      = 0
@@ -2822,6 +3334,11 @@ class SpectraWidget(QWidget):
         self._filter_busy       = False   # a per-shot value top-up is in flight
         self._filter_pending    = False   # another apply queued behind it
         self._filter_fetch_err: dict                     = {}   # (rid, ch) -> message
+        # The CSS Logger tab's custom PVs (formulas), set by the main window
+        # through set_custom_pv_host(). Unset when the tab runs on its own.
+        self._cpv_get_defs = None         # () -> [{name, expr, code, srcs, problem}]
+        self._cpv_open_editor = None      # (parent) -> bool, the "Add custom" editor
+        self._cpv_env: dict = {"__builtins__": {}}
         # A live poll of each filter channel, {channel: [(ts_ns, value)]}. Live
         # shots are filtered against this, held forward exactly as the archive
         # ones are.
@@ -3115,10 +3632,9 @@ class SpectraWidget(QWidget):
         _h0 = self._tbl_pvs.horizontalHeaderItem(_PV_COL_SHOW)
         if _h0 is not None:
             _h0.setToolTip("Drawn in the search graph")
-        # Channel is Interactive and sized in _fit_pv_columns(): wide enough for the
-        # longest name, but never narrower than the space left in the table, so the
-        # column always reaches the right-hand edge instead of leaving a grey gap.
-        # A name wider than the panel still scrolls rather than being elided.
+        # Channel is Interactive and sized in _fit_pv_columns() to exactly the
+        # space left in the table, so it ends at the right-hand edge — no grey gap,
+        # no horizontal scrolling. A longer name is elided in the middle.
         hdr = self._tbl_pvs.horizontalHeader()
         hdr.setSectionResizeMode(_PV_COL_SHOW, QHeaderView.ResizeMode.Fixed)
         hdr.setSectionResizeMode(_PV_COL_LABEL, QHeaderView.ResizeMode.Interactive)
@@ -3158,6 +3674,11 @@ class SpectraWidget(QWidget):
             self._fill_pv_row(i, lbl, ch)
         if self._search_pvs:
             self._tbl_pvs.selectRow(self._first_shown_row())
+        # Columns are fitted to the viewport's REAL width, which is only known
+        # once the table is laid out — and changes again when its vertical
+        # scrollbar appears. Fitted earlier, the viewport still had Qt's default
+        # width and Channel came out far wider than the panel.
+        self._tbl_pvs.viewport().installEventFilter(self)
         b2.addWidget(self._tbl_pvs)
 
         # Add / Remove buttons
@@ -3191,7 +3712,7 @@ class SpectraWidget(QWidget):
             "font-size: 9px; color: #607D8B; border: none; background: transparent;")
         self._lbl_spec_pair.setWordWrap(True)
         row_sp.addWidget(self._lbl_spec_pair, stretch=1)
-        self._btn_spec = QPushButton("Change…")
+        self._btn_spec = QPushButton("Change")
         # Sized from the text, not a magic number: the old setFixedWidth(62) lost
         # ~16 px to the stylesheet's padding and border and clipped the label to
         # "Chang…" as soon as the display was scaled to 125 %.
@@ -3199,7 +3720,7 @@ class SpectraWidget(QWidget):
         self._btn_spec.setToolTip(
             "Search CPVA for a spectrum PV. Pick any _X or _Y variant — both axes "
             "are paired automatically. If the _X channel is missing you can build "
-            "the wavelength axis from another PV or a CSV file."
+            "the X axis from another PV or a CSV file (X axis settings, below)."
         )
         row_sp.addWidget(self._btn_spec, alignment=Qt.AlignmentFlag.AlignBottom)
         b3.addLayout(row_sp)
@@ -3234,6 +3755,14 @@ class SpectraWidget(QWidget):
         self._edit_x_unit.editingFinished.connect(self._on_x_unit_edited)
         row_un.addWidget(self._edit_x_unit)
         row_un.addStretch(1)
+        self._btn_x_axis = QPushButton("X axis settings")
+        _fit_button(self._btn_x_axis)
+        self._btn_x_axis.setToolTip(
+            "Choose where the horizontal axis of the spectrum graph comes from: "
+            "the channel's own X, a copy of another PV (optionally a·x + b), a "
+            "CSV / text file, or the sample index.")
+        self._btn_x_axis.clicked.connect(self._open_x_axis_settings)
+        row_un.addWidget(self._btn_x_axis)
         b3.addLayout(row_un)
         load_l.addWidget(card3)
 
@@ -3426,7 +3955,7 @@ class SpectraWidget(QWidget):
         # do the work (Live, Stop, Analyze, Export) sit at the very top, where
         # they are reachable whatever is folded away below.
 
-        # ── Selected spectra (the list itself) ─────────────────────────
+        # ── Spectra (the list itself, with its own Analyze) ────────────
         lay.addWidget(self._make_region_panel())
 
         # ── Shot filter ────────────────────────────────────────────────
@@ -4098,15 +4627,16 @@ class SpectraWidget(QWidget):
         canvas.mpl_connect("axes_leave_event",    _on_leave)
 
     def _make_region_panel(self) -> QWidget:
-        col = QWidget()
-        v = QVBoxLayout(col)
-        v.setContentsMargins(0, 2, 0, 0)
+        # A group of its own, like Loading data / Shot filter / Display
+        # settings, with an Analyze directly under the list it acts on. The
+        # Analyze at the top of the panel stays; both do the same thing.
+        self._g_spectra = _SettingsGroup("Spectra", accent=_SPECTRA_ACCENT)
+        v = self._g_spectra.body_layout
         v.setSpacing(6)
 
+        # No "Selected spectra" caption: the group's own header says it.
         head = QHBoxLayout()
-        lbl = QLabel("Selected spectra")
-        lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
-        head.addWidget(lbl, stretch=1)
+        head.addStretch(1)
         _small_btn = (
             "QPushButton { font-size: 11px; padding: 2px 6px; border: 1px solid #c8c8c8; "
             "border-radius: 3px; background: #f4f4f4; color: #111; }"
@@ -4152,9 +4682,12 @@ class SpectraWidget(QWidget):
         self._regions_w.setSizePolicy(QSizePolicy.Policy.Preferred,
                                       QSizePolicy.Policy.Fixed)
         v.addWidget(self._regions_w)
-        # Analyze, Export and the progress bar are NOT part of this panel — they
-        # are the action row at the top of the sidebar, beside Live.
-        return col
+        self._btn_analyze2 = QPushButton("✓  Analyze")
+        self._btn_analyze2.setEnabled(False)
+        self._btn_analyze2.setStyleSheet(_BTN_SUCCESS)
+        self._btn_analyze2.setToolTip(self._btn_analyze.toolTip())
+        v.addWidget(self._btn_analyze2)
+        return self._g_spectra
 
     # ── The shot filter's panel ───────────────────────────────────────────────
     # One row per condition: a tick box, the PV, "= value ± tolerance", and a
@@ -4356,7 +4889,7 @@ class SpectraWidget(QWidget):
         """Change the PV a condition is set on."""
         if not (0 <= i < len(self._filter_conds)):
             return
-        dlg = PvSearchDialog(self)
+        dlg = self._filter_pv_dialog()
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         added = dlg.added_pvs()
@@ -4364,13 +4897,35 @@ class SpectraWidget(QWidget):
             return
         lbl, ch = added[0]              # one row, one PV — take the first pick
         c = self._filter_conds[i]
-        if ch != c["channel"]:
-            c["label"], c["channel"] = lbl, ch
+        # The name is taken even for the same PV: re-picking it is how a row
+        # gets renamed.
+        c["label"], c["channel"] = lbl, ch
         self._rebuild_filter_rows()
         self._schedule_filter(0)
 
+    def set_custom_pv_host(self, get_defs, open_editor, env: dict):
+        """Wire the CSS Logger tab's custom PVs into the shot filter.
+
+        `get_defs()` gives `[{name, expr, code, srcs: [(letter, source)],
+        problem}]`, `open_editor(parent)` opens the "Add custom" editor and
+        returns True on OK, `env` is the only namespace a formula may reach."""
+        self._cpv_get_defs = get_defs
+        self._cpv_open_editor = open_editor
+        self._cpv_env = dict(env or {"__builtins__": {}})
+
+    def _filter_pv_dialog(self) -> "PvSearchDialog":
+        def _edit(parent):
+            ok = bool(self._cpv_open_editor(parent))
+            if ok:
+                # A changed formula changes its values: recompute and refilter.
+                self._schedule_filter(0)
+            return ok
+        return PvSearchDialog(
+            self, custom_defs=self._cpv_get_defs,
+            open_editor=_edit if self._cpv_open_editor is not None else None)
+
     def _filter_add_condition(self):
-        dlg = PvSearchDialog(self)
+        dlg = self._filter_pv_dialog()
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         have = {c["channel"] for c in self._filter_conds}
@@ -4504,12 +5059,24 @@ class SpectraWidget(QWidget):
         ch = c["channel"]
         if not c.get("on"):
             return "", grey
+        srcs = [ch]
+        if ch.startswith(CPV_PREFIX):
+            # A formula is only as good as its definition on the CSS Logger tab.
+            defs = self._cpv_defs()
+            why = self._cpv_problem(ch[len(CPV_PREFIX):], defs)
+            if why:
+                return f"{ch} cannot be computed — {why}", red
+            srcs = self._cpv_sources(ch[len(CPV_PREFIX):], defs) or []
         if c.get("value") is None:
             return "no value set — this condition is doing nothing", grey
-        pend = [r for r in self._regions
-                if r.get("analyzed") and ch in self._filter_missing_channels(r)]
-        if pend or (self._live and ch in (self._live_arming or [])):
-            return f"fetching {ch}…", grey
+        pend = [s for s in srcs
+                if any(r.get("analyzed") and s in self._filter_missing_channels(r)
+                       for r in self._regions)
+                or (self._live and s in (self._live_arming or []))]
+        if not pend and self._live and ch in (self._live_arming or []):
+            pend = srcs or [ch]
+        if pend:
+            return f"fetching {', '.join(pend)}…", grey
         # A channel that never recorded before a selection rejects every shot in
         # it, and that must not look like "the shots were not measured".
         for r in self._regions:
@@ -4675,8 +5242,16 @@ class SpectraWidget(QWidget):
         Two steps on purpose. Watching only for "not minimized" fired on the
         showMinimized() call in _focus_enter itself — the state change arrives
         before the window is actually minimized — so focus mode ended the instant
-        it started. The window must be seen minimized FIRST."""
-        if (self._focus_win is not None
+        it started. The window must be seen minimized FIRST.
+
+        Also: the PV table's own viewport resizing (first layout, its scrollbar
+        coming or going) re-fits the columns to the new width."""
+        tbl = getattr(self, "_tbl_pvs", None)
+        if (tbl is not None and obj is tbl.viewport()
+                and ev.type() == ev.Type.Resize):
+            self._fit_pv_columns()
+            return False
+        if (getattr(self, "_focus_win", None) is not None
                 and ev.type() == ev.Type.WindowStateChange
                 and obj is self.window()):
             if obj.isMinimized():
@@ -4758,22 +5333,25 @@ class SpectraWidget(QWidget):
         self._btn_stop.clicked.connect(self.cancel_scan)
         self._btn_live.clicked.connect(self._on_live_clicked)
         self._btn_analyze.clicked.connect(self._run_analysis)
+        self._btn_analyze2.clicked.connect(self._run_analysis)
         self._btn_clear_regs.clicked.connect(self._clear_regions)
         self._btn_export.clicked.connect(self._export)
         self._cmb_norm.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_std.stateChanged.connect(self._redraw_spectra)
         self._cmb_band.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_smooth.stateChanged.connect(self._redraw_spectra)
-        self._sb_smooth.valueChanged.connect(self._redraw_spectra)
+        self._sb_smooth.valueChanged.connect(self._redraw_spectra_soon)
         self._chk_compare.stateChanged.connect(self._redraw_spectra)
         self._cmb_cmp_a.currentIndexChanged.connect(self._redraw_spectra)
         self._cmb_cmp_b.currentIndexChanged.connect(self._redraw_spectra)
         self._cmb_cmp_mode.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_show_energy.toggled.connect(self._update_top_visibility)
         self._cmb_method.currentIndexChanged.connect(self._on_method_changed)
-        self._sb_x_min.valueChanged.connect(self._on_x_range_edited)
-        self._sb_x_max.valueChanged.connect(self._on_x_range_edited)
-        self._sb_live_n.valueChanged.connect(self._redraw_spectra)
+        # Number boxes step or are typed digit by digit: each burst is drawn
+        # once, when it pauses, instead of once per step / keystroke.
+        self._sb_x_min.valueChanged.connect(self._on_x_range_edited_soon)
+        self._sb_x_max.valueChanged.connect(self._on_x_range_edited_soon)
+        self._sb_live_n.valueChanged.connect(self._redraw_spectra_soon)
         self._tbl_pvs.itemSelectionChanged.connect(self._on_search_pv_changed)
         self._tbl_pvs.itemChanged.connect(self._on_pv_item_changed)
         self._btn_add_pv.clicked.connect(self._open_add_pv_dialog)
@@ -5107,9 +5685,9 @@ class SpectraWidget(QWidget):
         else:
             self._stop_live()
 
-    def _enter_live(self):
+    def _enter_live(self, confirmed: bool = False):
         start_ns, now_ns = _live_span_ns(self._segments, self._windows)
-        if not self._confirm_live_preload(start_ns, now_ns):
+        if not confirmed and not self._confirm_live_preload(start_ns, now_ns):
             self._btn_live.setChecked(False)
             self._refresh_pill()
             return
@@ -5274,14 +5852,155 @@ class SpectraWidget(QWidget):
                 if c.get("on") and c.get("value") is not None and c.get("channel")]
 
     def _filter_channels(self) -> "list[str]":
-        """The channels the active conditions need, each once, in row order."""
+        """The archiver channels the active conditions need, each once, in row
+        order. A custom PV is not one of them — its sources are."""
         out, seen = [], set()
+        defs = None
         for c in self._active_conditions():
             ch = c["channel"]
-            if ch not in seen:
-                seen.add(ch)
-                out.append(ch)
+            if ch.startswith(CPV_PREFIX):
+                if defs is None:
+                    defs = self._cpv_defs()
+                chs = self._cpv_sources(ch[len(CPV_PREFIX):], defs) or []
+            else:
+                chs = [ch]
+            for s in chs:
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
         return out
+
+    # ── Shot filter: custom PVs (the CSS Logger tab's formulas) ───────────────
+    # A formula condition is stored under "ƒ <name>". Its SOURCE channels are
+    # fetched like any other filter channel; the formula's own per-shot values
+    # are then computed into r["shot_vals"]["ƒ <name>"] (and, live, into
+    # _live_scalars["ƒ <name>"]), which is where every other reader — the mask,
+    # the row notes, the CSV — already looks.
+    def _cpv_defs(self) -> dict:
+        if self._cpv_get_defs is None:
+            return {}
+        try:
+            return {d["name"]: d for d in (self._cpv_get_defs() or [])}
+        except Exception:
+            return {}
+
+    def _cpv_problem(self, name: str, defs: dict, _seen=None) -> str:
+        """Why a custom PV cannot be computed, or "" when it can."""
+        d = defs.get(name)
+        if d is None:
+            return "no such custom PV on the CSS Logger tab"
+        if d.get("problem"):
+            return d["problem"]
+        if d.get("code") is None:
+            return "the formula is not valid"
+        seen = set(_seen or ()) | {name}
+        for _lt, src in d.get("srcs") or []:
+            if src in defs:
+                if src in seen:
+                    return f"{src} uses itself"
+                why = self._cpv_problem(src, defs, seen)
+                if why:
+                    return f"{src}: {why}"
+        return ""
+
+    def _cpv_sources(self, name: str, defs: dict) -> "list[str] | None":
+        """The archiver channels a custom PV is computed from, through any other
+        custom PV it uses. None when it cannot be computed at all."""
+        if self._cpv_problem(name, defs):
+            return None
+        out = []
+        for _lt, src in defs[name].get("srcs") or []:
+            sub = self._cpv_sources(src, defs) if src in defs else [src]
+            for s in sub or []:
+                if s not in out:
+                    out.append(s)
+        return out
+
+    def _cpv_eval(self, name: str, defs: dict, vals_of, n: int) -> "np.ndarray | None":
+        """The formula's value at each of n shots. `vals_of(channel)` gives a
+        source's per-shot array. NaN where a source has no value or the formula
+        fails (a division by zero on one shot); None while a source is missing."""
+        d = defs[name]
+        cols = {}
+        for lt, src in d.get("srcs") or []:
+            arr = (self._cpv_eval(src, defs, vals_of, n) if src in defs
+                   else vals_of(src))
+            if arr is None or len(arr) != n:
+                return None
+            cols[lt] = np.asarray(arr, dtype=float)
+        out = np.full(n, np.nan)
+        code, env = d["code"], self._cpv_env
+        letters = list(cols)
+        for k in range(n):
+            ns = {}
+            for lt in letters:
+                v = cols[lt][k]
+                if not np.isfinite(v):
+                    break
+                ns[lt] = float(v)
+            else:
+                try:
+                    out[k] = float(eval(code, env, ns))
+                except Exception:
+                    pass
+        return out
+
+    def _cpv_condition_keys(self) -> "list[str]":
+        return list(dict.fromkeys(c["channel"] for c in self._filter_conds
+                                  if c.get("channel", "").startswith(CPV_PREFIX)))
+
+    def _derive_custom_shot_vals(self, r: dict):
+        """Compute every formula condition's per-shot values for one region."""
+        keys = self._cpv_condition_keys()
+        if not keys:
+            return
+        defs = self._cpv_defs()
+        sv = r.setdefault("shot_vals", {})
+        n = int(r.get("n_all") or 0)
+        sig_store = r.setdefault("_cpv_sig", {})
+        for key in keys:
+            name = key[len(CPV_PREFIX):]
+            if self._cpv_sources(name, defs) is None:
+                sv.pop(key, None)
+                continue
+            srcs = self._cpv_sources(name, defs)
+            # Recompute only when the formula or one of its source arrays changed.
+            sig = (repr([(d.get("name"), d.get("expr"), tuple(d.get("srcs") or []))
+                         for d in defs.values()]),
+                   tuple(id(sv.get(s)) for s in srcs), n)
+            if sig_store.get(key) == sig and key in sv:
+                continue
+            vals = self._cpv_eval(name, defs, lambda ch: sv.get(ch), n)
+            if vals is None:
+                sv.pop(key, None)
+                sig_store.pop(key, None)
+            else:
+                sv[key] = vals
+                sig_store[key] = sig
+
+    def _derive_live_custom(self):
+        """The formula conditions' live series, over every source sample time."""
+        keys = self._cpv_condition_keys()
+        if not keys:
+            return
+        defs = self._cpv_defs()
+        for key in keys:
+            name = key[len(CPV_PREFIX):]
+            srcs = self._cpv_sources(name, defs)
+            series = [self._live_scalars.get(s) for s in (srcs or [])]
+            if srcs is None or not all(series):
+                self._live_scalars.pop(key, None)
+                continue
+            ts = np.array(sorted({int(t) for ser in series for t, _ in ser}),
+                          dtype=np.int64)
+            held = {s: _hold_forward(self._live_scalars[s], ts) for s in srcs}
+            vals = self._cpv_eval(name, defs, lambda ch: held.get(ch), ts.size)
+            if vals is None:
+                self._live_scalars.pop(key, None)
+                continue
+            # NaN entries stay: where the formula has no value, held forward must
+            # not carry the previous one over it.
+            self._live_scalars[key] = [(int(t), float(v)) for t, v in zip(ts, vals)]
 
     def _cond_text(self, c: dict) -> str:
         """One condition as the user set it — 'GDD = 24700 ± 5'."""
@@ -5384,9 +6103,13 @@ class SpectraWidget(QWidget):
         picture the way the CSV's X column once did.
         """
         keys = self._stat_keys_needed()
+        if self._live and self._live_buf:
+            self._derive_live_custom()     # a formula edited between two ticks
         for r in self._regions:
             if not r.get("analyzed"):
                 continue
+            if r.get("stack_all") is not None:
+                self._derive_custom_shot_vals(r)
             if r.get("stack_all") is None:
                 # No spectra in this selection at all. The window means of the
                 # energy and the orders are still worth showing — they are how
@@ -5843,28 +6566,64 @@ class SpectraWidget(QWidget):
         if native_x_exists or (paired and not _cpva_channel_cache):
             self._x_axis_cfg = {"mode": "native"}
         else:
-            xdlg = XAxisSourceDialog(base, self)
+            xdlg = XAxisSourceDialog(base, self, unit=self._x_unit())
             if xdlg.exec() == QDialog.DialogCode.Accepted and xdlg.result_cfg():
                 self._x_axis_cfg = xdlg.result_cfg()
             else:
                 self._x_axis_cfg = {"mode": "index"}
 
-        self._lbl_spec_base.setText(base)
-        self._lbl_spec_base.setToolTip(
-            f"X axis: {self._x_axis_summary()}\nY axis: {self._spec_y_pv}"
-        )
-        self._lbl_spec_pair.setText(f"X: {self._x_axis_summary()}   /   Y: {self._spec_y_pv}")
-        # A new channel means a new axis, so the unit is guessed again from its
-        # name — a hand-typed unit belongs to the channel it was typed for.
-        self._edit_x_unit.setText(self._x_unit())
-        self._sync_x_unit_labels()
-        self._save_spec_base()
+        self._sync_spec_labels()
         if self._live:
             self._stop_live()
             self._set_status(f"Spectrum PV changed to {base} — live stopped.")
         else:
             self._set_status(f"Spectrum PV: {base}  (X: {self._x_axis_summary()})")
         self._reanalyze_all(f"Spectrum PV changed to {base}")
+
+    def _sync_spec_labels(self):
+        """Step 3's texts after the spectrum PV or its X axis changed; saved too."""
+        self._lbl_spec_base.setText(self._spec_base_pv)
+        self._lbl_spec_base.setToolTip(
+            f"X axis: {self._x_axis_summary()}\nY axis: {self._spec_y_pv}"
+        )
+        self._lbl_spec_pair.setText(f"X: {self._x_axis_summary()}   /   Y: {self._spec_y_pv}")
+        # A new axis means the unit is guessed again from its name — a
+        # hand-typed unit belongs to the channel it was typed for.
+        self._edit_x_unit.setText(self._x_unit())
+        self._sync_x_unit_labels()
+        self._save_spec_base()
+
+    def _open_x_axis_settings(self):
+        """The X axis can be changed on its own — before, the dialog only came
+        up when a newly picked spectrum PV had no _X channel of its own."""
+        native = self._spec_x_pv if (
+            self._spec_x_pv in _cpva_channel_cache
+            or (self._x_axis_cfg or {}).get("mode", "native") == "native") else None
+        dlg = XAxisSourceDialog(self._spec_base_pv, self, current=self._x_axis_cfg,
+                                native_x=native, unit=self._x_unit())
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_cfg():
+            return
+        cfg = dict(dlg.result_cfg())
+        old = self._x_axis_cfg or {}
+        # A hand-typed unit rides along; _x_unit() ignores it by itself once
+        # it no longer belongs to the axis channel in use.
+        for k in ("unit", "unit_for"):
+            if k in old:
+                cfg[k] = old[k]
+        if cfg == old:
+            return
+        self._x_axis_cfg = cfg
+        self._x_data = None
+        self._sync_spec_labels()
+        if self._live:
+            # Live keeps running: the buffer holds only the Y waveforms, so only
+            # the axis they are drawn against is read again.
+            self._fetch_live_x(self._live_last_ns or self._live_start_ns,
+                               then_tick=False)
+            self._set_status(f"X axis: {self._x_axis_summary()}  (live keeps running)")
+        else:
+            self._set_status(f"X axis: {self._x_axis_summary()}")
+        self._reanalyze_all(f"X axis changed to {self._x_axis_summary()}")
 
     # ── Re-analysis after the spectrum source changed ──────────────────────────
     # Results carried by a region belong to ONE channel and ONE wavelength axis.
@@ -5879,7 +6638,7 @@ class SpectraWidget(QWidget):
     # new curves against the old times would silently keep the wrong ones.
     _RESULT_KEYS = ("x", "mean", "median", "trimmed", "sigma", "std", "p10", "p90",
                     "stack", "stack_ts", "orders", "energy_avg", "energy_n", "n",
-                    "_metrics", "fetch_error",
+                    "_metrics", "fetch_error", "not_spectrum",
                     "stack_all", "stack_ts_all", "n_all", "stats_all", "stats_keys",
                     "orders_all", "energy_avg_all", "energy_n_all",
                     "scalar_series", "shot_vals", "filter_mask")
@@ -6078,8 +6837,10 @@ class SpectraWidget(QWidget):
                            max(60, min(tbl.columnWidth(_PV_COL_LABEL) + 6,
                                        _PV_LABEL_MAX_W)))
         room = (tbl.viewport().width() - tbl.columnWidth(_PV_COL_SHOW)
-                - tbl.columnWidth(_PV_COL_LABEL) - 2)
-        tbl.setColumnWidth(_PV_COL_CHAN, max(_PV_CHAN_MIN_W, room))
+                - tbl.columnWidth(_PV_COL_LABEL))
+        want = max(_PV_CHAN_MIN_W, room)
+        if tbl.columnWidth(_PV_COL_CHAN) != want:
+            tbl.setColumnWidth(_PV_COL_CHAN, want)
 
     def resizeEvent(self, ev):
         # The table's share of the width changes with the sidebar's scrollbar
@@ -6215,9 +6976,13 @@ class SpectraWidget(QWidget):
         sig.done.connect(self._on_channels_loaded)
         def _work():
             try:
-                sig.done.emit(_cpva_load_all_channels())
+                chans = _cpva_load_all_channels()
             except Exception:
-                sig.done.emit([])
+                chans = []
+            try:
+                sig.done.emit(chans)
+            except RuntimeError:
+                pass                     # the window closed while this ran
         _bg(_work)
 
     def _on_channels_loaded(self, channels: list):
@@ -6445,12 +7210,24 @@ class SpectraWidget(QWidget):
         # its own question, on the window it is really going to read.
         if not online and not self._confirm_request_volume(windows):
             return
+        # The live question is asked HERE, before anything is changed: declined,
+        # the session that was running (if any) carries on untouched. Asked
+        # inside _enter_live it came after the old session had already been
+        # torn down, which left neither live nor the archive on screen.
+        segments = list(dlg.all_segments())
+        if online:
+            start_ns, now_ns = _live_span_ns(segments, windows)
+            if not self._confirm_live_preload(start_ns, now_ns):
+                if not self._live:
+                    self._btn_live.setChecked(False)
+                    self._refresh_pill()
+                return
         # Picking days IS leaving live mode — the calendar decides what is on
         # screen. The window live was standing on is dropped, not re-fetched.
         self._archive_reload_pending = False
         if not online:
             self._stop_live()
-        self._segments = list(dlg.all_segments())
+        self._segments = segments
         self._windows  = windows
         # Keep already-selected spectra across day changes — they carry absolute
         # timestamps and stay in the list (delete them via the ✕ in the list).
@@ -6464,7 +7241,7 @@ class SpectraWidget(QWidget):
             if self._live:
                 self._live = False
                 self._live_timer.stop()
-            self._enter_live()
+            self._enter_live(confirmed=True)
         else:
             self._load_day_energy()
 
@@ -6736,6 +7513,11 @@ class SpectraWidget(QWidget):
         self._top_extra_axes = []
         self._top_cursor_series = []
         ax.clear()
+        # Every redraw follows a new load, a tick or a renamed label — exactly
+        # what a spectrum's name is made of. The list and the legend are rebuilt
+        # after this draw has finished, not from inside it.
+        if self._refresh_region_names():
+            QTimer.singleShot(0, self._on_region_names_changed)
         # Every listed PV is fetched, but only the ticked ones are drawn — that way
         # a tick box acts instantly instead of triggering another archive read.
         series = [s for s in self._energy_data
@@ -6818,6 +7600,13 @@ class SpectraWidget(QWidget):
             ax.set_xlim(self._top_user_xlim)
         if self._top_user_ylim is not None:
             ax.set_ylim(self._top_user_ylim)
+        else:
+            # The automatic ranges, kept so the head room for the name plates is
+            # always measured from them and never from an already lifted range.
+            for a in [ax] + list(self._top_extra_axes):
+                a._sp_natural_ylim = tuple(a.get_ylim())
+        # Last: whether a name fits its block is measured at the final zoom.
+        self._paint_region_names(ax)
         self._canvas_top.draw_idle()
 
     def _install_span(self):
@@ -6850,10 +7639,15 @@ class SpectraWidget(QWidget):
             "visible": True, "expanded": False, "show_individual": False,
             "analyzed": False, "n": 0,
         }
+        name = self._region_values_name(r)
+        if name:
+            r["name"] = name
         self._regions.append(r)
         # add only the new span (keeps current zoom/pan — nothing else changes)
         for x0, x1 in self._tmap.clip(t_start, t_end):
             self._ax_top.axvspan(x0, x1, alpha=0.25, color=color, zorder=0)
+        # All names again: the new one can add digits to an earlier one.
+        self._paint_region_names(self._ax_top)
         return r
 
     def _keep_drag_parts(self, parts: "list[tuple[int, int]]"):
@@ -6918,7 +7712,7 @@ class SpectraWidget(QWidget):
         if len(added) == 1:
             a, b = added[0]
             self._set_status(
-                f"Spectrum {len(self._regions)} added: "
+                f"{self._region_label(len(self._regions) - 1)} added: "
                 f"{_fmt_date(a)} {_fmt_hms(a)} – {_fmt_hms(b)}.{trimmed}  "
                 f"Add more or click Analyze."
             )
@@ -6974,13 +7768,272 @@ class SpectraWidget(QWidget):
         self._rebuild_regions_ui()
         self._update_action_buttons()
         self._set_status(
-            f"Spectrum {len(self._regions)} added: all of {_fmt_date(a)} "
+            f"{self._region_label(len(self._regions) - 1)} added: all of {_fmt_date(a)} "
             f"({_fmt_hms(a)} – {_fmt_hms(b)}).  Add more or click Analyze."
         )
 
     # ── Regions UI ────────────────────────────────────────────────────────────
+    # A spectrum is named after what was searched for: the mean of every ticked
+    # Search-by PV inside its stretch, "SBW4 energy [J] 20.1 · GDD (Order 2)
+    # 24780". "Spectrum 1, 2, 3" said nothing about which shaded block on the
+    # search graph a curve came from. The same name is printed inside the block,
+    # in the list, in the legend and in the export.
+    def _name_series(self) -> "list | None":
+        """(label, times, values) of every ticked Search-by PV, as numpy arrays
+        sorted by time — built once per refresh, not once per spectrum (a day of
+        a fast PV is half a million samples). None when no PV is ticked."""
+        if not any(self._pv_is_shown(ch) for _, ch in self._search_pvs):
+            return None
+        out = []
+        for s in self._energy_data:
+            if not self._pv_is_shown(s["channel"]):
+                continue
+            raw = s.get("data") or []
+            t = np.fromiter((a for a, _ in raw), dtype=np.int64, count=len(raw))
+            v = np.fromiter((b for _, b in raw), dtype=float, count=len(raw))
+            order = np.argsort(t, kind="stable")
+            out.append((s["label"], t[order], v[order]))
+        return out
+
+    def _region_values_name(self, r: dict, series=False) -> "str | None":
+        """The name from the search data. '' when no Search-by PV is ticked,
+        None when the loaded search data does not cover this stretch (a
+        selection kept from another day) — the caller then keeps the old name.
+        The unrounded means go to r["name_vals"], so that two spectra reading
+        the same at three digits can be told apart by more."""
+        vals = self._region_values(r, series)
+        if vals is None or (not vals and self._name_ticked()):
+            return None
+        r["name_vals"] = vals
+        return " · ".join(f"{label} {_fmt_name_value(v)}" for label, v in vals)
+
+    def _name_ticked(self) -> bool:
+        return any(self._pv_is_shown(ch) for _, ch in self._search_pvs)
+
+    def _region_values(self, r: dict, series=False) -> "list | None":
+        """[(label, mean)] of the ticked Search-by PVs inside the stretch; []
+        when none is ticked, None when the loaded data does not cover it."""
+        if series is False:
+            series = self._name_series()
+        if series is None:
+            return []
+        if not self._tmap or not self._tmap.clip(r["t_start"], r["t_end"]):
+            return None
+        t0, t1 = int(r["t_start"]), int(r["t_end"])
+        parts = []
+        for label, times, vals in series:
+            lo = int(np.searchsorted(times, t0, side="left"))
+            hi = int(np.searchsorted(times, t1, side="left"))
+            if hi > lo:
+                v = float(np.mean(vals[lo:hi]))
+            elif lo > 0:
+                # Nothing recorded inside: the value in force is the last one
+                # before it — a quiet set point is never "no data".
+                v = float(vals[lo - 1])
+            else:
+                continue
+            if np.isfinite(v):
+                parts.append((label, v))
+        return parts if parts else None
+
+    def _refresh_region_names(self) -> bool:
+        """Recompute every stored name. True when one of them changed."""
+        before = self._display_names()
+        series = self._name_series() if self._regions else None
+        for r in self._regions:
+            name = self._region_values_name(r, series)
+            if name is not None:
+                r["name"] = name
+        return self._display_names() != before
+
+    def _display_names(self) -> "list[str]":
+        """Every spectrum's name as shown. Two spectra reading the same at the
+        usual three digits get more digits on the PV whose means really
+        differ (26.72 / 26.68, not 26.7 / 26.7 (2)); a number is added only
+        when the means agree to the last shown digit."""
+        n = len(self._regions)
+        vals = [r.get("name_vals") if r.get("name") else None for r in self._regions]
+        extra: dict = {}
+
+        def text(k):
+            if not vals[k]:
+                return self._regions[k].get("name") or f"Spectrum {k + 1}"
+            return " · ".join(f"{lb} {_fmt_name_value(v, extra.get(lb, 0))}"
+                              for lb, v in vals[k])
+
+        for _ in range(_NAME_EXTRA_MAX * 4):
+            names = [text(k) for k in range(n)]
+            bump = set()
+            for a in range(n):
+                for b in range(a):
+                    if names[a] != names[b] or not vals[a] or not vals[b]:
+                        continue
+                    da, db = dict(vals[a]), dict(vals[b])
+                    for lb in da:
+                        if (lb in db and da[lb] != db[lb]
+                                and extra.get(lb, 0) < _NAME_EXTRA_MAX):
+                            bump.add(lb)
+            if not bump:
+                break
+            for lb in bump:
+                extra[lb] = extra.get(lb, 0) + 1
+        names = [text(k) for k in range(n)]
+        out = []
+        for k, name in enumerate(names):
+            # Still the same set point: a number on the later one keeps the
+            # legend entries apart.
+            same = sum(1 for j in range(k) if names[j] == name)
+            out.append(f"{name} ({same + 1})" if same else name)
+        return out
+
+    def _on_region_names_changed(self):
+        self._rebuild_regions_ui()
+        if any(r.get("analyzed") for r in self._regions):
+            self._redraw_spectra()
+
     def _region_label(self, i: int) -> str:
-        return f"Spectrum {i + 1}"
+        if not 0 <= i < len(self._regions):
+            return f"Spectrum {i + 1}"
+        return self._display_names()[i]
+
+    def _paint_region_name(self, ax, i: int, placed: "list | None" = None,
+                           names: "list | None" = None):
+        """The spectrum's name inside its shaded block on the search graph.
+
+        Darker ink of the block's own colour on a white plate with a black rim,
+        so it reads over any tint and over the curves. Always horizontal: a
+        name wider than its block gets one PV per line (split at " · " only,
+        never inside a PV) and may be wider than the block; it is kept inside
+        the plot, and one that would cover a neighbour's name is moved down
+        below it. `placed` collects the painted plates (pixels) of one
+        pass. It goes on the topmost of the twin axes, or the curves of the
+        other PVs would be drawn over it."""
+        r = self._regions[i]
+        parts = self._tmap.clip(r["t_start"], r["t_end"]) if self._tmap else []
+        if not parts:
+            return
+        x0, x1 = max(parts, key=lambda p: p[1] - p[0])
+        top = self._top_extra_axes[-1] if self._top_extra_axes else ax
+        tr = blended_transform_factory(top.transData, top.transAxes)
+        y = 0.88 if len(self._tmap.windows) > 1 else 0.97   # under the date labels
+        colour = r["color"] if isinstance(r["color"], str) else _mpl_colors.to_hex(r["color"])
+        name = names[i] if names is not None else self._region_label(i)
+        txt = _NamePlateText((x0 + x1) / 2.0, y, name, transform=tr,
+                             ha="center", va="top", ma="center", fontsize=8,
+                             fontweight="bold", color=_shade(colour, 0.55),
+                             clip_on=True, zorder=9, gid="region_name",
+                             bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                       ec="#111111", lw=0.8, alpha=0.92))
+        txt.set_clip_path(top.patch)
+        top._add_text(txt)
+        try:
+            renderer = self._canvas_top.get_renderer()
+            px0 = top.transData.transform((x0, 0))[0]
+            px1 = top.transData.transform((x1, 0))[0]
+            room = abs(px1 - px0) - 6
+
+            def width(s: str) -> float:
+                txt.set_text(s)
+                return txt.get_window_extent(renderer).width
+
+            # One line when it fits the block; otherwise one PV per line. The
+            # plate may be wider than its block — a name chopped word by word
+            # into eight lines over a narrow block could not be read at all.
+            if width(name) > room:
+                txt.set_text(name.replace(" · ", "\n"))
+            ax_box = top.get_window_extent(renderer)
+
+            def plate():
+                txt.update_bbox_position_size(renderer)
+                return txt.get_bbox_patch().get_window_extent(renderer)
+
+            # Sideways back into the plot when a wide plate sticks out of it.
+            bb = plate()
+            shift = 0.0
+            if bb.x0 < ax_box.x0 + 2:
+                shift = ax_box.x0 + 2 - bb.x0
+            elif bb.x1 > ax_box.x1 - 2:
+                shift = ax_box.x1 - 2 - bb.x1
+            if shift:
+                cx = top.transData.transform(((x0 + x1) / 2.0, 0))[0] + shift
+                txt.set_x(top.transData.inverted().transform((cx, 0))[0])
+            if placed is None:
+                return
+            # Below any earlier plate it would cover, as often as needed.
+            ax_h = ax_box.height or 1.0
+
+            for _ in range(len(placed) + 1):
+                bb = plate()
+                hit = next((p for p in placed if bb.overlaps(p)), None)
+                if hit is None:
+                    break
+                y -= (bb.y1 - hit.y0 + 4) / ax_h
+                txt.set_y(y)
+            placed.append(plate())
+        except Exception:
+            txt.set_text(name)   # no renderer yet: one line is still right
+
+    def _region_row_text(self, i: int, expanded: bool) -> str:
+        """The name button's text in the SPECTRA list: one PV per line.
+
+        On one line the panel cut "… · GDD (Order 2) 24820" off after "GDD (O",
+        so the second value of every name was never seen."""
+        chev = "▾" if expanded else "▸"
+        pieces = self._region_label(i).split(" · ")
+        # Continuation lines start under the first line's text, past the arrow.
+        return f"{chev}  " + "\n     ".join(pieces)
+
+    def _paint_region_names(self, ax):
+        for a in [ax] + list(self._top_extra_axes):
+            for t in list(a.texts):
+                if t.get_gid() == "region_name":
+                    t.remove()
+        names = self._display_names()
+        placed: list = []
+        for i in range(len(self._regions)):
+            self._paint_region_name(ax, i, placed, names)
+        self._make_room_for_names(ax, placed)
+
+    def _make_room_for_names(self, ax, placed: list):
+        """Lift the top of every Y-axis so the curves stay under the name plates.
+
+        A trace that runs along the top of its axis (the SBW4 energy at 26 J for
+        hours) went straight through the names. The plates keep their place at
+        the top; each axis gets head room down to the lowest plate, computed
+        from that axis's own automatic limits, so adding a spectrum or removing
+        one never ratchets the range up. Only automatic limits are touched — a
+        range the user zoomed to or typed in is theirs. At most 40 % of the
+        height goes to the names: a pile of plates over narrow blocks must not
+        squash the trace into a strip."""
+        axes = [ax] + list(self._top_extra_axes)
+        if self._top_user_ylim is not None:
+            return
+        frac = 1.0
+        try:
+            renderer = self._canvas_top.get_renderer()
+            box = ax.get_window_extent(renderer)
+            if placed and box.height > 0:
+                low = min(p.y0 for p in placed)
+                frac = (low - box.y0 - 4) / box.height
+        except Exception:
+            frac = 1.0
+        frac = min(1.0, max(0.6, frac))
+        # Not a gesture: with Pan or Zoom active the zoom memory would otherwise
+        # file this lifted range away as the user's own.
+        was = self._top_redrawing
+        self._top_redrawing = True
+        try:
+            for a in axes:
+                nat = getattr(a, "_sp_natural_ylim", None)
+                if nat is None:
+                    continue
+                lo, hi = nat
+                if frac >= 1.0 or hi <= lo:
+                    a.set_ylim(lo, hi)
+                else:
+                    a.set_ylim(lo, lo + (hi - lo) / frac)
+        finally:
+            self._top_redrawing = was
 
     def _find_region(self, rid: int) -> dict | None:
         return next((r for r in self._regions if r["id"] == rid), None)
@@ -7016,46 +8069,52 @@ class SpectraWidget(QWidget):
         # ── header (clickable name + eye + delete) ─────────────────────
         header = QWidget()
         h = QHBoxLayout(header)
-        h.setContentsMargins(4, 2, 4, 2)
-        h.setSpacing(4)
+        h.setContentsMargins(4, 2, 2, 2)
+        h.setSpacing(2)
 
         dot = QLabel("●")
         dot.setStyleSheet(f"color: {r['color']}; font-size: 15px; border: none;")
         dot.setFixedWidth(16)
 
-        chev = "▾" if r["expanded"] else "▸"
-        btn_name = QPushButton(f"{chev}  {self._region_label(i)}")
+        btn_name = _LeftTextButton(self._region_row_text(i, r["expanded"]))
         btn_name.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_name.setToolTip("Click to show/hide details")
+        btn_name.setToolTip(f"{self._region_label(i)}\nClick to show/hide details")
         btn_name.clicked.connect(lambda _, x=rid: self._toggle_region_expanded(x))
 
         btn_eye = QPushButton("\U0001F441")          # 👁
         btn_eye.setCheckable(True)
         btn_eye.setChecked(r["visible"])
-        btn_eye.setFixedSize(34, 30)
+        # Eye and ✕ only as wide as their symbol: every pixel more is taken
+        # from the name beside them.
+        btn_eye.setFixedSize(26, 30)
         btn_eye.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_eye.toggled.connect(lambda on, x=rid: self._toggle_region_visible(x, on))
 
         btn_del = QPushButton("✕")              # ✕
-        btn_del.setFixedSize(34, 30)
+        btn_del.setFixedSize(26, 30)
         btn_del.setToolTip("Remove this spectrum")
         btn_del.setStyleSheet(
             "QPushButton { color:#B71C1C; font-weight:700; font-size:18px; "
-            "border:none; background:transparent; }"
+            "border:none; background:transparent; padding:0; }"
             "QPushButton:hover { background:#ffe0e0; border-radius:3px; }"
         )
         btn_del.clicked.connect(lambda _, x=rid: self._delete_region(x))
 
-        h.addWidget(dot)
+        # Dot, eye and ✕ stay beside the first line of a multi-line name.
+        _top = Qt.AlignmentFlag.AlignTop
+        h.addWidget(dot, alignment=_top)
         h.addWidget(btn_name, stretch=1)
-        h.addWidget(btn_eye)
-        h.addWidget(btn_del)
+        h.addWidget(btn_eye, alignment=_top)
+        h.addWidget(btn_del, alignment=_top)
         v.addWidget(header)
 
         # ── details (collapsible) ──────────────────────────────────────
+        # Into the row FIRST, then shown: a parentless widget made visible is
+        # a top-level window — every expanded row flashed up as one on each
+        # rebuild of the list (i.e. after every drag on the search graph).
         details = self._build_region_details(r)
-        details.setVisible(r["expanded"])
         v.addWidget(details)
+        details.setVisible(r["expanded"])
 
         self._row_widgets[rid] = {"name": btn_name, "eye": btn_eye, "details": details,
                                   "metrics": getattr(details, "_metric_label", None),
@@ -7179,16 +8238,21 @@ class SpectraWidget(QWidget):
         refs["eye"].setToolTip("Visible — click to hide" if visible
                                else "Hidden — click to show")
         refs["eye"].setStyleSheet(
-            "QPushButton { border: none; background: transparent; font-size: 18px;"
+            "QPushButton { border: none; background: transparent; font-size: 18px; padding: 0;"
             + (" }" if visible else " color: #c4c4c4; }")
             + "QPushButton:hover { background: #e8f0fe; border-radius: 3px; }"
         )
         name_color = "#111" if visible else "#aaa"
         deco = "" if visible else "text-decoration: line-through;"
+        # The text is a label inside the button (_LeftTextButton), so the label
+        # carries the font and the colour, the hover included.
         refs["name"].setStyleSheet(
-            "QPushButton { text-align: left; border: none; background: transparent; "
-            f"font-weight: 700; font-size: 13px; color: {name_color}; {deco} padding: 2px; }}"
-            "QPushButton:hover { color: #1565C0; }"
+            "QPushButton { border: none; background: transparent; padding: 0; }"
+            "QPushButton QLabel { background: transparent; border: none; "
+            f"font-weight: 700; font-size: 12px; color: {name_color}; {deco} }}"
+            # "QPushButton:hover QLabel" paints every row blue, hovered or not;
+            # the button sets this property itself on enter / leave.
+            "QPushButton QLabel[hover=\"true\"] { color: #1565C0; }"
         )
 
     def _toggle_region_expanded(self, rid: int):
@@ -7199,8 +8263,7 @@ class SpectraWidget(QWidget):
         r["expanded"] = not r["expanded"]
         refs["details"].setVisible(r["expanded"])
         i = self._regions.index(r)
-        chev = "▾" if r["expanded"] else "▸"
-        refs["name"].setText(f"{chev}  {self._region_label(i)}")
+        refs["name"].setText(self._region_row_text(i, r["expanded"]))
         self._update_expand_all_btn()
 
     def _toggle_all_expanded(self):
@@ -7214,8 +8277,7 @@ class SpectraWidget(QWidget):
             refs = self._row_widgets.get(r["id"])
             if refs:
                 refs["details"].setVisible(expand)
-                chev = "▾" if expand else "▸"
-                refs["name"].setText(f"{chev}  {self._region_label(i)}")
+                refs["name"].setText(self._region_row_text(i, expand))
         self._regions_w.setUpdatesEnabled(True)
         self._update_expand_all_btn()
 
@@ -7263,7 +8325,9 @@ class SpectraWidget(QWidget):
         self._update_filter_readout()
 
     def _update_action_buttons(self):
-        self._btn_analyze.setEnabled(any(not r["analyzed"] for r in self._regions))
+        can = any(not r["analyzed"] for r in self._regions)
+        self._btn_analyze.setEnabled(can)
+        self._btn_analyze2.setEnabled(can)
         self._btn_export.setEnabled(any(r["analyzed"] for r in self._regions))
         self._btn_clear_regs.setEnabled(bool(self._regions))
         self._update_expand_all_btn()
@@ -7290,6 +8354,7 @@ class SpectraWidget(QWidget):
         self._busy = True
         self._refresh_pill()
         self._btn_analyze.setEnabled(False)
+        self._btn_analyze2.setEnabled(False)
         self._btn_pick_day.setEnabled(False)
         # snapshot only the immutable selection fields for the worker thread
         snap = [{"id": r["id"], "t_start": r["t_start"], "t_end": r["t_end"]}
@@ -7338,6 +8403,7 @@ class SpectraWidget(QWidget):
                     f"{_fmt_hms(r['t_start'])}–{_fmt_hms(r['t_end'])}…"
                 )
                 wfs = _fetch_waveforms(spec_y_ch, r["t_start"], r["t_end"])
+                not_spectrum = not wfs and spec_y_ch in _one_number_hits
                 # THE WINDOW IS THE WINDOW. Whatever is asked for, the archiver
                 # answers with one sample BEFORE the start and one AT OR AFTER
                 # the end — measured on the real archive: a five-minute window
@@ -7379,6 +8445,7 @@ class SpectraWidget(QWidget):
                     "energy_n_all": len(energy_vals),
                     "scalar_series": series,
                     "fetch_error": fetch_err,
+                    "not_spectrum": not_spectrum,
                 }
                 if st is None:
                     res.update({"mean": None, "median": None, "trimmed": None,
@@ -7452,7 +8519,11 @@ class SpectraWidget(QWidget):
                         if r["id"] in by_id and r.get("n", 0) == 0
                         and int(r.get("n_all") or 0) > 0]
         msg = f"Analysis done. {n_total} spectra total."
-        if empties:
+        if any(res.get("not_spectrum") for res in results):
+            # Not "no spectra in Spectrum 1, 2, 3" — the channel itself is the
+            # wrong kind, and naming every selection would hide that.
+            msg += "  " + _not_a_spectrum_msg(self._spec_y_pv)
+        elif empties:
             msg += f"  No spectra in: {', '.join(empties)}."
             # An empty selection can also mean the archive read failed — say so
             # instead of leaving it looking like the shots were simply not taken.
@@ -8346,6 +9417,19 @@ class SpectraWidget(QWidget):
         self._bot_user_xlim = None
         self._redraw_spectra()
 
+    def _on_x_range_edited_soon(self, *_):
+        self._bot_user_xlim = None
+        self._redraw_spectra_soon()
+
+    def _redraw_spectra_soon(self, *_):
+        """One redraw after a burst of number-box changes (40 ms quiet)."""
+        t = getattr(self, "_redraw_soon_timer", None)
+        if t is None:
+            t = self._redraw_soon_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._redraw_spectra)
+        t.start(40)
+
     def _signal_span(self, x, y) -> "tuple | None":
         """Return the (lo, hi) wavelength span of (x, y) that actually contains
         signal (1% of peak above the baseline), or None when there is no signal."""
@@ -8419,8 +9503,8 @@ class SpectraWidget(QWidget):
     def _single_draw_estimate(self) -> int:
         """How many individual curves the next draw would put on the graph."""
         return sum(len(self._single_rows(r.get("stack"))[0])
-                   for r in self._regions
-                   if r.get("analyzed") and r.get("visible", True))
+                    for r in self._regions
+                    if r.get("analyzed") and r.get("visible", True))
 
     def _redraw_spectra(self):
         """Wait cursor around a heavy draw.
@@ -8428,6 +9512,9 @@ class SpectraWidget(QWidget):
         Thousands of curves take a couple of seconds to lay out and paint, and
         every Normalize / Smooth / range click comes back through here — without
         the cursor the window just looks stuck."""
+        t = getattr(self, "_redraw_soon_timer", None)
+        if t is not None:
+            t.stop()                     # this draw covers the pending one
         heavy = self._is_single() and self._single_draw_estimate() > 500
         if heavy:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -8489,14 +9576,14 @@ class SpectraWidget(QWidget):
                 v = (r.get("orders") or {}).get(order_label)
                 if v is not None:
                     label = (f"{self._region_label(i)}  {order_label}="
-                             f"{round(float(v))} · {m_short} (n={n_txt})")
+                                f"{round(float(v))} · {m_short} (n={n_txt})")
             if single:
                 # every shot in the region, no averaged curve at all
                 stack = r.get("stack")
                 idx, total = self._single_rows(stack)
                 n_drawn = len(idx)
                 count = (f"{total} spectra" if n_drawn >= total
-                         else f"{n_drawn} of {total} spectra drawn")
+                            else f"{n_drawn} of {total} spectra drawn")
                 if r.get("filter_mask") is not None:
                     count += f" · {total} of {int(r.get('n_all') or 0)} matched"
                 head = self._region_label(i)
@@ -8521,7 +9608,7 @@ class SpectraWidget(QWidget):
                 ref_scale = self._norm_scale(xp_m, yp_m, norm)
                 self._plot_individual(ax, r.get("x"), r["stack"], col, ref_scale)
             self._plot_spectrum(ax, r.get("x"), center, std_arg, col, label, norm,
-                                 band_lo, band_hi, smooth_win=smooth_win)
+                                    band_lo, band_hi, smooth_win=smooth_win)
             any_drawn = True
 
         # live: only the last N shots (newest red, older faint blue, average black)
@@ -8568,14 +9655,19 @@ class SpectraWidget(QWidget):
             # time domain is labelled "Time [fs]" and not nanometres either.
             ax.set_xlabel(self._x_title())
             ax.set_ylabel(self._intensity_label(norm))
+            # The title names the spectrum PV the curves come from.
+            pv = str(self._spec_base_pv or "").strip()
+            of = f" of {pv}" if pv else ""
             if single:
-                head = "Live spectra — every shot" if self._live else "Every spectrum"
+                head = (f"Live spectra{of} — every shot" if self._live
+                        else f"Every spectrum{of}")
                 if single_total:
                     head += (f" ({single_total} measured)" if single_shown >= single_total
                              else f" ({single_shown} of {single_total} drawn)")
                 ax.set_title(head + self._filter_title_suffix())
             else:
-                ax.set_title(("Live spectra — " if self._live else "Averaged spectra — ")
+                ax.set_title((f"Live spectra{of} — " if self._live
+                              else f"Averaged spectra{of} — ")
                              + self._cmb_method.currentText()
                              + self._filter_title_suffix())
             ax.set_xlim(x_min, x_max)
@@ -8614,7 +9706,12 @@ class SpectraWidget(QWidget):
             # so blaming the wavelength range (or the archive) would name the
             # wrong culprit and send the user hunting in the wrong place.
             filt_msg = self._filter_keeps_nothing_msg()
-            if filt_msg:
+            if (any(r.get("analyzed") and r.get("not_spectrum")
+                    for r in self._regions)
+                    or (self._live and not self._live_buf
+                        and self._spec_y_pv in _one_number_hits)):
+                self._draw_bot_empty(_not_a_spectrum_msg(self._spec_y_pv))
+            elif filt_msg:
                 self._draw_bot_empty(filt_msg)
             else:
                 self._draw_bot_empty(self._range_misses_data_msg()
@@ -8710,6 +9807,9 @@ class SpectraWidget(QWidget):
     # streaming itself.
     def _start_live(self, start_ns: "int | None" = None):
         self._live = True
+        # A new session: a tick or an X-axis read still in flight from the old
+        # window must not land in this one (it carries the old gen and is dropped).
+        self._live_gen += 1
         self._live_buf = deque(maxlen=LIVE_BUF_MAX)
         # The filter's own series starts empty too. No lookback is needed: the
         # first tick asks from _live_start_ns, and that request comes back with
@@ -8736,24 +9836,40 @@ class SpectraWidget(QWidget):
         # Resolve the (possibly custom) wavelength axis BEFORE polling Y, otherwise the
         # first frames are drawn on a bare index axis and masked away by the From/To range.
         if self._x_data is None:
-            t0 = self._live_start_ns - int(10 * 60 * 1e9)
-            t1 = self._live_start_ns + int(60 * 1e9)
-            sig_x = _Sig(self)
-
-            def _on_x(arr):
-                if arr is not None:
-                    self._x_data = arr
-                if self._live:
-                    self._live_tick()
-
-            sig_x.done.connect(_on_x)
-
-            def _fetch_x():
-                sig_x.done.emit(self._resolve_x_data(t0, t1))
-
-            _bg(_fetch_x)
+            self._fetch_live_x(self._live_start_ns, then_tick=True)
         else:
             self._live_tick()
+
+    def _fetch_live_x(self, around_ns: int, then_tick: bool):
+        """Read the wavelength axis in the background for the running live
+        session. Used on start (then the first tick follows) and when the X axis
+        is changed while live runs (the stream keeps going, only X is swapped)."""
+        gen = self._live_gen
+        t0 = int(around_ns) - int(10 * 60 * 1e9)
+        t1 = int(around_ns) + int(60 * 1e9)
+        sig_x = _Sig(self)
+
+        def _on_x(arr):
+            if gen != self._live_gen or not self._live:
+                return
+            if arr is not None:
+                self._x_data = arr
+            if then_tick:
+                self._live_tick()
+            else:
+                # A new axis can lie outside the old From/To — fit once more.
+                self._live_autofit_done = False
+                if self._live_buf and self._chk_autofit.isChecked():
+                    self._auto_fit_live_range()
+                    self._live_autofit_done = True
+                self._redraw_spectra()
+
+        sig_x.done.connect(_on_x)
+
+        def _fetch_x():
+            sig_x.done.emit(self._resolve_x_data(t0, t1))
+
+        _bg(_fetch_x)
 
     def _stop_live(self):
         """Stop streaming and go back to the archive view.
@@ -8766,6 +9882,7 @@ class SpectraWidget(QWidget):
             self._refresh_pill()
             return
         self._live = False
+        self._live_gen += 1
         self._live_timer.stop()
         self._set_status("Live stopped.")
         self._leave_live()
@@ -8801,9 +9918,10 @@ class SpectraWidget(QWidget):
         start_ns = self._live_last_ns
 
         # live mode only needs spectra — the top search graph is hidden
+        gen = self._live_gen
         sig_y = _Sig(self)
-        sig_y.done.connect(self._on_live_y)
-        sig_y.error.connect(self._on_live_y_error)
+        sig_y.done.connect(lambda p: self._on_live_y(p, gen))
+        sig_y.error.connect(lambda e: self._on_live_y_error(e, gen))
         spec_y_ch = self._spec_y_pv
         # Whatever the shot filter is set on, read on the same 3-second window.
         # One request each, and each brings the archiver's last sample before the
@@ -8846,9 +9964,15 @@ class SpectraWidget(QWidget):
                 before = [s for s in kept if s[0] <= oldest]
                 after  = [s for s in kept if s[0] > oldest]
                 self._live_scalars[ch] = (before[-1:] + after) if before else after
+        self._derive_live_custom()
         return changed
 
-    def _on_live_y(self, payload):
+    def _on_live_y(self, payload, gen: "int | None" = None):
+        # A tick asked by an earlier session (the window was re-picked, or live
+        # was stopped meanwhile) belongs to a different window: drop it, and do
+        # not restart the timer — the current session runs its own.
+        if gen is not None and gen != self._live_gen:
+            return
         now_ns, wfs, scalars = payload
         # ONE ENTRY PER SHOT. Every request also returns the sample before its
         # start and the first one at or after its end, so consecutive 3-second
@@ -8906,11 +10030,15 @@ class SpectraWidget(QWidget):
         if conds and self._live_arming:
             msg += (", shot filter arming (waiting for "
                     + ", ".join(self._live_arming) + ")")
+        if not self._live_buf and self._spec_y_pv in _one_number_hits:
+            msg = "Live: " + _not_a_spectrum_msg(self._spec_y_pv)
         self._set_status(f"{msg}  ({_fmt_hms(now_ns)})")
         if self._live:
             self._live_timer.start(LIVE_INTERVAL_S * 1000)
 
-    def _on_live_y_error(self, err: str):
+    def _on_live_y_error(self, err: str, gen: "int | None" = None):
+        if gen is not None and gen != self._live_gen:
+            return
         self._set_status(f"Live error: {err}")
         if self._live:
             self._live_timer.start((LIVE_INTERVAL_S + 2) * 1000)
@@ -9277,6 +10405,12 @@ if __name__ == "__main__":
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(_APP_STYLESHEET)
+    # Same wheel rule as the suite: a hovered field never changes on a scroll.
+    try:
+        from main import _install_wheel_guard
+        _install_wheel_guard()
+    except Exception as _e:
+        print(f"[Spectra] wheel guard not installed: {_e}")
 
     win = QMainWindow()
     win.setWindowTitle("Spectral analysis")

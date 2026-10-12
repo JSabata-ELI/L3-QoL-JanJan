@@ -32,6 +32,8 @@ for _stream_name in ("stdout", "stderr"):
 # ── stdlib ─────────────────────────────────────────────────────────────────
 import bisect
 import csv
+import functools
+import html
 import json
 import math
 import os
@@ -44,15 +46,28 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
+# Python's garbage collector, at its default setting, re-scans every object
+# the program holds each few hundred allocations. This program holds millions
+# of small objects (every archived sample is a tuple), so a refresh that merely
+# builds a list of rows spent most of its time in those scans: measured on a
+# 60 000-row custom-PV compute next to a million samples, 300 ms at the default
+# and 65 ms with this setting. Reference counting frees almost everything at
+# once; only the youngest generation is made lazier, the older two keep their
+# default ratios, so the cycles a discarded matplotlib figure leaves behind are
+# still collected regularly.
+import gc as _gc
+_gc.set_threshold(50_000, 20, 10)
+
 # ── PySide6 ────────────────────────────────────────────────────────────────
 from PySide6.QtCore import (
     Qt, QObject, QTimer, Signal, QDate, QLocale, QRect, QSize, QPoint,
-    QPointF, QEvent,
+    QPointF, QEvent, QDateTime, QTime,
 )
 from PySide6.QtGui import (
     QColor, QIcon, QPalette, QPainter, QPen, QShortcut, QKeySequence,
-    QPolygonF,
+    QPolygonF, QPixmap, QBrush, QPainterPath, QImage,
 )
+from PySide6.QtCore import QRectF
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QLineEdit, QListWidget, QListWidgetItem,
@@ -63,7 +78,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QToolButton, QMenu, QColorDialog,
     QCalendarWidget, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
     QTextEdit, QProgressBar, QProgressDialog, QLayout,
-    QAbstractSpinBox, QAbstractScrollArea, QSlider,
+    QAbstractSpinBox, QAbstractScrollArea, QSlider, QDateTimeEdit, QTimeEdit,
+    QTabBar,
 )
 
 # ── matplotlib ─────────────────────────────────────────────────────────────
@@ -77,6 +93,31 @@ from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.widgets import SpanSelector, RectangleSelector
+
+
+class _EdgeSpanSelector(SpanSelector):
+    """SpanSelector whose drag keeps going when the mouse leaves the plot.
+
+    matplotlib replaces an event outside the axes (no xdata) by the last one
+    inside, so a drag past the edge froze a few pixels short of it and the
+    selection missed the "follow the newest point" edge. Here the position is
+    taken from the pixels instead and clipped to the plot, so running off the
+    side lands exactly on the edge.
+    """
+
+    def _clean_event(self, event):
+        if event.xdata is None and getattr(event, "x", None) is not None:
+            import copy
+            event = copy.copy(event)
+            event.inaxes = None        # _get_data_coords then reads the pixels
+            event.xdata = event.ydata = 0.0
+            event.xdata, event.ydata = self._get_data(event)
+            # The drag handler reads the position again; as an event "in" the
+            # plot it takes the clipped xdata instead of the raw pixels.
+            event.inaxes = self.ax
+            self._prev_event = event
+            return event
+        return super()._clean_event(event)
 
 # ── Non-UI helpers from cpva_core ──────────────────────────────────────────
 from cpva_core import (
@@ -112,10 +153,8 @@ except ImportError:      # pragma: no cover - Spectra layout changed
     _MplToolbar = NavigationToolbar2QT
     _TB_STYLE   = ""
     _TB_HINTS   = {}
-try:
-    from sp_t import _AxisLimitsDialog
-except ImportError:      # pragma: no cover
-    _AxisLimitsDialog = None
+# (Spectra's _AxisLimitsDialog is not used here: the banded graph has one Y
+# axis per PV and a time X axis — see _GraphAxisLimitsDialog.)
 
 
 def _make_mpl_toolbar(nav_cls, canvas, parent=None):
@@ -164,6 +203,217 @@ def _make_mpl_toolbar(nav_cls, canvas, parent=None):
     return toolbar
 
 
+# ── Graph tool strip: drawn icons ──────────────────────────────────────────
+# The strip above the graph shows matplotlib's own toolbar pictures, re-inked
+# here in a fixed colour for every button state (left to matplotlib, a dark
+# Windows theme turns them white on the white bar). The QPainter drawings below
+# are the fallback when a picture is missing, and the loupe's only artwork.
+_GICON_BOX = 20.0
+_GICON_PX = 24
+_GICON_SIZES = (24, 36, 48)            # 100 % / 150 % / 200 % display scaling
+_GINK_NORMAL = "#000000"
+_GINK_CHECKED = "#000000"              # the checked background is light blue
+_GINK_DISABLED = "#a0a8b2"
+_GICON_CACHE: dict = {}
+
+# The look of the matplotlib toolbar the graph always had: flat buttons on the
+# white bar, a light-blue tint on hover and while a mode is on.
+_GRAPH_TOOLBTN_QSS = (
+    "QToolButton { padding: 0px; margin: 0px; border: none;"
+    " border-radius: 3px; background: transparent; color: #000000; }"
+    "QToolButton:hover { background: #e8f0fe; }"
+    "QToolButton:checked { background: #bbd4f8; }"
+    "QToolButton:checked:hover { background: #a8c6f5; }"
+    "QToolButton:pressed { background: #bbd4f8; }"
+    "QToolButton::menu-indicator { image: none; width: 0px; }"
+)
+
+
+def _gpen(c, w=2.0, cap=Qt.PenCapStyle.RoundCap, join=Qt.PenJoinStyle.RoundJoin,
+          dash=None):
+    p = QPen(QColor(c))
+    p.setWidthF(w)
+    p.setCapStyle(cap)
+    p.setJoinStyle(join)
+    if dash:
+        p.setDashPattern(dash)
+    return p
+
+
+def _gicon_head(p, c, tip, dx, dy, size=3.1):
+    """Filled arrow head at `tip`, pointing along the unit vector (dx, dy)."""
+    base = QPointF(tip.x() - dx * size * 1.5, tip.y() - dy * size * 1.5)
+    px, py = -dy, dx
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(c)))
+    p.drawPolygon(QPolygonF([
+        tip,
+        QPointF(base.x() + px * size * 0.82, base.y() + py * size * 0.82),
+        QPointF(base.x() - px * size * 0.82, base.y() - py * size * 0.82)]))
+
+
+def _gico_home(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.0))
+    p.drawPolyline(QPolygonF([QPointF(2.8, 10.2), QPointF(10.0, 3.4),
+                              QPointF(17.2, 10.2)]))
+    p.drawPolyline(QPolygonF([QPointF(5.2, 8.6), QPointF(5.2, 16.6),
+                              QPointF(14.8, 16.6), QPointF(14.8, 8.6)]))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(c)))
+    p.drawRect(QRectF(8.4, 11.4, 3.2, 5.2))          # the door
+
+
+def _gico_back(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.4))
+    p.drawLine(QPointF(16.6, 10.0), QPointF(8.0, 10.0))
+    _gicon_head(p, c, QPointF(3.2, 10.0), -1.0, 0.0, 3.4)
+
+
+def _gico_forward(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.4))
+    p.drawLine(QPointF(3.4, 10.0), QPointF(12.0, 10.0))
+    _gicon_head(p, c, QPointF(16.8, 10.0), 1.0, 0.0, 3.4)
+
+
+def _gico_pan(p, c):
+    # Solid palm with three fingers and a thumb (hollow turns to mush at 20 px).
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(c)))
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(5.0, 8.0, 10.0, 9.5), 3.2, 3.2)
+    p.drawPath(path)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.6))
+    p.drawLine(QPointF(7.0, 9.0), QPointF(7.0, 5.2))
+    p.drawLine(QPointF(10.0, 9.0), QPointF(10.0, 3.6))
+    p.drawLine(QPointF(13.0, 9.0), QPointF(13.0, 5.6))
+    p.drawLine(QPointF(5.4, 12.2), QPointF(3.2, 9.6))
+
+
+def _gico_zoom(p, c):
+    # Magnifying glass: drag a rectangle to zoom into it.
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.0))
+    p.drawEllipse(QPointF(8.6, 8.6), 5.0, 5.0)
+    p.setPen(_gpen(c, 2.6))
+    p.drawLine(QPointF(12.5, 12.5), QPointF(17.0, 17.0))
+
+
+def _gico_loupe(p, c):
+    # A small framed window with a cross-hair in it — the preview that follows
+    # the mouse. Deliberately NOT a magnifying glass: that one is Zoom.
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.0, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRoundedRect(QRectF(2.6, 3.6, 14.8, 12.8), 1.6, 1.6)
+    p.setPen(_gpen(c, 1.6))
+    p.drawLine(QPointF(10.0, 5.8), QPointF(10.0, 8.4))
+    p.drawLine(QPointF(10.0, 11.6), QPointF(10.0, 14.2))
+    p.drawLine(QPointF(4.8, 10.0), QPointF(8.2, 10.0))
+    p.drawLine(QPointF(11.8, 10.0), QPointF(15.2, 10.0))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(c)))
+    p.drawEllipse(QPointF(10.0, 10.0), 1.4, 1.4)
+
+
+def _gico_margins(p, c):
+    # Outer frame = the figure, dashed inner frame = the plot area inside it.
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.0, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRect(QRectF(2.6, 2.6, 14.8, 14.8))
+    p.setPen(_gpen(c, 1.5, cap=Qt.PenCapStyle.FlatCap,
+                   join=Qt.PenJoinStyle.MiterJoin, dash=[1.6, 1.2]))
+    p.drawRect(QRectF(6.6, 6.0, 7.6, 7.6))
+
+
+def _gico_save(p, c):
+    # A floppy disk: body, shutter at the top, label at the bottom.
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 2.0, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawPolygon(QPolygonF([QPointF(3.0, 3.0), QPointF(14.2, 3.0),
+                             QPointF(17.0, 5.8), QPointF(17.0, 17.0),
+                             QPointF(3.0, 17.0)]))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(c)))
+    p.drawRect(QRectF(6.2, 3.0, 6.6, 4.4))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_gpen(c, 1.6, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRect(QRectF(6.0, 11.0, 8.0, 6.0))
+
+
+_GICON_RECIPES = {
+    "home": _gico_home, "back": _gico_back, "forward": _gico_forward,
+    "pan": _gico_pan, "zoom": _gico_zoom, "loupe": _gico_loupe,
+    "margins": _gico_margins, "save": _gico_save,
+}
+
+# The strip shows matplotlib's own toolbar pictures (the look the graph always
+# had); the drawn recipes above are the fallback when a picture is missing, and
+# the only artwork for the loupe, which matplotlib has no picture for.
+_MPL_ICON_FILES = {
+    "home": "home", "back": "back", "forward": "forward", "pan": "move",
+    "zoom": "zoom_to_rect", "margins": "subplots", "save": "filesave",
+}
+
+
+def _mpl_icon_image(name):
+    """matplotlib's large toolbar picture for strip button `name`, or None."""
+    fn = _MPL_ICON_FILES.get(name)
+    if not fn:
+        return None
+    try:
+        import matplotlib as _mpl
+        path = os.path.join(_mpl.get_data_path(), "images", f"{fn}_large.png")
+        img = QImage(path)
+    except Exception:
+        return None
+    if img.isNull():
+        return None
+    return img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+
+
+def _graph_icon(name):
+    """The icon for one strip button, with its own artwork for every state.
+
+    Every mode is spelled out: left alone, Qt fades the disabled version until
+    it is barely there and keeps the dark artwork on the blue checked button."""
+    ic = _GICON_CACHE.get(name)
+    if ic is not None:
+        return ic
+    ic = QIcon()
+    src = _mpl_icon_image(name)
+    for mode, state, ink in (
+            (QIcon.Mode.Normal,   QIcon.State.Off, _GINK_NORMAL),
+            (QIcon.Mode.Active,   QIcon.State.Off, _GINK_NORMAL),
+            (QIcon.Mode.Selected, QIcon.State.Off, _GINK_NORMAL),
+            (QIcon.Mode.Normal,   QIcon.State.On,  _GINK_CHECKED),
+            (QIcon.Mode.Active,   QIcon.State.On,  _GINK_CHECKED),
+            (QIcon.Mode.Selected, QIcon.State.On,  _GINK_CHECKED),
+            (QIcon.Mode.Disabled, QIcon.State.Off, _GINK_DISABLED),
+            (QIcon.Mode.Disabled, QIcon.State.On,  _GINK_DISABLED)):
+        for px in _GICON_SIZES:
+            pm = QPixmap(px, px)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            if src is not None:
+                # matplotlib's own artwork, its shape only, re-inked here so a
+                # dark theme can never turn it white.
+                p.drawImage(QRectF(0, 0, px, px), src)
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+                p.fillRect(QRectF(0, 0, px, px), QColor(ink))
+            else:
+                p.scale(px / _GICON_BOX, px / _GICON_BOX)
+                _GICON_RECIPES[name](p, ink)
+            p.end()
+            ic.addPixmap(pm, mode, state)
+    _GICON_CACHE[name] = ic
+    return ic
+
+
 # ── Styles ─────────────────────────────────────────────────────────────────
 _APP_STYLESHEET = """
 QWidget      { background: #f3f3f3; color: #111;
@@ -189,6 +439,13 @@ QTabBar::tab {
 QTabBar::tab:selected { background: #f3f3f3; color: #111; font-weight: 600; }
 QTabBar::tab:hover    { background: #d8e8ff; }
 QToolTip { background: #ffffcc; color: #111; border: 1px solid #aaa; padding: 4px; }
+/* The QWidget rule above also paints every menu entry, which wiped out the
+   hover highlight and made greyed-out entries look live. */
+QMenu { background: #ffffff; color: #111; border: 1px solid #bbb; padding: 2px; }
+QMenu::item { background: transparent; padding: 4px 22px 4px 18px; }
+QMenu::item:selected { background: #DCEBFF; color: #111; }
+QMenu::item:disabled { color: #9a9a9a; }
+QMenu::separator { height: 1px; background: #d0d0d0; margin: 3px 6px; }
 QScrollBar:vertical { width: 8px; background: #eee; }
 QScrollBar::handle:vertical { background: #bbb; border-radius: 4px; }
 /* Item-view check indicators (Show / Auto / Grid columns) must stay visible
@@ -263,9 +520,14 @@ _GRAPH_OPTS_DEFAULTS = {
     "tick_font_delta":  -1,     # tick-number size = font_size + this
     "cursor_font_delta": 0,     # cursor readout size = font_size + this
     # Left axis columns
-    "axis_gap_px":       6,     # whitespace between a title and the axis left of it
-    "label_pad_px":      5,     # gap between a title and its OWN tick numbers
-    "outer_margin_px":   8,     # whitespace left of the outermost title
+    # Measured with testing/probe_y_axis_columns.py and looked at: the title's
+    # capitals reach the edge of its text box, so 0 px puts the neighbour's
+    # spine ON the letters; 3 px is a clear gap at every font size. The title
+    # side towards its own numbers carries the descender space, so 1 px is
+    # enough there. (Were 6 / 5 / 8 — a column was ~20 % wider.)
+    "axis_gap_px":       5,     # whitespace between a title and the axis left of it
+    "label_pad_px":      0,     # gap between a title and its OWN tick numbers
+    "outer_margin_px":   4,     # whitespace left of the outermost title
     "show_axis_titles":  True,
     "y_ticks_max":       6,     # upper bound on major Y ticks per axis
     # Minor Y ticks are decoration, but matplotlib builds a full Tick object
@@ -274,7 +536,9 @@ _GRAPH_OPTS_DEFAULTS = {
     # off by default and can be switched back on in Graph settings.
     "y_minor_ticks":     False,
     # Time axis
-    "x_ticks_max":       8,     # upper bound on time stamps across the plot
+    # Upper bound on time stamps across the plot. 12 (was 8) puts the round step
+    # one rung finer: 1 h → every 5 min instead of 10, 1 day → every 2 h, not 3.
+    "x_ticks_max":       12,
     "x_tick_seconds":    0,     # fixed spacing in s; 0 = pick a round one to fit
     "x_time_format":     "auto",  # auto | hms (12:34:56) | hm (12:34)
     # Plot rectangle (figure fractions)
@@ -317,14 +581,16 @@ _XY_CMAP = LinearSegmentedColormap.from_list(
 # so the button does not jump when it is pressed.
 _LIVE_BTN_OFF_STYLE = (
     "QPushButton{background:#2E7D32;color:white;font-weight:700;"
-    "padding:10px;border-radius:4px;font-size:13px;border:none;}"
+    "padding:4px 6px;border-radius:4px;font-size:13px;border:none;}"
     "QPushButton:hover{background:#1B5E20;}"
-    "QPushButton:disabled{background:#bbb;color:#888;}")
+    "QPushButton:disabled{background:#bbb;color:#444;}")
 _LIVE_BTN_ON_STYLE = (
     "QPushButton{background:#F57F17;color:white;font-weight:700;"
-    "padding:10px;border-radius:4px;font-size:13px;border:none;}"
+    "padding:4px 6px;border-radius:4px;font-size:13px;border:none;}"
     "QPushButton:hover{background:#EF6C00;}"
-    "QPushButton:disabled{background:#bbb;color:#888;}")
+    "QPushButton:disabled{background:#bbb;color:#444;}")
+# Height of the Time window / Live pair at the top of the sidebar.
+_TW_ROW_BTN_H = 36
 
 # Grid line styles, handed out in this order to the channels that have Grid
 # ticked, so several grids on one plot can be told apart. The colour already says
@@ -381,6 +647,83 @@ _CPV_SAFE_ENV = {"__builtins__": {}, "abs": abs, "min": min,
                  "max": max, "round": round, "math": math}
 
 
+def _np_min(*a):
+    return functools.reduce(np.minimum, a)
+
+
+def _np_max(*a):
+    return functools.reduce(np.maximum, a)
+
+
+# The same names over whole columns. The builtins fail on an array (and
+# np.minimum's third argument is ``out``, so min(A, B, C) needs the reduce).
+_CPV_NP_ENV = {"__builtins__": {}, "abs": np.abs, "min": _np_min,
+               "max": _np_max, "round": np.round, "math": np}
+
+
+def _cpv_numeric(v):
+    """A source value as a formula sees it: a number, else missing (NaN)."""
+    return float(v) if isinstance(v, (int, float)) else np.nan
+
+
+def _cpv_eval_columns(code, cols, n):
+    """Evaluate one compiled formula over whole columns at once.
+
+    ``cols`` maps each letter to a float array of length ``n`` with NaN where
+    the source has no number. Returns a float array, NaN where there is no
+    result. A formula numpy cannot take as a whole (``A if A > 0 else B``,
+    ``math.factorial``) is evaluated element by element with the scalar
+    environment instead — the answer is the same, only slower.
+    """
+    if n == 0:
+        return np.empty(0)
+    with np.errstate(all="ignore"):
+        try:
+            res = eval(code, _CPV_NP_ENV, dict(cols))
+            res = np.asarray(res, dtype=np.float64)
+            if res.shape != (n,):
+                res = np.broadcast_to(res, (n,)).astype(np.float64)
+            return np.where(np.isfinite(res), res, np.nan)
+        except Exception:
+            pass
+    out = np.full(n, np.nan)
+    letters = list(cols)
+    arrs = [cols[k] for k in letters]
+    for i in range(n):
+        ns = {}
+        for k, a in zip(letters, arrs):
+            x = a[i]
+            ns[k] = None if x != x else float(x)
+        try:
+            r = eval(code, _CPV_SAFE_ENV, ns)
+        except Exception:
+            continue
+        if isinstance(r, (int, float)) and math.isfinite(r):
+            out[i] = float(r)
+    return out
+
+
+def _held_column(ts_list, samples, pre_val):
+    """Each grid time → the value ``samples`` held at it (the last sample at or
+    before it), ``pre_val`` before the first one. ``ts_list`` is an int64 array
+    of sorted ns times; ``samples`` the PV's ``(ts_ns, value, units)`` list."""
+    n = ts_list.size
+    if not samples:
+        return np.full(n, _cpv_numeric(pre_val) if pre_val is not None else np.nan)
+    m = len(samples)
+    s_ts = np.fromiter((s[0] for s in samples), dtype=np.int64, count=m)
+    s_v = np.fromiter((_cpv_numeric(s[1]) for s in samples), dtype=np.float64, count=m)
+    if m > 1 and np.any(s_ts[1:] < s_ts[:-1]):
+        order = np.argsort(s_ts, kind="stable")
+        s_ts, s_v = s_ts[order], s_v[order]
+    idx = np.searchsorted(s_ts, ts_list, side="right") - 1
+    out = s_v[np.maximum(idx, 0)]
+    if np.any(idx < 0):
+        out = out.copy()
+        out[idx < 0] = _cpv_numeric(pre_val) if pre_val is not None else np.nan
+    return out
+
+
 def _cpv_vars(expr: str) -> list:
     """Ordered unique channel-letter variables appearing in ``expr``."""
     out = []
@@ -405,7 +748,7 @@ def _cpv_to_display(entry: dict, letter_by_pv: dict):
     """Rewrite a stored expression into the letters that are valid right now.
 
     Returns ``(expr_text, unbound)``; ``unbound`` lists the letters carrying no
-    binding (entries saved before bindings existed), which stay positional.
+    binding — they read nothing until a PV is picked for them.
     """
     expr     = entry.get("expr", "") or ""
     bindings = entry.get("bindings") or {}
@@ -559,10 +902,8 @@ def _export_row_ok(vals, conditions) -> bool:
         v = vals.get(pv)
         if not isinstance(v, (int, float)) or isinstance(v, bool):
             return False
-        vmin, vmax = cond.get("min"), cond.get("max")
-        if vmin is not None and v < vmin:
-            return False
-        if vmax is not None and v > vmax:
+        if not _cond_value_passes(v, cond.get("min"), cond.get("max"),
+                                  cond.get("outside", False)):
             return False
     return True
 
@@ -582,6 +923,33 @@ def _export_fmt(val, decimal_comma: bool) -> str:
     if isinstance(val, int):
         return str(val)
     return str(val)
+
+
+# ── Day cache ───────────────────────────────────────────────────────────────
+
+_DAY_CACHE = None
+
+
+def _day_cache():
+    """The one day cache every load (and every tab) shares — see cpva_cache.
+
+    On in the built program, where it lives on the scratch share. A run from
+    source (development, and every test) leaves it off unless CPVA_CACHE_DIR
+    names a folder: a test's fake archive must never land in the shared cache
+    everybody else reads. CPVA_CACHE_DIR="" switches it off in the program too.
+    """
+    global _DAY_CACHE
+    if _DAY_CACHE is None:
+        from cpva_cache import DayCache
+        env = os.environ.get("CPVA_CACHE_DIR")
+        if env is not None:
+            root = env
+        elif getattr(sys, "frozen", False):
+            root = None            # look for the scratch share, in the background
+        else:
+            root = ""
+        _DAY_CACHE = DayCache(root)
+    return _DAY_CACHE
 
 
 # ── Signal helpers ─────────────────────────────────────────────────────────
@@ -608,24 +976,98 @@ class _WheelGuard(QObject):
     """The mouse wheel must never change a number box or a drop-down just
     because the pointer happens to hover over it.
 
-    A field only reacts to the wheel once it has been clicked into (focused);
-    otherwise the scroll is handed to the panel underneath, so the toolbar or
-    the page scrolls the way the user expects.
+    A field only reacts to the wheel after it has been clicked, and only while
+    the pointer has stayed on it since; otherwise the scroll is handed to the
+    panel underneath, so the toolbar or the page scrolls the way the user
+    expects.
+
+    "Has focus" was the old test and it never held: a combo box and a spin box
+    take keyboard focus FROM THE WHEEL ITSELF (Qt's default WheelFocus policy,
+    applied before any event filter sees the event), so the first scroll over
+    an untouched field focused it and then changed it. And a field clicked a
+    minute ago kept its focus and changed again when the page was scrolled
+    over it. So every such field is switched to StrongFocus when it is
+    polished, and the wheel is gated on a click that is "armed" until the
+    pointer leaves the field.
+
+    Tab bars and calendars never take the wheel at all: over a tab bar it
+    switched tabs, over a calendar's day grid it flipped the month — and in
+    the time-window dialog that silently moved the From/To day.
     """
 
     _TARGETS = (QAbstractSpinBox, QComboBox, QSlider)
+    _NEVER = (QTabBar, QCalendarWidget)
+    _ARMED = "_wheel_armed"
 
-    def eventFilter(self, obj, ev):
-        if ev.type() != QEvent.Type.Wheel or not isinstance(obj, self._TARGETS):
-            return False
-        if obj.hasFocus():
-            return False                    # clicked into it -> normal behaviour
+    @classmethod
+    def _never_target(cls, obj):
+        """True for a tab bar, or any part of a calendar (its day grid is a
+        view nested two levels inside the QCalendarWidget)."""
+        w = obj
+        for _ in range(4):
+            if w is None or not isinstance(w, QWidget):
+                return False
+            if isinstance(w, cls._NEVER):
+                return True
+            w = w.parentWidget()
+        return False
+
+    @staticmethod
+    def _in_calendar(w):
+        for _ in range(4):
+            w = w.parentWidget() if w is not None else None
+            if isinstance(w, QCalendarWidget):
+                return True
+        return False
+
+    @classmethod
+    def _pass_to_panel(cls, obj, ev):
         w = obj.parentWidget()
         while w is not None:                # pass the scroll on to the panel
-            if isinstance(w, QAbstractScrollArea):
+            # The calendar's own day grid is a scroll area too: skip it.
+            if isinstance(w, QAbstractScrollArea) and not cls._in_calendar(w):
                 QApplication.sendEvent(w.viewport(), ev)
                 break
             w = w.parentWidget()
+
+    def _target_of(self, obj):
+        """The guarded field ``obj`` belongs to — itself, or the spin box /
+        combo whose inner line edit received the event."""
+        w = obj
+        for _ in range(3):
+            if w is None or not isinstance(w, QWidget):
+                return None
+            if isinstance(w, self._TARGETS):
+                return w
+            w = w.parentWidget()
+        return None
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.Polish:
+            if isinstance(obj, self._TARGETS) and \
+                    obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            return False
+        if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+            tgt = self._target_of(obj)
+            if tgt is not None:
+                tgt.setProperty(self._ARMED, True)
+            return False
+        if t in (QEvent.Type.Leave, QEvent.Type.FocusOut, QEvent.Type.Hide):
+            if isinstance(obj, self._TARGETS) and obj.property(self._ARMED):
+                obj.setProperty(self._ARMED, False)
+            return False
+        if t != QEvent.Type.Wheel:
+            return False
+        if not isinstance(obj, self._TARGETS):
+            if not self._never_target(obj):
+                return False
+            self._pass_to_panel(obj, ev)
+            return True
+        if obj.property(self._ARMED) and obj.hasFocus():
+            return False                    # clicked into it -> normal behaviour
+        self._pass_to_panel(obj, ev)
         return True
 
 
@@ -663,6 +1105,79 @@ def _install_wheel_guard():
     guard = _WheelGuard(app)
     app._wheel_guard = guard
     app.installEventFilter(guard)
+
+
+class _HeaderDropMarker(QObject):
+    """Blue upright line showing where a dragged column heading will land.
+
+    Qt moves the section on release but draws no marker on the way. This only
+    watches the header's mouse events (it never takes one away from Qt) and
+    works out the landing place with Qt's own rule (qheaderview.cpp, the
+    MoveSection branch of mouseMoveEvent)."""
+
+    _WIDTH = 3
+
+    def __init__(self, table):
+        super().__init__(table)
+        self._tv   = table
+        self._hdr  = table.horizontalHeader()
+        self._line = QFrame(table)
+        self._line.setStyleSheet("QFrame{background:#1565C0;border:none;}")
+        self._line.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._line.hide()
+        self._press = None          # (x, logical section) of a press that may become a move
+        self._hdr.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Type.MouseButtonPress:
+            self._press = None
+            x = int(ev.position().x())
+            sec = self._hdr.logicalIndexAt(x)
+            # A press on a column edge starts a resize, not a move.
+            resizing = (self._hdr.viewport().cursor().shape()
+                        == Qt.CursorShape.SplitHCursor)
+            if (ev.button() == Qt.MouseButton.LeftButton and sec >= 0
+                    and not resizing and self._hdr.sectionsMovable()):
+                self._press = (x, sec)
+        elif t == QEvent.Type.MouseMove:
+            if self._press is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+                self._update(int(ev.position().x()))
+        elif t in (QEvent.Type.MouseButtonRelease, QEvent.Type.Hide):
+            self._press = None
+            self._line.hide()
+        return False
+
+    def _update(self, x):
+        x0, sec = self._press
+        if abs(x - x0) < QApplication.startDragDistance():
+            return
+        hdr    = self._hdr
+        visual = hdr.visualIndexAt(x)
+        if visual < 0:
+            return                   # past the last column: Qt keeps the old target too
+        moving    = hdr.visualIndex(sec)
+        under     = hdr.logicalIndex(visual)
+        threshold = hdr.sectionViewportPosition(under) + hdr.sectionSize(under) // 2
+        if visual < moving:
+            target = under if x < threshold else hdr.logicalIndex(visual + 1)
+        elif visual > moving:
+            target = under if x > threshold else hdr.logicalIndex(visual - 1)
+        else:
+            target = sec
+        tv = hdr.visualIndex(target)
+        if target < 0 or tv == moving:
+            self._line.hide()
+            return
+        edge = hdr.sectionViewportPosition(target)
+        if tv > moving:
+            edge += hdr.sectionSize(target)
+        edge = max(0, min(edge, hdr.viewport().width()))
+        left = hdr.x() + edge - self._WIDTH // 2
+        self._line.setGeometry(left, hdr.y(), self._WIDTH,
+                               self._tv.height() - hdr.y())
+        self._line.raise_()
+        self._line.show()
 
 
 class _CenteredCheckDelegate(QStyledItemDelegate):
@@ -753,10 +1268,24 @@ class _ColorSwatchDelegate(QStyledItemDelegate):
             super().paint(painter, option, index)
 
     def editorEvent(self, event, model, option, index):
-        from PySide6.QtCore import QEvent
-        if event.type() == QEvent.Type.MouseButtonRelease:
+        # Only a left click that starts AND ends on this cell opens the picker:
+        # a right/middle click, or the end of a row drag dropped here, used to
+        # open it too.
+        etype = event.type()
+        if etype in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+        if etype == QEvent.Type.MouseButtonPress:
+            self._pressed = (index.row(), index.column())
+            return False
+        if etype == QEvent.Type.MouseButtonRelease:
+            pressed, self._pressed = getattr(self, "_pressed", None), None
+            if pressed != (index.row(), index.column()):
+                return False
             current = index.data(Qt.ItemDataRole.UserRole) or "#1976D2"
-            color = QColorDialog.getColor(QColor(current), None, "Choose color")
+            view = option.widget
+            parent = view.window() if isinstance(view, QWidget) else None
+            color = QColorDialog.getColor(QColor(current), parent, "Choose color")
             if color.isValid():
                 model.setData(index, color.name(), Qt.ItemDataRole.UserRole)
                 self.color_changed.emit(index.row(), color.name())
@@ -785,6 +1314,8 @@ _MARKER_HOLLOW = {"○"}          # same glyph as ●, drawn with a white face
 # Reference lines offer the same line styles, minus "none" (an invisible
 # reference line is never what anyone wants).
 _REF_LINE_STYLES = {k: v for k, v in _LINE_STYLES.items() if k != "none"}
+# Which side of a reference line counts as crossing it (Limit crossings).
+_REF_CROSSING = ("above", "below", "off")
 
 # PV-list columns the user cannot type into: either the PV name itself or a
 # number the program measures and fills in.
@@ -1135,6 +1666,11 @@ _LIVE_MAX_SPAN_S = 86400 * 366
 # clamped — Live now only ever starts for a period that ends at "now", and above
 # this span the cost is stated in the Log instead. See _live_span_from_window.
 _LIVE_SLOW_SPAN_S = 24 * 3600
+# A setting tab that is not on screen still follows "now" in Live, but asks the
+# archiver only this often (the user's choice, 12.10.2026: slow in the
+# background, caught up at once when the tab is shown). Well inside
+# _LIVE_TICK_LOOKBACK_NS, so a hidden tick never misses a stretch.
+HIDDEN_LIVE_POLL_MS = 10_000
 
 # How far back a single live tick may ask for data. _live_last_ts only advances
 # when new samples actually arrive, so on a quiet archiver it stays pinned to the
@@ -1149,6 +1685,10 @@ _LIVE_TICK_LOOKBACK_NS = int(120e9)          # 2 min ≤ CHUNK_SIZE_NS (1 h)
 # next tick asks for a small slice instead of re-asking for everything since the
 # last sample. The overlap is what covers archiver ingestion lag.
 _LIVE_TICK_OVERLAP_NS = int(30e9)
+# Every tick also re-asks this much from before the newest sample of any PV, so
+# a slower channel's sample that is archived a moment late is still picked up.
+# Duplicates cannot result: each PV keeps only samples newer than its own last.
+_LIVE_LATE_ARRIVAL_NS = int(5e9)
 
 # Rebuilding the whole QTableWidget on every live tick gets visibly laggy once
 # the row count grows large, so only the most recent rows are ever rendered.
@@ -1247,6 +1787,170 @@ def _downsample_arrays_mean(ts, vals, target: int):
     return t0 + sum_t / c, sum_v / c
 
 
+# ── Min/max envelope ───────────────────────────────────────────────────────
+# A thinned point from the archiver carries the mean of its interval AND the
+# lowest and highest value really archived in it (measured 2026-09-30 on PCM4:
+# raw day max 38.8465, the means peak at 38.8229, the maxima at 38.8465 exactly).
+# Drawing the mean alone hides every spike, so the graph draws the band from
+# minimum to maximum under the line, the way CS Studio's "Area" trace does.
+
+def _num1(x):
+    """A one-element list (how the archiver wraps scalars) → the element."""
+    if isinstance(x, list) and len(x) == 1:
+        x = x[0]
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def _minmax_arrays(raw_samples):
+    """Archiver sample dicts → (ts, lo, hi) float64 arrays, sorted by time.
+
+    Every numeric sample is kept, so a lookup always lands on the channel's own
+    sample: a thinned one brings its minimum/maximum, a raw one its value twice.
+    None when nothing in the list carries a real spread (a raw-only channel),
+    so a plain channel costs no memory.
+    """
+    ts, lo, hi = [], [], []
+    spread = False
+    for s in raw_samples:
+        t = s.get("time")
+        v = _num1(s.get("value"))
+        if t is None or v is None:
+            continue
+        mn, mx = _num1(s.get("minimum")), _num1(s.get("maximum"))
+        if mn is None or mx is None:
+            mn = mx = v
+        elif mn != mx:
+            spread = True
+        ts.append(t); lo.append(min(mn, v)); hi.append(max(mx, v))
+    if not spread:
+        return None
+    ts_a = np.asarray(ts, dtype=np.float64)
+    order = np.argsort(ts_a, kind="stable")
+    return (ts_a[order], np.asarray(lo, dtype=np.float64)[order],
+            np.asarray(hi, dtype=np.float64)[order])
+
+
+def _envelope_for(ts, vals, mm):
+    """Low/high edge for each (ts, value) of a trace, from the channel's own
+    samples (`mm` from _minmax_arrays). A held value (a row where another
+    channel moved) gets the envelope of the sample it is held from. No `mm`,
+    or a point before the first sample: the edges are the value itself."""
+    lo = vals.copy(); hi = vals.copy()
+    if mm is None or not ts.size:
+        return lo, hi
+    m_ts, m_lo, m_hi = mm
+    idx = np.searchsorted(m_ts, ts, side="right") - 1
+    ok = idx >= 0
+    if ok.any():
+        j = idx[ok]
+        lo[ok] = np.fmin(m_lo[j], vals[ok])
+        hi[ok] = np.fmax(m_hi[j], vals[ok])
+    return lo, hi
+
+
+def _downsample_arrays_envelope(ts, vals, lo, hi, target: int):
+    """Like _downsample_arrays_mean, but each bin also keeps the LOWEST low
+    edge and the HIGHEST high edge that fell into it — so thinning for the
+    screen never loses a spike. Arrays at or under the target are untouched."""
+    n = ts.size
+    if target <= 0 or n <= target:
+        return ts, vals, lo, hi
+    t0   = ts[0]
+    rel  = ts - t0
+    span = rel[-1]
+    if not (span > 0):
+        return ts, vals, lo, hi
+    idx  = np.minimum((rel / (span / target)).astype(np.int64), target - 1)
+    cnt  = np.bincount(idx, minlength=target)
+    keep = cnt > 0
+    c    = cnt[keep].astype(np.float64)
+    sum_t = np.bincount(idx, weights=rel,  minlength=target)[keep]
+    sum_v = np.bincount(idx, weights=vals, minlength=target)[keep]
+    # ts is sorted, so each bin is one contiguous run: reduceat over its starts.
+    starts = np.flatnonzero(np.diff(idx, prepend=-1))
+    b_lo = np.fmin.reduceat(lo, starts)
+    b_hi = np.fmax.reduceat(hi, starts)
+    return t0 + sum_t / c, sum_v / c, b_lo, b_hi
+
+
+def _has_spread(lo, hi) -> bool:
+    """True when any point's band is wider than a line."""
+    with np.errstate(invalid="ignore"):
+        return bool(lo.size) and bool(np.any(hi > lo))
+
+
+# ── Limit crossings ────────────────────────────────────────────────────────
+# Found in two steps. The thinned points say WHERE a crossing can be (an
+# interval whose maximum is over the line — exact, since the maximum is the
+# archived one); only those intervals are then read raw, which gives the exact
+# time and value of every shot over the line at a small cost.
+
+_CROSS_RAW_MAX_RANGES = 400             # more candidate stretches than this ...
+_CROSS_RAW_MAX_NS     = 7 * 86400 * 10**9   # ... or more time: interval-level only
+
+
+def _crosses(vals, y, side):
+    with np.errstate(invalid="ignore"):
+        return vals > y if side == "above" else vals < y
+
+
+def _crossing_candidates(ts, lo, hi, y, side, end_ns):
+    """Stretches [a, b) of a sample-held series in which the line may be
+    crossed: a sample's interval runs until the next sample (the last one to
+    `end_ns`). Touching stretches are merged."""
+    if not ts.size:
+        return []
+    edge = hi if side == "above" else lo
+    hit = np.flatnonzero(_crosses(edge, y, side))
+    out = []
+    for i in hit:
+        a = int(ts[i])
+        b = int(ts[i + 1]) if i + 1 < ts.size else int(end_ns)
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, max(a + 1, b)))
+    return out
+
+
+def _crossing_episodes(ts, vals, y, side, end_ns, exact=True, lo=None, hi=None):
+    """Runs of consecutive samples on the wrong side of the line.
+
+    Each episode: start (first sample over), end (first sample back, or None
+    if still over at `end_ns`), peak value and its time, sample count, and
+    whether it is exact (raw samples) or only to the interval (thinned).
+    """
+    if not ts.size:
+        return []
+    edge = vals
+    if not exact:
+        edge = hi if side == "above" else lo
+    over = _crosses(edge, y, side)
+    eps = []
+    i, n = 0, ts.size
+    while i < n:
+        if not over[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and over[j + 1]:
+            j += 1
+        seg = edge[i:j + 1]
+        k = int(np.nanargmax(seg) if side == "above" else np.nanargmin(seg))
+        eps.append({
+            "start": int(ts[i]),
+            "end":   int(ts[j + 1]) if j + 1 < n else None,
+            "peak":  float(seg[k]),
+            "peak_at": int(ts[i + k]),
+            "samples": j - i + 1,
+            "exact": exact,
+        })
+        i = j + 1
+    if eps and eps[-1]["end"] is None and end_ns is not None:
+        eps[-1]["open_until"] = int(end_ns)
+    return eps
+
+
 def _moving_avg_np(vals, w: int):
     """Trailing moving average of a float array, same length as the input.
     NaNs only affect the windows they fall into (a cumsum-based version would
@@ -1257,29 +1961,73 @@ def _moving_avg_np(vals, w: int):
     return np.convolve(ext, np.full(w, 1.0 / w), mode="valid")
 
 
-class TimeWindowDialog(QDialog):
-    """CS-Studio-style Start/End time picker.
+_TW_BTN_STYLE = (
+    "QPushButton{background:#f5f5f5;color:#111111;border:1px solid #aaaaaa;"
+    "border-radius:3px;padding:3px 8px;}"
+    "QPushButton:hover{background:#e3e3e3;}"
+    "QPushButton:checked{background:#1565C0;color:#ffffff;border-color:#0D47A1;}"
+    "QPushButton:disabled{color:#9e9e9e;}")
+_TW_TIME_STYLE = (
+    "QTimeEdit{background:#ffffff;color:#111111;border:1px solid #aaaaaa;"
+    "border-radius:3px;padding:2px 4px;}"
+    "QTimeEdit:disabled{color:#9e9e9e;background:#f2f2f2;}")
 
-    Each side (Start, End) has an Absolute tab (calendar + clock) and a Relative
-    tab (years…seconds before/after now). The bottom status line mirrors CS Studio
-    ("Start Time: -1 hours 0.0 seconds" / "End Time: now").
+
+_TW_TABS_STYLE = (
+    "QTabWidget::pane{border:1px solid #9e9e9e;background:#f7f7f7;top:-1px;}"
+    "QTabBar::tab{background:#e3e3e3;color:#111111;border:1px solid #9e9e9e;"
+    "border-bottom:none;padding:4px 12px;margin-right:2px;"
+    "border-top-left-radius:3px;border-top-right-radius:3px;}"
+    "QTabBar::tab:selected{background:#f7f7f7;color:#111111;font-weight:600;}"
+    "QTabBar::tab:!selected{margin-top:2px;}"
+    "QTabBar::tab:hover{background:#ececec;}")
+_TW_SPIN_STYLE = (
+    "QSpinBox{background:#ffffff;color:#111111;border:1px solid #aaaaaa;"
+    "border-radius:3px;padding:2px 4px;}")
+_TW_FIELD_STYLE = (
+    "QLineEdit{background:#ffffff;color:#111111;border:1px solid #aaaaaa;"
+    "border-radius:3px;padding:2px 4px;}")
+
+
+class TimeWindowDialog(QDialog):
+    """CS-Studio-style Start/End time picker, in the Image Tools look.
+
+    Two panes side by side, Start and End, each with two tabs like CS Studio:
+    "Absolute" (calendar + clock) and "Relative" (a span before/after now in
+    years … seconds, plus quick spans). Both tabs of a pane take the same room
+    and the window has one fixed size, so switching a tab never makes the
+    window jump. While a pane is relative, its calendar and clock follow the
+    moment the span gives, so switching to Absolute starts from there. The
+    bottom line mirrors CS Studio ("Start Time: - 1 hours" / "End Time: now").
     """
+
+    _PRESETS = [("30 min", 0, 0, 30), ("1 h", 0, 1, 0), ("2 h", 0, 2, 0),
+                ("6 h", 0, 6, 0), ("12 h", 0, 12, 0), ("1 day", 1, 0, 0),
+                ("3 days", 3, 0, 0), ("7 days", 7, 0, 0)]
+    # The span boxes, laid out as CS Studio does: two columns of three.
+    _UNIT_ROWS = (("Years", "Hours"), ("Months", "Minutes"), ("Days", "Secs"))
 
     def __init__(self, parent, dt_from: datetime, dt_to: datetime):
         super().__init__(parent)
         self.setWindowTitle("Start/End Time")
-        self.setMinimumSize(720, 470)
         self.setModal(True)
         self._result_from = dt_from
         self._result_to   = dt_to
         self._sides: dict = {}
+        self._syncing = False
+        self._live_requested = False
         self._build_ui(dt_from, dt_to)
         self._refresh_status()
+        # One size for every tab and every text in the status fields.
+        self.setFixedSize(self.sizeHint())
 
     # ── construction ──────────────────────────────────────────────────────
     def _build_ui(self, dt_from, dt_to):
         lay = QVBoxLayout(self)
-        row = QHBoxLayout(); lay.addLayout(row, stretch=1)
+        lay.setContentsMargins(10, 10, 10, 8)
+        lay.setSpacing(8)
+
+        row = QHBoxLayout(); row.setSpacing(10); lay.addLayout(row)
 
         # Default relative span: Start = window length before now, End = now.
         # Decompose into days/hours/minutes/seconds so the user's units survive a
@@ -1295,38 +2043,55 @@ class TimeWindowDialog(QDialog):
         row.addWidget(self._build_side("from", dt_from, rel_from, is_start=True))
         row.addWidget(self._build_side("to",   dt_to,   {},       is_start=False))
 
-        # Status strip
-        st_row = QHBoxLayout()
-        self._lbl_start_status = QLabel("Start Time:")
-        self._lbl_end_status   = QLabel("End Time:")
-        for l in (self._lbl_start_status, self._lbl_end_status):
-            l.setStyleSheet("color:#1565C0;font-weight:600;")
-        st_row.addWidget(self._lbl_start_status, stretch=1)
-        st_row.addWidget(self._lbl_end_status,   stretch=1)
+        # What the two panes say, in words — read-only fields of a fixed
+        # width, so a longer text never widens the window.
+        st_row = QHBoxLayout(); st_row.setSpacing(6)
+        self._lbl_start_status = QLineEdit()
+        self._lbl_end_status   = QLineEdit()
+        for caption, fld in (("Start Time:", self._lbl_start_status),
+                             ("End Time:", self._lbl_end_status)):
+            cap = QLabel(caption)
+            cap.setStyleSheet("color:#111111;font-weight:600;")
+            fld.setReadOnly(True)
+            fld.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            fld.setStyleSheet(_TW_FIELD_STYLE)
+            fld.setSizePolicy(QSizePolicy.Policy.Ignored,
+                              QSizePolicy.Policy.Fixed)
+            st_row.addWidget(cap)
+            st_row.addWidget(fld, stretch=1)
         lay.addLayout(st_row)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._on_ok)
         btns.rejected.connect(self.reject)
+        for b in btns.buttons():
+            b.setStyleSheet(_TW_BTN_STYLE)
+            b.setMinimumWidth(80)
         lay.addWidget(btns)
 
-        # Default to the Relative view (matches CS Studio: "-1 hours" / "now").
+        # Default to the relative mode (matches CS Studio: "-1 hours" / "now").
         # Done last so the status labels already exist when currentChanged fires.
         self._sides["from"]["tabs"].setCurrentIndex(1)
         self._sides["to"]["tabs"].setCurrentIndex(1)
+        self._apply_modes()
 
     def _build_side(self, which, init_dt, rel_values, is_start):
+        word = "Start" if is_start else "End"
         tabs = QTabWidget()
-        abs_lbl = "Absolute Start" if is_start else "Absolute End"
-        rel_lbl = "Relative Start" if is_start else "Relative End"
+        tabs.setStyleSheet(_TW_TABS_STYLE)
 
-        # ── Absolute tab ──
-        abs_w = QWidget(); abs_lay = QVBoxLayout(abs_w)
+        # ── Absolute tab: calendar, clock, quick times ──
+        abs_page = QWidget()
+        v = QVBoxLayout(abs_page)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
         q_init = QDate(init_dt.year, init_dt.month, init_dt.day)
         # follow_page: this side's value is the one selected day, so paging the
         # calendar must move it — see _make_calendar.
         frame, cal = _make_calendar(q_init, follow_page=True)
+        cal.setMinimumSize(260, 160)
         # Make clicks register visually (highlight) — the weekend delegate paints
         # selection from its own list, so we must feed it on every click.
         def _on_click(d, c=cal):
@@ -1340,70 +2105,132 @@ class TimeWindowDialog(QDialog):
         cal.selectionChanged.connect(self._refresh_status)
         deleg = getattr(cal, "_wk_delegate", None)
         if deleg is not None: deleg.set_selected([q_init])
-        abs_lay.addWidget(frame)
+        v.addWidget(frame, stretch=1)
 
-        t_row = QHBoxLayout(); t_row.addWidget(QLabel("Time:"))
-        h = QSpinBox(); h.setRange(0, 23); h.setValue(init_dt.hour); h.setFixedWidth(52)
-        m = QSpinBox(); m.setRange(0, 59); m.setValue(init_dt.minute); m.setFixedWidth(52)
-        s = QSpinBox(); s.setRange(0, 59); s.setValue(init_dt.second); s.setFixedWidth(52)
-        for sp in (h, m, s): sp.valueChanged.connect(self._refresh_status)
-        t_row.addWidget(h); t_row.addWidget(QLabel(":")); t_row.addWidget(m)
-        t_row.addWidget(QLabel(":")); t_row.addWidget(s); t_row.addStretch()
-        abs_lay.addLayout(t_row)
+        t_row = QHBoxLayout(); t_row.setSpacing(6)
+        t_row.addStretch()
+        t_lbl = QLabel("Time:"); t_lbl.setStyleSheet("color:#111111;")
+        t_row.addWidget(t_lbl)
+        tedit = QTimeEdit(QTime(init_dt.hour, init_dt.minute, init_dt.second))
+        tedit.setDisplayFormat("HH:mm:ss")
+        tedit.setButtonSymbols(QTimeEdit.ButtonSymbols.NoButtons)
+        tedit.setStyleSheet(_TW_TIME_STYLE)
+        tedit.setFixedWidth(74)
+        tedit.timeChanged.connect(self._refresh_status)
+        t_row.addWidget(tedit)
+        t_row.addStretch()
+        v.addLayout(t_row)
 
-        q_row = QHBoxLayout()
+        q_row = QHBoxLayout(); q_row.setSpacing(4)
+        q_row.addStretch()
+        abs_btns = []
         for lbl in ("Now", "00:00", "12:00"):
-            b = QPushButton(lbl); b.setFixedWidth(56)
+            b = QPushButton(lbl); b.setStyleSheet(_TW_BTN_STYLE)
             b.clicked.connect(self._mk_abs_quick(which, lbl))
             q_row.addWidget(b)
+            abs_btns.append(b)
+        if not is_start:
+            # End follows the clock and the graph goes live on OK; Start gets a
+            # default of one hour back, which the user may change afterwards.
+            live_b = QPushButton("Live"); live_b.setStyleSheet(_TW_BTN_STYLE)
+            live_b.setToolTip("End = now, following the clock; Start = 1 hour "
+                              "before now (can be changed). OK starts Live mode.")
+            live_b.clicked.connect(self._on_live)
+            q_row.addWidget(live_b)
+            abs_btns.append(live_b)
         q_row.addStretch()
-        abs_lay.addLayout(q_row)
-        tabs.addTab(abs_w, abs_lbl)
+        v.addLayout(q_row)
 
-        # ── Relative tab ──
-        rel_w = QWidget(); rel_lay = QVBoxLayout(rel_w)
+        # ── Relative tab: the span, quick spans, before/after, now ──
+        rel_page = QWidget()
+        rv = QVBoxLayout(rel_page)
+        rv.setContentsMargins(10, 10, 10, 8)
+        rv.setSpacing(8)
+
         grid = QGridLayout()
-        specs = [("Years", 0, 0), ("Hours", 0, 2), ("Months", 1, 0),
-                 ("Minutes", 1, 2), ("Days", 2, 0), ("Secs", 2, 2)]
+        grid.setHorizontalSpacing(6); grid.setVerticalSpacing(6)
+        grid.setColumnMinimumWidth(2, 14)
         rel_spins = {}
-        for name, r, c in specs:
-            sp = QSpinBox(); sp.setRange(0, 9999); sp.setFixedWidth(70)
-            sp.valueChanged.connect(self._refresh_status)
-            grid.addWidget(QLabel(name + ":"), r, c)
-            grid.addWidget(sp, r, c + 1)
-            rel_spins[name] = sp
+        for r, pair in enumerate(self._UNIT_ROWS):
+            for k, name in enumerate(pair):
+                lbl = QLabel(f"{name}:"); lbl.setStyleSheet("color:#111111;")
+                sp = QSpinBox(); sp.setRange(0, 9999)
+                sp.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+                sp.setAlignment(Qt.AlignmentFlag.AlignRight)
+                sp.setFixedWidth(64)
+                sp.setStyleSheet(_TW_SPIN_STYLE)
+                sp.valueChanged.connect(self._refresh_status)
+                grid.addWidget(lbl, r, 3 * k)
+                grid.addWidget(sp, r, 3 * k + 1)
+                rel_spins[name] = sp
+        grid.setColumnStretch(5, 1)
+        rv.addLayout(grid)
         for name, val in (rel_values or {}).items():
             if name in rel_spins:
                 rel_spins[name].setValue(val)
-        rel_lay.addLayout(grid)
 
-        qr = QHBoxLayout()
-        for lbl, hrs in [("12 h", 12), ("1 Day", 24), ("3 Days", 72), ("7 Days", 168)]:
-            b = QPushButton(lbl); b.setFixedWidth(58)
-            b.clicked.connect(self._mk_rel_quick(which, hrs))
-            qr.addWidget(b)
-        rel_lay.addLayout(qr)
+        # Quick spans. On Start they mean "the last N, up to now" (End is put
+        # on now as well); on End they set End's own span.
+        qg = QGridLayout(); qg.setSpacing(4)
+        for i, (text, d, h, m) in enumerate(self._PRESETS):
+            b = QPushButton(text); b.setStyleSheet(_TW_BTN_STYLE)
+            if is_start:
+                b.setToolTip(f"From {text} ago up to now (follows the clock)")
+                b.clicked.connect(self._mk_preset(d, h, m))
+            else:
+                b.setToolTip(f"End {text} before now")
+                b.clicked.connect(self._mk_rel_span(which, d, h, m))
+            qg.addWidget(b, i // 4, i % 4)
+        rv.addLayout(qg)
 
-        br = QHBoxLayout()
-        before = QCheckBox("Before…"); before.setChecked(True)
+        b_row = QHBoxLayout(); b_row.setSpacing(6)
+        before = QCheckBox("Before now")
+        before.setToolTip("Ticked: the span is counted back from now; "
+                          "unticked: forward from now")
+        before.setChecked(True)
         before.setStyleSheet(_CHK_STYLE)
         before.toggled.connect(self._refresh_status)
-        now_b = QPushButton("Now"); now_b.setFixedWidth(56)
+        b_row.addWidget(before)
+        b_row.addStretch()
+        now_b = QPushButton("Now"); now_b.setStyleSheet(_TW_BTN_STYLE)
+        now_b.setToolTip(f"Zero span: {word} is \"now\" and follows the clock")
         now_b.clicked.connect(self._mk_rel_now(which))
-        br.addWidget(before); br.addStretch(); br.addWidget(now_b)
-        rel_lay.addLayout(br)
-        rel_lay.addStretch()
-        tabs.addTab(rel_w, rel_lbl)
+        b_row.addWidget(now_b)
+        rv.addLayout(b_row)
+        rv.addStretch(1)
 
-        tabs.currentChanged.connect(self._refresh_status)
+        tabs.addTab(abs_page, f"Absolute {word}")
+        tabs.addTab(rel_page, f"Relative {word}")
+        tabs.currentChanged.connect(lambda _i: self._refresh_status())
 
         self._sides[which] = {
-            "tabs": tabs, "cal": cal, "h": h, "m": m, "s": s,
-            "rel": rel_spins, "before": before,
+            "tabs": tabs, "cal": cal, "frame": frame, "time": tedit,
+            "abs_btns": abs_btns, "rel": rel_spins, "before": before,
+            "rel_widgets": list(rel_spins.values()) + [before, now_b],
         }
         return tabs
 
+    def _apply_modes(self):
+        """Each mode has its own tab now, so nothing needs greying out or
+        hiding — kept so the quick buttons can still call it."""
+        return
+
     # ── quick-button factories ────────────────────────────────────────────
+    def _mk_preset(self, days, hours, minutes):
+        def _cb():
+            for which in ("from", "to"):
+                sd = self._sides[which]
+                for sp in sd["rel"].values():
+                    sp.setValue(0)
+                sd["before"].setChecked(True)
+                sd["tabs"].setCurrentIndex(1)
+            r = self._sides["from"]["rel"]
+            r["Days"].setValue(days); r["Hours"].setValue(hours)
+            r["Minutes"].setValue(minutes)
+            self._apply_modes()
+            self._refresh_status()
+        return _cb
+
     def _mk_abs_quick(self, which, kind):
         def _cb():
             sd = self._sides[which]
@@ -1412,11 +2239,11 @@ class TimeWindowDialog(QDialog):
                 sd["cal"].setSelectedDate(QDate(t.year, t.month, t.day))
                 deleg = getattr(sd["cal"], "_wk_delegate", None)
                 if deleg is not None: deleg.set_selected([QDate(t.year, t.month, t.day)])
-                sd["h"].setValue(t.hour); sd["m"].setValue(t.minute); sd["s"].setValue(t.second)
+                sd["time"].setTime(QTime(t.hour, t.minute, t.second))
             elif kind == "00:00":
-                sd["h"].setValue(0); sd["m"].setValue(0); sd["s"].setValue(0)
+                sd["time"].setTime(QTime(0, 0, 0))
             elif kind == "12:00":
-                sd["h"].setValue(12); sd["m"].setValue(0); sd["s"].setValue(0)
+                sd["time"].setTime(QTime(12, 0, 0))
             self._refresh_status()
         return _cb
 
@@ -1431,6 +2258,18 @@ class TimeWindowDialog(QDialog):
             self._refresh_status()
         return _cb
 
+    def _mk_rel_span(self, which, days, hours, minutes):
+        def _cb():
+            sd = self._sides[which]
+            for sp in sd["rel"].values():
+                sp.setValue(0)
+            sd["rel"]["Days"].setValue(days)
+            sd["rel"]["Hours"].setValue(hours)
+            sd["rel"]["Minutes"].setValue(minutes)
+            sd["before"].setChecked(True)
+            self._refresh_status()
+        return _cb
+
     def _mk_rel_now(self, which):
         def _cb():
             sd = self._sides[which]
@@ -1438,13 +2277,32 @@ class TimeWindowDialog(QDialog):
             self._refresh_status()
         return _cb
 
+    def _on_live(self):
+        """The "Live" button on Absolute End: End becomes "now" (its Relative
+        tab, every box zero) and Start "- 1 hours". Start stays editable; OK
+        then starts Live mode as long as End is still "now"."""
+        self._live_requested = True
+        for which, hours in (("to", 0), ("from", 1)):
+            sd = self._sides[which]
+            for sp in sd["rel"].values():
+                sp.setValue(0)
+            sd["rel"]["Hours"].setValue(hours)
+            sd["before"].setChecked(True)
+            sd["tabs"].setCurrentIndex(1)
+        self._refresh_status()
+
+    def wants_live(self) -> bool:
+        """Was "Live" pressed, and does the period still end at "now"?"""
+        return self._live_requested and self.ends_at_now()
+
     # ── computation ───────────────────────────────────────────────────────
     def _compute(self, which):
         sd = self._sides[which]
         if sd["tabs"].currentIndex() == 0:          # Absolute
             d = sd["cal"].selectedDate()
+            t = sd["time"].time()
             return datetime(d.year(), d.month(), d.day(),
-                            sd["h"].value(), sd["m"].value(), sd["s"].value())
+                            t.hour(), t.minute(), t.second())
         # Relative — approximate years/months as 365/30 days
         r = sd["rel"]
         delta = timedelta(
@@ -1466,15 +2324,34 @@ class TimeWindowDialog(QDialog):
         return sign + " " + " ".join(parts)
 
     def _refresh_status(self):
-        if len(self._sides) < 2:        # both sides must exist (guards construction)
+        if len(self._sides) < 2 or self._syncing:   # guards construction
             return
         f = self._compute("from"); t = self._compute("to")
+        # A relative side shows on its (greyed) calendar and clock the moment
+        # its span gives, so both calendars always say where the period lies.
+        self._syncing = True
+        try:
+            for which, dt in (("from", f), ("to", t)):
+                sd = self._sides[which]
+                if sd["tabs"].currentIndex() != 1:
+                    continue
+                qd = QDate(dt.year, dt.month, dt.day)
+                sd["cal"].setSelectedDate(qd)
+                sd["cal"].setCurrentPage(dt.year, dt.month)
+                deleg = getattr(sd["cal"], "_wk_delegate", None)
+                if deleg is not None:
+                    deleg.set_selected([qd])
+                sd["time"].setTime(QTime(dt.hour, dt.minute, dt.second))
+        finally:
+            self._syncing = False
         f_txt = (self._rel_text("from") if self._sides["from"]["tabs"].currentIndex() == 1
                  else f.strftime("%Y-%m-%d %H:%M:%S"))
         t_txt = (self._rel_text("to") if self._sides["to"]["tabs"].currentIndex() == 1
                  else t.strftime("%Y-%m-%d %H:%M:%S"))
-        self._lbl_start_status.setText(f"Start Time:  {f_txt}")
-        self._lbl_end_status.setText(f"End Time:  {t_txt}")
+        self._lbl_start_status.setText(f_txt)
+        self._lbl_end_status.setText(t_txt)
+        self._lbl_start_status.setCursorPosition(0)
+        self._lbl_end_status.setCursorPosition(0)
 
     def ends_at_now(self) -> bool:
         """Does the chosen period end at "now" — i.e. should it follow the clock?
@@ -1530,8 +2407,8 @@ class PVBrowserDialog(QDialog):
     def _build_ui(self):
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
-            "Search for a CPVA channel — several words match in order, "
-            "like *word1*word2*:"))
+            "Search for a CPVA channel — several words, separated by spaces, "
+            "match in order:"))
         self._edit = QLineEdit()
         self._edit.setPlaceholderText("e.g. 023 l3   or   L3-SPFE   or   Energy")
         self._edit.textEdited.connect(self._filter)
@@ -1602,7 +2479,634 @@ class PVBrowserDialog(QDialog):
         self.selected_pvs = [it.text() for it in items]
         self.accept()
 
+
+def _fmt_span(seconds):
+    """A period the way a person says it: 45 s, 20 min, 6 h, 1 d 6 h, 30 d."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        m, r = divmod(s, 60)
+        return f"{m} min" + (f" {r} s" if r else "")
+    if s < 86400:
+        h, r = divmod(s, 3600)
+        m = r // 60
+        return f"{h} h" + (f" {m} min" if m else "")
+    d, r = divmod(s, 86400)
+    h = r // 3600
+    return f"{d} d" + (f" {h} h" if h else "")
+
+
+# The built-in preset with no PVs in it (see CSSLoggerWidget._presets).
+_BLANK_PRESET = "Blank"
+
+
+def _read_presets_file() -> list:
+    """The preset file as the combo shows it: built-in Blank first, then one
+    entry per name. The file is shared by every station, and an older build
+    let "Save as new" add a second preset under an existing name; the program
+    then opened the first copy while Save had written into the second, so
+    saved PVs seemed lost. Duplicates collapse here: the later copy's content
+    in the earlier copy's place."""
+    merged: dict = {}
+    for p in load_presets():
+        name = str(p.get("name", "")).strip()
+        if not name or name == _BLANK_PRESET:
+            continue
+        merged[name] = dict(p, name=name)   # dict keeps first position
+    out = [{"name": _BLANK_PRESET, "pvs": [], "builtin": True}]
+    out.extend(merged.values())
+    return out
+
+_GRAPH_STALE_NOTES = ("Load data first.", "No PVs loaded.",
+                      "Graph error — see Log tab.")
+
+
+class _SidebarText(QLabel):
+    """A wrapped label for the narrow sidebar that never changes its width.
+
+    A word-wrapped QLabel asks for at least the width of its longest word, and
+    a PV name is one 40-character word — so a status line naming one pushed
+    the whole sidebar wider than its viewport, and every message reflowed
+    every button. This label ignores its own width hint (it takes the width
+    the panel gives it), offers a line break after ``:`` ``_`` ``-`` ``/``
+    ``.`` inside long names (zero-width spaces, display only), and with
+    ``max_lines`` keeps a fixed height and ends a longer text with "…".
+    ``text()`` always returns exactly what was set; the full text is the
+    tooltip whenever it had to be shortened.
+    """
+
+    _BREAK_AFTER = re.compile(r"([:_\-/.])(?=\S)")
+
+    def __init__(self, text="", max_lines=0, parent=None):
+        super().__init__("", parent)
+        self._raw = ""
+        self._max_lines = int(max_lines)
+        self.setWordWrap(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Fixed if self._max_lines
+                           else QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def setStyleSheet(self, css):
+        super().setStyleSheet(css)
+        self._fit_height()
+
+    def _fit_height(self):
+        if not self._max_lines:
+            return
+        m = self.contentsMargins()
+        self.ensurePolished()
+        fm = self.fontMetrics()
+        self.setFixedHeight(fm.lineSpacing() * self._max_lines
+                            + m.top() + m.bottom() + 2 * self.margin()
+                            + 2 * self.frameWidth() + 8)
+
+    def text(self):
+        return self._raw
+
+    def _display(self, text):
+        return self._BREAK_AFTER.sub("\\1\u200b", text)
+
+    def setText(self, text):
+        self._raw = "" if text is None else str(text)
+        self._render()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if self._max_lines:
+            self._render()
+
+    def _render(self):
+        shown = self._display(self._raw)
+        cut = False
+        if self._max_lines and shown:
+            w = self.contentsRect().width() - 2 * self.margin() - 10
+            if w > 20:
+                fm = self.fontMetrics()
+                limit = fm.lineSpacing() * self._max_lines
+                flags = int(Qt.TextFlag.TextWordWrap)
+
+                def _h(s):
+                    return fm.boundingRect(QRect(0, 0, w, 100000), flags, s).height()
+
+                if _h(shown) > limit:
+                    lo, hi = 0, len(shown)
+                    while lo < hi:               # longest prefix that fits with "…"
+                        mid = (lo + hi + 1) // 2
+                        if _h(shown[:mid].rstrip() + "…") <= limit:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    shown = shown[:lo].rstrip() + "…"
+                    cut = True
+        super().setText(shown)
+        self.setToolTip(self._raw if cut else "")
+
+
+def _bin_icon(px=18):
+    """A waste-bin drawn in dark ink. The 🗑 emoji came out as a pale grey
+    outline that read as a disabled, empty button on the light panel."""
+    icon = QIcon()
+    for mode, ink in ((QIcon.Mode.Normal, "#263238"), (QIcon.Mode.Active, "#263238"),
+                      (QIcon.Mode.Selected, "#263238"), (QIcon.Mode.Disabled, "#9E9E9E")):
+        for scale in (1, 2):
+            s = px * scale
+            pm = QPixmap(s, s)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor(ink)); pen.setWidthF(1.5 * scale)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            u = s / 18.0
+            p.drawLine(QPointF(3 * u, 4.5 * u), QPointF(15 * u, 4.5 * u))      # lid
+            p.drawLine(QPointF(7 * u, 2.5 * u), QPointF(11 * u, 2.5 * u))      # handle
+            body = QPolygonF([QPointF(4.5 * u, 6 * u), QPointF(13.5 * u, 6 * u),
+                              QPointF(12.6 * u, 16 * u), QPointF(5.4 * u, 16 * u)])
+            p.drawPolygon(body)
+            for x in (7.3, 9.0, 10.7):                                     # ribs
+                p.drawLine(QPointF(x * u, 8 * u), QPointF(x * u, 14 * u))
+            p.end()
+            pm.setDevicePixelRatio(scale)
+            icon.addPixmap(pm, mode)
+    return icon
+
+
+class _InfoLabel(_SidebarText):
+    """A label that takes no room while it has nothing to say."""
+
+    def setText(self, text):
+        super().setText(text)
+        self.setVisible(bool(text))
+
+
+class _GraphAxisLimitsDialog(QDialog):
+    """Axis limits for the banded Graph tab.
+
+    The generic Spectra dialog showed the time as a bare number and edited one
+    unnamed Y axis — on this graph every PV has its own. Here the time range is
+    a date and a clock, and the Y range is set per PV picked from a list. The Y
+    numbers are the PV's own Y min / Y max (the same cells as in the PV table),
+    so they survive the next redraw instead of being overwritten by it.
+    """
+
+    # The boxes take the program's own look: a border set here would cost the
+    # date boxes their up/down arrows (a styled spin box drops its arrows).
+    _FMT = "yyyy-MM-dd HH:mm:ss"
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.setWindowTitle("Axis limits")
+        self.setModal(True)
+        self._owner = owner
+        self._pvs = list(owner._graph_pvs)
+        # pv → [ymin text, ymax text]; kept per PV so several can be set in one go.
+        self._edits = {}
+        self._cur_pv = None
+
+        lay = QVBoxLayout(self)
+
+        # ── Time ──
+        gb_t = QGroupBox("Time axis")
+        gt = QGridLayout(gb_t)
+        lo_n, hi_n = owner._graph_axes[0].get_xlim()
+        self._dt_from = self._dt_edit(lo_n)
+        self._dt_to   = self._dt_edit(hi_n)
+        gt.addWidget(QLabel("From:"), 0, 0); gt.addWidget(self._dt_from, 0, 1)
+        gt.addWidget(QLabel("To:"),   1, 0); gt.addWidget(self._dt_to,   1, 1)
+        gt.setColumnStretch(1, 1)
+        lay.addWidget(gb_t)
+
+        # ── Y ──
+        gb_y = QGroupBox("Y axis")
+        gy = QGridLayout(gb_y)
+        self._combo = QComboBox()
+        for i, pv in enumerate(self._pvs):
+            st = owner._pv_settings.get(pv, {})
+            name = st.get("display_name") or shorten_pv_name(pv)
+            pm = QPixmap(12, 12)
+            pm.fill(QColor(st.get("color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])))
+            self._combo.addItem(QIcon(pm), name, pv)
+            self._edits[pv] = [self._num_txt(st.get("ymin")), self._num_txt(st.get("ymax"))]
+        self._e_ymin = QLineEdit(); self._e_ymax = QLineEdit()
+        self._lbl_range = QLabel("")
+        self._lbl_range.setStyleSheet("color:#444444;")
+        gy.addWidget(QLabel("Signal:"), 0, 0); gy.addWidget(self._combo, 0, 1, 1, 2)
+        gy.addWidget(QLabel("Y min:"), 1, 0); gy.addWidget(self._e_ymin, 1, 1, 1, 2)
+        gy.addWidget(QLabel("Y max:"), 2, 0); gy.addWidget(self._e_ymax, 2, 1, 1, 2)
+        gy.addWidget(self._lbl_range, 3, 1)
+        b_fit = QPushButton("Fit to data")
+        b_fit.setToolTip("Empty both boxes: this signal's band follows its data again")
+        b_fit.clicked.connect(self._fit_to_data)
+        gy.addWidget(b_fit, 3, 2)
+        gy.setColumnStretch(1, 1)
+        lay.addWidget(gb_y)
+        self._combo.currentIndexChanged.connect(self._on_pv_changed)
+        if self._pvs:
+            self._on_pv_changed(0)
+        else:
+            gb_y.setEnabled(False)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._apply)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        self.setMinimumWidth(420)
+
+    # ── helpers ──
+    def _dt_edit(self, num):
+        e = QDateTimeEdit()
+        e.setDisplayFormat(self._FMT)
+        d = mdates.num2date(num, tz=TZ_PRAGUE)
+        e.setDateTime(QDateTime(QDate(d.year, d.month, d.day),
+                                QTime(d.hour, d.minute, d.second)))
+        return e
+
+    @staticmethod
+    def _qdt_to_num(qdt):
+        d, t = qdt.date(), qdt.time()
+        dt = datetime(d.year(), d.month(), d.day(), t.hour(), t.minute(),
+                      t.second(), tzinfo=TZ_PRAGUE)
+        return mdates.date2num(dt)
+
+    @staticmethod
+    def _num_txt(v):
+        return "" if v is None else f"{v:.10g}"
+
+    def _data_range(self, pv):
+        try:
+            i = self._owner._graph_pvs.index(pv)
+            v = self._owner._graph_raw_np[i][1]
+            v = v[np.isfinite(v)]
+            if v.size:
+                return float(v.min()), float(v.max())
+        except Exception:
+            pass
+        return None
+
+    def _store_current(self):
+        if self._cur_pv is not None:
+            self._edits[self._cur_pv] = [self._e_ymin.text(), self._e_ymax.text()]
+
+    def _on_pv_changed(self, idx):
+        self._store_current()
+        pv = self._combo.itemData(idx)
+        self._cur_pv = pv
+        lo_t, hi_t = self._edits.get(pv, ["", ""])
+        self._e_ymin.setText(lo_t); self._e_ymax.setText(hi_t)
+        rng = self._data_range(pv)
+        if rng:
+            self._e_ymin.setPlaceholderText(f"data: {_fmt_cursor_value(rng[0])}")
+            self._e_ymax.setPlaceholderText(f"data: {_fmt_cursor_value(rng[1])}")
+            self._lbl_range.setText("")
+        else:
+            self._e_ymin.setPlaceholderText(""); self._e_ymax.setPlaceholderText("")
+            self._lbl_range.setText("No values on screen")
+
+    def _fit_to_data(self):
+        self._e_ymin.clear(); self._e_ymax.clear()
+
+    def _apply(self):
+        self._store_current()
+        x_lo = self._qdt_to_num(self._dt_from.dateTime())
+        x_hi = self._qdt_to_num(self._dt_to.dateTime())
+        if x_hi <= x_lo:
+            QMessageBox.warning(self, "Axis limits", "'To' must be later than 'From'.")
+            return
+        parsed = {}
+        for pv, (lo_t, hi_t) in self._edits.items():
+            lo = CSSLoggerWidget._safe_float(lo_t, fallback="bad")
+            hi = CSSLoggerWidget._safe_float(hi_t, fallback="bad")
+            st = self._owner._pv_settings.get(pv, {})
+            name = st.get("display_name") or shorten_pv_name(pv)
+            if lo == "bad" or hi == "bad":
+                QMessageBox.warning(self, "Axis limits", f"{name}: not a number.")
+                return
+            if lo is not None and hi is not None and hi <= lo:
+                QMessageBox.warning(self, "Axis limits",
+                                    f"{name}: Y max must be above Y min.")
+                return
+            parsed[pv] = (lo, hi)
+        self._owner._apply_axis_limits_dialog((x_lo, x_hi), parsed)
+        self.accept()
+
 # ── Flow layout (wraps children to the next row, never overflows) ───────────
+
+class _ResizeHook(QObject):
+    """Calls `callback()` whenever the watched widget changes size. Watch a
+    widget whose size the callback itself does not change, or it loops."""
+
+    def __init__(self, widget, callback):
+        super().__init__(widget)
+        self._cb = callback
+        self._w = None
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.Resize:
+            w = (obj.width(), obj.height())
+            if w != self._w:
+                self._w = w
+                try:
+                    self._cb()
+                except Exception:
+                    pass
+        return False
+
+
+class _GraphLoupe(QFrame):
+    """A small magnified view of the spot under the mouse.
+
+    It shows ONE signal — the one whose trace is nearest the mouse — and only
+    the patch of graph around the mouse: a box `magnification` times smaller
+    than the loupe, in both time and value, so the picture is the main graph
+    magnified evenly. The trace is redrawn from the main line's own data (not
+    a blown-up screenshot), so it stays sharp and follows live updates. A
+    cross-hair marks the mouse; the title names the signal, the time and the
+    value there.
+
+    A child widget of the graph area, never a window of its own: it cannot take
+    the keyboard focus, and it lets every mouse event through to the graph."""
+
+    W, H = 380, 230
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setObjectName("graphLoupe")
+        self.setStyleSheet("QFrame#graphLoupe { background: #ffffff;"
+                           " border: 2px solid #2f6fb5; border-radius: 3px; }")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(0)
+        self._fig = Figure(figsize=(self.W / 100.0, self.H / 100.0), dpi=100)
+        self._fig.patch.set_facecolor("white")
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._canvas.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lay.addWidget(self._canvas)
+        self.setFixedSize(self.W, self.H)
+        self._key = None                 # (main figure, source line) it was built for
+        self._ax = None
+        self._line = None
+        self._vline = None
+        self._hline = None
+        self._title = None
+        self._sel_patch = None
+        self.hide()
+
+    @staticmethod
+    def _value_at(xs, ys, x):
+        """The value holding at time `x` (steps-post: the last sample at or
+        before it), or None before the first sample."""
+        if xs.size == 0:
+            return None
+        i = int(np.searchsorted(xs, x, side="right")) - 1
+        if i < 0:
+            return None
+        v = float(ys[i])
+        return v if np.isfinite(v) else None
+
+    @classmethod
+    def nearest_trace(cls, x, y_px, main_axes, main_lines):
+        """Index of the visible trace whose value at time `x` is drawn closest
+        (in screen pixels, vertically) to the mouse at height `y_px`."""
+        best, best_d = None, None
+        for i, ax in enumerate(main_axes):
+            if i >= len(main_lines) or not main_lines[i]:
+                continue
+            src = main_lines[i][-1]
+            if not src.get_visible():
+                continue
+            try:
+                xs = np.asarray(src.get_xdata(), dtype=float)
+                ys = np.asarray(src.get_ydata(), dtype=float)
+            except Exception:
+                continue
+            v = cls._value_at(xs, ys, x)
+            if v is None:
+                continue
+            d = abs(float(ax.transData.transform((x, v))[1]) - float(y_px))
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        return best
+
+    def _rebuild(self, src):
+        self._fig.clear()
+        ax = self._fig.add_axes([0.01, 0.02, 0.98, 0.86])
+        ax.set_navigate(False)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for sp in ax.spines.values():
+            sp.set_color("#9e9e9e")
+        self._sel_patch = ax.axvspan(0, 0, color="#1565C0", alpha=0.15, lw=0)
+        # The same look as the main trace: colour, width, line and point style.
+        self._line, = ax.plot(
+            [], [], color=src.get_color(), linewidth=float(src.get_linewidth()),
+            linestyle=src.get_linestyle(), drawstyle=src.get_drawstyle(),
+            marker=src.get_marker(), markersize=float(src.get_markersize()),
+            alpha=src.get_alpha(), zorder=2)
+        # Neutral grey dashes: a coloured cross-hair could match the trace.
+        self._vline = ax.axvline(0, color="#555555", lw=0.9, ls=(0, (4, 3)), zorder=10)
+        self._hline = ax.axhline(0, color="#555555", lw=0.9, ls=(0, (4, 3)), zorder=10)
+        self._title = self._fig.text(0.5, 0.985, "", ha="center", va="top",
+                                     fontsize=9, fontweight="bold", color="#111111")
+        self._ax = ax
+
+    def update_at(self, x, main_axes, main_lines, magnification, sel_range,
+                  y_px=None, names=None):
+        """Show the spot around the mouse at date number `x` and screen height
+        `y_px` (matplotlib display pixels; None = the middle of the graph).
+        `names[i]` labels trace i. Returns False if there is nothing to show."""
+        if not main_axes:
+            self.hide()
+            return False
+        ax0 = main_axes[0]
+        if y_px is None:
+            y_px = float(ax0.bbox.y0 + ax0.bbox.height / 2.0)
+        i = self.nearest_trace(x, y_px, main_axes, main_lines)
+        if i is None:
+            self.hide()
+            return False
+        src, ax_main = main_lines[i][-1], main_axes[i]
+        key = (id(ax0.figure), id(src))
+        if key != self._key:
+            self._rebuild(src)
+            self._key = key
+        # The box shown: the loupe's own size shrunk by the magnification, in
+        # screen pixels around the mouse, read back into this signal's data.
+        mag = max(1.0, float(magnification))
+        try:
+            dpr = float(getattr(ax0.figure.canvas, "device_pixel_ratio", 1.0) or 1.0)
+        except Exception:
+            dpr = 1.0
+        x_px = float(ax_main.transData.transform((x, 0.0))[0])
+        hw = self.W * dpr / mag / 2.0
+        hh = self.H * dpr / mag / 2.0
+        inv = ax_main.transData.inverted()
+        (lo, y_lo), (hi, y_hi) = inv.transform([(x_px - hw, y_px - hh),
+                                                (x_px + hw, y_px + hh)])
+        y_mouse = float(inv.transform((x_px, y_px))[1])
+        try:
+            xs = np.asarray(src.get_xdata(), dtype=float)
+            ys = np.asarray(src.get_ydata(), dtype=float)
+        except Exception:
+            xs = ys = np.empty(0)
+        if xs.size:
+            # One sample either side of the box: with steps-post the one before
+            # is the value still holding at the left edge.
+            a = max(0, int(np.searchsorted(xs, lo, side="right")) - 1)
+            b = min(xs.size, int(np.searchsorted(xs, hi, side="right")) + 1)
+            self._line.set_data(xs[a:b], ys[a:b])
+        else:
+            self._line.set_data([], [])
+        self._ax.set_xlim(lo, hi)
+        self._ax.set_ylim(min(y_lo, y_hi), max(y_lo, y_hi))
+        self._vline.set_xdata([x, x])
+        self._hline.set_ydata([y_mouse, y_mouse])
+        if sel_range:
+            s0, s1 = sel_range
+            self._sel_patch.set_visible(True)
+            try:
+                self._sel_patch.set_x(s0)
+                self._sel_patch.set_width(s1 - s0)
+            except AttributeError:       # older matplotlib: a Polygon
+                self._sel_patch.set_xy([[s0, 0], [s0, 1], [s1, 1], [s1, 0], [s0, 0]])
+        else:
+            self._sel_patch.set_visible(False)
+        name = (names[i] if names and i < len(names) else "") or ""
+        v = self._value_at(xs, ys, x)
+        try:
+            t = mdates.num2date(x, tz=TZ_PRAGUE)
+            when = f"{t.strftime('%H:%M:%S')}.{t.microsecond // 1000:03d}"
+        except Exception:
+            when = ""
+        parts = [p for p in (name, when,
+                             _fmt_cursor_value(v) if v is not None else "",
+                             f"{int(mag)}×") if p]
+        self._title.set_text("   ".join(parts))
+        self._canvas.draw()
+        return True
+
+    def place_near(self, pos):
+        """Put the loupe beside `pos` (parent coordinates), never under it."""
+        p = self.parentWidget()
+        if p is None:
+            return
+        gap = 24
+        x = pos.x() + gap
+        y = pos.y() + gap
+        if x + self.width() > p.width():
+            x = pos.x() - gap - self.width()
+        if y + self.height() > p.height():
+            y = pos.y() - gap - self.height()
+        self.move(max(0, x), max(0, y))
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+
+class _RowDragger(QObject):
+    """Lets the user drag table rows up and down with the mouse.
+
+    Qt's own drag-and-drop for a QTableWidget moves CELLS, overwrites the
+    target and needs every cell to be drag-enabled; here a row is a channel
+    and the table is rebuilt from an order list anyway. So the drag is done
+    by hand: press on a row, move a few pixels, and a blue line shows where the
+    row(s) will land; releasing calls `on_drop(rows, before_row)`, where `rows`
+    are the selected rows (or the pressed one) and `before_row` is the row the
+    line sits above (rowCount() = after the last row). `can_drag(row)` says
+    whether a row may be picked up at all (divider rows may not)."""
+
+    def __init__(self, table, can_drag, on_drop):
+        super().__init__(table)
+        self._tv = table
+        self._can_drag = can_drag
+        self._on_drop = on_drop
+        self._press = None              # (row, QPoint) of the left press
+        self._dragging = False
+        self._before = -1
+        self._line = QFrame(table.viewport())
+        self._line.setStyleSheet("background:#1565C0;border:none;")
+        self._line.setFixedHeight(3)
+        self._line.hide()
+        table.viewport().installEventFilter(self)
+
+    def _gap_at(self, y):
+        """The row boundary nearest to viewport height `y`."""
+        tv = self._tv
+        n = tv.rowCount()
+        row = tv.rowAt(y)
+        if row < 0:
+            return n if y > 0 else 0
+        top = tv.rowViewportPosition(row)
+        return row if y < top + tv.rowHeight(row) / 2 else row + 1
+
+    def _place_line(self, before):
+        tv = self._tv
+        n = tv.rowCount()
+        if n == 0:
+            self._line.hide()
+            return
+        if before >= n:
+            y = tv.rowViewportPosition(n - 1) + tv.rowHeight(n - 1)
+        else:
+            y = tv.rowViewportPosition(before)
+        self._line.setGeometry(0, max(0, y - 1), tv.viewport().width(), 3)
+        self._line.show()
+        self._line.raise_()
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        tv = self._tv
+        if t == QEvent.Type.MouseButtonPress:
+            self._press = None
+            if (ev.button() == Qt.MouseButton.LeftButton
+                    and tv.state() != QAbstractItemView.State.EditingState):
+                pos = ev.position().toPoint()
+                row = tv.rowAt(pos.y())
+                if row >= 0 and self._can_drag(row):
+                    self._press = (row, pos)
+            return False
+        if t == QEvent.Type.MouseMove and self._press is not None:
+            if not (ev.buttons() & Qt.MouseButton.LeftButton):
+                self._press = None
+                return False
+            pos = ev.position().toPoint()
+            if not self._dragging:
+                if ((pos - self._press[1]).manhattanLength()
+                        < QApplication.startDragDistance()):
+                    return False
+                self._dragging = True
+                tv.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._before = self._gap_at(pos.y())
+            self._place_line(self._before)
+            return True                 # no rubber-band selection while dragging
+        if t == QEvent.Type.MouseButtonRelease and self._press is not None:
+            row0 = self._press[0]
+            self._press = None
+            if not self._dragging:
+                return False
+            self._dragging = False
+            self._line.hide()
+            tv.viewport().unsetCursor()
+            rows = sorted({i.row() for i in tv.selectionModel().selectedRows()})
+            if row0 not in rows:
+                rows = [row0]
+            rows = [r for r in rows if self._can_drag(r)]
+            if rows:
+                try:
+                    self._on_drop(rows, self._before)
+                except Exception as exc:      # never let a drop crash the app
+                    print(f"[row drag] {exc!r}")
+            return True
+        return False
+
 
 class _FlowLayout(QLayout):
     """A left-to-right layout that wraps onto a new row when it runs out of
@@ -1635,14 +3139,29 @@ class _FlowLayout(QLayout):
         return True
 
     def heightForWidth(self, width):
+        """Full height (margins included) the items need at this width."""
         return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def first_row_height(self, width):
+        """Height (margins included) of the FIRST row only at this width — what
+        the statistics strip shows when it is folded to one row."""
+        return self._do_layout(QRect(0, 0, width, 0), True, rows=1)
+
+    def rows_height(self, width, rows):
+        """Height (margins included) of the first ``rows`` rows at this width."""
+        return self._do_layout(QRect(0, 0, width, 0), True, rows=rows)
 
     def setGeometry(self, rect):
         super().setGeometry(rect)
         self._do_layout(rect, False)
 
     def sizeHint(self):
-        return self.minimumSize()
+        # The size this layout really wants at its current width. Returning the
+        # minimum (the largest single card) made the strip's height a guess —
+        # too tall for one row of cards, leaving a dead band under them.
+        g = self.geometry()
+        w = g.width() if g.width() > 0 else 600
+        return QSize(w, self.heightForWidth(w))
 
     def minimumSize(self):
         size = QSize()
@@ -1652,15 +3171,23 @@ class _FlowLayout(QLayout):
         size += QSize(m.left() + m.right(), m.top() + m.bottom())
         return size
 
-    def _do_layout(self, rect, test_only):
-        x, y = rect.x(), rect.y()
+    def _do_layout(self, rect, test_only, rows=None):
+        m = self.contentsMargins()
+        inner = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y = inner.x(), inner.y()
         line_height = 0
         spacing = self.spacing()
+        row = 1
         for item in self._items:
             hint = item.sizeHint()
             next_x = x + hint.width() + spacing
-            if next_x - spacing > rect.right() and line_height > 0:
-                x = rect.x()
+            # QRect.right() is the last pixel INSIDE, so a card ending exactly
+            # on the edge still fits (it used to be pushed to a new row).
+            if next_x - spacing > inner.x() + inner.width() and line_height > 0:
+                if rows is not None and row >= rows:
+                    break
+                row += 1
+                x = inner.x()
                 y = y + line_height + spacing
                 next_x = x + hint.width() + spacing
                 line_height = 0
@@ -1668,7 +3195,7 @@ class _FlowLayout(QLayout):
                 item.setGeometry(QRect(QPoint(x, y), hint))
             x = next_x
             line_height = max(line_height, hint.height())
-        return y + line_height - rect.y()
+        return y + line_height - rect.y() + m.bottom()
 
 
 # ── Floating graph window (F11 fullscreen / Ctrl+F11 windowed) ──────────────
@@ -1678,6 +3205,8 @@ class _GraphPopupWindow(QWidget):
     pressing Esc / F11) hands the tab back to the notebook instead of destroying
     it."""
 
+    _BORDER = 8          # px of frame round the graph that doubles as the resize grip
+
     def __init__(self, owner):
         # No title bar: "focus mode" means the graph and nothing else, the same on
         # both tabs and the same as the Image Slider. Esc / F11 dock it back, and
@@ -1686,7 +3215,68 @@ class _GraphPopupWindow(QWidget):
                                | Qt.WindowType.FramelessWindowHint)
         self._owner = owner
         self.setWindowTitle("CSS Logger — Graph")
-        self._drag_start = None
+        self._resize = None         # (edges, press point, start geometry) of a manual resize
+        self.setObjectName("graphFocus")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("QWidget#graphFocus { background: #202020; }")
+        self.setMouseTracking(True)
+        self.setMinimumSize(320, 240)
+        # Any left press on the graph moves the window (the statistics drag is
+        # given up in focus mode — Spectra and Image Slider behave the same).
+        # Watched application-wide rather than per child because the graph's
+        # canvas is rebuilt on every replot, and a new canvas would escape a
+        # filter installed once.
+        QApplication.instance().installEventFilter(self)
+
+    def set_framed(self, framed: bool):
+        """Windowed: a frame to grab for resizing. Fullscreen: no frame."""
+        b = self._BORDER if framed else 0
+        lay = self.layout()
+        if lay is not None:
+            lay.setContentsMargins(b, b, b, b)
+
+    def stop_watching(self):
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if (ev.type() == QEvent.Type.MouseButtonPress
+                and ev.button() == Qt.MouseButton.LeftButton
+                and not self.isFullScreen()
+                and isinstance(obj, QWidget) and obj is not self
+                and self.isAncestorOf(obj)):
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+                return True
+        return False
+
+    def _edges_at(self, pos) -> Qt.Edge:
+        if self.isFullScreen():
+            return Qt.Edge(0)
+        b, edges = self._BORDER, Qt.Edge(0)
+        if pos.x() <= b:                    edges |= Qt.Edge.LeftEdge
+        if pos.x() >= self.width() - b:     edges |= Qt.Edge.RightEdge
+        if pos.y() <= b:                    edges |= Qt.Edge.TopEdge
+        if pos.y() >= self.height() - b:    edges |= Qt.Edge.BottomEdge
+        return edges
+
+    @staticmethod
+    def _cursor_for(edges) -> Qt.CursorShape:
+        left  = bool(edges & Qt.Edge.LeftEdge)
+        right = bool(edges & Qt.Edge.RightEdge)
+        top   = bool(edges & Qt.Edge.TopEdge)
+        bot   = bool(edges & Qt.Edge.BottomEdge)
+        if (left and top) or (right and bot):
+            return Qt.CursorShape.SizeFDiagCursor
+        if (right and top) or (left and bot):
+            return Qt.CursorShape.SizeBDiagCursor
+        if left or right:
+            return Qt.CursorShape.SizeHorCursor
+        if top or bot:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.ArrowCursor
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key.Key_Escape:
@@ -1700,15 +3290,39 @@ class _GraphPopupWindow(QWidget):
         super().keyPressEvent(ev)
 
     def mousePressEvent(self, ev):
-        # No title bar to grab, so a press on the window's own background (not on a
-        # child widget) drags it. Only needed in the windowed F11 mode; harmless
-        # when fullscreen.
-        if ev.button() == Qt.MouseButton.LeftButton and not self.isFullScreen():
-            handle = self.windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
-                return
-        super().mousePressEvent(ev)
+        # Only the frame reaches here (the graph's own presses are taken by the
+        # filter above): the frame resizes, its corners resize both ways.
+        if ev.button() != Qt.MouseButton.LeftButton or self.isFullScreen():
+            return super().mousePressEvent(ev)
+        edges  = self._edges_at(ev.position().toPoint())
+        handle = self.windowHandle()
+        if edges and handle is not None and handle.startSystemResize(edges):
+            return
+        if edges:
+            # The window manager declined; do the arithmetic ourselves.
+            self._resize = (edges, ev.globalPosition().toPoint(), QRect(self.geometry()))
+            return
+        if handle is not None:
+            handle.startSystemMove()
+
+    def mouseMoveEvent(self, ev):
+        if self._resize is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+            edges, g0, r0 = self._resize
+            d = ev.globalPosition().toPoint() - g0
+            g = QRect(r0)
+            if edges & Qt.Edge.LeftEdge:   g.setLeft(r0.left() + d.x())
+            if edges & Qt.Edge.RightEdge:  g.setRight(r0.right() + d.x())
+            if edges & Qt.Edge.TopEdge:    g.setTop(r0.top() + d.y())
+            if edges & Qt.Edge.BottomEdge: g.setBottom(r0.bottom() + d.y())
+            if g.width() >= self.minimumWidth() and g.height() >= self.minimumHeight():
+                self.setGeometry(g)
+            return
+        self.setCursor(self._cursor_for(self._edges_at(ev.position().toPoint())))
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        self._resize = None
+        super().mouseReleaseEvent(ev)
 
     def closeEvent(self, ev):
         # Never lose the tab — reparent it back into the notebook.
@@ -1721,11 +3335,22 @@ class _GraphPopupWindow(QWidget):
 class CSSLoggerWidget(QWidget):
     """Full PySide6 port of CPVAExplorerApp from cssl.py."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, tab_state=None):
         super().__init__(parent)
+        _day_cache()          # starts looking for the share now, not at the first load
+        # A setting tab restored from logger_tabs.json (see logger_tabs.py), or
+        # None for the classic start from the config file.
+        self._tab_state = dict(tab_state) if tab_state else None
+        self._suspended = False
+        try:
+            self._custom_pvs_mtime = CUSTOM_PVS_FILE.stat().st_mtime
+        except OSError:
+            self._custom_pvs_mtime = None
         self._init_state()
         self._build_ui()
         self._populate_ui()
+        if self._tab_state:
+            self._apply_tab_state(self._tab_state)
         self._install_graph_shortcuts()
         # Graph tab defaults to live mode — start it shortly after the window shows
         # (deferred so the UI is fully realised and the Operation preset PVs are loaded).
@@ -1735,8 +3360,128 @@ class CSSLoggerWidget(QWidget):
         if self._live_mode:
             return
         pvs = self._real_pv_names()
-        if pvs:
-            self._toggle_live_mode()
+        if not pvs:
+            return
+        if self._tab_state is not None and not self._tab_state.get("live", True):
+            # A tab saved standing still comes back on its own window.
+            self._request_reload(delay_ms=0, reason="tab restored")
+            return
+        self._toggle_live_mode()
+
+    # ── Setting tabs (logger_tabs.py) ────────────────────────────────────────
+
+    def export_tab_state(self) -> dict:
+        """What a setting tab remembers across a restart: its channels, preset,
+        master filter, conditions, and its window — live with its span, or the
+        fixed From/To."""
+        span = (self._live_window_span.total_seconds()
+                if self._live_mode and self._live_window_span else None)
+        return {
+            "preset": self._preset_combo.currentText(),
+            "pvs": self._real_pv_names(),
+            "master_pv": self._get_master_pv(),
+            "master_multiple": self._get_master_multiple(),
+            "conditions": [dict(c) for c in self._conditions_view()],
+            "conditions_on": bool(getattr(self, "_conditions_on", True)),
+            "live": bool(self._live_mode),
+            "live_span_s": span,
+            "time_from": self._dt_from.strftime("%Y-%m-%d %H:%M:%S"),
+            "time_to": self._dt_to.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _apply_tab_state(self, st: dict):
+        """Put a saved tab's setting on screen (before anything is loaded)."""
+        name = st.get("preset") or ""
+        idx = self._preset_combo.findText(name) if name else -1
+        if idx >= 0:
+            self._preset_combo.blockSignals(True)
+            self._preset_combo.setCurrentIndex(idx)
+            self._preset_combo.blockSignals(False)
+        pvs = st.get("pvs")
+        if isinstance(pvs, list):
+            self._pv_list.clear()
+            for pv in pvs:
+                if isinstance(pv, str) and pv:
+                    self._pv_list.addItem(self._make_pv_item(pv))
+            self._sync_pv_list_customs()
+            self._update_pv_count()
+        if st.get("master_pv") and self._master_pv_edit is not None:
+            self._master_pv_edit.setText(str(st["master_pv"]))
+        if "master_multiple" in st and self._master_multiple_edit is not None:
+            self._master_multiple_edit.setText(str(st.get("master_multiple") or ""))
+        if isinstance(st.get("conditions"), list):
+            self._conditions_on = bool(st.get("conditions_on", True))
+            chk = getattr(self, "_chk_cond_on", None)
+            if chk is not None:
+                chk.blockSignals(True)
+                chk.setChecked(self._conditions_on)
+                chk.blockSignals(False)
+            self._set_conditions(st["conditions"])
+        span = st.get("live_span_s")
+        if st.get("live") and isinstance(span, (int, float)) and span > 0:
+            now = datetime.now()
+            self._dt_from, self._dt_to = now - timedelta(seconds=float(span)), now
+        else:
+            dt_from = parse_user_datetime(st.get("time_from") or "")
+            dt_to = parse_user_datetime(st.get("time_to") or "")
+            if dt_from and dt_to and dt_to > dt_from:
+                self._dt_from, self._dt_to = dt_from, dt_to
+        self._refresh_time_labels()
+
+    def suspend(self):
+        """This tab is no longer on screen. Live keeps reading — every
+        HIDDEN_LIVE_POLL_MS instead of every few hundred milliseconds — but
+        nothing is redrawn until the tab is shown again."""
+        if self._suspended:
+            return
+        self._suspended = True
+        self._countdown_timer.stop()
+        if self._live_mode and self._live_timer.isActive():
+            # Re-arm at the slow pace straight away.
+            self._live_timer.start(self._live_poll_ms())
+
+    def resume(self):
+        """This tab is on screen again: bring Live up to now at once, and draw
+        what was read while it was hidden."""
+        if not self._suspended:
+            return
+        self._suspended = False
+        self._reload_custom_pvs_if_changed()
+        if self._live_mode:
+            # Rebuild the table and the graph on the next tick, whatever their
+            # clocks say, and make that tick happen now.
+            self._live_rows_stale = True
+            self._live_last_rebuild_ns = 0
+            self._live_last_graph_ns = 0
+            if self._live_timer.isActive():
+                self._live_timer.stop()
+                self._live_tick()
+        elif getattr(self, "_hidden_dirty", False) and self._samples_by_pv:
+            self._hidden_dirty = False
+            self._plot_graph()
+            self._populate_table()
+
+    def _reload_custom_pvs_if_changed(self):
+        """custom_pvs.json is shared by every tab: another tab may have changed
+        the custom PVs while this one was hidden."""
+        try:
+            mtime = CUSTOM_PVS_FILE.stat().st_mtime
+        except OSError:
+            return
+        seen = getattr(self, "_custom_pvs_mtime", None)
+        self._custom_pvs_mtime = mtime
+        if mtime == seen:
+            return
+        self._custom_pvs = load_custom_pvs()
+        self._sync_pv_list_customs()
+        self._update_pv_count()
+        self._cpv_last_diag = None
+        if self._table_rows_unfiltered:
+            self._rebuild_custom_pvs()
+            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+            self._table_rows = self._apply_conditions_to_rows(rows)
+            self._plot_graph()
+            self._populate_table()
 
     # ── State init ─────────────────────────────────────────────────────────
 
@@ -1749,13 +3494,40 @@ class CSSLoggerWidget(QWidget):
         for k, v in (self.config.get("graph_opts") or {}).items():
             if k in self._graph_opts:
                 self._graph_opts[k] = v
+        # A saved 8 is the old default written back on close, not a choice —
+        # moved once to the new default; an 8 picked after that is kept.
+        if not self.config.get("x_ticks_default_12"):
+            if self._graph_opts.get("x_ticks_max") == 8:
+                self._graph_opts["x_ticks_max"] = _GRAPH_OPTS_DEFAULTS["x_ticks_max"]
+            self.config["x_ticks_default_12"] = True
+        # Same for the Y-axis column spacing: the old defaults written back on
+        # close move to the tighter ones once; a value set by hand is kept.
+        if not self.config.get("y_axis_tight_v1"):
+            for _k, _old in (("axis_gap_px", 6), ("label_pad_px", 5),
+                             ("outer_margin_px", 8)):
+                if self._graph_opts.get(_k) == _old:
+                    self._graph_opts[_k] = _GRAPH_OPTS_DEFAULTS[_k]
+            self.config["y_axis_tight_v1"] = True
+        # Second step: a little more air towards the neighbouring axis, one
+        # pixel less between a title and its own numbers.
+        if not self.config.get("y_axis_spacing_v2"):
+            for _k, _old in (("axis_gap_px", 3), ("label_pad_px", 1)):
+                if self._graph_opts.get(_k) == _old:
+                    self._graph_opts[_k] = _GRAPH_OPTS_DEFAULTS[_k]
+            self.config["y_axis_spacing_v2"] = True
         self._samples_by_pv: dict = {}
         self._table_rows:    list = []
         self._pv_order:      list = []
+        # The user's own order of the PV table rows and the graph's Y axes, set
+        # by dragging rows in the table. Independent of the PV list on the left.
+        self._plot_order:    list = [str(p) for p in
+                                     (self.config.get("plot_order") or [])]
         self._base_pv_order: list = []
         self._last_pv_search: str = ""
         self._col_full_names: dict = {}
-        self._presets:           list = load_presets()
+        # "Blank" (no PVs) is built in and always first. It is never written to
+        # the preset file (_store_presets), so it cannot be saved over or lost.
+        self._presets: list = _read_presets_file()
         self._condition_presets: list = load_condition_presets()
         self._custom_pvs:        list = load_custom_pvs()
         self._cpv_diag:          list = []    # problems from the last compute
@@ -1789,6 +3561,9 @@ class CSSLoggerWidget(QWidget):
         # stat cards), which is why the selected region and its numbers used to
         # disappear on a reload, a font change or any axis-table edit.
         self._sel_range = None
+        # True while the selection was dragged out past the right-hand edge: its
+        # end then follows the newest sample (_follow_live_selection).
+        self._sel_live = False
         self._crosshair_vlines = []
         self._crosshair_hlines = []
         self._crosshair_texts  = []
@@ -1814,7 +3589,8 @@ class CSSLoggerWidget(QWidget):
         self._pv_time_canvas  = None
         self._pv_time_figure  = None
         self._pv_time_toolbar = None
-        self._pv_time_condition_rows: list = []
+        self._pv_time_cond_counts: dict = {}   # condition → (kept, total) shots
+        self._pv_time_auto_ready = False         # True once the tab has been opened
         # The PV Time tab reads the ARCHIVER itself — whole days of the channels
         # the user has in the PV list — instead of the pre-built day files it
         # used to read (those stopped being written in June 2026). Every day it
@@ -1828,6 +3604,10 @@ class CSSLoggerWidget(QWidget):
         self._pv_time_epoch  = 0                 # bumped to abandon a fetch
         self._pv_time_busy   = False
         self._pv_settings: dict = {}
+        # Names the user gave PVs (PV list rename or the PV table's Display
+        # Name), kept across restarts. Only the ones that differ from the
+        # automatic short name are stored.
+        self._pv_display_names: dict = dict(self.config.get("pv_display_names") or {})
         self._live_mode     = False
         self._live_last_ts  = None
         self._live_window_span = None
@@ -1868,6 +3648,18 @@ class CSSLoggerWidget(QWidget):
         self._load_epoch      = 0
         self._last_fetch_report = None
         self._partial_busy    = False
+        self._loading_from_ns = None   # load in progress: older than this is unread
+        self._partial_table_done = False
+        # pv -> (ts, lo, hi) arrays: the lowest/highest value archived behind
+        # each thinned point (see _minmax_arrays). The graph draws it as a band.
+        self._minmax_by_pv: dict = {}
+        # Finer data read for a zoomed-in range: {"a", "b", "epoch", "pvs":
+        # {pv: (ts, val, lo, hi)}}. Spliced into the traces, never the table.
+        self._zoom_detail = None
+        self._detail_in_flight = False
+        self._graph_bands: list = []
+        self._graph_env: list = []
+        self._graph_base: list = []
         self._autoload_timer = QTimer(self)
         self._autoload_timer.setSingleShot(True)
         self._autoload_timer.timeout.connect(self._do_auto_reload)
@@ -1888,8 +3680,38 @@ class CSSLoggerWidget(QWidget):
         self._ref_lines: list      = []
         self._pre_window_vals: dict = {}  # pv → (ts_ns, value, units) before window start
         self._plot_window_ns = None       # explicit carry-forward window (live mode)
-        self._conditions: list = copy(self.config.get("conditions", []))
+        # The last shot before the window that passes the Conditions, held
+        # across a window whose own shots (and the value just before it) the
+        # Conditions reject — see _maybe_hunt_last_good.
+        self._last_good = None
+        self._lg_epoch = 0
+        self._lg_sig = None
+        # Every condition row, switched on or not (what the editor shows), and
+        # the switched-on ones with their effective min/max (what filters).
+        self._conditions_all: list = [_cond_normalize(c) for c in
+                                      (self.config.get("conditions") or [])]
+        # "Apply conditions" in the sidebar: off shows everything (trigger shots
+        # included) without losing the rows. _conditions is always the list
+        # that actually filters, so every filter path obeys the switch.
+        self._conditions_on: bool = bool(self.config.get("conditions_enabled", True))
+        self._conditions: list = ([c for c in self._conditions_all if c["enabled"]]
+                                  if self._conditions_on else [])
         self._cond_last_diag = None   # de-dupes the per-refresh conditions log
+        # Live selection: its own untrimmed copy of the samples since its start
+        # (the live window trims older ones), and the "restart after a pause".
+        self._sel_samples: dict = {}
+        self._sel_pre: dict = {}
+        self._sel_restart_note = ""
+        self._sel_pause_on: bool = bool(self.config.get("sel_pause_restart", False))
+        self._sel_pause_s: float = float(self.config.get("sel_pause_s", 15.0) or 15.0)
+        self._sel_fixed_restart_note = ""
+        # Dead shots (energy ~0 at an unchanged waveplate) left out of the
+        # selection statistics — see _dead_shot_mask.
+        self._dead_shot_on: bool = bool(self.config.get("dead_shot_skip", True))
+        self._dead_energy_pv: str = str(self.config.get(
+            "dead_shot_energy_pv", "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy") or "")
+        self._dead_energy_thr: float = float(
+            self.config.get("dead_shot_energy_max", 0.05) or 0.0)
         self._table_rows_unfiltered: list = []
         self._numeric_pvs: set = set()
         self._master_pv: str       = self.config.get("master_pv", MASTER_RAMP_PV)
@@ -1920,6 +3742,10 @@ class CSSLoggerWidget(QWidget):
         # Named looks the user chose to keep (colours, line/point styles,
         # reference lines, column layout). Nothing is stored automatically.
         self._style_presets: dict = dict(self.config.get("style_presets") or {})
+        # Name of the look last loaded, saved or imported ("" = none yet).
+        # Not kept between runs: the current look itself is not kept either,
+        # so a fresh start is always "none".
+        self._style_current: str = ""
         self._graph_popup = None       # floating graph window (F11 / Ctrl+F11)
         self._load_data_repository()
 
@@ -1938,9 +3764,24 @@ class CSSLoggerWidget(QWidget):
         sidebar_scroll.setWidgetResizable(True)
         sidebar_scroll.setFixedWidth(310)
         sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Always there, so the panel's inner width never changes: a scrollbar
+        # that came and went with the height of the INFO text reflowed the
+        # whole sidebar each time.
+        sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._sidebar_widget = QWidget()
         sidebar_scroll.setWidget(self._sidebar_widget)
-        splitter.addWidget(sidebar_scroll)
+        # INFO sits under the scrolling part, pinned to the window's bottom
+        # edge: inside the scroll area it fell below the fold whenever the
+        # sidebar was taller than the window, and the status went unseen.
+        sidebar_col = QWidget()
+        sidebar_col.setFixedWidth(310)
+        _col_lay = QVBoxLayout(sidebar_col)
+        _col_lay.setContentsMargins(0, 0, 0, 0)
+        _col_lay.setSpacing(0)
+        _col_lay.addWidget(sidebar_scroll, 1)
+        self._sidebar_info = QWidget()
+        _col_lay.addWidget(self._sidebar_info, 0)
+        splitter.addWidget(sidebar_col)
 
         # Main notebook
         self._notebook = QTabWidget()
@@ -1972,14 +3813,15 @@ class CSSLoggerWidget(QWidget):
         # and the list changes while the user is looking at another tab, so its
         # drop-downs are refilled the moment that tab comes to the front.
         self._notebook.currentChanged.connect(self._on_main_tab_changed)
-
-        self._lbl_status = QLabel("Ready.")
-        self._lbl_status.setStyleSheet("color:#777;padding:2px 6px;")
-        root_lay.addWidget(self._lbl_status)
+        # The status line is in the sidebar's INFO section (_build_sidebar).
 
     def _on_main_tab_changed(self, idx):
         if self._notebook.widget(idx) is self._tab_pv_time:
             self._refresh_pv_time_choices()
+            # Opened for the first time, or something changed while it was
+            # hidden: draw without waiting for a click.
+            self._pv_time_auto_ready = True
+            QTimer.singleShot(0, self._on_notebook_tab_changed_pv_time)
         elif self._notebook.widget(idx) is self._tab_xy:
             # Live ticks and condition changes only redraw the XY cloud while it
             # is the visible tab; a hidden one is marked and caught up here, so
@@ -2003,22 +3845,45 @@ class CSSLoggerWidget(QWidget):
         h.setStyleSheet("font-weight:700;color:#1565C0;")
         bar.addWidget(h)
 
-        btn_tw = QPushButton("\U0001f4c5 Set time window")
+        # The two things that decide WHICH stretch of time is shown sit side by
+        # side, same size: pick a window, or follow "now". What they set is
+        # spelled out underneath.
+        tw_row = QHBoxLayout()
+        tw_row.setSpacing(6)
+        btn_tw = QPushButton("\U0001f4c5 Time window")
+        btn_tw.setFixedHeight(_TW_ROW_BTN_H)
+        btn_tw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn_tw.setToolTip("Pick the start and end of the period to show")
         btn_tw.clicked.connect(self._open_time_window_dialog)
-        bar.addWidget(btn_tw)
+        tw_row.addWidget(btn_tw, 1)
 
-        sep1 = QFrame(); sep1.setFrameShape(QFrame.Shape.HLine)
-        bar.addWidget(sep1)
+        # There is no "Load data" button: data is fetched on its own whenever
+        # the channels, the time window or the preset change, so the only thing
+        # left to decide is whether the view keeps following "now".
+        self._btn_live = QPushButton("⏵ Live mode")
+        self._btn_live.setFixedHeight(_TW_ROW_BTN_H)
+        self._btn_live.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._btn_live.clicked.connect(self._toggle_live_mode)
+        self._btn_live.setToolTip(
+            "Keep following new values as they arrive. Off = the chosen time "
+            "window stays put. Data is loaded automatically either way.")
+        self._btn_live.setStyleSheet(_LIVE_BTN_OFF_STYLE)
+        tw_row.addWidget(self._btn_live, 1)
+        bar.addLayout(tw_row)
 
+        tw_col = QVBoxLayout()
+        tw_col.setContentsMargins(2, 2, 0, 0)
+        tw_col.setSpacing(1)
         self._lbl_tw_from = QLabel("From: --")
-        self._lbl_tw_from.setStyleSheet("color:#555;font-size:11px;")
+        self._lbl_tw_from.setStyleSheet("color:#333;font-size:11px;")
         self._lbl_tw_to   = QLabel("To:   --")
-        self._lbl_tw_to.setStyleSheet("color:#555;font-size:11px;")
+        self._lbl_tw_to.setStyleSheet("color:#333;font-size:11px;")
         self._lbl_tw_live = QLabel("Live: OFF")
         self._lbl_tw_live.setStyleSheet("color:#555;font-size:11px;")
-        bar.addWidget(self._lbl_tw_from)
-        bar.addWidget(self._lbl_tw_to)
-        bar.addWidget(self._lbl_tw_live)
+        tw_col.addWidget(self._lbl_tw_from)
+        tw_col.addWidget(self._lbl_tw_to)
+        tw_col.addWidget(self._lbl_tw_live)
+        bar.addLayout(tw_col)
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         bar.addWidget(sep2)
@@ -2031,10 +3896,12 @@ class CSSLoggerWidget(QWidget):
         self._preset_combo = QComboBox()
         self._preset_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._preset_combo.currentIndexChanged.connect(self._load_preset)
-        btn_del_preset = QPushButton("✕")
-        btn_del_preset.setFixedWidth(28)
+        # A word, not a bare ✕: the small red cross was not read as "delete".
+        btn_del_preset = QPushButton("Delete")
+        btn_del_preset.setToolTip("Delete the selected preset")
         btn_del_preset.setStyleSheet(
-            "QPushButton{background:#B71C1C;color:white;border-radius:3px;padding:3px 4px;}"
+            "QPushButton{background:#B71C1C;color:white;border-radius:3px;"
+            "padding:3px 8px;font-weight:600;}"
             "QPushButton:hover{background:#7F0000;}")
         btn_del_preset.clicked.connect(self._delete_preset)
         preset_row.addWidget(self._preset_combo)
@@ -2067,38 +3934,63 @@ class CSSLoggerWidget(QWidget):
             "border:1px solid #b0b0b0;border-radius:3px;}")
         self._pv_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._pv_list.setMinimumHeight(120)
-        self._pv_list.setMaximumHeight(220)
+        self._pv_list.setMaximumHeight(360)
+        # PVs are put in order by dragging them (or Ctrl+Up / Ctrl+Down); the
+        # graph's bands and the table's columns follow.
+        self._pv_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._pv_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._pv_list.model().rowsMoved.connect(
+            lambda *_: QTimer.singleShot(0, self._on_pv_list_dropped))
+        # Rows show the channel's NAME (the one the graph and the PV table use);
+        # the full PV is the tooltip. A long PV never needs a sideways scroll.
+        self._pv_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self._pv_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._pv_list.itemDoubleClicked.connect(self._on_pv_double_click)
+        self._pv_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._pv_list.customContextMenuRequested.connect(self._open_pv_list_menu)
+        for key, slot in (("F2", self._rename_current_pv),
+                          ("Delete", self._remove_selected_pvs),
+                          ("Ctrl+Up", lambda: self._move_selected_pvs(-1)),
+                          ("Ctrl+Down", lambda: self._move_selected_pvs(1)),
+                          ("Ctrl+C", self._copy_selected_pv_names),
+                          ("Ctrl+V", self._paste_pv_names)):
+            sc = QShortcut(QKeySequence(key), self._pv_list)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(slot)
         bar.addWidget(self._pv_list)
 
         pv_btns = QHBoxLayout()
-        self._btn_browse = QPushButton("Browse")
+        pv_btns.setSpacing(4)
+        self._btn_browse = QPushButton("+ Add PV")
         self._btn_browse.setStyleSheet(_BTN_SUCCESS)
+        self._btn_browse.setToolTip("Find archiver PVs and add them to the list")
         self._btn_browse.clicked.connect(self._open_pv_browser)
+        # The one place custom PVs are defined — the tab rows no longer carry
+        # their own copy of this button.
+        btn_add_custom = QPushButton("Custom PV")
+        btn_add_custom.setToolTip("Define, edit or delete PVs calculated from "
+                                  "other PVs with a formula (the ƒ rows)")
+        btn_add_custom.clicked.connect(self._open_custom_pv_dialog)
         btn_remove = QPushButton("✕ Remove")
+        btn_remove.setToolTip("Remove the selected PVs (Delete key)")
         btn_remove.clicked.connect(self._remove_selected_pvs)
-        btn_clear  = QPushButton("\U0001f5d1")
+        btn_clear  = QPushButton()
+        btn_clear.setIcon(_bin_icon())
         btn_clear.setFixedWidth(32)
+        btn_clear.setToolTip("Remove every PV from the list")
         btn_clear.clicked.connect(self._clear_pv_list)
         pv_btns.addWidget(self._btn_browse)
+        pv_btns.addWidget(btn_add_custom)
         pv_btns.addWidget(btn_remove)
         pv_btns.addWidget(btn_clear)
         bar.addLayout(pv_btns)
 
         self._lbl_pv_count = QLabel("0 PVs")
         self._lbl_pv_count.setStyleSheet("color:#777;font-size:10px;")
+        self._lbl_pv_count.setToolTip(
+            "Double-click or F2 renames a PV · drag to reorder · Ctrl+C / "
+            "Ctrl+V copy and paste PV names · right-click for more")
         bar.addWidget(self._lbl_pv_count)
-
-        # There is no "Load data" button any more: data is fetched on its own
-        # whenever the channels, the time window or the preset change, so the only
-        # thing left to decide is whether the view keeps following "now".
-        self._btn_live = QPushButton("⏵ Live mode")
-        self._btn_live.clicked.connect(self._toggle_live_mode)
-        self._btn_live.setToolTip(
-            "Keep following new values as they arrive. Off = the chosen time "
-            "window stays put. Data is loaded automatically either way.")
-        self._btn_live.setStyleSheet(_LIVE_BTN_OFF_STYLE)
-        bar.addWidget(self._btn_live)
 
         sep_m = QFrame(); sep_m.setFrameShape(QFrame.Shape.HLine)
         bar.addWidget(sep_m)
@@ -2125,6 +4017,99 @@ class CSSLoggerWidget(QWidget):
         mm_row.addStretch()
         bar.addLayout(mm_row)
 
+        # Dead shots: the waveplate did not move but the energy fell to ~0 —
+        # a trigger shot or a dropout, not a measurement. Ticked = they are
+        # left out of the selection statistics; unticked = counted like any
+        # other shot, for when the trigger shots are what is being looked at.
+        self._chk_dead_shot = QCheckBox("Skip zero-energy shots at same waveplate")
+        self._chk_dead_shot.setStyleSheet(_CHK_STYLE)
+        self._chk_dead_shot.setChecked(self._dead_shot_on)
+        _dead_tip = ("Leave out of the selection statistics every shot whose "
+                     "energy is below the limit while the master PV (waveplate) "
+                     "stayed where it was on the shot before. Untick to count "
+                     "those shots too (e.g. to see the trigger shots).")
+        self._chk_dead_shot.setToolTip(_dead_tip)
+        bar.addWidget(self._chk_dead_shot)
+        de_row = QHBoxLayout()
+        de_row.setContentsMargins(18, 0, 0, 0)
+        de_row.addWidget(QLabel("Energy:"))
+        self._dead_energy_edit = QLineEdit(self._dead_energy_pv)
+        self._dead_energy_edit.setToolTip(
+            "Energy channel the rule reads. It must be in the PV list, and so "
+            "must the master PV.")
+        de_row.addWidget(self._dead_energy_edit, 1)
+        de_row.addWidget(QLabel("<"))
+        self._dead_energy_spin = QDoubleSpinBox()
+        self._dead_energy_spin.setDecimals(3)
+        self._dead_energy_spin.setRange(0.0, 1e6)
+        self._dead_energy_spin.setSingleStep(0.01)
+        self._dead_energy_spin.setValue(self._dead_energy_thr)
+        self._dead_energy_spin.setButtonSymbols(
+            QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self._dead_energy_spin.setFixedWidth(58)
+        self._dead_energy_spin.setToolTip("An energy below this counts as zero")
+        de_row.addWidget(self._dead_energy_spin)
+        bar.addLayout(de_row)
+
+        def _dead_changed(*_):
+            self._dead_shot_on = self._chk_dead_shot.isChecked()
+            self._dead_energy_pv = self._dead_energy_edit.text().strip()
+            self._dead_energy_thr = float(self._dead_energy_spin.value())
+            self._dead_energy_edit.setEnabled(self._dead_shot_on)
+            self._dead_energy_spin.setEnabled(self._dead_shot_on)
+            if self._sel_range:
+                self._recompute_stats()
+        self._chk_dead_shot.toggled.connect(_dead_changed)
+        self._dead_energy_edit.editingFinished.connect(_dead_changed)
+        self._dead_energy_spin.valueChanged.connect(_dead_changed)
+        self._dead_energy_edit.setEnabled(self._dead_shot_on)
+        self._dead_energy_spin.setEnabled(self._dead_shot_on)
+
+        def _section(title):
+            sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+            bar.addWidget(sep)
+            hdr = QLabel(title)
+            hdr.setStyleSheet("font-weight:700;color:#1565C0;")
+            bar.addWidget(hdr)
+
+        # ── Info: what the program is doing right now ─────────────────────
+        # Used to be a grey line under the whole window; here it sits next to
+        # the progress bar it talks about, and wraps instead of running off.
+        # It lives in its own holder under the scrolling sidebar, so it is
+        # always on screen at the bottom of the window.
+        info_lay = QVBoxLayout(self._sidebar_info)
+        info_lay.setContentsMargins(6, 0, 6, 6)
+        info_lay.setSpacing(4)
+        _info_sep = QFrame(); _info_sep.setFrameShape(QFrame.Shape.HLine)
+        info_lay.addWidget(_info_sep)
+        _info_hdr = QLabel("INFO")
+        _info_hdr.setStyleSheet("font-weight:700;color:#1565C0;")
+        info_lay.addWidget(_info_hdr)
+        # Fixed width AND fixed height: the status changes several times a
+        # second while loading, and a box that grew and shrank with it moved
+        # every control below it (and a long PV name widened the sidebar).
+        # A longer message ends in "…"; the whole of it is the tooltip.
+        self._lbl_status = _SidebarText("Ready.", max_lines=4)
+        self._lbl_status.setStyleSheet(
+            "QLabel{background:#ffffff;color:#222222;border:1px solid #c8c8c8;"
+            "border-radius:3px;padding:3px 5px;font-size:11px;}")
+        info_lay.addWidget(self._lbl_status)
+        # Graph-specific notes (zoom mode, "load data first", …) — formerly the
+        # grey text at the top right of the graph. Hidden while empty.
+        self._lbl_graph_info = _InfoLabel("")
+        self._lbl_graph_info.setWordWrap(True)
+        self._lbl_graph_info.setStyleSheet("color:#444444;font-size:11px;padding:0 2px;")
+        self._lbl_graph_info.hide()
+        info_lay.addWidget(self._lbl_graph_info)
+        # Custom PVs that cannot be computed right now, and why.
+        self._lbl_cpv_info = _InfoLabel("")
+        self._lbl_cpv_info.setWordWrap(True)
+        self._lbl_cpv_info.setStyleSheet(
+            "QLabel{background:#FFF3E0;color:#3E2723;border:1px solid #E65100;"
+            "border-radius:3px;padding:3px 5px;font-size:11px;}")
+        self._lbl_cpv_info.hide()
+        info_lay.addWidget(self._lbl_cpv_info)
+
         # ── Progress bar ───────────────────────────────────────────────────
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
@@ -2133,10 +4118,10 @@ class CSSLoggerWidget(QWidget):
         self._progress_bar.setFixedHeight(14)
         self._progress_bar.setStyleSheet(
             "QProgressBar{border:1px solid #bbb;border-radius:3px;"
-            "background:#eee;text-align:center;font-size:10px;}"
-            "QProgressBar::chunk{background:#2E7D32;border-radius:2px;}")
+            "background:#eee;color:#111;text-align:center;font-size:10px;}"
+            "QProgressBar::chunk{background:#81C784;border-radius:2px;}")
         self._progress_bar.hide()
-        bar.addWidget(self._progress_bar)
+        info_lay.addWidget(self._progress_bar)
 
         # Stop: a long period is loaded newest-first and painted as it arrives,
         # so the user must be able to say "that is enough" and keep what is
@@ -2148,7 +4133,145 @@ class CSSLoggerWidget(QWidget):
             "QPushButton:hover{background:#FFE0B2;}")
         self._btn_stop_load.clicked.connect(self._stop_loading)
         self._btn_stop_load.hide()
-        bar.addWidget(self._btn_stop_load)
+        info_lay.addWidget(self._btn_stop_load)
+
+        # ── The controls that used to sit in a row above the graph ────────
+        # Grouped by what they act on. Conditions serve the Graph, XY and Table
+        # tabs alike, so a place outside any one tab is where they belong.
+        def _grid(*buttons):
+            g = QGridLayout()
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setHorizontalSpacing(4)
+            g.setVerticalSpacing(4)
+            g.setColumnStretch(0, 1)
+            g.setColumnStretch(1, 1)
+            for i, b in enumerate(buttons):
+                b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                g.addWidget(b, i // 2, i % 2)
+            bar.addLayout(g)
+
+        _section("DATA FILTER")
+        b_cond = QPushButton("Conditions")
+        b_cond.setToolTip("Keep only the rows where chosen signals are within limits")
+        b_cond.clicked.connect(self._open_conditions_dialog)
+        b_cross = QPushButton("Limit crossings")
+        b_cross.setToolTip("Every time a signal went above (or below) one of its "
+                           "reference lines: when, how long, how far")
+        b_cross.clicked.connect(self._open_limit_crossings)
+        _grid(b_cond, b_cross)
+        # One switch for all conditions: off shows everything again (trigger
+        # shots, ramps) without losing the condition rows.
+        self._chk_cond_on = QCheckBox("Apply conditions")
+        self._chk_cond_on.setStyleSheet(_CHK_STYLE)
+        self._chk_cond_on.setChecked(self._conditions_on)
+        self._chk_cond_on.toggled.connect(self._set_conditions_on)
+        bar.addWidget(self._chk_cond_on)
+        self._sync_conditions_tick()
+        # A live selection starts again at the first shot after a firing pause.
+        p_row = QHBoxLayout()
+        p_row.setContentsMargins(0, 0, 0, 0)
+        self._chk_sel_pause = QCheckBox("Restart after pause >")
+        self._chk_sel_pause.setStyleSheet(_CHK_STYLE)
+        self._chk_sel_pause.setChecked(self._sel_pause_on)
+        self._chk_sel_pause.setToolTip(
+            "The selection statistics count only from the first shot after the "
+            "newest pause in firing longer than this. A live selection (dragged "
+            "out past the right edge) moves its start there.")
+        self._spin_sel_pause = QSpinBox()
+        self._spin_sel_pause.setRange(1, 3600)
+        self._spin_sel_pause.setSuffix(" s")
+        self._spin_sel_pause.setValue(int(round(self._sel_pause_s)))
+        self._spin_sel_pause.setToolTip(self._chk_sel_pause.toolTip())
+
+        def _pause_changed(*_):
+            self._sel_pause_on = self._chk_sel_pause.isChecked()
+            self._sel_pause_s = float(self._spin_sel_pause.value())
+            if self._sel_range:
+                self._recompute_stats()
+        self._chk_sel_pause.toggled.connect(_pause_changed)
+        self._spin_sel_pause.valueChanged.connect(_pause_changed)
+        p_row.addWidget(self._chk_sel_pause)
+        p_row.addWidget(self._spin_sel_pause)
+        p_row.addStretch()
+        bar.addLayout(p_row)
+
+        _section("GRAPH")
+        b_ref = QPushButton("Reference lines")
+        b_ref.clicked.connect(self._open_ref_lines_dialog)
+        b_gset = QPushButton("Graph settings")
+        b_gset.setToolTip("Fonts, axis-column spacing, time stamps, plot margins, "
+                          "cursor readouts")
+        b_gset.clicked.connect(self._open_graph_settings_dialog)
+        self._btn_graph_view = QPushButton("View ▾")
+        self._btn_graph_view.setToolTip(
+            "Reset the view, set axis limits by hand, hide all grids")
+        self._btn_graph_view.clicked.connect(self._open_graph_view_menu)
+        b_clean = QPushButton("Clean graph")
+        b_clean.setToolTip("Remove the plotted points from the graph")
+        b_clean.clicked.connect(self._clean_graph)
+        _grid(b_ref, b_gset, self._btn_graph_view, b_clean)
+
+        num_row = QGridLayout()
+        num_row.setContentsMargins(0, 2, 0, 0)
+        num_row.setHorizontalSpacing(4)
+        num_row.addWidget(QLabel("Font:"), 0, 0)
+        self._font_size_spin = QSpinBox()
+        self._font_size_spin.setRange(5, 24)
+        self._font_size_spin.setValue(int(self._graph_opts.get("font_size", 11)))
+        self._font_size_spin.setFixedWidth(90)
+        self._font_size_spin.valueChanged.connect(self._apply_font_size)
+        num_row.addWidget(self._font_size_spin, 0, 1)
+        num_row.addWidget(QLabel("pt"), 0, 2)
+
+        # Averaging / downsampling: bin each trace to at most N points per PV so
+        # long windows stay responsive. 0 = off (plot raw, capped only by a
+        # safety limit).
+        num_row.addWidget(QLabel("Avg to:"), 1, 0)
+        self._avg_target_spin = QSpinBox()
+        self._avg_target_spin.setRange(0, 200000)
+        self._avg_target_spin.setValue(int(self.config.get("avg_target_points", 2000)))
+        self._avg_target_spin.setSingleStep(500)
+        self._avg_target_spin.setFixedWidth(90)
+        self._avg_target_spin.setToolTip(
+            "Target points per PV. >0 lets a densely archived signal be thinned "
+            "by the server (fast, like CS Studio 'Optimized'); a signal with few "
+            "samples is always read exactly as archived, and a thinned series "
+            "that turns out flat or short is read again. The trace is then "
+            "trimmed to this many points by time-binned mean. "
+            "0 = read everything as archived (slow for long windows). "
+            "Applies on next Load.")
+        self._avg_target_spin.valueChanged.connect(self._on_avg_target_changed)
+        num_row.addWidget(self._avg_target_spin, 1, 1)
+        num_row.addWidget(QLabel("points per PV"), 1, 2)
+        num_row.setColumnStretch(3, 1)
+        bar.addLayout(num_row)
+
+        # The PV table under the graph: its columns and its whole look.
+        _section("PV TABLE")
+        b_reset_cols = QPushButton("Reset columns")
+        b_reset_cols.setToolTip("Put the columns back in their original order, width "
+                                "and selection.\nDrag a column heading to move it; "
+                                "right-click the headings to show or hide columns.")
+        b_reset_cols.clicked.connect(self._reset_axis_columns)
+        b_styles = QPushButton("Styles")
+        b_styles.setToolTip("Save or load the whole look of the graph: colours, line "
+                            "and point styles, reference lines and the column layout.")
+        b_styles.setMenu(self._build_styles_menu(b_styles))
+        _grid(b_reset_cols, b_styles)
+        # Which saved look is on the graph now. Wraps rather than cutting a
+        # long name short.
+        self._lbl_style_current = QLabel()
+        self._lbl_style_current.setWordWrap(True)
+        self._lbl_style_current.setStyleSheet("color:#222222;font-size:11px;")
+        bar.addWidget(self._lbl_style_current)
+        self._show_style_current()
+
+        _section("SELECTION")
+        self._btn_clear_sel = QPushButton("Clear selection")
+        self._btn_clear_sel.setToolTip(
+            "Remove the blue selected region and its statistics")
+        self._btn_clear_sel.clicked.connect(self._clear_selection)
+        _grid(self._btn_clear_sel)
 
         bar.addStretch()
         self._refresh_preset_combo()
@@ -2168,78 +4291,20 @@ class CSSLoggerWidget(QWidget):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(2)
 
-        # Controls row (wrapped in a container so it can be hidden in the
-        # fullscreen / windowed "graph only" pop-out).
-        self._graph_ctrl_bar = QWidget()
-        ctrl = QHBoxLayout(self._graph_ctrl_bar)
-        ctrl.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self._graph_ctrl_bar)
+        # The row of controls that used to sit here (Conditions, Reference lines,
+        # View, Font, Avg to, …) lives in the sidebar now — see _build_sidebar.
 
-        # Zoom, pan, view history, margins and Save all live on the graph toolbar
-        # built below (the same one the Spectra tab uses), so this row no longer
-        # carries its own Back / Save graph — two view histories side by side
-        # would disagree with each other.
-        b_clean = QPushButton("Clean graph"); b_clean.clicked.connect(self._clean_graph); ctrl.addWidget(b_clean)
-        self._btn_clear_sel = QPushButton("Clear selection")
-        self._btn_clear_sel.setToolTip(
-            "Remove the blue selected region and its statistics")
-        self._btn_clear_sel.clicked.connect(self._clear_selection)
-        ctrl.addWidget(self._btn_clear_sel)
-        self._btn_graph_view = QPushButton("View ▾")
-        self._btn_graph_view.setToolTip(
-            "Reset the view, set axis limits by hand, hide all grids")
-        self._btn_graph_view.clicked.connect(self._open_graph_view_menu)
-        ctrl.addWidget(self._btn_graph_view)
-        b_ref  = QPushButton("Reference lines"); b_ref.clicked.connect(self._open_ref_lines_dialog); ctrl.addWidget(b_ref)
-        b_cond = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
-        b_cpv  = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
-        b_gset = QPushButton("Graph settings")
-        b_gset.setToolTip("Fonts, axis-column spacing, time stamps, plot margins, "
-                          "cursor readouts")
-        b_gset.clicked.connect(self._open_graph_settings_dialog); ctrl.addWidget(b_gset)
-
-        ctrl.addWidget(QLabel("Font:"))
-        self._font_size_spin = QSpinBox()
-        self._font_size_spin.setRange(5, 24)
-        self._font_size_spin.setValue(int(self._graph_opts.get("font_size", 11)))
-        self._font_size_spin.setFixedWidth(48)
-        self._font_size_spin.valueChanged.connect(self._apply_font_size)
-        ctrl.addWidget(self._font_size_spin)
-        ctrl.addWidget(QLabel("pt"))
-
-        # Averaging / downsampling: bin each trace to at most N points per PV so
-        # long windows stay responsive. 0 = off (plot raw, capped only by a
-        # safety limit). Kept client-side until a server-side option exists.
-        ctrl.addSpacing(12)
-        ctrl.addWidget(QLabel("Avg to:"))
-        self._avg_target_spin = QSpinBox()
-        self._avg_target_spin.setRange(0, 200000)
-        self._avg_target_spin.setValue(int(self.config.get("avg_target_points", 2000)))
-        self._avg_target_spin.setSingleStep(500)
-        self._avg_target_spin.setFixedWidth(78)
-        self._avg_target_spin.setToolTip(
-            "Target points per PV. >0 lets a densely archived signal be thinned "
-            "by the server (fast, like CS Studio 'Optimized'); a signal with few "
-            "samples is always read exactly as archived, and a thinned series "
-            "that turns out flat or short is read again. The trace is then "
-            "trimmed to this many points by time-binned mean. "
-            "0 = read everything as archived (slow for long windows). "
-            "Applies on next Load.")
-        self._avg_target_spin.valueChanged.connect(self._on_avg_target_changed)
-        ctrl.addWidget(self._avg_target_spin)
-        ctrl.addWidget(QLabel("pts"))
-        ctrl.addStretch()
-        self._lbl_graph_info = QLabel("")
-        self._lbl_graph_info.setStyleSheet("color:#777;")
-        ctrl.addWidget(self._lbl_graph_info)
-
-        # Graph toolbar (zoom, pan, view history, margins, save). The toolbar is
-        # tied to one canvas and the canvas is rebuilt on every redraw, so only an
-        # empty holder is created here and refilled by _install_graph_toolbar.
+        # Graph tool strip (view history, pan/zoom/loupe, margins, save). It is
+        # built once and stays; the matplotlib toolbar behind it is tied to one
+        # canvas and rebuilt on every redraw, so it lives in a HIDDEN holder and
+        # only serves as the engine the strip's buttons drive.
+        self._graph_strip = self._build_graph_strip()
+        lay.addWidget(self._graph_strip)
         self._graph_tb_holder = QWidget()
         _tb_lay = QHBoxLayout(self._graph_tb_holder)
         _tb_lay.setContentsMargins(0, 0, 0, 0)
         _tb_lay.setSpacing(0)
+        self._graph_tb_holder.hide()
         lay.addWidget(self._graph_tb_holder)
 
         # Vertical splitter: graph canvas (top) + axis settings (bottom).
@@ -2293,23 +4358,93 @@ class CSSLoggerWidget(QWidget):
         # drags out a region (left-drag) on the plot. One compact card per PV,
         # laid out side by side and wrapping onto new rows so nothing spills
         # past the panel edge; the whole strip scrolls if it gets too tall.
+        # Heading row: the title on the left, the All / One row / Hide switch on
+        # the right. The strip itself is exactly as tall as its cards (see
+        # _fit_stats_strip) — no dead band under them.
+        self._stats_head = QWidget()
+        sh_lay = QHBoxLayout(self._stats_head)
+        sh_lay.setContentsMargins(0, 0, 4, 0)
+        sh_lay.setSpacing(2)
         self._stats_title = QLabel("")
         self._stats_title.setStyleSheet(
             "font-size:10px;font-weight:700;color:#1565C0;padding:2px 6px 0 6px;")
         self._stats_title.hide()
-        top_lay.addWidget(self._stats_title)
+        sh_lay.addWidget(self._stats_title, stretch=1)
+        # The selection's two edges, to type or step one shot at a time — on a
+        # two-hour graph a pixel is several seconds, too coarse to put an edge
+        # exactly on the first shot after a short pause by dragging.
+        _edge_css = ("QDateTimeEdit{background:#ffffff;color:#111;border:1px solid "
+                     "#b6b6b6;border-radius:3px;padding:0 2px;font-size:10px;}")
+        _step_css = ("QToolButton{background:#efefef;color:#111;border:1px solid "
+                     "#b6b6b6;border-radius:3px;padding:0px 4px;font-size:10px;}"
+                     "QToolButton:hover{background:#dce9fb;border-color:#8fb4de;}")
+        self._sel_edge_edits = {}
+        for edge, label in (("start", "Start"), ("end", "End")):
+            lbl = QLabel(label + ":")
+            lbl.setStyleSheet("font-size:10px;color:#333;padding-left:6px;")
+            sh_lay.addWidget(lbl)
+            b_prev = QToolButton(); b_prev.setText("-1")
+            b_prev.setToolTip(f"Move the {label.lower()} one shot earlier")
+            b_prev.setStyleSheet(_step_css)
+            b_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b_prev.clicked.connect(lambda _c=False, e=edge: self._step_sel_edge(e, -1))
+            ed = QDateTimeEdit()
+            ed.setDisplayFormat("HH:mm:ss")
+            ed.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            ed.setFixedWidth(62)
+            ed.setStyleSheet(_edge_css)
+            ed.setToolTip(f"Selection {label.lower()} — type a time and press Enter")
+            ed.editingFinished.connect(lambda e=edge: self._on_sel_edge_typed(e))
+            b_next = QToolButton(); b_next.setText("+1")
+            b_next.setToolTip(f"Move the {label.lower()} one shot later")
+            b_next.setStyleSheet(_step_css)
+            b_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b_next.clicked.connect(lambda _c=False, e=edge: self._step_sel_edge(e, 1))
+            for w in (b_prev, ed, b_next):
+                sh_lay.addWidget(w)
+            self._sel_edge_edits[edge] = ed
+        sh_lay.addSpacing(8)
+        self._stats_mode = str(self.config.get("stats_strip_mode", "all"))
+        if self._stats_mode not in ("all", "row", "hide"):
+            self._stats_mode = "all"
+        self._stats_mode_btns = {}
+        for key, text, tip in (
+                ("all", "All", "Show every statistics card"),
+                ("row", "One row", "Show only the first row of cards; scroll for "
+                                   "the rest"),
+                ("hide", "Hide", "Fold the cards away, keep only this heading")):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setChecked(key == self._stats_mode)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setStyleSheet(
+                "QToolButton{background:#efefef;color:#111;border:1px solid #b6b6b6;"
+                "border-radius:3px;padding:0px 6px;font-size:10px;}"
+                "QToolButton:hover{background:#dce9fb;border-color:#8fb4de;}"
+                "QToolButton:checked{background:#2f6fb5;color:#ffffff;"
+                "border-color:#255a94;}")
+            b.clicked.connect(lambda _c=False, k=key: self._set_stats_mode(k))
+            self._stats_mode_btns[key] = b
+            sh_lay.addWidget(b)
+        self._stats_head.hide()
+        top_lay.addWidget(self._stats_head)
 
         self._stats_scroll = QScrollArea()
         self._stats_scroll.setWidgetResizable(True)
         self._stats_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._stats_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._stats_scroll.setMaximumHeight(150)
-        self._stats_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self._stats_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._stats_container = QWidget()
         self._stats_flow = _FlowLayout(self._stats_container, margin=4, spacing=6)
         self._stats_scroll.setWidget(self._stats_container)
         self._stats_scroll.hide()
         top_lay.addWidget(self._stats_scroll)
+        self._stats_top_pane = top_pane
+        # Re-fit when the window gets wider or narrower: cards re-wrap.
+        self._stats_resize_hook = _ResizeHook(top_pane, self._fit_stats_strip)
 
         self._graph_v_splitter.addWidget(top_pane)
 
@@ -2359,28 +4494,8 @@ class CSSLoggerWidget(QWidget):
         lay = QVBoxLayout(parent)
         lay.setContentsMargins(4, 2, 4, 4)
         lay.setSpacing(2)
-
-        hdr = QHBoxLayout()
-        h = QLabel("Axis settings")
-        h.setStyleSheet("font-weight:700;color:#1565C0;")
-        self._axis_hdr_label = h
-        hdr.addWidget(h)
-        hdr.addSpacing(12)
-        b_reset_cols = QPushButton("Reset columns")
-        b_reset_cols.setToolTip("Put the columns back in their original order, width "
-                                "and selection.\nDrag a column heading to move it; "
-                                "right-click the headings to show or hide columns.")
-        b_reset_cols.clicked.connect(self._reset_axis_columns)
-        hdr.addWidget(b_reset_cols)
-        b_styles = QToolButton()
-        b_styles.setText("Styles")
-        b_styles.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        b_styles.setToolTip("Save or load the whole look of the graph: colours, line "
-                            "and point styles, reference lines and the column layout.")
-        b_styles.setMenu(self._build_styles_menu(b_styles))
-        hdr.addWidget(b_styles)
-        hdr.addStretch()
-        lay.addLayout(hdr)
+        # Reset columns / Styles live in the sidebar's PV TABLE section; the
+        # table starts right under the splitter handle.
 
         _COLS   = list(self._axis_tv_cols)
         _HEADS  = self._AXIS_COL_HEADS
@@ -2415,9 +4530,17 @@ class CSSLoggerWidget(QWidget):
         # Column headings can be dragged into any order; "Reset columns" undoes it.
         hdr.setSectionsMovable(True)
         hdr.setFirstSectionMovable(True)
+        self._axis_drop_marker = _HeaderDropMarker(self._axis_tv)
         hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         hdr.customContextMenuRequested.connect(self._open_axis_column_menu)
         self._apply_default_axis_columns()
+
+        # Rows can be dragged into the user's own order; the graph follows.
+        self._axis_row_drag = _RowDragger(
+            self._axis_tv,
+            lambda r: 0 <= r < len(getattr(self, "_axis_row_pv", []))
+            and self._axis_row_pv[r] is not None,
+            self._on_axis_rows_dropped)
 
         self._axis_tv.cellDoubleClicked.connect(self._on_axis_tv_double_click)
         # Second click on an already-selected row clears the highlight (toggle).
@@ -2491,21 +4614,37 @@ class CSSLoggerWidget(QWidget):
         return menu
 
     def _fill_styles_menu(self, menu):
+        # Every entry runs after the popup has closed: a yes/no box or file
+        # dialog opened while the menu still holds the mouse cannot be answered,
+        # and the entry looks dead.
+        def later(fn):
+            return lambda: QTimer.singleShot(0, fn)
         menu.clear()
-        menu.addAction("Save current look as", self._save_style_preset)
-        load_menu = menu.addMenu("Load")
-        del_menu  = menu.addMenu("Delete")
+        menu.setToolTipsVisible(True)
+        menu.addAction("Save current look as", later(self._save_style_preset))
+        # menu.addMenu("Load") hands back a sub-menu that PySide destroys as
+        # soon as this function returns — Load / Delete then opened nothing.
+        # Own them explicitly and drop the previous pair (clear() leaves them).
+        for old in getattr(menu, "_style_submenus", ()):
+            old.deleteLater()
+        load_menu = QMenu("Load", menu)
+        del_menu  = QMenu("Delete", menu)
+        menu._style_submenus = (load_menu, del_menu)
+        menu.addMenu(load_menu)
+        menu.addMenu(del_menu)
         names = sorted(self._style_presets)
         if names:
             for name in names:
-                load_menu.addAction(name, lambda n=name: self._load_style_preset(n))
-                del_menu.addAction(name, lambda n=name: self._delete_style_preset(n))
+                load_menu.addAction(name, later(lambda n=name: self._load_style_preset(n)))
+                del_menu.addAction(name, later(lambda n=name: self._delete_style_preset(n)))
         else:
-            load_menu.setEnabled(False)
-            del_menu.setEnabled(False)
+            for sub in (load_menu, del_menu):
+                sub.setEnabled(False)
+                sub.menuAction().setToolTip(
+                    "No saved looks yet. Use “Save current look as” first.")
         menu.addSeparator()
-        menu.addAction("Export to file", self._export_style_preset)
-        menu.addAction("Import from file", self._import_style_preset)
+        menu.addAction("Export to file", later(self._export_style_preset))
+        menu.addAction("Import from file", later(self._import_style_preset))
         menu.addSeparator()
         menu.addAction("Reset columns", self._reset_axis_columns)
 
@@ -2571,6 +4710,7 @@ class CSSLoggerWidget(QWidget):
             return
         self._style_presets[name] = self._current_style_payload()
         self._save_runtime_state()
+        self._set_style_current(name)
         self._lbl_status.setText(f"Saved look “{name}”")
 
     def _load_style_preset(self, name):
@@ -2578,6 +4718,7 @@ class CSSLoggerWidget(QWidget):
         if not data:
             return
         self._apply_style_payload(data)
+        self._set_style_current(name)
         self._lbl_status.setText(f"Loaded look “{name}”")
 
     def _delete_style_preset(self, name):
@@ -2586,6 +4727,22 @@ class CSSLoggerWidget(QWidget):
             return
         self._style_presets.pop(name, None)
         self._save_runtime_state()
+        if name == self._style_current:
+            self._set_style_current("")
+        self._lbl_status.setText(f"Deleted look “{name}”")
+
+    def _set_style_current(self, name):
+        """Remember which look is on the graph and show it under Styles."""
+        self._style_current = name
+        self._show_style_current()
+
+    def _show_style_current(self):
+        lbl = getattr(self, "_lbl_style_current", None)
+        if lbl is None:
+            return
+        name = self._style_current
+        lbl.setText(f"Loaded style: <b>{html.escape(name)}</b>" if name
+                    else "Loaded style: none")
 
     def _export_style_preset(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -2614,6 +4771,7 @@ class CSSLoggerWidget(QWidget):
             QMessageBox.warning(self, "Import look", "That file is not a saved look.")
             return
         self._apply_style_payload(data)
+        self._set_style_current(f"{pathlib.Path(path).stem} (file)")
         self._lbl_status.setText(f"Look imported from {path}")
 
     def _open_axis_column_menu(self, pos):
@@ -2660,7 +4818,6 @@ class CSSLoggerWidget(QWidget):
         b_plot.clicked.connect(self._plot_xy); ctrl.addWidget(b_plot)
         b_clean = QPushButton("Clean XY"); b_clean.clicked.connect(self._clean_xy); ctrl.addWidget(b_clean)
         b_cond  = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
-        b_cpv   = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
         ctrl.addStretch()
         lay.addLayout(ctrl)
 
@@ -2710,14 +4867,28 @@ class CSSLoggerWidget(QWidget):
         self._pv_time_mode_combo.addItems(["Daily distribution", "Raw shots"])
         ctrl.addWidget(self._pv_time_mode_combo)
 
-        self._btn_pv_time_plot = QPushButton("Plot")
-        self._btn_pv_time_plot.setStyleSheet(_BTN_SUCCESS)
+        # The plot follows every change on its own; this only re-reads and
+        # redraws on request (e.g. after a long wait, for today's new shots).
+        self._btn_pv_time_plot = QPushButton("Refresh")
+        self._btn_pv_time_plot.setToolTip(
+            "Redraw now. The plot also redraws by itself whenever the channel, "
+            "the days, the mode or a condition changes.")
         self._btn_pv_time_plot.clicked.connect(self._plot_pv_time)
         ctrl.addWidget(self._btn_pv_time_plot)
-        b_add_cond = QPushButton("+ Condition"); b_add_cond.clicked.connect(self._pv_time_add_condition_row)
-        ctrl.addWidget(b_add_cond)
         ctrl.addStretch()
         lay.addLayout(ctrl)
+
+        # One collapsed redraw per burst of changes; a hidden tab only notes
+        # that it is out of date and redraws when it is opened.
+        self._pv_time_auto_timer = QTimer(self)
+        self._pv_time_auto_timer.setSingleShot(True)
+        self._pv_time_auto_timer.setInterval(400)
+        self._pv_time_auto_timer.timeout.connect(self._pv_time_auto_plot)
+        self._pv_time_stale = False
+        self._pv_time_y_combo.currentIndexChanged.connect(
+            lambda _i: self._pv_time_request_plot())
+        self._pv_time_mode_combo.currentIndexChanged.connect(
+            lambda _i: self._pv_time_request_plot())
 
         # Zoom / pan / save for this plot, from the same toolbar the time graph
         # uses. A toolbar belongs to one canvas, so it is rebuilt with it.
@@ -2733,6 +4904,20 @@ class CSSLoggerWidget(QWidget):
         pv_inner.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._pv_time_canvas_container, stretch=1)
 
+        # How far the reading of the days has got — shown only while reading.
+        # Same look as the Graph tab's bar.
+        self._pv_time_progress = QProgressBar()
+        self._pv_time_progress.setRange(0, 100)
+        self._pv_time_progress.setTextVisible(True)
+        self._pv_time_progress.setFormat("%v %")
+        self._pv_time_progress.setFixedHeight(14)
+        self._pv_time_progress.setStyleSheet(
+            "QProgressBar{border:1px solid #bbb;border-radius:3px;"
+            "background:#eee;color:#111;text-align:center;font-size:10px;}"
+            "QProgressBar::chunk{background:#81C784;border-radius:2px;}")
+        self._pv_time_progress.hide()
+        lay.addWidget(self._pv_time_progress)
+
         self._lbl_pv_time_info = QLabel("Pick the days and a Y channel, then press Plot.")
         self._lbl_pv_time_info.setStyleSheet("color:#555555;")
         lay.addWidget(self._lbl_pv_time_info)
@@ -2742,8 +4927,37 @@ class CSSLoggerWidget(QWidget):
                                 "border:1px solid #ccc;border-radius:4px;}"
                                 "QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px;}")
         self._pv_time_cond_layout = QVBoxLayout(cond_grp)
+        # The same editor as the Conditions window. Its own rows, because this
+        # tab reads whole days of its own, independent of the Graph's window.
+        # A new row starts switched OFF: a row that filtered the moment it
+        # appeared would empty the plot for no stated reason.
+        self._pv_time_cond_editor = _ConditionEditor(
+            [], self.config.get("pv_time_conditions") or [],
+            count_fn=self._pv_time_cond_count, new_row_enabled=False)
+        self._pv_time_cond_editor.changed.connect(self._pv_time_request_plot)
+        # One switch for every row (like the sidebar's for the Graph), and the
+        # Graph's own rows brought over in one go instead of typed twice.
+        pvt_cond_top = QHBoxLayout()
+        pvt_cond_top.setContentsMargins(0, 0, 0, 0)
+        self._pv_time_cond_apply = bool(self.config.get("pv_time_conditions_on", True))
+        self._chk_pv_time_cond = QCheckBox("Apply conditions")
+        self._chk_pv_time_cond.setStyleSheet(_CHK_STYLE)
+        self._chk_pv_time_cond.setChecked(self._pv_time_cond_apply)
+        self._chk_pv_time_cond.setToolTip(
+            "Untick to plot every shot (trigger shots included) without losing "
+            "the condition rows")
+        self._chk_pv_time_cond.toggled.connect(self._set_pv_time_cond_apply)
+        b_copy_cond = QPushButton("Copy from Graph conditions")
+        b_copy_cond.setToolTip("Replace these rows with the rows of the "
+                               "Conditions window (Graph, XY and Table tabs)")
+        b_copy_cond.clicked.connect(self._copy_graph_conditions_to_pv_time)
+        pvt_cond_top.addWidget(self._chk_pv_time_cond)
+        pvt_cond_top.addSpacing(12)
+        pvt_cond_top.addWidget(b_copy_cond)
+        pvt_cond_top.addStretch()
+        self._pv_time_cond_layout.addLayout(pvt_cond_top)
+        self._pv_time_cond_layout.addWidget(self._pv_time_cond_editor)
         lay.addWidget(cond_grp)
-        self._pv_time_add_condition_row()
 
         # A fresh tab opens on the last five working days: enough for a daily
         # pattern to be visible, and about a dozen seconds to read.
@@ -2783,6 +4997,7 @@ class CSSLoggerWidget(QWidget):
             return
         self._pv_time_days = days
         self._refresh_pv_time_days_label()
+        self._pv_time_request_plot()
 
     def _refresh_pv_time_choices(self):
         """Fill the Y and condition drop-downs from the PV LIST on the left —
@@ -2793,55 +5008,65 @@ class CSSLoggerWidget(QWidget):
                                          (getattr(self, "_custom_pvs", None) or [])
                                          if d.get("name")]
         custom_names = {d.get("name", "") for d in (getattr(self, "_custom_pvs", None) or [])}
+        old_map = dict(self._pv_time_choice_map or {})
         choices, self._pv_time_choice_map = [], {}
         for p in names:
-            label = p if p in custom_names else shorten_pv_name(p)
+            label = p if p in custom_names else self._col_label(p)
             if label in self._pv_time_choice_map:      # same short name twice
                 label = p
             choices.append(label)
             self._pv_time_choice_map[label] = p
-        combos = [self._pv_time_y_combo] + [r["variable"] for r in self._pv_time_condition_rows]
-        for combo in combos:
-            keep = combo.currentText()
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(choices)
-            idx = combo.findText(keep)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            combo.blockSignals(False)
+        label_of = {p: lb for lb, p in self._pv_time_choice_map.items()}
+        combo = self._pv_time_y_combo
+        # Kept by the CHANNEL, not by its text: a rename must not lose it.
+        keep = old_map.get(combo.currentText(), combo.currentText())
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(choices)
+        idx = combo.findText(label_of.get(keep, keep))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        ed = getattr(self, "_pv_time_cond_editor", None)
+        if ed is not None:
+            ed.set_choices([(lb, p) for lb, p in self._pv_time_choice_map.items()])
+        # A different channel list can change what Y is, so the plot follows.
+        if combo.currentText() != label_of.get(keep, keep):
+            self._pv_time_request_plot()
 
     def _pv_time_add_condition_row(self):
-        row_w = QWidget()
-        row_lay = QHBoxLayout(row_w)
-        row_lay.setContentsMargins(0, 0, 0, 0)
-        # A new row starts switched OFF. The channel list is whatever the user
-        # has queued, so a row that filtered on "the first channel, 70 ± 10 %"
-        # the moment it appeared would empty the plot for no stated reason.
-        chk = QCheckBox(); chk.setChecked(False)
-        var_combo = QComboBox(); var_combo.setMinimumWidth(200)
-        target_edit = QLineEdit("70"); target_edit.setFixedWidth(60)
-        tol_edit    = QLineEdit("10"); tol_edit.setFixedWidth(60)
-        b_del = QPushButton("Remove"); b_del.setFixedWidth(70)
-        row_lay.addWidget(chk)
-        row_lay.addWidget(var_combo)
-        row_lay.addWidget(QLabel("target ±")); row_lay.addWidget(target_edit)
-        row_lay.addWidget(QLabel("%")); row_lay.addWidget(tol_edit)
-        row_lay.addWidget(b_del)
-        row_lay.addStretch()
-        self._pv_time_cond_layout.addWidget(row_w)
-        row = {"widget": row_w, "enabled": chk,
-               "variable": var_combo, "target": target_edit, "tolerance": tol_edit}
-        self._pv_time_condition_rows.append(row)
-        b_del.clicked.connect(lambda: self._pv_time_remove_condition_row(row))
-        self._refresh_pv_time_choices()
+        return self._pv_time_cond_editor.add_row()
 
-    def _pv_time_remove_condition_row(self, row):
-        if row not in self._pv_time_condition_rows:
+    # -- redrawing on its own -------------------------------------------------
+
+    def _pv_time_tab_visible(self):
+        nb = getattr(self, "_notebook", None)
+        return nb is not None and nb.currentWidget() is self._tab_pv_time \
+            and self._tab_pv_time.isVisible()
+
+    def _pv_time_request_plot(self):
+        """Something the plot depends on changed: redraw shortly (collapsed
+        over a burst), or — on a hidden tab — remember to do it when shown."""
+        if not getattr(self, "_pv_time_auto_ready", False):
+            return                       # still building / no plot asked for yet
+        if self._pv_time_tab_visible():
+            self._pv_time_auto_timer.start()
+        else:
+            self._pv_time_stale = True
+
+    def _pv_time_auto_plot(self):
+        if self._pv_time_busy:
+            # A read is running; it draws when done. Ask again after it.
+            self._pv_time_auto_timer.start(600)
             return
-        self._pv_time_condition_rows.remove(row)
-        row["widget"].setParent(None)
-        row["widget"].deleteLater()
+        self._pv_time_stale = False
+        self._plot_pv_time()
+
+    def _on_notebook_tab_changed_pv_time(self, _idx=0):
+        if self._pv_time_tab_visible() and (self._pv_time_stale
+                                            or self._pv_time_canvas is None):
+            self._pv_time_stale = False
+            self._pv_time_auto_timer.start(0)
 
     # ── Table tab ───────────────────────────────────────────────────────────
 
@@ -2870,10 +5095,9 @@ class CSSLoggerWidget(QWidget):
         info_row.addWidget(self._lbl_table_info)
         info_row.addStretch()
         b_cond = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog)
-        b_cpv  = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog)
         self._btn_export = QPushButton("Export table")
         self._btn_export.clicked.connect(self._open_export_dialog)
-        info_row.addWidget(b_cond); info_row.addWidget(b_cpv); info_row.addWidget(self._btn_export)
+        info_row.addWidget(b_cond); info_row.addWidget(self._btn_export)
         lay.addLayout(info_row)
 
     # ── Log tab ─────────────────────────────────────────────────────────────
@@ -2888,7 +5112,8 @@ class CSSLoggerWidget(QWidget):
             "QPlainTextEdit{background:#1e1e1e;color:#d4d4d4;"
             "font-family:'Consolas','Courier New',monospace;font-size:11px;}")
         lay.addWidget(self._log_area, stretch=1)
-        b_clear = QPushButton("🗑 Clear log"); b_clear.clicked.connect(self._clear_log)
+        b_clear = QPushButton("Clear log"); b_clear.setIcon(_bin_icon())
+        b_clear.clicked.connect(self._clear_log)
         lay.addWidget(b_clear)
 
     # ── Populate UI from config ─────────────────────────────────────────────
@@ -2907,8 +5132,11 @@ class CSSLoggerWidget(QWidget):
             if "operac" in nm or "operat" in nm:
                 _auto_idx = i
                 break
-        if _auto_idx < 0 and self._presets:
-            _auto_idx = 0
+        if _auto_idx < 0:
+            # The first saved preset — never the built-in Blank, which would
+            # open the program on an empty list.
+            _auto_idx = next((i for i, p in enumerate(self._presets)
+                              if not p.get("builtin")), -1)
 
         if _auto_idx >= 0:
             # Block signal so currentIndexChanged doesn't trigger _load_preset here
@@ -2917,7 +5145,7 @@ class CSSLoggerWidget(QWidget):
             self._preset_combo.blockSignals(False)
             p = self._presets[_auto_idx]
             for pv in p.get("pvs", []):
-                self._pv_list.addItem(pv)
+                self._pv_list.addItem(self._make_pv_item(pv))
             # Also apply master PV/multiple from preset if saved
             if p.get("master_pv") and self._master_pv_edit is not None:
                 self._master_pv_edit.setText(p["master_pv"])
@@ -2927,7 +5155,7 @@ class CSSLoggerWidget(QWidget):
         else:
             # Fallback: restore last PV list from config
             for pv in self.config.get("pv_list", []):
-                self._pv_list.addItem(pv)
+                self._pv_list.addItem(self._make_pv_item(pv))
 
         self._migrate_custom_pv_bindings()  # pre-bindings entries -> explicit PVs
         self._sync_pv_list_customs()   # show defined custom PVs alongside the real ones
@@ -2941,9 +5169,7 @@ class CSSLoggerWidget(QWidget):
             # From/To it was started from (a too-wide window is clamped — see
             # _live_span_from_window), so show the span that is really on screen
             # instead of two timestamps that would both be wrong a minute later.
-            hours = self._live_window_span.total_seconds() / 3600.0
-            span = f"{hours:.0f} h" if hours >= 1 else \
-                   f"{self._live_window_span.total_seconds():.0f} s"
+            span = _fmt_span(self._live_window_span.total_seconds())
             self._lbl_tw_from.setText(f"From: now − {span}")
             self._lbl_tw_to.setText(  "To:   now")
         else:
@@ -2967,12 +5193,15 @@ class CSSLoggerWidget(QWidget):
             c = dmin
             pad = abs(c) * 0.1 or 1.0
             dmin, dmax = c - pad, c + pad
+        band_h = 1.0 / max(n, 1)
+        pad_f  = min(0.45, max(0.0, float(
+            self._graph_opts.get("band_pad_frac", 0.12))))
         if autoscale:
-            f_bot, f_top = 0.02, 0.98
+            # Full height, with the same gap in screen terms as a band has, so
+            # "Gap inside band" reaches the Autoscale'd PVs too.
+            margin = max(0.005, pad_f * band_h)
+            f_bot, f_top = margin, 1.0 - margin
         else:
-            band_h = 1.0 / max(n, 1)
-            pad_f  = min(0.45, max(0.0, float(
-                self._graph_opts.get("band_pad_frac", 0.12))))
             margin = pad_f * band_h                # gap so traces don't touch band edges
             f_top  = 1.0 - idx * band_h - margin
             f_bot  = 1.0 - (idx + 1) * band_h + margin
@@ -2989,6 +5218,97 @@ class CSSLoggerWidget(QWidget):
         one expensive full rebuild per click."""
         self._replot_timer.start(delay_ms)
 
+    # ── Trace arrays: envelope, zoom detail, window hold ─────────────────────
+
+    def _thin_trace(self, pv, ts, vals, avg_target):
+        """(ts, values) → (ts, values, low edge, high edge), thinned for the
+        screen. Each bin keeps the lowest and highest value behind it, so no
+        spike is ever averaged away. 0 = no target: only the 25 000 cap.
+        With conditions on, the archiver's own bin min/max is not used: it
+        covers the rejected values too, so the band would show them again."""
+        lo, hi = _envelope_for(ts, vals, None if self._conditions
+                               else self._minmax_by_pv.get(pv))
+        target = avg_target if avg_target > 0 else 25000
+        if avg_target <= 0 and ts.size > 25000:
+            self._plot_thinned = max(getattr(self, "_plot_thinned", 0) or 0,
+                                     int(ts.size))
+        return _downsample_arrays_envelope(ts, vals, lo, hi, target)
+
+    def _splice_detail(self, pv, ts, vals, lo, hi):
+        """Replace the part of a trace inside the zoom-detail range with the
+        finer data read for it (see _load_zoom_detail). Untouched without one."""
+        d = self._zoom_detail
+        if not d or d.get("epoch") != self._load_epoch or pv not in d["pvs"]:
+            return ts, vals, lo, hi
+        d_ts, d_v, d_lo, d_hi = d["pvs"][pv]
+        keep = (ts < d["a"]) | (ts > d["b"])
+        ts2 = np.concatenate((ts[keep], d_ts))
+        order = np.argsort(ts2, kind="stable")
+        return (ts2[order], np.concatenate((vals[keep], d_v))[order],
+                np.concatenate((lo[keep], d_lo))[order],
+                np.concatenate((hi[keep], d_hi))[order])
+
+    def _hold_to_window(self, pv, ts, vals, lo, hi, win_start_ns, win_end_ns):
+        """Carry-forward / hold (like CS Studio): the value seen BEFORE the
+        window is drawn from its left edge, the last value out to its right
+        edge, so the trace spans the whole window instead of breaking off.
+        The value from before the window is a shot like any other: when the
+        conditions reject it, it is not drawn."""
+        pre = self._pre_window_vals.get(pv)
+        pre_val = pre[1] if (pre and isinstance(pre[1], (int, float))) else None
+        if self._conditions and (pre_val is None or not self._pre_window_ok()):
+            # Rejected (laser off): hold the last shot the Conditions accept.
+            pre_val = self._last_good_value(pv, win_start_ns)
+        if not ts.size:
+            if pre_val is None:
+                return ts, vals, lo, hi
+            two = np.array([pre_val, pre_val], dtype=np.float64)
+            return (np.array([win_start_ns, win_end_ns], dtype=np.float64),
+                    two, two.copy(), two.copy())
+        if pre_val is not None and ts[0] > win_start_ns:
+            ts   = np.concatenate(([win_start_ns], ts))
+            vals = np.concatenate(([pre_val], vals))
+            lo   = np.concatenate(([pre_val], lo))
+            hi   = np.concatenate(([pre_val], hi))
+        if ts[-1] < win_end_ns:
+            ts   = np.concatenate((ts, [win_end_ns]))
+            vals = np.concatenate((vals, vals[-1:]))
+            lo   = np.concatenate((lo, lo[-1:]))
+            hi   = np.concatenate((hi, hi[-1:]))
+        return ts, vals, lo, hi
+
+    def _replace_band(self, i, ax, times_num, lo, hi):
+        """Redraw trace i's min–max band for new arrays, in place (a filled
+        area cannot be given new data, so the old one is removed)."""
+        while len(self._graph_bands) <= i:
+            self._graph_bands.append(None)
+        old = self._graph_bands[i]
+        pv = self._graph_pvs[i] if i < len(self._graph_pvs) else None
+        st = self._pv_settings.get(pv, {}) if pv else {}
+        visible = st.get("show", True) if old is None else old.get_visible()
+        color = st.get("color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
+        alpha = self._pv_style_kwargs(st, times_num.size, True).get("alpha", 1.0) \
+            if st else 1.0
+        if old is not None:
+            try:
+                old.remove()
+            except Exception:
+                pass
+        self._graph_bands[i] = self._draw_band(ax, times_num, lo, hi, color,
+                                               alpha, visible)
+
+    @staticmethod
+    def _draw_band(ax, times_num, lo, hi, color, alpha, visible):
+        """The light min–max band under a trace, or None when the trace has no
+        spread (raw data: every point is a single archived value)."""
+        if not _has_spread(lo, hi):
+            return None
+        band = ax.fill_between(times_num, lo, hi, step="post", facecolor=color,
+                               edgecolor="none", linewidth=0,
+                               alpha=max(0.08, 0.28 * float(alpha)), zorder=1)
+        band.set_visible(visible)
+        return band
+
     def _plot_graph(self):
         """Safe wrapper: a plotting failure must never crash the app or leave a
         stale graph — clear the canvas and show a message instead."""
@@ -2998,6 +5318,14 @@ class CSSLoggerWidget(QWidget):
         # half-finished reference-line placement has to end here.
         if self._ref_pick:
             self._cancel_ref_pick()
+        # A zoomed-in view survives a rebuild: changing a channel's look must
+        # not throw the user back to the whole window.
+        self._keep_xlim = None
+        if self._user_zoomed and self._graph_axes:
+            try:
+                self._keep_xlim = tuple(self._graph_axes[0].get_xlim())
+            except Exception:
+                pass
         try:
             self._plot_graph_impl()
         except Exception:
@@ -3008,14 +5336,24 @@ class CSSLoggerWidget(QWidget):
             except Exception:
                 pass
             self._lbl_graph_info.setText("Graph error — see Log tab.")
+            try:
+                self._refresh_axis_settings_tv()
+            except Exception:
+                pass
 
     def _plot_graph_impl(self):
         # Always start from a clean canvas so an early return never leaves a
         # stale graph sitting under a "no data" message.
         self._clear_graph()
 
-        if not self._samples_by_pv:
+        # In Live an empty start (no channel has said anything yet) still gets
+        # its empty axes, so the user can drag a selection that waits for the
+        # first shot.
+        if not self._samples_by_pv and not self._live_mode:
             self._lbl_graph_info.setText("Load data first.")
+            # Every way out of here refreshes the PV table, so callers need not
+            # (they used to, and every load rebuilt it twice).
+            self._refresh_axis_settings_tv()
             return
 
         # Carry-forward window bounds (ns) — used to draw the last known value
@@ -3033,12 +5371,16 @@ class CSSLoggerWidget(QWidget):
 
         def _pre_numeric(pv):
             p = self._pre_window_vals.get(pv)
-            return p is not None and isinstance(p[1], (int, float))
+            return ((p is not None and isinstance(p[1], (int, float)))
+                    or self._last_good_value(pv, _win_start_ns) is not None)
 
         # PVs with actual numeric samples (or a numeric last-known value before
         # the window, so a fully-empty window still shows the held line).
+        # The user's own order from the PV table (dragged rows), not the order
+        # of the PV list on the left — that one only decides what is loaded.
+        _plot_pvs = self._ordered_for_plot(self._pv_order)
         numeric_pvs = [
-            pv for pv in self._pv_order
+            pv for pv in _plot_pvs
             if self._pv_settings.get(pv, {}).get("show", True)
             and (any(isinstance(v, (int, float)) for _, v, _ in self._samples_by_pv.get(pv, []))
                  or _pre_numeric(pv))
@@ -3046,7 +5388,7 @@ class CSSLoggerWidget(QWidget):
 
         # All visible PVs (for axis layout — includes PVs with no data yet)
         visible_pvs = [
-            pv for pv in self._pv_order
+            pv for pv in _plot_pvs
             if self._pv_settings.get(pv, {}).get("show", True)
         ]
 
@@ -3061,8 +5403,19 @@ class CSSLoggerWidget(QWidget):
         no_data = len(numeric_pvs) == 0
 
         _dpi = 96
-        _cw  = max(self._graph_container.width()  - 8, 960)
-        _ch  = max(self._graph_container.height() - 8, 480)
+        # The figure is laid out for the size it will REALLY have on screen.
+        # The pixel gaps of the axis columns become fractions of this width,
+        # and matplotlib keeps fractions when the canvas is stretched — so
+        # laying out for a made-up 960 px (whenever the graph was narrower)
+        # shrank every gap the user set. Only a container that has not been
+        # laid out yet (a few px) falls back to a typical size.
+        _cw  = self._graph_container.width()  - 8
+        _ch  = self._graph_container.height() - 8
+        if _cw < 150:
+            _cw = 960
+        if _ch < 120:
+            _ch = 480
+        self._graph_layout_w = _cw
 
         fig = Figure(figsize=(_cw / _dpi, _ch / _dpi), dpi=_dpi)
         n   = len(pvs_for_axes)
@@ -3084,11 +5437,13 @@ class CSSLoggerWidget(QWidget):
         # axis to its left, and between the title and its own tick numbers. Both
         # are user-tunable (Graph settings) because the "right" spacing depends on
         # the font size and how many PVs share the width.
-        _GAP_PX      = max(0.0, float(_opts.get("axis_gap_px", 6)))
+        _GAP_PX      = max(0.0, float(_opts.get(
+            "axis_gap_px", _GRAPH_OPTS_DEFAULTS["axis_gap_px"])))
         # May be negative: the rotated tick numbers keep a couple of pixels of
         # empty margin around their digits, so a small negative value moves the
         # title closer without touching any ink.
-        _MIN_PAD_PX  = max(-8.0, float(_opts.get("label_pad_px", 5)))
+        _MIN_PAD_PX  = max(-8.0, float(_opts.get(
+            "label_pad_px", _GRAPH_OPTS_DEFAULTS["label_pad_px"])))
         _ticksize    = max(5, _fsize + int(_opts.get("tick_font_delta", -1)))
         _ticklen_px  = 3.5 * _PX_PER_PT          # rcParams ytick.major.size
         _tickpad_px  = 2 * _PX_PER_PT            # tick_params(pad=2) below
@@ -3145,7 +5500,9 @@ class CSSLoggerWidget(QWidget):
         # unused band there and stole plot width).
         BASE_R = max(0.0, min(0.3, float(_opts.get("margin_right", 0.015))))
         BASE_L = max(0.005, (_col_need_px
-                             + max(0.0, float(_opts.get("outer_margin_px", 8)))) / _fig_w_px)
+                             + max(0.0, float(_opts.get(
+                                 "outer_margin_px",
+                                 _GRAPH_OPTS_DEFAULTS["outer_margin_px"])))) / _fig_w_px)
         left_margin  = min(0.60, BASE_L + (n - 1) * STEP_fig)
         right_margin = 1.0 - BASE_R
         fig.subplots_adjust(left=left_margin, right=right_margin, top=_TOP, bottom=_BOTTOM)
@@ -3214,6 +5571,8 @@ class CSSLoggerWidget(QWidget):
         _n_times  = 0
         _markers  = bool(_opts.get("line_markers", True))
         self._graph_lines = []; self._graph_pvs = list(pvs_for_axes); self._graph_raw = []
+        self._graph_bands = []; self._graph_env = []; self._graph_base = []
+        self._graph_hold = (_use_window, _win_start_ns, _win_end_ns)
         self._plot_thinned = 0
 
         avg_target = self._avg_target_points()
@@ -3221,40 +5580,15 @@ class CSSLoggerWidget(QWidget):
             # Everything from here on is numpy: binning and the window edges over
             # 100k+ samples per PV in Python lists was a large part of a replot.
             ts_a, values = _pairs_to_ns_arrays(_pairs_by_pv.get(pv, []))
-
-            # Downsample: time-binned mean to the user's target (keeps the trace
-            # shape while cutting point count). 0 = off → only a hard safety cap.
-            if avg_target > 0:
-                ts_a, values = _downsample_arrays_mean(ts_a, values, avg_target)
-            else:
-                MAX_PTS = 25000
-                if ts_a.size > MAX_PTS:
-                    step = max(1, ts_a.size // MAX_PTS)
-                    # Remember it: over a long period this quietly drops most of
-                    # the points, and the status line has to own up to that
-                    # rather than let the user read the trace as complete.
-                    self._plot_thinned = max(
-                        getattr(self, "_plot_thinned", 0) or 0, int(ts_a.size))
-                    ts_a = ts_a[::step]; values = values[::step]
-
-            # Carry-forward / hold (like CS Studio): fill gaps at the window
-            # edges so the trace spans the whole window instead of breaking off.
-            # • Prepend the last value seen BEFORE the window at the start edge.
-            # • Extend the last in-window value flat out to the window end.
+            # Thinned for the screen, but every bin keeps its lowest and highest
+            # value (never a plain mean — that hid every spike), then any finer
+            # zoom detail is spliced in, then held out to the window edges.
+            ts_a, values, lo_a, hi_a = self._thin_trace(pv, ts_a, values, avg_target)
+            self._graph_base.append((ts_a, values, lo_a, hi_a))
+            ts_a, values, lo_a, hi_a = self._splice_detail(pv, ts_a, values, lo_a, hi_a)
             if _use_window:
-                pre = self._pre_window_vals.get(pv)
-                pre_val = pre[1] if (pre and isinstance(pre[1], (int, float))) else None
-                if not ts_a.size:
-                    if pre_val is not None:
-                        ts_a   = np.array([_win_start_ns, _win_end_ns], dtype=np.float64)
-                        values = np.array([pre_val, pre_val], dtype=np.float64)
-                else:
-                    if pre_val is not None and ts_a[0] > _win_start_ns:
-                        ts_a   = np.concatenate(([_win_start_ns], ts_a))
-                        values = np.concatenate(([pre_val], values))
-                    if ts_a[-1] < _win_end_ns:
-                        ts_a   = np.concatenate((ts_a, [_win_end_ns]))
-                        values = np.concatenate((values, values[-1:]))
+                ts_a, values, lo_a, hi_a = self._hold_to_window(
+                    pv, ts_a, values, lo_a, hi_a, _win_start_ns, _win_end_ns)
 
             # X in matplotlib date numbers (plain floats) — no datetime objects.
             times_num = _ns_to_num(ts_a)
@@ -3273,9 +5607,13 @@ class CSSLoggerWidget(QWidget):
             eff_smooth = pv_smooth if pv_smooth is not None else 1
 
             self._graph_raw.append((times_num, values))
+            self._graph_env.append((lo_a, hi_a))
 
             # Per-signal look: line style, point style, point size, transparency.
             style_kw = self._pv_style_kwargs(pv_setting, times_num.size, _markers)
+            self._graph_bands.append(self._draw_band(
+                ax, times_num, lo_a, hi_a, line_color,
+                style_kw.get("alpha", 1.0), visible))
 
             if eff_smooth > 1 and values.size >= eff_smooth:
                 lw_raw = (line_width * 0.5) if line_width is not None else 0.8
@@ -3335,7 +5673,8 @@ class CSSLoggerWidget(QWidget):
             # mapped into the band.
             ymin_pv = pv_setting.get("ymin"); ymax_pv = pv_setting.get("ymax")
             if values.size and not np.all(np.isnan(values)):
-                dmin = float(np.nanmin(values)); dmax = float(np.nanmax(values))
+                # The band's edges, not the means: a spike must fit on screen.
+                dmin = float(np.nanmin(lo_a)); dmax = float(np.nanmax(hi_a))
             else:
                 dmin, dmax = 0.0, 1.0
             autosc  = pv_setting.get("auto_scale", False)
@@ -3345,41 +5684,7 @@ class CSSLoggerWidget(QWidget):
             lo, hi = self._band_ylim(i, n, dmin, dmax, autosc)
             ax.set_ylim(lo, hi)
 
-        # Grids, one per ticked channel. Every channel has its own Y scale, so a
-        # single shared grid could only ever line up with one of them — which is
-        # why ticking the second, third, … Grid box used to do nothing visible.
-        # Each ticked channel now gets a horizontal grid on ITS OWN axis, in its
-        # own colour and its own line style, so several can be read apart at once.
-        # The vertical time lines stay single: all channels share one time axis.
-        _grid_pvs = [pv for pv in pvs_for_axes
-                     if self._pv_settings.get(pv, {}).get("grid", False)]
-        # Remembered so the tick box's tooltip can name the style a channel
-        # ACTUALLY got. Working it out again from _pv_order would drift by one
-        # whenever a shown channel carries no numeric data (it gets no axis here).
-        self._grid_pvs_drawn = list(_grid_pvs)
-        for i, (pv, ax) in enumerate(zip(pvs_for_axes, axes)):
-            # Grids must never sit on top of the traces. twinx axes are drawn in
-            # order, so a later channel's grid would otherwise cross an earlier
-            # channel's line.
-            ax.set_axisbelow(True)
-            ax.yaxis.grid(False)
-            if pv not in _grid_pvs:
-                continue
-            _st = self._grid_style_for(pv, _grid_pvs)
-            _c  = self._pv_settings.get(pv, {}).get(
-                "color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
-            ax.yaxis.grid(True, which="major", linestyle=_st, linewidth=0.9,
-                          color=_c, alpha=0.35, zorder=0)
-        # One shared set of vertical time lines, faint grey, drawn on the axis that
-        # owns the time axis. The style arguments are only passed when the lines are
-        # actually wanted: matplotlib switches a grid ON regardless of the first
-        # argument as soon as any line property comes with it, so passing them
-        # alongside False would draw a grid nobody asked for.
-        if _grid_pvs:
-            axes[0].xaxis.grid(True, which="major", linestyle="-",
-                               linewidth=0.8, color="#9e9e9e", alpha=0.30, zorder=0)
-        else:
-            axes[0].xaxis.grid(False)
+        self._apply_grids(pvs_for_axes, axes)
 
         # X-axis (the single shared bottom axis, axes[0])
         ax0 = ax_x
@@ -3417,6 +5722,17 @@ class CSSLoggerWidget(QWidget):
         elif total_seconds > 0:
             pad = timedelta(seconds=max(total_seconds * 0.02, 5))
             ax0.set_xlim(t_min - pad, t_max + pad)
+        # While a load runs, the part of the window not read yet is greyed, so
+        # the user can see how far back it has got and what is still missing.
+        _unread_to = getattr(self, "_loading_from_ns", None)
+        if (using_window and self._load_in_flight and _unread_to
+                and _unread_to > dt_to_ns(self._dt_from)):
+            _edge = datetime.fromtimestamp(_unread_to / 1e9, timezone.utc)
+            ax0.axvspan(t_min, _edge, facecolor="#e4e4e4", edgecolor="none",
+                        zorder=0)
+            ax0.text(t_min + (_edge - t_min) / 2, 0.5, "loading",
+                     transform=ax0.get_xaxis_transform(), ha="center",
+                     va="center", color="#555555", fontsize=_fsize, zorder=1)
         # Same size as the Y numbers (one notch below the label font), not the
         # full label size: the time stamps are the widest text on the plot, and
         # the two-line form over several days needs the room. Rotation stays 0 —
@@ -3425,6 +5741,19 @@ class CSSLoggerWidget(QWidget):
         ax0.tick_params(axis="x", which="minor", length=3, labelsize=0)
 
         self._draw_ref_lines(ax0, axes, pvs_for_axes, _fsize)
+
+        # A held line looks exactly like a live one, so a window drawn only from
+        # the last good shot says so on the plot itself.
+        _note = self._last_good_note(_win_start_ns) if _use_window else ""
+        if _note:
+            # Never cut: the text size gives way to the plot's width.
+            _longest = max(len(s) for s in _note.split("\n"))
+            _note_pt = min(_fsize, _axes_px_w / (0.58 * _longest * _dpi / 72.0))
+            ax0.text(0.5, 0.985, _note, transform=ax0.transAxes, ha="center",
+                     va="top", color="#111111", fontsize=max(5.0, _note_pt),
+                     zorder=10, linespacing=1.3,
+                     bbox=dict(boxstyle="round,pad=0.35", facecolor="#FFF3CD",
+                               edgecolor="#B58100", linewidth=1.0))
 
         # (Carry-forward is now drawn as a solid held line in the per-PV loop
         # above, so no separate dotted "last known value" overlay is needed.)
@@ -3549,19 +5878,44 @@ class CSSLoggerWidget(QWidget):
         # table opens; the time-axis title has to stay readable through that.
         canvas.mpl_connect("resize_event", self._keep_x_label_visible)
         self._crosshair_cid = canvas.mpl_connect("motion_notify_event", self._on_graph_mouse_move)
+        # The loupe disappears the moment the mouse leaves the graph.
+        canvas.mpl_connect("figure_leave_event",
+                           lambda _e: getattr(self, "_loupe", None) is not None
+                           and self._loupe.hide())
 
         try:
-            self._span_selector = SpanSelector(
+            # Left button only: without button= matplotlib takes every button,
+            # so the right-drag zoom below also started a statistics region.
+            self._span_selector = _EdgeSpanSelector(
                 ax_x, self._on_span_select, direction="horizontal",
-                useblit=False, props=dict(alpha=0.15, facecolor="#1565C0"), interactive=True)
+                useblit=False, button=1,
+                props=dict(alpha=0.15, facecolor="#1565C0"), interactive=True)
         except Exception:
             self._span_selector = None
         try:
-            self._zoom_selector = SpanSelector(
+            self._zoom_selector = _EdgeSpanSelector(
                 ax_x, self._on_zoom_select, direction="horizontal",
                 useblit=False, button=3, props=dict(alpha=0.20, facecolor="#FF6600"))
         except Exception:
             self._zoom_selector = None
+
+        # The zoom the user had before this rebuild (see _plot_graph). Put back
+        # before the xlim callback is connected: the detail for that range is
+        # already spliced in, nothing needs to be read again.
+        _keep = getattr(self, "_keep_xlim", None)
+        self._keep_xlim = None
+        if _keep and self._user_zoomed:
+            self._push_graph_view()     # Home / Back still reach the full window
+            ax_x.set_xlim(*_keep)
+            self._push_graph_view()
+            try:
+                self._retick_from_current_xlim()
+            except Exception:
+                pass
+
+        # Any change of the time range (right-drag, toolbar zoom, pan, Back,
+        # Home) may call for finer data — see _maybe_load_zoom_detail.
+        ax_x.callbacks.connect("xlim_changed", self._on_graph_xlim_changed)
 
         # Put the remembered selection back: the band on the new selector, the
         # numbers recomputed from the new arrays.
@@ -3569,8 +5923,65 @@ class CSSLoggerWidget(QWidget):
         if self._sel_range:
             self._recompute_stats()
 
+        # A graph is on screen, so "Load data first" / "No PVs loaded" / an
+        # earlier error no longer apply.
+        if self._lbl_graph_info.text() in _GRAPH_STALE_NOTES:
+            self._lbl_graph_info.setText("")
+
         canvas.draw()
         self._refresh_axis_settings_tv()
+
+    def _apply_grids(self, pvs=None, axes=None):
+        """Grids, one per ticked channel. Every channel has its own Y scale, so a
+        single shared grid could only ever line up with one of them — which is
+        why ticking the second, third, … Grid box used to do nothing visible.
+        Each ticked channel gets a horizontal grid on ITS OWN axis, in its own
+        colour and its own line style, so several can be read apart at once.
+        The vertical time lines stay single: all channels share one time axis.
+
+        Touches only the grid lines, so the Grid tick box switches them on the
+        graph as it is — no rebuild, the view and the zoom stay where they are."""
+        pvs  = list(self._graph_pvs if pvs is None else pvs)
+        axes = list(self._graph_axes if axes is None else axes)
+        if not axes:
+            return
+        _grid_pvs = [pv for pv in pvs
+                     if self._pv_settings.get(pv, {}).get("grid", False)]
+        # Remembered so the tick box's tooltip can name the style a channel
+        # ACTUALLY got. Working it out again from _pv_order would drift by one
+        # whenever a shown channel carries no numeric data (it gets no axis here).
+        self._grid_pvs_drawn = list(_grid_pvs)
+        for i, (pv, ax) in enumerate(zip(pvs, axes)):
+            # Grids must never sit on top of the traces. twinx axes are drawn in
+            # order, so a later channel's grid would otherwise cross an earlier
+            # channel's line.
+            ax.set_axisbelow(True)
+            ax.yaxis.grid(False)
+            if pv not in _grid_pvs:
+                continue
+            _st = self._grid_style_for(pv, _grid_pvs)
+            _c  = self._pv_settings.get(pv, {}).get(
+                "color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
+            ax.yaxis.grid(True, which="major", linestyle=_st, linewidth=0.9,
+                          color=_c, alpha=0.35, zorder=0)
+        # One shared set of vertical time lines, faint grey, drawn on the axis that
+        # owns the time axis. The style arguments are only passed when the lines are
+        # actually wanted: matplotlib switches a grid ON regardless of the first
+        # argument as soon as any line property comes with it, so passing them
+        # alongside False would draw a grid nobody asked for.
+        if _grid_pvs:
+            axes[0].xaxis.grid(True, which="major", linestyle="-",
+                               linewidth=0.8, color="#9e9e9e", alpha=0.30, zorder=0)
+        else:
+            axes[0].xaxis.grid(False)
+
+    def _regrid_in_place(self):
+        """Grid settings changed: redraw only the grid lines."""
+        if self._mpl_canvas is None or not self._graph_axes:
+            return
+        self._apply_grids()
+        self._blit_bg = None
+        self._mpl_canvas.draw_idle()
 
     def _update_graph_data(self):
         if self._mpl_canvas is None or not self._graph_lines:
@@ -3585,40 +5996,39 @@ class CSSLoggerWidget(QWidget):
         win_start_ns = dt_to_ns(win_start) if win_start is not None else None
         now_ns_      = dt_to_ns(now_utc)
         avg_target   = self._avg_target_points()
+        # The conditions apply here too: this path reads the samples, not the
+        # filtered table rows, and used to put every rejected shot back on the
+        # graph at the next live refresh.
+        cond_tables  = self._condition_tables()
 
         t_lo_num = t_hi_num = None
         new_raw   = []
+        new_env   = []
         for i, (pv, ax, pv_lines) in enumerate(zip(self._graph_pvs, self._graph_axes, self._graph_lines)):
             ts_a, values = _samples_to_ns_arrays(self._samples_by_pv.get(pv, []))
-            # Downsample (in numpy) BEFORE anything else. The live fast path used
-            # to push EVERY raw sample to matplotlib on every ~1 s refresh with no
+            if cond_tables and ts_a.size:
+                _keep = self._condition_mask(ts_a, cond_tables)
+                ts_a, values = ts_a[_keep], values[_keep]
+            # Thin (in numpy) BEFORE anything else. The live fast path used to
+            # push EVERY raw sample to matplotlib on every ~1 s refresh with no
             # cap, so a 100k+ point window rebuilt 100k datetimes and redrew 100k
             # vertices per PV per tick — the source of the judder. Binning to the
-            # same target the full replot uses keeps each refresh light.
-            if avg_target > 0:
-                ts_a, values = _downsample_arrays_mean(ts_a, values, avg_target)
-            elif ts_a.size > 25000:
-                step = max(1, ts_a.size // 25000)
-                ts_a = ts_a[::step]; values = values[::step]
-            pre     = self._pre_window_vals.get(pv)
-            pre_val = pre[1] if (pre and isinstance(pre[1], (int, float))) else None
-            if not ts_a.size:
-                # No data in the window: draw the last-known value flat across it.
-                if pre_val is not None and win_start_ns is not None:
-                    ts_a   = np.array([win_start_ns, now_ns_], dtype=np.float64)
-                    values = np.array([pre_val, pre_val], dtype=np.float64)
-                else:
-                    new_raw.append(self._graph_raw[i] if i < len(self._graph_raw)
-                                   else (np.empty(0), np.empty(0)))
-                    continue
-            else:
-                # Extend to the window edges so the trace spans start → now.
-                if win_start_ns is not None and pre_val is not None and ts_a[0] > win_start_ns:
-                    ts_a   = np.concatenate(([win_start_ns], ts_a))
-                    values = np.concatenate(([pre_val], values))
-                if ts_a[-1] < now_ns_:
-                    ts_a   = np.concatenate((ts_a, [now_ns_]))
-                    values = np.concatenate((values, values[-1:]))
+            # same target the full replot uses keeps each refresh light, and
+            # every bin keeps its min and max, so no spike is averaged away.
+            ts_a, values, lo_a, hi_a = self._thin_trace(pv, ts_a, values, avg_target)
+            if not ts_a.size and (win_start_ns is None
+                                  or (self._pre_window_vals.get(pv) is None
+                                      and self._last_good_value(pv, win_start_ns) is None)):
+                new_raw.append(self._graph_raw[i] if i < len(self._graph_raw)
+                               else (np.empty(0), np.empty(0)))
+                new_env.append(self._graph_env[i] if i < len(self._graph_env)
+                               else (np.empty(0), np.empty(0)))
+                continue
+            # Extend to the window edges so the trace spans start → now.
+            ts_a, values, lo_a, hi_a = self._hold_to_window(
+                pv, ts_a, values, lo_a, hi_a,
+                win_start_ns if win_start_ns is not None else ts_a[0], now_ns_)
+            new_env.append((lo_a, hi_a))
             # Arithmetic ns → date-number conversion (no datetime objects, see
             # _ns_to_num): this runs for every PV on every live refresh.
             times_num = _ns_to_num(ts_a)
@@ -3637,9 +6047,10 @@ class CSSLoggerWidget(QWidget):
                 pv_lines[1].set_data(times_num, sm)
             elif pv_lines:
                 pv_lines[0].set_data(times_num, values)
+            self._replace_band(i, ax, times_num, lo_a, hi_a)
             # Re-apply this PV's band (or full height if Autoscale on).
             if values.size and not np.all(np.isnan(values)):
-                dmin = float(np.nanmin(values)); dmax = float(np.nanmax(values))
+                dmin = float(np.nanmin(lo_a)); dmax = float(np.nanmax(hi_a))
                 autosc = pv_setting.get("auto_scale", False)
                 if not autosc:
                     ymin_pv = pv_setting.get("ymin"); ymax_pv = pv_setting.get("ymax")
@@ -3649,6 +6060,7 @@ class CSSLoggerWidget(QWidget):
                 ax.set_ylim(lo, hi)
 
         self._graph_raw = new_raw
+        self._graph_env = new_env
         if self._graph_axes:
             ax0 = self._graph_axes[0]
             live_span = self._live_window_span
@@ -3747,6 +6159,12 @@ class CSSLoggerWidget(QWidget):
         canvas = self._mpl_canvas
         bg     = self._blit_bg
 
+        if getattr(self, "_loupe_on", False):
+            try:
+                self._update_loupe(event)
+            except Exception:
+                pass
+
         if event.inaxes is None:
             self._cursor_active = False
             if bg is not None:
@@ -3784,6 +6202,7 @@ class CSSLoggerWidget(QWidget):
         for ax_i, ax in enumerate(self._graph_axes):
             pv = self._graph_pvs[ax_i] if ax_i < len(self._graph_pvs) else None
             snap_val = None
+            snap_span = None
             if raw_np and ax_i < len(raw_np):
                 arr, vals = raw_np[ax_i]
                 if len(arr):
@@ -3798,6 +6217,13 @@ class CSSLoggerWidget(QWidget):
                     pos = int(np.searchsorted(arr, x_f, side="right"))
                     idx = pos - 1 if pos > 0 else 0
                     snap_val = float(vals[idx])
+                    # A thinned point stands for an interval: say what really
+                    # happened in it, lowest to highest, not just its mean.
+                    env = self._graph_env[ax_i] if ax_i < len(self._graph_env) else None
+                    if env is not None and idx < len(env[0]):
+                        e_lo, e_hi = float(env[0][idx]), float(env[1][idx])
+                        if e_hi > e_lo:
+                            snap_span = (e_lo, e_hi)
             if pv and pv in self._pv_settings:
                 self._pv_settings[pv]["cursor_val"] = (
                     _fmt_cursor_value(snap_val) if snap_val is not None else "")
@@ -3810,6 +6236,9 @@ class CSSLoggerWidget(QWidget):
                     # hovered X (snap_val) — not the arbitrary raw mouse Y.
                     has_data = snap_val is not None
                     val_str = _fmt_cursor_value(snap_val) if has_data else "—"
+                    if snap_span is not None:
+                        val_str += (f"  (min {_fmt_cursor_value(snap_span[0])}"
+                                    f" · max {_fmt_cursor_value(snap_span[1])})")
                     ann.set_text(f" {val_str}")
                     if has_data:
                         y_ann = snap_val
@@ -3829,7 +6258,14 @@ class CSSLoggerWidget(QWidget):
         if self._x_cursor_ann is not None:
             try:
                 dt_cursor = mdates.num2date(x_f, tz=TZ_PRAGUE)
-                ts_str    = dt_cursor.strftime("%H:%M:%S")
+                # The date used to be printed at the top right of the graph;
+                # that label is gone, so a view spanning more than one day
+                # puts it in this box instead.
+                _xl = self._x_cursor_ann.axes.get_xlim()
+                if int(min(_xl)) != int(max(_xl)) or (max(_xl) - min(_xl)) >= 1.0:
+                    ts_str = dt_cursor.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    ts_str = dt_cursor.strftime("%H:%M:%S")
                 self._x_cursor_ann.set_position((x_f, -0.01))
                 self._x_cursor_ann.set_text(ts_str)
                 # Centred under the cursor normally, but at either end of the
@@ -3839,7 +6275,6 @@ class CSSLoggerWidget(QWidget):
                     self._edge_align(self._x_cursor_ann, x_f, centred=True))
                 self._x_cursor_ann.set_visible(True)
                 if bg is not None: self._x_cursor_ann.axes.draw_artist(self._x_cursor_ann)
-                self._lbl_graph_info.setText(dt_cursor.strftime("%Y-%m-%d %H:%M:%S"))
             except Exception:
                 dt_cursor = None
 
@@ -4063,6 +6498,9 @@ class CSSLoggerWidget(QWidget):
         self._mpl_figure  = None
         self._graph_axes  = []
         self._graph_lines = []
+        self._graph_bands = []
+        self._graph_env   = []
+        self._graph_base  = []
         self._graph_pvs   = []
         self._graph_raw   = []
         self._graph_raw_np = []
@@ -4096,6 +6534,20 @@ class CSSLoggerWidget(QWidget):
             # Cancel must undo anything a live "Apply" already painted.
             self._apply_graph_opts(dlg.original_opts)
 
+    def _open_margins_dialog(self):
+        """Margins and spacing — a small window that applies every change at
+        once. Not modal: the graph stays usable while it is open."""
+        dlg = getattr(self, "_margins_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            return
+        dlg = _MarginsDialog(self._graph_opts, self)
+        dlg.changed.connect(self._apply_graph_opts)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.destroyed.connect(lambda *_: setattr(self, "_margins_dlg", None))
+        self._margins_dlg = dlg
+        dlg.show()
+
     def _apply_graph_opts(self, opts: dict):
         if all(self._graph_opts.get(k) == v for k, v in opts.items()):
             return                                  # nothing to repaint
@@ -4125,6 +6577,68 @@ class CSSLoggerWidget(QWidget):
             self._stats_scroll.hide()
         if getattr(self, "_stats_title", None) is not None:
             self._stats_title.hide()
+        if getattr(self, "_stats_head", None) is not None:
+            self._stats_head.hide()
+        # What the cards showed, for the saved image: (name, colour, stats).
+        self._stats_rows = []
+
+    def _set_stats_mode(self, mode):
+        """All / One row / Hide switch above the statistics cards."""
+        self._stats_mode = mode
+        self.config["stats_strip_mode"] = mode
+        for k, b in getattr(self, "_stats_mode_btns", {}).items():
+            b.setChecked(k == mode)
+        self._fit_stats_strip()
+
+    def _fit_stats_strip(self):
+        """Make the statistics strip exactly as tall as the cards it shows.
+
+        All → every row of cards; One row → the first row only (the rest is
+        one scroll away); Hide → no cards, only the heading. Never more than
+        about half of the graph pane: beyond that a scroll bar appears, so many
+        PVs cannot squeeze the graph to nothing."""
+        scroll = getattr(self, "_stats_scroll", None)
+        flow = getattr(self, "_stats_flow", None)
+        head = getattr(self, "_stats_head", None)
+        if scroll is None or flow is None:
+            return
+        has_cards = flow.count() > 0 and bool(getattr(self, "_stats_rows", None))
+        if head is not None:
+            head.setVisible(has_cards)
+        if not has_cards or self._stats_mode == "hide":
+            scroll.hide()
+            return
+        sb_w = scroll.verticalScrollBar().sizeHint().width()
+        width = max(50, scroll.width() if scroll.isVisible() else
+                    self._stats_top_pane.width())
+        full = flow.heightForWidth(width)
+        if full > 0 and self._stats_mode == "row":
+            want = flow.first_row_height(width - sb_w)
+        else:
+            want = full
+        cap = max(60, int(self._stats_top_pane.height() * 0.45))
+        # Two rows of cards are always shown whole (up to most of the pane):
+        # a second row cut in half behind a scroll bar hid half the numbers.
+        if (self._stats_mode != "row" and full > cap
+                and full <= flow.rows_height(width, 2)):
+            cap = max(cap, min(full, int(self._stats_top_pane.height() * 0.7)))
+        if want > cap or (self._stats_mode == "row" and want < full):
+            # A scroll bar takes width, so the cards re-wrap a little narrower.
+            want = min(cap, flow.first_row_height(width - sb_w)
+                       if self._stats_mode == "row" else
+                       flow.heightForWidth(width - sb_w))
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        else:
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFixedHeight(max(1, want))
+        was_hidden = not scroll.isVisible()
+        scroll.show()
+        if was_hidden:
+            # The cards were measured before they were ever shown, when their
+            # small fonts were not applied yet — so they measured taller, and
+            # the strip kept an empty band under them. Measure once more after
+            # they are on screen.
+            QTimer.singleShot(0, self._fit_stats_strip)
 
     def _make_stat_card(self, disp_name, color, stats):
         """Build one compact per-PV statistics card for the selection strip."""
@@ -4194,12 +6708,219 @@ class CSSLoggerWidget(QWidget):
         if xmax - xmin < 1e-9 or not self._graph_pvs:
             self._clear_selection()
             return
+        # Dragged out past the right-hand edge → a "live" selection: the start
+        # stays where it was put, the end keeps moving onto the newest sample.
+        # The selector stops at the last position the mouse had inside the plot,
+        # so "at the edge" is a few pixels' tolerance, not an exact match. A view
+        # zoomed into the past (newest data off to the right) is not "the end".
+        self._sel_live = False
+        try:
+            ax0 = self._graph_axes[0]
+            v_lo, v_hi = ax0.get_xlim()
+            w_px = max(1.0, float(ax0.bbox.width))
+            tol = (v_hi - v_lo) * max(8.0 / w_px, 0.01)
+            newest = self._newest_sample_num()
+            if xmax >= v_hi - tol and (newest is None or newest <= v_hi + tol):
+                self._sel_live = True
+        except Exception:
+            pass
+        xmin, xmax = self._snap_sel_edges(float(xmin), float(xmax))
         self._sel_range = (float(xmin), float(xmax))
+        if self._span_selector is not None:
+            try:
+                self._span_selector.extents = self._sel_range
+            except Exception:
+                pass
+        # A new region: its own copy of the samples starts afresh.
+        self._sel_samples = {}
+        self._sel_restart_note = ""
         self._recompute_stats()
+
+    # ── Selection edges: snapping, typing, one shot at a time ────────────────
+
+    def _all_shot_times_ns(self):
+        """(first, last) sample time of every shot in the loaded window that
+        counts (see _shot_times). The channels of one shot are archived a few
+        ms apart; samples closer than the merge gap are one shot, as in the
+        table rows."""
+        sbp, pre = self._samples_by_pv, self._pre_window_vals
+        t = self._shot_times(sbp, pre, self._condition_tables(sbp, pre),
+                             -np.inf, np.inf)
+        if not t.size:
+            return t, t
+        new = np.concatenate(([True], np.diff(t) > SAMPLE_HOLD_MIN_GAP_MS * 1e6))
+        firsts = t[new]
+        lasts = t[np.concatenate((new[1:], [True]))]
+        return firsts, lasts
+
+    def _snap_sel_edges(self, xmin, xmax):
+        """Put a dragged edge exactly on the start (or end) of a burst of shots
+        when it was let go within a few pixels of one. On a long graph a pixel
+        is seconds wide, so "the first shot after that short pause" could not
+        be hit by hand. A pause is at least 2 s, 3 px and three times the
+        usual spacing of the shots."""
+        try:
+            ax0 = self._graph_axes[0]
+            v_lo, v_hi = ax0.get_xlim()
+            px_num = (v_hi - v_lo) / max(1.0, float(ax0.bbox.width))
+            firsts, lasts = self._all_shot_times_ns()
+        except Exception:
+            return xmin, xmax
+        if firsts.size < 2:
+            return xmin, xmax
+        f_num, l_num = _ns_to_num(firsts), _ns_to_num(lasts)
+        gaps = f_num[1:] - l_num[:-1]
+        # A pause is clearly longer than the usual spacing of the shots; with
+        # evenly spaced shots there is none and nothing snaps.
+        pause = gaps > max(2.0 / 86400.0, 3 * px_num, 3 * float(np.median(gaps)))
+        starts = f_num[np.concatenate(([True], pause))]
+        ends = l_num[np.concatenate((pause, [True]))]
+        tol = 8 * px_num
+        one_ms = 1e-3 / 86400.0
+
+        def _near(x, cands):
+            j = int(np.argmin(np.abs(cands - x)))
+            c = float(cands[j])
+            if abs(c - x) > tol:
+                return None
+            # Never jump over another shot: the edge may only take in (or let
+            # go of) the one shot it lands on.
+            a, b = min(c, x), max(c, x)
+            between = int(np.count_nonzero((f_num >= a) & (f_num <= b)))
+            return c if between <= 1 else None
+
+        s = _near(xmin, starts)
+        if s is not None:
+            xmin = s - one_ms
+        if not getattr(self, "_sel_live", False):
+            e = _near(xmax, ends)
+            if e is not None:
+                xmax = e + one_ms
+        return xmin, max(xmin, xmax)
+
+    def _set_selection_edges(self, xmin, xmax):
+        """Move the selection to [xmin, xmax] (date numbers) from a typed time
+        or a one-shot step, and redraw its band and numbers."""
+        if xmax <= xmin:
+            return
+        self._sel_range = (float(xmin), float(xmax))
+        self._sel_samples = {}
+        self._sel_restart_note = ""
+        if self._span_selector is not None:
+            try:
+                self._span_selector.set_visible(True)
+                self._span_selector.extents = self._sel_range
+            except Exception:
+                pass
+        self._recompute_stats()
+        if self._mpl_canvas is not None:
+            self._blit_bg = None
+            self._mpl_canvas.draw_idle()
+
+    def _step_sel_edge(self, edge, step):
+        """Move one edge of the selection onto the next (+1) or the previous
+        (−1) shot."""
+        if not self._sel_range:
+            return
+        firsts, lasts = self._all_shot_times_ns()
+        if not firsts.size:
+            return
+        f_num, l_num = _ns_to_num(firsts), _ns_to_num(lasts)
+        one_ms = 1e-3 / 86400.0
+        lo, hi = self._sel_range
+        if edge == "start":
+            # From the first shot inside the selection to its neighbour.
+            i = int(np.searchsorted(f_num, lo, side="left"))
+            i = min(f_num.size - 1, i + 1) if step > 0 else max(0, i - 1)
+            lo = float(f_num[i]) - one_ms
+        else:
+            self._sel_live = False
+            k = int(np.searchsorted(l_num, hi, side="right")) - 1  # last shot inside
+            k = min(l_num.size - 1, k + 1) if step > 0 else max(0, k - 1)
+            hi = float(l_num[k]) + one_ms
+        self._set_selection_edges(lo, hi)
+
+    def _on_sel_edge_typed(self, edge):
+        """A time was typed into the Start or End box."""
+        ed = self._sel_edge_edits.get(edge)
+        if ed is None or not self._sel_range:
+            return
+        try:
+            dt = ed.dateTime().toPython().replace(tzinfo=TZ_PRAGUE)
+            x = float(mdates.date2num(dt))
+        except Exception:
+            return
+        lo, hi = self._sel_range
+        if edge == "start":
+            if abs(x - lo) < 0.5 / 86400.0:
+                return
+            lo = x
+        else:
+            if abs(x - hi) < 0.5 / 86400.0:
+                return
+            self._sel_live = False
+            hi = x
+        self._set_selection_edges(lo, hi)
+
+    def _sync_sel_edge_edits(self):
+        """Show the selection's edges in the Start / End boxes."""
+        edits = getattr(self, "_sel_edge_edits", None) or {}
+        if not self._sel_range or not edits:
+            return
+        for edge, x in zip(("start", "end"), self._sel_range):
+            ed = edits.get(edge)
+            if ed is None or ed.hasFocus():
+                continue
+            dt = mdates.num2date(x, tz=TZ_PRAGUE).replace(tzinfo=None)
+            ed.blockSignals(True)
+            ed.setDateTime(dt)
+            ed.blockSignals(False)
+
+    def _newest_sample_num(self):
+        """Time of the newest real sample on the graph, as a date number (the
+        traces are padded out to "now", so their arrays cannot answer this)."""
+        newest = None
+        for pv in self._graph_pvs:
+            s = self._samples_by_pv.get(pv)
+            if s:
+                t = s[-1][0]
+                if newest is None or t > newest:
+                    newest = t
+        if newest is None:
+            return None
+        return float(_ns_to_num(np.float64(newest)))
+
+    def _follow_live_selection(self):
+        """Move a live selection's end onto the newest sample (see
+        _on_span_select). Returns True when the region changed."""
+        if not (self._sel_range and getattr(self, "_sel_live", False)):
+            return False
+        newest = self._newest_sample_num()
+        lo, hi = self._sel_range
+        # The end sits ON the newest point — not on wherever the mouse left
+        # the plot — and moves with every new one. Before the first shot after
+        # the start arrives, it follows the clock, so a live selection over a
+        # quiet stretch is visibly live from the moment it is made.
+        if newest is None or newest <= lo:
+            newest = float(_ns_to_num(np.float64(time.time_ns())))
+            if newest <= lo:
+                return False
+        if newest == hi:
+            return False
+        self._sel_range = (lo, newest)
+        if self._span_selector is not None:
+            try:
+                self._span_selector.extents = self._sel_range
+            except Exception:
+                pass
+        return True
 
     def _clear_selection(self):
         """Forget the selected region and empty the statistics strip."""
         self._sel_range = None
+        self._sel_live = False
+        self._sel_samples = {}
+        self._sel_restart_note = ""
         sel = getattr(self, "_span_selector", None)
         if sel is not None:
             try:
@@ -4249,60 +6970,317 @@ class CSSLoggerWidget(QWidget):
         if not self._sel_range or not self._graph_pvs:
             self._clear_stats()
             return
+        live = bool(getattr(self, "_sel_live", False))
+        # Live mode trims samples older than its span, so any selection made
+        # while live (following or fixed) keeps its own copy of the shots.
+        own_copy = live or bool(self._live_mode)
+        if own_copy:
+            self._sel_sync()
+        else:
+            # Out of live mode the full samples are all there; a copy kept from
+            # an earlier live run would miss what came in while live was off.
+            self._sel_samples = {}
+        if live:
+            self._sel_restart_after_pause()
+        self._follow_live_selection()
         xmin, xmax = self._sel_range
 
         self._clear_stats()
-        any_card = False
+        # The numbers come from each channel's OWN samples — never from the
+        # trace drawn on screen. The drawn trace is thinned to a few thousand
+        # bins whose edges move with every live tick, and it carries held
+        # values from other channels' rows, so counting it gave a shot count
+        # that wandered (709, 710, 709) over a long window.
+        sbp = self._sel_samples if own_copy else self._samples_by_pv
+        pre = (getattr(self, "_sel_pre", {}) if own_copy
+               else self._pre_window_vals)
+        lo_ns = (xmin - _mpl_epoch_num()) * _NS_PER_DAY
+        # A live selection has no upper bound: its end IS the newest shot, and
+        # a date-number round trip could shave that shot off by a microsecond.
+        hi_ns = (np.inf if live
+                 else (xmax - _mpl_epoch_num()) * _NS_PER_DAY + 1e6)
+        tables = self._condition_tables(sbp, pre)
+        self._sel_fixed_restart_note = ""
+        if not live:
+            lo_ns = self._fixed_restart_after_pause(sbp, pre, tables, lo_ns, hi_ns)
         for i, pv in enumerate(self._graph_pvs):
-            if i >= len(self._graph_raw_np):
-                continue
-            t_arr, v_arr = self._graph_raw_np[i]
-            if t_arr.size == 0:
-                continue
-            mask = (t_arr >= xmin) & (t_arr <= xmax) & np.isfinite(v_arr)
-            sel = v_arr[mask]
-            if sel.size == 0:
-                continue
-            _mean = float(np.mean(sel))
-            _lo, _hi = float(np.min(sel)), float(np.max(sel))
-            stats = {
-                "n":   f"{sel.size:,}",
-                "avg": _fmt_cursor_value(_mean),
-                # Scatter and spread are read as "how steady is it", which is a
-                # share of the average, not a count of the channel's own units.
-                "std": _fmt_percent_of(float(np.std(sel)), _mean),
-                "min": _fmt_cursor_value(_lo),
-                "max": _fmt_cursor_value(_hi),
-                "ptp": _fmt_percent_of(_hi - _lo, _mean),
-            }
+            sel = np.empty(0)
+            _lo = _hi = None
+            t_s, v_s = _samples_to_ns_arrays(sbp.get(pv) or [])
+            if t_s.size:
+                keep = (t_s >= lo_ns) & (t_s <= hi_ns) & np.isfinite(v_s)
+                keep &= self._stats_keep_mask(t_s, tables, sbp, pre)
+                sel = v_s[keep]
+                # Points the archiver averaged for a long window: the extremes
+                # are the min/max it sent with them (only without conditions —
+                # those extremes include the shots the conditions reject).
+                mm = None if self._conditions else self._minmax_by_pv.get(pv)
+                if sel.size and mm is not None:
+                    e_lo, e_hi = _envelope_for(t_s[keep], sel, mm)
+                    _lo = float(np.nanmin(e_lo))
+                    _hi = float(np.nanmax(e_hi))
+            if sel.size:
+                _mean = float(np.mean(sel))
+                _lo = float(np.min(sel)) if _lo is None else min(_lo, float(np.min(sel)))
+                _hi = float(np.max(sel)) if _hi is None else max(_hi, float(np.max(sel)))
+                stats = {
+                    "n":   f"{sel.size:,}",
+                    "avg": _fmt_cursor_value(_mean),
+                    # Scatter and spread are read as "how steady is it", which is
+                    # a share of the average, not a count of the channel's units.
+                    "std": _fmt_percent_of(float(np.std(sel)), _mean),
+                    "min": _fmt_cursor_value(_lo),
+                    "max": _fmt_cursor_value(_hi),
+                    "ptp": _fmt_percent_of(_hi - _lo, _mean),
+                }
+            else:
+                # No shot in the region (yet): the card still stands, with
+                # zero shots, so the selection is visibly there.
+                stats = {"n": "0", "avg": "—", "std": "—",
+                         "min": "—", "max": "—", "ptp": "—"}
             pv_setting = self._pv_settings.get(pv, {})
-            disp_name = pv_setting.get("display_name", shorten_pv_name(pv))
+            disp_name = self._col_label(pv)
             color     = pv_setting.get("color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
             self._stats_flow.addWidget(self._make_stat_card(disp_name, color, stats))
-            any_card = True
-
-        if not any_card:
-            self._clear_stats()
-            return
+            self._stats_rows.append((disp_name, color, stats))
 
         t0 = mdates.num2date(xmin, tz=TZ_PRAGUE)
         t1 = mdates.num2date(xmax, tz=TZ_PRAGUE)
         span_s = (t1 - t0).total_seconds()
         # Warn when the window no longer covers the whole region, so the numbers
-        # are never silently taken for the full selection.
+        # are never silently taken for the full selection. A live selection
+        # counts its own copy of the shots, so its start may well lie left of
+        # the graph — that is said, not warned about.
         _note = ""
         if self._graph_axes:
             try:
                 _vlo, _vhi = self._graph_axes[0].get_xlim()
-                if xmin < _vlo - 1e-9 or xmax > _vhi + 1e-9:
+                if live:
+                    if xmin < _vlo - 1e-9:
+                        _note = "   (starts left of the graph)"
+                elif xmin < _vlo - 1e-9 or xmax > _vhi + 1e-9:
                     _note = "   ⚠ partly outside the shown window"
             except Exception:
                 pass
+        _live = "   ● end follows the newest point" if live else ""
+        if live and self._sel_restart_note:
+            _restart = f"   ↻ {self._sel_restart_note}"
+        elif not live and self._sel_fixed_restart_note:
+            _restart = f"   ↻ {self._sel_fixed_restart_note}"
+        else:
+            _restart = ""
         self._stats_title.setText(
             f"Selection statistics  ·  {t0.strftime('%Y-%m-%d %H:%M:%S')} → "
-            f"{t1.strftime('%H:%M:%S')}  ({span_s:,.1f} s){_note}")
+            f"{t1.strftime('%H:%M:%S')}  ({span_s:,.1f} s){_live}{_restart}{_note}")
         self._stats_title.show()
-        self._stats_scroll.show()
+        self._sync_sel_edge_edits()
+        self._fit_stats_strip()          # shows the strip at its cards' height
+
+    def _sel_sync(self):
+        """Copy every sample newer than the live selection's copy into it.
+
+        Runs before the live window trims old samples and on every stats
+        refresh (custom channels grow outside the live tick). The first call
+        takes everything from the selection's start on, plus each channel's
+        value just before it (for the conditions)."""
+        if not self._sel_range:
+            return
+        lo_ns = (self._sel_range[0] - _mpl_epoch_num()) * _NS_PER_DAY
+        first = not self._sel_samples
+        if first:
+            self._sel_pre = {}
+        for pv, s in self._samples_by_pv.items():
+            if not s:
+                # Nothing in the window yet — but its value from before the
+                # window still judges the shots (a condition channel that is
+                # quiet would otherwise drop out of the conditions entirely).
+                if pv not in self._sel_pre and \
+                        self._pre_window_vals.get(pv) is not None:
+                    self._sel_pre[pv] = self._pre_window_vals[pv]
+                continue
+            mine = self._sel_samples.get(pv)
+            if mine:
+                i = bisect.bisect_right(s, mine[-1][0], key=lambda x: x[0])
+                if i < len(s):
+                    mine.extend(s[i:])
+                continue
+            i = bisect.bisect_left(s, lo_ns, key=lambda x: x[0])
+            self._sel_samples[pv] = list(s[i:])
+            if first or pv not in self._sel_pre:
+                if i > 0:
+                    self._sel_pre[pv] = s[i - 1]
+                elif self._pre_window_vals.get(pv) is not None:
+                    self._sel_pre[pv] = self._pre_window_vals[pv]
+
+    def _stats_keep_mask(self, ts, tables, sbp, pre):
+        """Which sample times count in the selection statistics: inside the
+        conditions, on a master-PV multiple (when that filter is set), and not
+        a zero-energy shot at an unchanged waveplate (when that is ticked)."""
+        keep = np.ones(ts.size, dtype=bool)
+        if not ts.size:
+            return keep
+        if tables:
+            keep &= self._condition_mask(ts, tables)
+        on_step = self._master_multiple_mask(ts, sbp, pre)
+        if on_step is not None:
+            keep &= on_step
+        dead = self._dead_shot_mask(ts, sbp, pre)
+        if dead is not None:
+            keep &= ~dead
+        return keep
+
+    @staticmethod
+    def _held_at(ts, samples, pre_entry):
+        """Value a channel holds at each time of ``ts`` (ns), read the way the
+        table rows read it: its newest sample up to one shot-merge gap later,
+        else the value it had before the window (NaN when there is none)."""
+        c_ts, c_v = _samples_to_ns_arrays(samples or [])
+        p_val = (float(pre_entry[1]) if pre_entry is not None
+                 and isinstance(pre_entry[1], (int, float)) else np.nan)
+        v = np.full(ts.size, p_val)
+        if c_ts.size:
+            gap = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+            idx = np.searchsorted(c_ts, ts + gap, side="right") - 1
+            has = idx >= 0
+            v[has] = c_v[idx[has]]
+        return v
+
+    def _master_multiple_mask(self, ts, sbp, pre):
+        """The "Keep multiples of" filter for single samples: True where the
+        master PV sits on a multiple. None when the filter is off or the master
+        PV has no data (the rows skip it then too)."""
+        try:
+            multiple = float(self._get_master_multiple())
+        except (TypeError, ValueError):
+            return None
+        if multiple <= 0:
+            return None
+        master = self._get_master_pv()
+        if not (sbp.get(master) or pre.get(master) is not None):
+            return None
+        v = self._held_at(ts, sbp.get(master), pre.get(master))
+        tolerance = max(1e-6, abs(multiple) * 5e-3)
+        with np.errstate(invalid="ignore"):
+            return np.abs(v - np.round(v / multiple) * multiple) <= tolerance
+
+    def _dead_shot_mask(self, ts, sbp, pre):
+        """True for the samples of a dead shot: the energy channel read below
+        its threshold while the waveplate (the master PV) stood where it stood
+        on the shot before. Such a shot is a trigger shot or a dropout, not a
+        measurement at a new setting. None when the rule is switched off or the
+        energy channel has no data."""
+        if not getattr(self, "_dead_shot_on", False):
+            return None
+        e_pv = (getattr(self, "_dead_energy_pv", "") or "").strip()
+        if not e_pv:
+            return None
+        e_t, e_v = _samples_to_ns_arrays(sbp.get(e_pv) or [])
+        if not e_t.size:
+            return None
+        master = self._get_master_pv()
+        wp = self._held_at(e_t, sbp.get(master), pre.get(master))
+        p = pre.get(master)
+        wp_before = (float(p[1]) if p is not None
+                     and isinstance(p[1], (int, float)) else np.nan)
+        prev = np.concatenate(([wp_before], wp[:-1]))
+        with np.errstate(invalid="ignore"):
+            same = ((np.abs(wp - prev) <= 1e-9 * np.maximum(1.0, np.abs(wp)))
+                    | (np.isnan(wp) & np.isnan(prev)))
+            dead_e = same & np.isfinite(e_v) & (
+                e_v < float(getattr(self, "_dead_energy_thr", 0.05)))
+        # Each sample belongs to the energy reading of its own shot: the
+        # newest one up to a merge gap after it, if that is also no more than
+        # a merge gap before it.
+        gap = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+        j = np.searchsorted(e_t, ts + gap, side="right") - 1
+        near = j >= 0
+        near[near] &= e_t[j[near]] >= ts[near] - gap
+        out = np.zeros(ts.size, dtype=bool)
+        out[near] = dead_e[j[near]]
+        return out
+
+    def _shot_times(self, sbp, pre, tables, lo_ns, hi_ns):
+        """Times of the shots between lo_ns and hi_ns that count. A shot is a
+        sample of a condition channel (the energies — a slow housekeeping
+        channel keeps ticking through a pause), or without conditions a sample
+        of a shot-type graph channel."""
+        if self._conditions:
+            src = [c.get("pv") for c in self._conditions if c.get("pv")]
+        else:
+            src = self._export_shot_channels(self._graph_pvs) or list(self._graph_pvs)
+        parts = []
+        for pv in dict.fromkeys(src):
+            t_s, v_s = _samples_to_ns_arrays(sbp.get(pv) or [])
+            if not t_s.size:
+                continue
+            keep = np.isfinite(v_s) & (t_s >= lo_ns) & (t_s <= hi_ns)
+            keep &= self._stats_keep_mask(t_s, tables, sbp, pre)
+            parts.append(t_s[keep])
+        if not parts:
+            return np.empty(0)
+        return np.unique(np.concatenate(parts))
+
+    def _last_pause(self, sbp, pre, tables, lo_ns, hi_ns):
+        """(1 ms before the first shot after the newest firing pause longer
+        than the set seconds, that pause in s) — or None without one."""
+        shots = self._shot_times(sbp, pre, tables, lo_ns, hi_ns)
+        if shots.size < 2:
+            return None
+        gaps = np.diff(shots)
+        big = np.nonzero(gaps > float(self._sel_pause_s) * 1e9)[0]
+        if not big.size:
+            return None
+        k = int(big[-1])
+        return float(shots[k + 1]) - 1e6, float(gaps[k]) / 1e9
+
+    def _fixed_restart_after_pause(self, sbp, pre, tables, lo_ns, hi_ns):
+        """A fixed selection + "Restart after pause": count only from the first
+        shot after the newest pause inside it. The blue band stays where it was
+        put (the region is the user's), the title says where counting began."""
+        if not getattr(self, "_sel_pause_on", False):
+            return lo_ns
+        found = self._last_pause(sbp, pre, tables, lo_ns, hi_ns)
+        if found is None:
+            return lo_ns
+        new_lo_ns, pause_s = found
+        at = mdates.num2date(float(_ns_to_num(np.float64(new_lo_ns))),
+                             tz=TZ_PRAGUE).strftime("%H:%M:%S")
+        self._sel_fixed_restart_note = (
+            f"counted from {at}, after a {pause_s:,.0f} s pause")
+        return new_lo_ns
+
+    def _sel_restart_after_pause(self):
+        """Live selection + "restarts after pause": begin again at the first
+        shot after the newest pause in firing longer than the set seconds.
+
+        A shot is a sample of a condition channel that passes the conditions
+        (the energies — a slow housekeeping channel keeps ticking through a
+        pause), or without conditions a sample of a shot-type graph channel."""
+        if not (getattr(self, "_sel_pause_on", False) and self._sel_samples
+                and self._sel_range):
+            return
+        pre = getattr(self, "_sel_pre", {})
+        tables = self._condition_tables(self._sel_samples, pre)
+        lo_ns = (self._sel_range[0] - _mpl_epoch_num()) * _NS_PER_DAY
+        found = self._last_pause(self._sel_samples, pre, tables, lo_ns, np.inf)
+        if found is None:
+            return
+        new_lo_ns, pause_s = found
+        for pv, s in self._sel_samples.items():
+            i = bisect.bisect_left(s, new_lo_ns, key=lambda x: x[0])
+            if i:
+                self._sel_pre[pv] = s[i - 1]
+                del s[:i]
+        new_lo = float(_ns_to_num(np.float64(new_lo_ns)))
+        self._sel_range = (new_lo, max(new_lo, self._sel_range[1]))
+        at = mdates.num2date(new_lo, tz=TZ_PRAGUE).strftime("%H:%M:%S")
+        self._sel_restart_note = f"restarted at {at} after a {pause_s:,.0f} s pause"
+        self._log(f"Live selection {self._sel_restart_note}.")
+        if self._span_selector is not None:
+            try:
+                self._span_selector.extents = self._sel_range
+            except Exception:
+                pass
 
     def _on_zoom_select(self, xmin, xmax):
         # Right-drag = zoom in time. BOTH views go onto the TOOLBAR's history —
@@ -4320,6 +7298,310 @@ class CSSLoggerWidget(QWidget):
         self._retick_from_current_xlim()
         if self._mpl_canvas:
             self._mpl_canvas.draw_idle()
+
+    # ── Zoom detail: read the zoomed range again, finer ──────────────────────
+    # A long period arrives as thinned points (every ~10 min over a year). Their
+    # min–max band already shows every spike, but WHEN exactly and HOW MUCH needs
+    # the finer data — so, like CS Studio's Data Browser, a zoom asks the
+    # archiver for the visible range again at the same point count. Far enough
+    # in (an hour or less) the archiver hands back every archived sample.
+
+    def _on_graph_xlim_changed(self, _ax=None):
+        if self._live_mode or self._load_in_flight:
+            return
+        timer = getattr(self, "_detail_timer", None)
+        if timer is None:
+            timer = self._detail_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._maybe_load_zoom_detail)
+        timer.start(450)
+
+    def _zoom_detail_wanted(self):
+        """The (start, end) ns range to read finer, or None when the current
+        view needs nothing more."""
+        if (self._live_mode or self._load_in_flight or not self._graph_axes
+                or self._avg_target_points() <= 0):
+            return None                 # raw mode already has every sample
+        if self._conditions or self._get_master_multiple():
+            return None                 # detail would bypass the row filters
+        try:
+            v0, v1 = self._graph_axes[0].get_xlim()
+        except Exception:
+            return None
+        e0 = _mpl_epoch_num()
+        a = int((v0 - e0) * _NS_PER_DAY); b = int((v1 - e0) * _NS_PER_DAY)
+        w0, w1 = dt_to_ns(self._dt_from), dt_to_ns(self._dt_to)
+        a, b = max(a, w0), min(b, w1)
+        view = b - a
+        if view <= 0 or view >= 0.5 * (w1 - w0):
+            return None                 # (almost) the whole window: base is fine
+        d = self._zoom_detail
+        if (d and d.get("epoch") == self._load_epoch and d["a"] <= a
+                and d["b"] >= b and d["b"] - d["a"] <= 3 * view):
+            return None                 # already read, and fine enough
+        pad = view // 4                 # a little either side, for panning
+        return max(w0, a - pad), min(w1, b + pad)
+
+    def _maybe_load_zoom_detail(self):
+        rng = self._zoom_detail_wanted()
+        if rng is None:
+            return
+        if self._detail_in_flight:
+            self._on_graph_xlim_changed()      # try again once this one lands
+            return
+        real = set(self._real_pv_names())
+        pvs = [pv for pv in self._graph_pvs if pv in real]
+        if not pvs:
+            return
+        a, b = rng
+        epoch = self._load_epoch
+        target = self._avg_target_points()
+        # Zoomed to about an hour: ask for every archived sample outright. The
+        # archiver does this by itself at an hour or less, but only just —
+        # a range a hair over the hour would come back thinned.
+        count = None if b - a <= int(1.1 * 3600e9) else target
+        timeout = self._http_timeout()
+        self._detail_in_flight = True
+        self._detail_prev_status = self._lbl_status.text()
+        self._lbl_status.setText(
+            f"Reading the zoomed range in finer detail  "
+            f"({ns_to_local_str(a)[:16]} → {ns_to_local_str(b)[:16]})")
+        sig = self._detail_sig = _LoadSig()
+        sig.done.connect(self._on_zoom_detail_loaded)
+
+        def _worker():
+            out = {}
+            try:
+                from cpva_core import cpva_fetch_many_adaptive, cpva_decode_value
+                raw_by_pv, _err, _rep = cpva_fetch_many_adaptive(
+                    pvs, a, b, count=count, timeout=timeout, preflight=False,
+                    cancel_fn=lambda: self._load_epoch != epoch)
+                for pv in pvs:
+                    raw = [s for s in raw_by_pv.get(pv, [])
+                           if s.get("time") is not None and a <= s["time"] <= b]
+                    pairs = [(int(s["time"]), cpva_decode_value(s)) for s in raw]
+                    ts, vals = _pairs_to_ns_arrays(pairs)
+                    if not ts.size:
+                        continue
+                    lo, hi = _envelope_for(ts, vals, _minmax_arrays(raw))
+                    out[pv] = _downsample_arrays_envelope(ts, vals, lo, hi, target)
+            except Exception as exc:
+                out = {"_error": str(exc)}
+            sig.done.emit({"a": a, "b": b, "epoch": epoch, "pvs": out})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_zoom_detail_loaded(self, d):
+        self._detail_in_flight = False
+        err = d["pvs"].pop("_error", None)
+        if self._lbl_status.text().startswith("Reading the zoomed range"):
+            self._lbl_status.setText(getattr(self, "_detail_prev_status", ""))
+        if err:
+            self._log(f"Zoom detail could not be read: {err}")
+            return
+        if d["epoch"] != self._load_epoch or self._live_mode or not d["pvs"]:
+            return
+        self._zoom_detail = d
+        self._apply_detail_in_place()
+        self._maybe_load_zoom_detail()        # the view may have moved meanwhile
+
+    def _apply_detail_in_place(self):
+        """Put the zoom detail into the drawn traces without rebuilding the
+        figure, so the zoom, the toolbar's Back/Forward and the selection stay."""
+        if self._mpl_canvas is None or not self._graph_lines:
+            return
+        use_win, ws, we = getattr(self, "_graph_hold", (False, 0, 0))
+        for i, pv in enumerate(self._graph_pvs):
+            if i >= len(self._graph_base) or i >= len(self._graph_lines):
+                break
+            ts, v, lo, hi = self._splice_detail(pv, *self._graph_base[i])
+            if use_win:
+                ts, v, lo, hi = self._hold_to_window(pv, ts, v, lo, hi, ws, we)
+            times_num = _ns_to_num(ts)
+            lines = self._graph_lines[i]
+            if len(lines) == 2:
+                smooth = self._pv_settings.get(pv, {}).get("smooth") or 1
+                lines[0].set_data(times_num, v)
+                lines[1].set_data(times_num, _moving_avg_np(v, smooth)
+                                  if smooth > 1 and v.size >= smooth else v)
+            elif lines:
+                lines[0].set_data(times_num, v)
+            self._replace_band(i, self._graph_axes[i], times_num, lo, hi)
+            if i < len(self._graph_raw):
+                self._graph_raw[i] = (times_num, v)
+            if i < len(self._graph_env):
+                self._graph_env[i] = (lo, hi)
+        self._graph_raw_np = [(np.asarray(t, dtype=float), np.asarray(x, dtype=float))
+                              for t, x in self._graph_raw]
+        if self._sel_range:
+            self._recompute_stats()
+        self._blit_bg = None
+        self._mpl_canvas.draw_idle()
+
+    # ── Limit crossings ─────────────────────────────────────────────────────
+
+    def _crossing_lines(self):
+        """Reference lines that take part: tied to a loaded signal, not off."""
+        real = set(self._real_pv_names())
+        return [rl for rl in self._ref_lines
+                if rl.get("pv") in real and rl.get("crossing", "above") != "off"]
+
+    def _open_limit_crossings(self):
+        if not self._samples_by_pv:
+            QMessageBox.information(self, "Limit crossings", "Load data first.")
+            return
+        lines = self._crossing_lines()
+        if not lines:
+            QMessageBox.information(
+                self, "Limit crossings",
+                "No reference line is tied to a loaded signal.\n\n"
+                "Add one in Reference lines, pick its Signal, and set Crossing "
+                "to above or below.")
+            return
+        if getattr(self, "_cross_in_flight", False):
+            return
+        self._cross_in_flight = True
+        start_ns, end_ns = dt_to_ns(self._dt_from), dt_to_ns(self._dt_to)
+        timeout = self._http_timeout()
+        epoch = self._load_epoch
+        series = {}
+        for rl in lines:
+            pv = rl["pv"]
+            if pv in series:
+                continue
+            ts, vals = _samples_to_ns_arrays(
+                [s for s in self._samples_by_pv.get(pv, [])
+                 if start_ns <= s[0] <= end_ns])
+            series[pv] = (ts, vals, self._minmax_by_pv.get(pv))
+        self._cross_prev_status = self._lbl_status.text()
+        self._lbl_status.setText("Looking for limit crossings")
+        # The window opens now, at the click, and fills in when the search
+        # ends — never pops up on its own later.
+        old = getattr(self, "_cross_dialog", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        dlg = _LimitCrossingsDialog(self._conditions_active_text(), self)
+        dlg.zoom_to.connect(self._zoom_to_ns)
+        self._cross_dialog = dlg
+        dlg.show()                       # not exec(): the graph stays usable
+        sig = self._cross_sig = _LoadSig()
+        sig.progress.connect(self._lbl_status.setText)
+        sig.progress.connect(dlg.set_progress)
+        sig.done.connect(self._on_limit_crossings_found)
+
+        def _worker():
+            rows, notes = [], []
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                from cpva_core import cpva_fetch_many_adaptive, cpva_decode_value
+
+                def _raw(pv, a, b):
+                    got, err, _rep = cpva_fetch_many_adaptive(
+                        [pv], a, b, count=None, timeout=timeout, max_workers=4,
+                        preflight=False, verify=False,
+                        cancel_fn=lambda: self._load_epoch != epoch)
+                    if err.get(pv) and not got.get(pv):
+                        raise RuntimeError(err[pv])
+                    pairs = [(int(s["time"]), cpva_decode_value(s))
+                             for s in got.get(pv, []) if s.get("time") is not None]
+                    return _pairs_to_ns_arrays(sorted(pairs))
+
+                for n_line, rl in enumerate(lines, start=1):
+                    pv, y = rl["pv"], float(rl["y"])
+                    side = rl.get("crossing", "above")
+                    ts, vals, mm = series[pv]
+                    name = (rl.get("label") or "").strip() or _fmt_cursor_value(y)
+                    if mm is None:                     # read raw already: exact
+                        eps = _crossing_episodes(ts, vals, y, side, end_ns)
+                    else:
+                        lo, hi = _envelope_for(ts, vals, mm)
+                        cands = _crossing_candidates(ts, lo, hi, y, side, end_ns)
+                        total = sum(b - a for a, b in cands)
+                        if (len(cands) > _CROSS_RAW_MAX_RANGES
+                                or total > _CROSS_RAW_MAX_NS):
+                            eps = _crossing_episodes(ts, vals, y, side, end_ns,
+                                                     exact=False, lo=lo, hi=hi)
+                            notes.append(
+                                f"{shorten_pv_name(pv)} / {name}: over the line "
+                                f"{len(cands)}× across {total / 3.6e12:.0f} h — "
+                                f"too much to read every sample, so times are to "
+                                f"the thinned interval. Zoom in or shorten the "
+                                f"period for exact ones.")
+                        else:
+                            eps = []
+                            done = [0]
+
+                            def _one(rng):
+                                a, b = rng
+                                try:
+                                    r_ts, r_v = _raw(pv, a, b)
+                                    ep = _crossing_episodes(r_ts, r_v, y, side, b)
+                                    return [e for e in ep
+                                            if a <= e["start"] <= b] or []
+                                except Exception:
+                                    # Unreadable raw: keep the interval-level
+                                    # answer rather than lose the crossing.
+                                    m = (ts >= a) & (ts < b)
+                                    return _crossing_episodes(
+                                        ts[m], vals[m], y, side, b, exact=False,
+                                        lo=lo[m], hi=hi[m])
+                                finally:
+                                    done[0] += 1
+                                    sig.progress.emit(
+                                        f"Limit crossings · line {n_line}/{len(lines)} "
+                                        f"· reading {done[0]}/{len(cands)} stretches "
+                                        f"sample by sample")
+
+                            with ThreadPoolExecutor(max_workers=6) as ex:
+                                for part in ex.map(_one, cands):
+                                    eps.extend(part)
+                    for e in eps:
+                        if e["start"] > end_ns or (e["end"] or end_ns) < start_ns:
+                            continue
+                        rows.append(dict(e, line=name, pv=pv, y=y, side=side))
+                rows.sort(key=lambda r: r["start"])
+            except Exception as exc:
+                notes.append(f"Search stopped: {exc}")
+            sig.done.emit({"rows": rows, "notes": notes, "end_ns": end_ns,
+                           "lines": len(lines)})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_limit_crossings_found(self, res):
+        self._cross_in_flight = False
+        self._lbl_status.setText(getattr(self, "_cross_prev_status", ""))
+        for n in res["notes"]:
+            self._log(f"Limit crossings: {n}")
+        n = len(res["rows"])
+        self._log(f"Limit crossings: {n} found.")
+        dlg = getattr(self, "_cross_dialog", None)
+        if dlg is not None:
+            try:
+                dlg.set_result(res)      # a closed window stays closed
+            except RuntimeError:
+                pass                     # already deleted
+
+    def _conditions_active_text(self):
+        return ("Conditions are not applied here: every archived sample counts."
+                if self._conditions else "")
+
+    def _zoom_to_ns(self, a_ns, b_ns):
+        """Show [a, b] in the graph with a margin, the same way a right-drag
+        zoom does (so Back returns, and the range is read finer)."""
+        if not self._graph_axes:
+            return
+        span = max(b_ns - a_ns, int(60e9))
+        pad = max(span // 5, int(120e9))
+        a_ns, b_ns = a_ns - pad, b_ns + pad
+        e0 = _mpl_epoch_num()
+        try:
+            self._notebook.setCurrentIndex(0)          # the Graph tab
+        except Exception:
+            pass
+        self._on_zoom_select(e0 + a_ns / _NS_PER_DAY, e0 + b_ns / _NS_PER_DAY)
 
     # ── Graph toolbar ───────────────────────────────────────────────────────
 
@@ -4375,14 +7657,200 @@ class CSSLoggerWidget(QWidget):
                 act.triggered.connect(self._retick_from_current_xlim)
             elif act.text() in ("Zoom", "Pan"):
                 act.toggled.connect(self._sync_graph_interaction_mode)
-        # Margins changed in the toolbar's dialog: keep them, otherwise the next
-        # redraw would put the stored ones straight back.
-        if hasattr(tb, "subplot_params_changed"):
+            # Back / Forward greyed out when there is nowhere to go: the strip
+            # button follows the toolbar's own action.
+            act.changed.connect(self._sync_graph_strip)
+        # A redraw builds a new toolbar, which starts with Pan and Zoom off. The
+        # user pressed one of them in and has not let go — keep it pressed.
+        keep = getattr(self, "_graph_tb_mode_wanted", "")
+        if keep == "pan":
+            tb.pan()
+        elif keep == "zoom":
+            tb.zoom()
+        self._sync_graph_interaction_mode()
+
+    def _graph_tb_action(self, text):
+        """The hidden matplotlib toolbar's action called `text`, or None."""
+        tb = getattr(self, "_graph_toolbar", None)
+        if tb is None:
+            return None
+        for act in tb.actions():
+            if act.text() == text:
+                return act
+        return None
+
+    def _graph_tb_trigger(self, text):
+        """A strip button was pressed: fire the matching toolbar action, so every
+        hook connected to it (Home, Back/Forward re-stamping) runs as before."""
+        act = self._graph_tb_action(text)
+        if act is not None and act.isEnabled():
+            act.trigger()
+        self._sync_graph_strip()
+
+    def _build_graph_strip(self):
+        """The bar above the graph: icon buttons in three groups split by thin
+        lines — View (Home, Back, Forward), Navigate (Pan, Zoom, Loupe) and
+        Graph (Margins & spacing, Save image). Same look as the Workshop strip
+        in Image Tools."""
+        box = QFrame()
+        box.setObjectName("graphStrip")
+        box.setStyleSheet("QFrame#graphStrip { background: #ffffff; border: none; }")
+        row = QHBoxLayout(box)
+        row.setContentsMargins(4, 2, 4, 2)
+        row.setSpacing(2)
+        self._gstrip_btns = {}
+
+        def _btn(key, tip, checkable=False):
+            b = QToolButton()
+            b.setIcon(_graph_icon(key))
+            b.setIconSize(QSize(_GICON_PX, _GICON_PX))
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            b.setToolTip(tip)
+            b.setAccessibleName(tip.split("\n")[0])
+            b.setCheckable(checkable)
+            b.setFixedSize(32, 32)
+            b.setStyleSheet(_GRAPH_TOOLBTN_QSS)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self._gstrip_btns[key] = b
+            row.addWidget(b)
+            return b
+
+        def _sep():
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.VLine)
+            sep.setStyleSheet("color: #c3c9d2;")
+            row.addSpacing(4)
+            row.addWidget(sep)
+            row.addSpacing(4)
+
+        _btn("home", "Reset view").clicked.connect(
+            lambda: self._graph_tb_trigger("Home"))
+        _btn("back", "Previous view").clicked.connect(
+            lambda: self._graph_tb_trigger("Back"))
+        _btn("forward", "Next view").clicked.connect(
+            lambda: self._graph_tb_trigger("Forward"))
+        _sep()
+        _btn("pan", "Pan: left drag moves the graph, right drag stretches it",
+             checkable=True).clicked.connect(
+            lambda: self._on_graph_strip_mode("pan"))
+        _btn("zoom", "Zoom: drag a rectangle to zoom into it",
+             checkable=True).clicked.connect(
+            lambda: self._on_graph_strip_mode("zoom"))
+        _btn("loupe", "Loupe: the spot around the mouse, magnified, for the "
+                      "signal nearest the mouse — handy for placing a selection "
+                      "edge exactly",
+             checkable=True).toggled.connect(self._set_loupe_on)
+        # Magnification of the loupe, picked from a short list.
+        self._btn_loupe_mag = QToolButton()
+        self._btn_loupe_mag.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._btn_loupe_mag.setFixedSize(40, 32)
+        self._btn_loupe_mag.setStyleSheet(_GRAPH_TOOLBTN_QSS +
+                                          "QToolButton { font-weight: 600; }")
+        self._btn_loupe_mag.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_loupe_mag.setToolTip("How much the loupe magnifies")
+        mag_menu = QMenu(self._btn_loupe_mag)
+        for m in (5, 10, 20, 50):
+            mag_menu.addAction(f"{m}×", lambda m=m: self._set_loupe_mag(m))
+        self._btn_loupe_mag.setMenu(mag_menu)
+        row.addWidget(self._btn_loupe_mag)
+        _sep()
+        _btn("margins", "Margins and spacing: plot margins, the gap between a "
+                        "Y-axis title and its numbers, the gap between Y axes"
+             ).clicked.connect(self._open_margins_dialog)
+        b_save = _btn("save", "Save the graph as an image")
+        b_save.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        save_menu = QMenu(b_save)
+        save_menu.addAction("Save graph", lambda: self._save_graph_image(False))
+        save_menu.addAction("Save graph with selection",
+                            lambda: self._save_graph_image(True))
+        b_save.setMenu(save_menu)
+        row.addStretch(1)
+
+        self._loupe_mag = int(self.config.get("loupe_mag", 10))
+        if self._loupe_mag not in (5, 10, 20, 50):
+            self._loupe_mag = 10
+        self._btn_loupe_mag.setText(f"{self._loupe_mag}×")
+        self._graph_tb_mode_wanted = ""
+        return box
+
+    def _set_loupe_on(self, on):
+        """Loupe button: a magnified view that follows the mouse over the graph."""
+        self._loupe_on = bool(on)
+        loupe = getattr(self, "_loupe", None)
+        if on and loupe is None and getattr(self, "_graph_container", None) is not None:
+            self._loupe = _GraphLoupe(self._graph_container)
+        elif not on and loupe is not None:
+            loupe.hide()
+
+    def _set_loupe_mag(self, mag):
+        self._loupe_mag = int(mag)
+        self.config["loupe_mag"] = self._loupe_mag
+        self._btn_loupe_mag.setText(f"{self._loupe_mag}×")
+        ev = getattr(self, "_mouse_last_event", None)
+        if ev is not None and getattr(self, "_loupe_on", False):
+            self._update_loupe(ev)
+
+    def _update_loupe(self, event):
+        """Move the loupe to the mouse and redraw it (called from the throttled
+        mouse handler, so it costs no more frames than the crosshair)."""
+        loupe = getattr(self, "_loupe", None)
+        if loupe is None:
+            return
+        if (event is None or event.inaxes is None or event.xdata is None
+                or not self._graph_axes):
+            loupe.hide()
+            return
+        # While a region is being dragged out, show where its edges are now.
+        sel_range = self._sel_range
+        sel = getattr(self, "_span_selector", None)
+        if sel is not None:
             try:
-                tb.subplot_params_changed.connect(self._adopt_toolbar_margins)
+                if any(a.get_visible() for a in getattr(sel, "artists", [])):
+                    lo, hi = sel.extents
+                    if hi > lo:
+                        sel_range = (float(lo), float(hi))
             except Exception:
                 pass
+        names = [self._pv_settings.get(pv, {}).get("display_name")
+                 or shorten_pv_name(pv) for pv in self._graph_pvs]
+        if not loupe.update_at(float(event.xdata), self._graph_axes,
+                               self._graph_lines, self._loupe_mag, sel_range,
+                               y_px=float(event.y), names=names):
+            return
+        from PySide6.QtGui import QCursor
+        loupe.place_near(self._graph_container.mapFromGlobal(QCursor.pos()))
+
+    def _on_graph_strip_mode(self, mode):
+        """Pan or Zoom pressed on the strip: hand it to the toolbar, which turns
+        the other one off by itself."""
+        self._graph_tb_trigger("Pan" if mode == "pan" else "Zoom")
         self._sync_graph_interaction_mode()
+
+    def _sync_graph_strip(self, *_):
+        """Strip buttons show what the toolbar is doing: Pan/Zoom pressed in,
+        Back/Forward greyed out when there is no view to go to."""
+        btns = getattr(self, "_gstrip_btns", None)
+        if not btns:
+            return
+        tb = getattr(self, "_graph_toolbar", None)
+        mode = ""
+        if tb is not None:
+            try:
+                mode = str(getattr(tb.mode, "name", tb.mode) or "").lower()
+            except Exception:
+                mode = ""
+        for key in ("pan", "zoom"):
+            b = btns.get(key)
+            if b is not None:
+                b.blockSignals(True)
+                b.setChecked(key in mode)
+                b.blockSignals(False)
+        for key, text in (("back", "Back"), ("forward", "Forward"),
+                          ("home", "Home")):
+            act = self._graph_tb_action(text)
+            b = btns.get(key)
+            if b is not None:
+                b.setEnabled(act is not None and act.isEnabled())
 
     def _sync_graph_interaction_mode(self, *_):
         """Decide what a LEFT drag on the graph does.
@@ -4399,6 +7867,11 @@ class CSSLoggerWidget(QWidget):
             except Exception:
                 mode = ""
         busy = bool(mode.strip())
+        # Remembered so a redraw (which builds a new toolbar) keeps it pressed.
+        low = mode.lower()
+        self._graph_tb_mode_wanted = ("pan" if "pan" in low else
+                                      "zoom" if "zoom" in low else "")
+        self._sync_graph_strip()
         sel = getattr(self, "_span_selector", None)
         if sel is not None:
             try:
@@ -4433,26 +7906,6 @@ class CSSLoggerWidget(QWidget):
         except Exception:
             return False
 
-    def _adopt_toolbar_margins(self):
-        """Copy the margins set in the toolbar's dialog into the saved settings.
-
-        Every redraw re-applies the stored margins, so without this the sliders
-        would be undone by the next redraw. The LEFT margin is deliberately not
-        copied: it is computed from how many channels have their own axis.
-        """
-        fig = self._mpl_figure
-        if fig is None:
-            return
-        try:
-            sp = fig.subplotpars
-            self._graph_opts["margin_right"]  = float(1.0 - sp.right)
-            self._graph_opts["margin_top"]    = float(sp.top)
-            self._graph_opts["margin_bottom"] = float(sp.bottom)
-            self.config["graph_opts"] = dict(self._graph_opts)
-            self._lbl_status.setText("Plot margins updated.")
-        except Exception:
-            pass
-
     def _open_graph_view_menu(self):
         """The "View ▾" menu: reset, axis limits, hide grids.
 
@@ -4467,7 +7920,7 @@ class CSSLoggerWidget(QWidget):
         act_clear = menu.addAction("Clear selection")
         act_clear.setEnabled(bool(self._sel_range))
         menu.addSeparator()
-        act_lim = menu.addAction("Axis limits") if _AxisLimitsDialog else None
+        act_lim = menu.addAction("Axis limits")
         menu.addSeparator()
         act_grid_off = menu.addAction("Hide all grids")
         btn = getattr(self, "_btn_graph_view", None)
@@ -4486,17 +7939,60 @@ class CSSLoggerWidget(QWidget):
             self._on_graph_view_home()
         elif chosen is act_clear:
             self._clear_selection()
-        elif act_lim is not None and chosen is act_lim:
+        elif chosen is act_lim:
             try:
-                _AxisLimitsDialog(self._graph_axes[0], canvas, self).exec()
-                self._retick_from_current_xlim()
+                _GraphAxisLimitsDialog(self).exec()
             except Exception:
-                pass
+                import traceback
+                self._log(f"[axis_limits]\n{traceback.format_exc()}")
         elif chosen is act_grid_off:
             for pv in list(self._pv_settings):
                 self._pv_settings[pv]["grid"] = False
             self._refresh_axis_settings_tv()
-            self._schedule_replot()
+            self._regrid_in_place()
+
+    def _apply_axis_limits_dialog(self, x_range, y_by_pv):
+        """OK in the Axis limits dialog: the time range becomes the view (with
+        Back/Forward history, like a zoom), the Y numbers become each PV's own
+        Y min / Y max, exactly as if typed into the PV table."""
+        y_changed = False
+        for pv, (lo, hi) in y_by_pv.items():
+            st = self._pv_settings.setdefault(pv, {})
+            if st.get("ymin") == lo and st.get("ymax") == hi:
+                continue
+            st["ymin"], st["ymax"] = lo, hi
+            if lo is not None or hi is not None:
+                st["auto_scale"] = False     # Autoscale would ignore the numbers
+            y_changed = True
+        if not self._graph_axes:
+            return
+        x_before = tuple(self._graph_axes[0].get_xlim())
+        was_zoomed = self._user_zoomed
+        # The boxes show whole seconds, so an untouched range comes back up to
+        # a second off — that is not a request to move the view.
+        _tol = 1.5 / 86400.0
+        x_moved = (abs(x_range[0] - x_before[0]) > _tol
+                   or abs(x_range[1] - x_before[1]) > _tol)
+        if y_changed:
+            # A full redraw builds a new figure on the window's own range, so it
+            # runs first and the time range is put back on top of it.
+            self._plot_graph()          # also refreshes the PV table
+            if not self._graph_axes:
+                return
+        target = x_range if x_moved else (x_before if was_zoomed else None)
+        if target is None:
+            return
+        ax0 = self._graph_axes[0]
+        if x_moved:
+            self._push_graph_view()
+        ax0.set_xlim(*target)
+        if x_moved:
+            self._push_graph_view()
+        self._user_zoomed = True
+        self._retick_from_current_xlim()
+        if self._mpl_canvas is not None:
+            self._blit_bg = None
+            self._mpl_canvas.draw_idle()
 
     def _push_graph_view(self):
         """Remember the current view in the toolbar history (so Back returns to it)."""
@@ -4540,13 +8036,201 @@ class CSSLoggerWidget(QWidget):
 
     # ── Save / clean graph ──────────────────────────────────────────────────
 
-    def _save_graph(self):
-        if self._mpl_figure is None:
-            QMessageBox.information(self, "No graph", "No graph to save."); return
-        path, _ = QFileDialog.getSaveFileName(self, "Save graph", "", "PNG (*.png);;PDF (*.pdf)")
-        if path:
-            self._mpl_figure.savefig(path, dpi=150, bbox_inches="tight")
-            self._log(f"Graph saved: {path}")
+    def _save_graph_image(self, with_selection=True):
+        """Save the graph as an image, the way it looks on screen.
+
+        with_selection=True: a selected region is saved together with its
+        statistics, as a table under the graph (the cards are Qt widgets, not
+        part of the figure, so they have to be drawn into it for the save).
+        with_selection=False: the blue band is left out and so are the numbers.
+        """
+        fig = self._mpl_figure
+        if fig is None:
+            QMessageBox.information(self, "No graph", "No graph to save.")
+            return
+        start_dir = str(self.config.get("graph_save_dir") or "")
+        # A name that says what is in the picture: the period shown and when
+        # it was saved, so a folder of saved graphs sorts and reads by itself.
+        start_path = start_dir
+        try:
+            lo, hi = self._graph_axes[0].get_xlim()
+            t0 = mdates.num2date(lo, tz=TZ_PRAGUE)
+            t1 = mdates.num2date(hi, tz=TZ_PRAGUE)
+            end_fmt = "%H%M%S" if t0.date() == t1.date() else "%Y-%m-%d %H%M%S"
+            name = (f"CSS Logger {t0:%Y-%m-%d %H%M%S} to {t1.strftime(end_fmt)}"
+                    f"{'' if with_selection else ' no selection'}"
+                    f" (saved {datetime.now():%Y-%m-%d %H%M%S}).png")
+            start_path = str(pathlib.Path(start_dir) / name) if start_dir else name
+        except Exception:
+            pass
+        path, _flt = QFileDialog.getSaveFileName(
+            self, "Save graph image", start_path,
+            "PNG image (*.png);;PDF document (*.pdf);;SVG drawing (*.svg)")
+        if not path:
+            return
+        try:
+            self.config["graph_save_dir"] = str(pathlib.Path(path).parent)
+        except Exception:
+            pass
+        try:
+            self._write_graph_image(path, with_selection)
+        except Exception as exc:
+            QMessageBox.warning(self, "Save failed",
+                                f"The image could not be saved:\n{exc}")
+            return
+        self._lbl_status.setText(f"Graph saved: {path}")
+        self._log(f"Graph saved: {path}")
+
+    def _write_graph_image(self, path, with_selection=True, dpi=150):
+        """The save itself, without any dialog (also what the tests call)."""
+        fig = self._mpl_figure
+        sel = getattr(self, "_span_selector", None)
+        sel_artists = list(getattr(sel, "artists", []) or []) if sel is not None else []
+        has_sel = bool(self._sel_range)
+        hidden, extra = [], []
+        try:
+            if not with_selection:
+                for a in sel_artists:
+                    if a.get_visible():
+                        a.set_visible(False)
+                        hidden.append(a)
+            elif has_sel and getattr(self, "_stats_rows", None):
+                extra = self._add_stats_table_to_figure(fig)
+            extra = self._add_header_to_figure(fig) + list(extra)
+            fig.savefig(path, dpi=dpi, bbox_inches="tight",
+                        bbox_extra_artists=extra or None,
+                        facecolor="white")
+        finally:
+            for a in hidden:
+                a.set_visible(True)
+            for t in extra:
+                try:
+                    t.remove()
+                except Exception:
+                    pass
+            self._blit_bg = None
+            if self._mpl_canvas is not None:
+                self._mpl_canvas.draw_idle()
+
+    def _add_header_to_figure(self, fig):
+        """Draw a heading ABOVE the figure for the saved image: the period
+        shown, when it was saved, and the PVs on the graph in their trace
+        colours. Returns the text artists (the caller removes them)."""
+        from matplotlib.transforms import offset_copy
+        f_pt = max(7.0, float(self._graph_opts.get("font_size", 11)) - 1.0)
+        line_pt = f_pt * 1.55
+        renderer = fig.canvas.get_renderer()
+        texts = []
+
+        def _txt(x_pt, y_pt, s, **kw):
+            tr = offset_copy(fig.transFigure, fig=fig, x=x_pt, y=y_pt, units="points")
+            t = fig.text(0.0, 1.0, s, transform=tr, fontsize=f_pt, va="bottom", **kw)
+            texts.append(t)
+            return t
+
+        try:
+            lo, hi = self._graph_axes[0].get_xlim()
+            t0 = mdates.num2date(lo, tz=TZ_PRAGUE)
+            t1 = mdates.num2date(hi, tz=TZ_PRAGUE)
+            end_fmt = ("%H:%M:%S" if t0.date() == t1.date()
+                       else "%Y-%m-%d %H:%M:%S")
+            period = f"{t0:%Y-%m-%d %H:%M:%S} → {t1.strftime(end_fmt)}"
+        except Exception:
+            period = ""
+        width_pt = fig.get_size_inches()[0] * 72.0
+        # PV names, wrapped onto as many lines as the figure width needs.
+        names = []
+        for i, pv in enumerate(self._graph_pvs):
+            st = self._pv_settings.get(pv, {})
+            if not st.get("show", True):
+                continue
+            names.append((self._col_label(pv),
+                          st.get("color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])))
+        rows, cur, x = [], [], 6.0
+        for name, color in names:
+            t = _txt(0, 0, name, color=color, fontweight="bold")
+            w = t.get_window_extent(renderer).width * 72.0 / fig.dpi
+            if cur and x + w > width_pt - 6.0:
+                rows.append(cur); cur, x = [], 6.0
+            cur.append((t, x))
+            x += w + 16.0
+        if cur:
+            rows.append(cur)
+        # Bottom-up: the last row of names sits just above the figure.
+        y = 4.0
+        for row in reversed(rows):
+            for t, x0 in row:
+                t.set_transform(offset_copy(fig.transFigure, fig=fig,
+                                            x=x0, y=y, units="points"))
+            y += line_pt
+        _txt(6.0, y, f"CSS Logger  ·  {period}   (saved "
+                     f"{datetime.now():%Y-%m-%d %H:%M:%S})",
+             color="#111111", fontweight="bold")
+        return texts
+
+    def _add_stats_table_to_figure(self, fig):
+        """Draw the selection statistics as a small table BELOW the figure and
+        return the text artists (the caller removes them after saving).
+
+        Placed under the figure's bottom edge; savefig's tight box grows to
+        take them in, so the graph itself keeps exactly its on-screen size."""
+        from matplotlib.transforms import offset_copy
+        rows = list(self._stats_rows)
+        heads = ["PV", "N", "Avg", "Std", "Min", "Max", "P-P"]
+        keys = ["n", "avg", "std", "min", "max", "ptp"]
+        f_pt = max(7.0, float(self._graph_opts.get("font_size", 11)) - 1.0)
+        line_pt = f_pt * 1.55
+        renderer = fig.canvas.get_renderer()
+        texts = []
+
+        def _txt(x_pt, y_pt, s, **kw):
+            tr = offset_copy(fig.transFigure, fig=fig, x=x_pt, y=y_pt, units="points")
+            t = fig.text(0.0, 0.0, s, transform=tr, fontsize=f_pt,
+                         va="top", **kw)
+            texts.append(t)
+            return t
+
+        # Below the time-axis title: start under the lowest thing already drawn.
+        try:
+            low_px = min(a.get_tightbbox(renderer).y0 for a in fig.axes
+                         if a.get_visible())
+            top_pt = min(0.0, low_px * 72.0 / fig.dpi) - 6.0
+        except Exception:
+            top_pt = -6.0
+        title = self._stats_title.text() if getattr(self, "_stats_title", None) else ""
+        if title:
+            _txt(6.0, top_pt, title, color="#1565C0", fontweight="bold")
+            top_pt -= line_pt * 1.2
+
+        # Column texts first, then line them up by their measured widths.
+        grid = [[_txt(0, 0, h, color="#555555", fontweight="bold") for h in heads]]
+        for name, color, stats in rows:
+            cells = [_txt(0, 0, name, color=color, fontweight="bold")]
+            cells += [_txt(0, 0, str(stats.get(k, "")), color="#111111") for k in keys]
+            grid.append(cells)
+        widths = [0.0] * len(heads)
+        for line in grid:
+            for j, t in enumerate(line):
+                w_pt = t.get_window_extent(renderer).width * 72.0 / fig.dpi
+                widths[j] = max(widths[j], w_pt)
+        x = 6.0
+        xs = []
+        for w in widths:
+            xs.append(x)
+            x += w + 14.0
+        for i, line in enumerate(grid):
+            y = top_pt - i * line_pt
+            for j, t in enumerate(line):
+                # Numbers right-aligned in their column, names left-aligned.
+                if j == 0:
+                    t.set_transform(offset_copy(fig.transFigure, fig=fig,
+                                                x=xs[j], y=y, units="points"))
+                else:
+                    t.set_ha("right")
+                    t.set_transform(offset_copy(fig.transFigure, fig=fig,
+                                                x=xs[j] + widths[j], y=y,
+                                                units="points"))
+        return texts
 
     def _clean_graph(self):
         # Clear only the plotted data points — keep the plot frame (axes,
@@ -4559,6 +8243,14 @@ class CSSLoggerWidget(QWidget):
                         ln.set_data([], [])
                     except Exception:
                         pass
+            for band in self._graph_bands:
+                if band is not None:
+                    try:
+                        band.remove()
+                    except Exception:
+                        pass
+            self._graph_bands  = []
+            self._graph_env    = []
             self._graph_raw    = []
             self._graph_raw_np = []
             self._clear_selection()   # deliberate act: drop the region too
@@ -4602,6 +8294,7 @@ class CSSLoggerWidget(QWidget):
                 self._restore_graph_from_popup(); return
             if (not windowed) and is_full:
                 self._restore_graph_from_popup(); return
+            self._graph_popup.set_framed(windowed)
             if windowed:
                 self._graph_popup.showNormal()
                 self._graph_popup.resize(1200, 800)
@@ -4615,13 +8308,12 @@ class CSSLoggerWidget(QWidget):
         self._graph_tab_label = self._notebook.tabText(self._graph_tab_index)
         popup = _GraphPopupWindow(self)
         pl = QVBoxLayout(popup)
-        pl.setContentsMargins(0, 0, 0, 0)
+        popup.set_framed(windowed)
         self._notebook.removeTab(self._graph_tab_index)
         pl.addWidget(self._tab_graph)
         self._tab_graph.show()
         # "Graph only": hide the toolbar and the axis-settings table.
-        self._graph_ctrl_bar.hide()
-        self._graph_tb_holder.hide()
+        self._graph_strip.hide()
         self._graph_axis_pane.hide()
         self._graph_popup = popup
         if windowed:
@@ -4636,13 +8328,13 @@ class CSSLoggerWidget(QWidget):
             return
         popup = self._graph_popup
         self._graph_popup = None
+        popup.stop_watching()
         lay = popup.layout()
         if lay is not None:
             lay.removeWidget(self._tab_graph)
         self._tab_graph.setParent(None)
         # Restore the toolbar and axis-settings table hidden during pop-out.
-        self._graph_ctrl_bar.show()
-        self._graph_tb_holder.show()
+        self._graph_strip.show()
         self._graph_axis_pane.show()
         self._notebook.insertTab(self._graph_tab_index, self._tab_graph,
                                  self._graph_tab_label)
@@ -4732,6 +8424,19 @@ class CSSLoggerWidget(QWidget):
         fig = self._mpl_figure
         if fig is None or self._mpl_canvas is None:
             return
+        # The axis columns were laid out in pixels for one width. When the
+        # canvas ends up clearly wider or narrower (window, splitter or the
+        # statistics strip moved), lay it out again once the resizing stops,
+        # so the gaps set in Margins and spacing stay the size they were set.
+        try:
+            w = float(self._mpl_canvas.width())
+            laid = float(getattr(self, "_graph_layout_w", 0) or 0)
+            if laid > 0 and w > 150 and abs(w - laid) / laid > 0.03 \
+                    and w != getattr(self, "_graph_relayout_asked", None):
+                self._graph_relayout_asked = w
+                self._schedule_replot(300)
+        except Exception:
+            pass
         try:
             h_px = float(fig.get_size_inches()[1] * fig.dpi)
             top  = float(fig.subplotpars.top)
@@ -4902,7 +8607,7 @@ class CSSLoggerWidget(QWidget):
         """
         span_s = (t_hi - t_lo).total_seconds()
         _opts  = getattr(self, "_graph_opts", None) or {}
-        _want  = max(2, int(_opts.get("x_ticks_max", 8)))
+        _want  = max(2, int(_opts.get("x_ticks_max", 12)))
         _fixed = max(0, int(_opts.get("x_tick_seconds", 0)))
         # The ladder used to stop at two days, so a week asked for ~85 stamps
         # and a year for ~180 — all written over each other. It now runs out to
@@ -4963,6 +8668,7 @@ class CSSLoggerWidget(QWidget):
         """A fetch has ended (well or badly): let the next one start, and run one
         that was asked for while this was busy."""
         self._load_in_flight = False
+        self._loading_from_ns = None
         btn = getattr(self, "_btn_stop_load", None)
         if btn is not None:
             btn.hide()
@@ -5030,6 +8736,10 @@ class CSSLoggerWidget(QWidget):
             self._live_timer.stop()
             self._countdown_timer.stop()
             self._live_window_span = self._live_span_from_window()
+            # The span just changed: say so next to the button. Without this the
+            # label kept the span Live started with ("now − 1 h") while the
+            # graph showed the month picked since.
+            self._refresh_time_labels()
             self._live_last_ts = None
             self._live_last_rebuild_ns = 0
             self._live_last_graph_ns   = 0
@@ -5061,12 +8771,16 @@ class CSSLoggerWidget(QWidget):
         self._progress_bar.setValue(0)
         self._progress_bar.show()
         self._btn_stop_load.show()
+        self._partial_table_done = False
+        self._zoom_detail = None          # belongs to the previous load
         start_ns = dt_to_ns(self._dt_from)
         end_ns   = dt_to_ns(self._dt_to)
         # Read the target-points value on the UI thread (Qt widgets are not
         # thread-safe). >0 → ask the archiver to decimate; 0 → every raw sample.
         avg_target = self._avg_target_points()
         timeout_base = self._http_timeout()
+        day_cache = _day_cache()
+        self._partial_cost = 0.0
         print(f"[CSS Logger] Load clicked: {len(pvs)} PVs, window {start_ns} → {end_ns}, "
               f"avg_target={avg_target}")
         self._load_sig = _LoadSig()          # keep alive until done
@@ -5081,7 +8795,8 @@ class CSSLoggerWidget(QWidget):
         def _worker():
             try:
                 from cpva_core import (cpva_fetch_many_adaptive, cpva_decode_value,
-                                       cpva_fetch_last_before_many)
+                                       cpva_fetch_last_before_many,
+                                       LAST_BEFORE_DEADLINE_S)
                 samples_by_pv   = {}
                 pv_order        = []
                 errors          = []
@@ -5098,99 +8813,191 @@ class CSSLoggerWidget(QWidget):
                                     (s.get("metaData") or {}).get("units", "") or ""))
                     return out
 
+                def _seed_tuple(s):
+                    return (int(s.get("time") or 0), cpva_decode_value(s),
+                            (s.get("metaData") or {}).get("units", "") or "")
+
                 # ── show the period filling in while it loads ──────────────
-                # The requests are served newest first, so the picture grows
-                # from the right-hand (present) edge backwards. Snapshots are
-                # kept well apart in time: redrawing a dozen signals costs far
-                # more than one request does.
-                acc = {pv: [] for pv in pvs}
+                # Whole days are read newest first, so the picture grows from
+                # the right-hand (present) edge backwards. A new picture is made
+                # only when the window has finished drawing the last one, and
+                # never sooner than one and a half times what that one cost:
+                # the redraw runs on the window's own thread, and back-to-back
+                # redraws of months of data left it no time to answer at all.
+                # The fetch threads only APPEND here, under a lock held for a
+                # moment. Building a picture (merging, sorting) happens in its
+                # own thread: done inside the fetch threads, under the lock, it
+                # re-sorted everything read so far on every arrival and held up
+                # the whole pool — measured, a 20 s load took 146 s.
+                acc = {pv: [] for pv in pvs}          # pv -> [decoded chunk, …]
+                acc_mm = {pv: [] for pv in pvs}       # pv -> [(ts, lo, hi) arrays]
                 acc_lock = threading.Lock()
+                gui_ready = threading.Event()     # set by _on_load_partial when done
+                gui_ready.set()
                 last_snap = [time.monotonic()]
+                cov = [0.0]           # share of the period read, 0..1
+                edge = [end_ns]       # everything newer than this is read
+                dirty = [False]       # something arrived since the last picture
+                snap_stop = threading.Event()
+
+                def _join_mm(parts):
+                    parts = [p for p in parts if p is not None]
+                    if not parts:
+                        return None
+                    ts = np.concatenate([p[0] for p in parts])
+                    order = np.argsort(ts, kind="stable")
+                    return (ts[order],
+                            np.concatenate([p[1] for p in parts])[order],
+                            np.concatenate([p[2] for p in parts])[order])
+
+                def _merge(chunks):
+                    rows = [r for c in chunks for r in c]
+                    rows.sort(key=lambda r: r[0])
+                    out, last = [], None
+                    for r in rows:
+                        if r[0] != last:
+                            out.append(r)
+                            last = r[0]
+                    return out
+
+                def _snapshotter():
+                    """Send the window a picture of what has arrived, now and
+                    then. Never while it is still drawing the last one, and
+                    never sooner than three times what that one cost: the
+                    redraw runs on the window's own thread, and back-to-back
+                    redraws of months of data starve the fetch threads too."""
+                    while not snap_stop.wait(0.25):
+                        if not dirty[0] or not gui_ready.is_set() or cancel():
+                            continue
+                        # Nearly read: the full picture is moments away, and a
+                        # partial one now would only delay it (measured: a
+                        # seven-second redraw started at 98 %).
+                        if cov[0] >= 0.9:
+                            continue
+                        gap = max(2.0, 3.0 * float(getattr(self, "_partial_cost", 0.0)))
+                        if time.monotonic() - last_snap[0] < gap:
+                            continue
+                        with acc_lock:
+                            dirty[0] = False
+                            parts = {p: list(v) for p, v in acc.items()}
+                            mm_parts = {p: list(v) for p, v in acc_mm.items()}
+                        snap = {p: _merge(v) for p, v in parts.items()}
+                        snap_mm = {p: _join_mm(v) for p, v in mm_parts.items()}
+                        pre = None      # hunted after the read, see below
+                        gui_ready.clear()
+                        last_snap[0] = time.monotonic()
+                        sig.partial.emit((snap, list(pvs), start_ns, end_ns, epoch,
+                                          cov[0], snap_mm, gui_ready, edge[0], pre))
 
                 def _on_chunk(pv, raw):
                     rows = _decode(raw)
                     if not rows:
                         return
+                    mm = _minmax_arrays(raw)
                     with acc_lock:
-                        acc.setdefault(pv, []).extend(rows)
-                        if time.monotonic() - last_snap[0] < 1.5:
-                            return
-                        last_snap[0] = time.monotonic()
-                        snap = {}
-                        for p, v in acc.items():
-                            by_ts = {}
-                            for row in v:
-                                by_ts[row[0]] = row
-                            snap[p] = [by_ts[k] for k in sorted(by_ts)]
-                    sig.partial.emit((snap, list(pvs), start_ns, end_ns, epoch))
+                        acc.setdefault(pv, []).append(rows)
+                        if mm is not None:
+                            acc_mm.setdefault(pv, []).append(mm)
+                        dirty[0] = True
+
+                def _on_tile(e):
+                    edge[0] = e
+                    dirty[0] = True
+
+                threading.Thread(target=_snapshotter, daemon=True,
+                                 name="css-logger-snapshots").start()
 
                 # ── progress ───────────────────────────────────────────────
-                # "total" grows as the archiver refuses a range and it is split,
-                # so the percentage can stall; the counts are the honest part.
-                # Throttled, or a long load floods Qt with tens of thousands of
+                # Driven by the share of the period READ, not by the number of
+                # requests: a few huge requests used to hold the bar on one
+                # number for minutes. Throttled, or a long load floods Qt with
                 # signal emissions and freezes the window on its own.
                 shown = [-1, 0.0]
                 t_start = time.monotonic()
                 what = f"{len(pvs)} signal{'' if len(pvs) == 1 else 's'}"
+                span = max(1, end_ns - start_ns)
 
-                def _report(done, total):
-                    if not total:
-                        return
-                    pct = int(done / total * 100)
+                def _cover(frac):
+                    cov[0] = frac
+                    pct = int(frac * 95)              # the last 5 % is the tidy-up
                     now = time.monotonic()
-                    if pct == shown[0] and now - shown[1] < 0.2:
+                    if pct == shown[0] and now - shown[1] < 0.5:
                         return
                     shown[0], shown[1] = pct, now
                     sig.pct.emit(pct)
-                    txt = f"Reading {what} · {done}/{total} requests"
-                    if done:
-                        left = (now - t_start) / done * (total - done)
+                    reached = ns_to_local_str(max(start_ns, edge[0]))[:16]
+                    txt = f"Reading {what} · back to {reached}"
+                    if frac > 0.02:
+                        left = (now - t_start) / frac * (1 - frac)
                         if left > 5:
-                            txt += f" · about {left:.0f} s left"
+                            txt += (f" · about {left / 60:.0f} min left" if left > 90
+                                    else f" · about {left:.0f} s left")
                     sig.progress.emit(txt)
 
-                sig.progress.emit(f"Reading {what}…")
+                sig.progress.emit(f"Reading {what}")
                 raw_by_pv, chunk_errors, report = cpva_fetch_many_adaptive(
                     pvs, start_ns, end_ns,
                     count=(avg_target if avg_target > 0 else None),
                     timeout=timeout_base,
-                    progress_fn=_report, cancel_fn=cancel,
-                    log_fn=sig.note.emit, chunk_fn=_on_chunk)
+                    coverage_fn=_cover, cancel_fn=cancel,
+                    phase_fn=sig.progress.emit,
+                    log_fn=sig.note.emit, chunk_fn=_on_chunk,
+                    tile_fn=_on_tile, cache=day_cache)
+                snap_stop.set()
+                sig.pct.emit(96)
+                if report is not None and getattr(report, "cached", 0):
+                    sig.note.emit(f"{report.cached} signal-day"
+                                  f"{'' if report.cached == 1 else 's'} came from "
+                                  f"the day cache")
 
+                minmax_by_pv = {}
                 for pv in pvs:
                     if pv in chunk_errors:
                         errors.append(f"{shorten_pv_name(pv)}: {chunk_errors[pv]}")
                         print(f"[CSS Logger]   → ERROR {pv}: {chunk_errors[pv]}")
                     samples_by_pv[pv] = _decode(raw_by_pv.get(pv, []))
+                    minmax_by_pv[pv] = _minmax_arrays(raw_by_pv.get(pv, []))
                     pv_order.append(pv)
                     print(f"[CSS Logger]   {pv} → {len(samples_by_pv[pv])} samples")
 
-                # Look back for the last sample BEFORE the window start whenever a
-                # PV has no data or its first sample sits after start_ns, so the
-                # trace can start at the window edge instead of jumping in later.
-                sig.progress.emit("Filling gaps at window start…")
-                need_lookback = []
-                for pv in pvs:
-                    first_ts = min((t for t, _, _ in samples_by_pv.get(pv, [])),
-                                   default=None)
-                    if first_ts is None or first_ts > start_ns:
-                        need_lookback.append(pv)
-                last_map = cpva_fetch_last_before_many(
-                    need_lookback, start_ns, timeout_base, cancel_fn=cancel)
-                for pv, last_s in last_map.items():
-                    last_ts = last_s.get("time")
-                    if last_ts:
-                        pre_window_vals[pv] = (
-                            int(last_ts), cpva_decode_value(last_s),
-                            (last_s.get("metaData") or {}).get("units", "") or "")
+                # The value each signal had when the window starts — only for
+                # a signal whose first sample sits after the start (the others
+                # carry it in the read). This step used to have no limit: on a
+                # three-month load it sat at "92 %" until the program was
+                # killed. It now stops at a deadline and says what it missed.
+                # (Hunted here, not beside the read: wide look-backs for every
+                # signal at once slowed the archiver for the read itself.)
+                need = [pv for pv in pvs
+                        if not samples_by_pv.get(pv)
+                        or min(t for t, _v, _u in samples_by_pv[pv]) > start_ns]
+                if need and not cancel():
+                    sig.progress.emit("Reading the last value before the window")
+                    t_hunt = time.monotonic()
+                    seeds = cpva_fetch_last_before_many(
+                        need, start_ns, timeout_base, cancel_fn=cancel,
+                        deadline_s=LAST_BEFORE_DEADLINE_S)
+                    for pv, last_s in seeds.items():
+                        if last_s and last_s.get("time"):
+                            pre_window_vals[pv] = _seed_tuple(last_s)
+                    missing = [pv for pv in need if pv not in pre_window_vals]
+                    if (missing and time.monotonic() - t_hunt
+                            >= LAST_BEFORE_DEADLINE_S - 0.5):
+                        sig.note.emit("value before the window not found in time "
+                                      "for: " + ", ".join(shorten_pv_name(p)
+                                                          for p in missing))
                 sig.pct.emit(100)
                 print(f"[CSS Logger] Emitting done: {len(pv_order)} PVs, errors={errors}")
                 sig.done.emit((samples_by_pv, pv_order, errors, start_ns, end_ns,
                                pre_window_vals,
-                               {"report": report, "epoch": epoch}))
+                               {"report": report, "epoch": epoch,
+                                "minmax": minmax_by_pv}))
             except Exception as exc:
                 import traceback; traceback.print_exc()
                 sig.error.emit(str(exc))
+            finally:
+                stop = locals().get("snap_stop")
+                if stop is not None:
+                    stop.set()
 
         try:
             threading.Thread(target=_worker, daemon=True).start()
@@ -5216,17 +9023,39 @@ class CSSLoggerWidget(QWidget):
         still running.
         """
         try:
-            snap, pvs, start_ns, end_ns, epoch = payload
+            snap, pvs, start_ns, end_ns, epoch, frac, snap_mm = payload[:7]
         except Exception:
             return
-        if epoch != self._load_epoch or not self._load_in_flight:
-            return                      # a stale worker, or the load has ended
+        ready = payload[7] if len(payload) > 7 else None
+        edge = payload[8] if len(payload) > 8 else None
+        pre = payload[9] if len(payload) > 9 else None
+        try:
+            if epoch != self._load_epoch or not self._load_in_flight:
+                return                  # a stale worker, or the load has ended
+            if getattr(self, "_suspended", False):
+                return                  # a hidden tab draws once, when it ends
+            t0 = time.monotonic()
+            self._draw_load_partial(snap, pvs, start_ns, end_ns, frac, snap_mm,
+                                    edge, pre)
+            # What a picture costs sets how soon the worker may send the next.
+            self._partial_cost = time.monotonic() - t0
+        finally:
+            # Tell the worker the next picture may be made.
+            if ready is not None:
+                ready.set()
+
+    def _draw_load_partial(self, snap, pvs, start_ns, end_ns, frac, snap_mm,
+                           edge=None, pre=None):
         if self._partial_busy:
             return                      # the previous repaint has not finished
         self._partial_busy = True
         try:
             self._pv_stats_cache.clear()
             self._plot_window_ns = None
+            # The value each signal had before the window, once the hunt for it
+            # has answered. Never the PREVIOUS load's values: those belong to a
+            # different start and would hold a wrong line at the left edge.
+            self._pre_window_vals = dict(pre) if pre else {}
             for pv in snap:
                 snap[pv].sort(key=lambda s: s[0])
             self._samples_by_pv = {
@@ -5235,6 +9064,7 @@ class CSSLoggerWidget(QWidget):
                 for pv in pvs}
             self._pv_order      = list(pvs)
             self._base_pv_order = list(pvs)
+            self._minmax_by_pv  = snap_mm or {}
             self._numeric_pvs = {
                 pv for pv, s in self._samples_by_pv.items()
                 if any(isinstance(v, (int, float)) for _, v, _ in s)}
@@ -5246,9 +9076,19 @@ class CSSLoggerWidget(QWidget):
             rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
             self._table_rows = self._apply_conditions_to_rows(rows)
             self._resync_pv_colors()
-            self._plot_graph()
-            self._refresh_axis_settings_tv()
-            self._populate_table()
+            # Everything older than this is still to come: the graph greys it.
+            # The edge is where the read is complete for EVERY signal (whole
+            # days, newest first); the old average over signals greyed less
+            # than was really missing.
+            self._loading_from_ns = (int(edge) if edge is not None
+                                     else end_ns - int(frac * (end_ns - start_ns)))
+            self._plot_graph()              # also refreshes the PV table
+            # The table is filled from the first piece (so it never shows the
+            # previous load's rows) and then once more when the load ends:
+            # rebuilding it every second and a half made a long load feel frozen.
+            if not self._partial_table_done:
+                self._partial_table_done = True
+                self._populate_table()
         except Exception as exc:
             import traceback; traceback.print_exc()
             self._log(f"[partial redraw skipped] {exc}")
@@ -5288,6 +9128,7 @@ class CSSLoggerWidget(QWidget):
         report = meta.get("report")
         self._last_fetch_report = report
         self._pre_window_vals = pre_window_vals
+        self._minmax_by_pv = meta.get("minmax") or {}
         self._plot_window_ns = None   # regular load uses the user's From/To
         self._finish_load()
         self._progress_bar.hide()
@@ -5353,8 +9194,8 @@ class CSSLoggerWidget(QWidget):
         # for whatever PVs are currently displayed (see _resync_pv_colors).
         self._resync_pv_colors()
 
-        self._plot_graph()
-        self._refresh_axis_settings_tv()   # always show PV list, even with 0 samples
+        self._maybe_hunt_last_good()
+        self._plot_graph()      # refreshes the PV list too, even with 0 samples
         self._populate_table()
         self._refresh_xy_choices()
 
@@ -5415,7 +9256,7 @@ class CSSLoggerWidget(QWidget):
                         f"{n_rows_all:,} rows")
         thinned = int(getattr(self, "_plot_thinned", 0) or 0)
         if thinned > 25000:
-            bits.append(f"graph shows 25,000 of {thinned:,} pts")
+            bits.append(f"graph draws {thinned:,} pts as 25,000 min–max bins")
         return ("  |  " + "  |  ".join(bits)) if bits else ""
 
     def _build_table_rows(self, samples_by_pv, pv_order, pre_vals=None):
@@ -5541,6 +9382,7 @@ class CSSLoggerWidget(QWidget):
         pvs      = self._real_pv_names()
         avg_target = self._avg_target_points()   # read on UI thread
         timeout_base = self._http_timeout()
+        day_cache = _day_cache()
         # This starts a fresh live session, so anything still fetching for the
         # previous one (a preset switch or a new time window restarts the load) is
         # now stale and must abort instead of competing for the GIL.
@@ -5586,11 +9428,12 @@ class CSSLoggerWidget(QWidget):
                     count=(avg_target if avg_target > 0 else None),
                     timeout=timeout_base,
                     progress_fn=_report, cancel_fn=cancel,
-                    log_fn=sig.note.emit)
+                    log_fn=sig.note.emit, cache=day_cache)
 
                 if cancel():
                     return                      # session ended while fetching
 
+                minmax_by_pv = {}
                 for pv in pvs:
                     samples = []
                     for s in raw_by_pv.get(pv, []):
@@ -5600,6 +9443,7 @@ class CSSLoggerWidget(QWidget):
                         units = (s.get("metaData") or {}).get("units", "") or ""
                         samples.append((int(t_ns), value, units))
                     samples_by_pv[pv] = samples
+                    minmax_by_pv[pv] = _minmax_arrays(raw_by_pv.get(pv, []))
                     pv_order.append(pv)
 
                 # Carry-forward: hold the last known value so a PV without a fresh
@@ -5624,7 +9468,8 @@ class CSSLoggerWidget(QWidget):
                             int(last_s["time"]), cpva_decode_value(last_s),
                             (last_s.get("metaData") or {}).get("units", "") or "")
                 sig.pct.emit(100)
-                sig.done.emit((samples_by_pv, pv_order, [], start_ns, end_ns, pre_window_vals))
+                sig.done.emit((samples_by_pv, pv_order, [], start_ns, end_ns,
+                               pre_window_vals, minmax_by_pv))
             except Exception as exc:
                 sig.error.emit(str(exc))
 
@@ -5657,8 +9502,13 @@ class CSSLoggerWidget(QWidget):
         self._progress_bar.hide()
         self._live_init_retries = 0          # success clears the retry budget
         try:
-            if len(result) == 6:
+            self._zoom_detail = None
+            if len(result) == 7:
+                (samples_by_pv, pv_order, _, start_ns, end_ns, pre_window_vals,
+                 self._minmax_by_pv) = result
+            elif len(result) == 6:
                 samples_by_pv, pv_order, _, start_ns, end_ns, pre_window_vals = result
+                self._minmax_by_pv = {}
             else:
                 samples_by_pv, pv_order, _, start_ns, end_ns = result
                 pre_window_vals = {}
@@ -5702,6 +9552,7 @@ class CSSLoggerWidget(QWidget):
             for samples in samples_by_pv.values():
                 if samples: max_ts = max(max_ts, samples[-1][0])
             self._live_last_ts = max_ts if max_ts else end_ns
+            self._maybe_hunt_last_good()
             self._plot_graph()
             self._populate_table()
             self._refresh_xy_choices()
@@ -5725,6 +9576,15 @@ class CSSLoggerWidget(QWidget):
         # _LIVE_TICK_LOOKBACK_NS. Without that cap the range is unbounded on a
         # quiet archiver (see the constant), and one tick fans out into dozens of
         # 1-hour chunks per PV every 300 ms.
+        # Each PV keeps its own "newest sample I have". The cursor above is the
+        # newest of ALL of them, and filtering every PV by it threw away a slow
+        # channel's sample that reached the archiver a moment after a faster
+        # channel's newer one — lost for good, and a custom PV built on it held
+        # a stale value until the next full load. The query reaches a few
+        # seconds further back to catch such late arrivals.
+        own_last = {pv: (self._samples_by_pv.get(pv) or [(None,)])[-1][0]
+                    for pv in pvs}
+        start_ns -= _LIVE_LATE_ARRIVAL_NS
         min_start = end_ns - _LIVE_TICK_LOOKBACK_NS
         if start_ns < min_start:
             start_ns = min_start
@@ -5752,9 +9612,12 @@ class CSSLoggerWidget(QWidget):
                     if pv in fetch_errs:
                         errors.append(f"{shorten_pv_name(pv)}: {fetch_errs[pv]}")
                     new_pts = []
+                    floor_ns = own_last.get(pv)
+                    if floor_ns is None:
+                        floor_ns = start_ns
                     for s in raw_by_pv.get(pv, []):
                         t_ns = s.get("time")
-                        if t_ns is None or int(t_ns) <= start_ns: continue
+                        if t_ns is None or int(t_ns) <= floor_ns: continue
                         value = cpva_decode_value(s)
                         units = (s.get("metaData") or {}).get("units", "") or ""
                         new_pts.append((int(t_ns), value, units))
@@ -5798,6 +9661,11 @@ class CSSLoggerWidget(QWidget):
                                      2 * getattr(self, "_live_table_cost_ns", 0))
             graph_due = (now - getattr(self, "_live_last_graph_ns", 0)) >= _graph_interval_ns
             table_due = (now - getattr(self, "_live_last_rebuild_ns", 0)) >= _table_interval_ns
+            hidden = getattr(self, "_suspended", False)
+            if hidden:
+                # A setting tab that is not on screen only collects: the merge,
+                # the table and the graph wait for resume().
+                graph_due = table_due = False
             refresh_due = table_due            # the table rebuild, as before
             if graph_due:
                 self._live_last_graph_ns = now
@@ -5806,8 +9674,11 @@ class CSSLoggerWidget(QWidget):
                 if self._live_window_span:
                     span_ns = int(self._live_window_span.total_seconds() * 1e9)
                     self._plot_window_ns = (now - span_ns, now)
-            if table_due:
-                self._live_last_rebuild_ns = now
+            # The table clock is restarted only by a rebuild that really ran
+            # (below). It used to restart on every due tick, so a due tick that
+            # happened to bring nothing skipped the rebuild AND postponed the
+            # next one — with sparse channels the custom PVs, which are only
+            # recomputed here, fell further and further behind.
 
             if added_count > 0:
                 # Advance the cursor to the newest sample we actually received —
@@ -5818,33 +9689,31 @@ class CSSLoggerWidget(QWidget):
                               default=0)
                 if maxrecv:
                     self._live_last_ts = max(self._live_last_ts or 0, maxrecv)
+                cutoff_ns = None
+                if self._live_window_span:
+                    cutoff_ns = int((datetime.now().astimezone(timezone.utc)
+                                     - self._live_window_span).timestamp() * 1e9)
                 for pv, pts in new_samples.items():
-                    existing = self._samples_by_pv.get(pv, [])
+                    existing = self._samples_by_pv.get(pv)
+                    if existing is None:
+                        existing = self._samples_by_pv[pv] = []
                     existing.extend(pts)
-                    # Trim to window
-                    if self._live_window_span:
-                        cutoff_ns = int((datetime.now().astimezone(timezone.utc)
-                                         - self._live_window_span).timestamp() * 1e9)
-                        self._samples_by_pv[pv] = [s for s in existing if s[0] >= cutoff_ns]
-                    else:
-                        self._samples_by_pv[pv] = existing
-
-                if table_due:
-                    _table_t0 = time.perf_counter()
-                    rows = self._build_table_rows(
-                        self._samples_by_pv, self._base_pv_order or self._pv_order,
-                        self._pre_window_vals)
-                    rows = self._remove_master_only_rows(rows)
-                    rows = self._remove_fake_hour_boundary_rows(rows)
-                    self._table_rows_unfiltered = rows
-                    self._rebuild_custom_pvs()          # recompute derived channels live
-                    rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
-                    self._table_rows = self._apply_conditions_to_rows(rows)
-                    self._populate_table()
-                    self._flush_axis_measured()   # Last/Min/Max/… keep up with Live
-                    self._xy_refresh_live()       # …and so does the XY cloud
-                    self._live_table_cost_ns = int(
-                        (time.perf_counter() - _table_t0) * 1e9)
+                # A live selection keeps its own copy of everything since its
+                # start — taken BEFORE the trim, which would otherwise make it
+                # stop counting once its start is older than the graph's span.
+                if self._sel_range and getattr(self, "_sel_live", False):
+                    self._sel_sync()
+                for pv in new_samples:
+                    existing = self._samples_by_pv[pv]
+                    # Trim to the window. The list is in time order, so the cut
+                    # is one bisect instead of a copy of the whole list per tick.
+                    if cutoff_ns is not None and existing and existing[0][0] < cutoff_ns:
+                        del existing[:bisect.bisect_left(existing, cutoff_ns,
+                                                         key=lambda s: s[0])]
+                # New samples the table has not merged yet. A due rebuild runs
+                # as soon as there is something to merge — also on a later tick
+                # that brings nothing itself.
+                self._live_rows_stale = True
                 total_pts = sum(len(v) for v in self._samples_by_pv.values())
                 self._lbl_status.setText(
                     f"Live +{added_count} pts  |  total {total_pts}")
@@ -5871,6 +9740,27 @@ class CSSLoggerWidget(QWidget):
                     self._lbl_status.setText(f"Live: polling… no new data  |  "
                                              f"last data {last_str}")
 
+            rebuilt = False
+            if table_due and getattr(self, "_live_rows_stale", False):
+                self._live_rows_stale = False
+                self._live_last_rebuild_ns = now
+                _table_t0 = time.perf_counter()
+                rows = self._build_table_rows(
+                    self._samples_by_pv, self._base_pv_order or self._pv_order,
+                    self._pre_window_vals)
+                rows = self._remove_master_only_rows(rows)
+                rows = self._remove_fake_hour_boundary_rows(rows)
+                self._table_rows_unfiltered = rows
+                self._rebuild_custom_pvs()          # recompute derived channels live
+                rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+                self._table_rows = self._apply_conditions_to_rows(rows)
+                self._populate_table()
+                self._flush_axis_measured()   # Last/Min/Max/… keep up with Live
+                self._xy_refresh_live()       # …and so does the XY cloud
+                self._live_table_cost_ns = int(
+                    (time.perf_counter() - _table_t0) * 1e9)
+                rebuilt = True
+
             # Log fetch errors and an occasional heartbeat so the Log tab reveals
             # whether live polling is actually running and reaching the archiver.
             if errors:
@@ -5888,14 +9778,35 @@ class CSSLoggerWidget(QWidget):
             # ones (the cheap path).
             if graph_due:
                 _graph_t0 = time.perf_counter()
+                # Custom traces are computed from the merged rows, which only the
+                # (slower) table rebuild makes. Between rebuilds their newest
+                # stretch is computed straight from the sources, so a derived
+                # trace moves with the real ones instead of lagging behind them.
+                if not rebuilt and self._custom_pvs:
+                    try:
+                        self._extend_custom_series_live()
+                    except Exception:
+                        import traceback
+                        self._log(f"[live custom PVs]\n{traceback.format_exc()}")
                 numeric_now = {
                     pv for pv in self._pv_order
                     if self._pv_settings.get(pv, {}).get("show", True)
                     and any(isinstance(v, (int, float))
                             for _, v, _ in self._samples_by_pv.get(pv, []))
                 }
-                if not self._graph_lines or not numeric_now.issubset(set(self._graph_pvs)):
+                # With no shot anywhere yet there is nothing new to draw. A full
+                # rebuild on every tick (which "no lines yet" used to mean)
+                # threw away the canvas under the mouse, so a selection could
+                # not be dragged until the first shot came. Just slide the time
+                # axis instead.
+                if self._mpl_canvas is None or \
+                        not numeric_now.issubset(set(self._graph_pvs)) or \
+                        (not self._graph_lines and numeric_now):
                     self._plot_graph()
+                elif not self._graph_lines:
+                    self._scroll_live_time_axis()
+                    if self._sel_range:
+                        self._recompute_stats()
                 else:
                     self._update_graph_data()
                 # Cost of the graph refresh alone; paces the next one. The canvas
@@ -5903,7 +9814,7 @@ class CSSLoggerWidget(QWidget):
                 # allowance for it rather than under-counting the work.
                 self._live_graph_cost_ns = int(
                     (time.perf_counter() - _graph_t0) * 1.6e9)
-            else:
+            elif not hidden:
                 # Between graph refreshes, still slide the time axis so the window
                 # glides instead of jumping once per refresh. This touches no data:
                 # new range, fresh time stamps, repaint.
@@ -5944,17 +9855,23 @@ class CSSLoggerWidget(QWidget):
             pass
 
     def _live_poll_ms(self) -> int:
-        """How often the archive is asked for new values (Graph settings)."""
+        """How often the archive is asked for new values (Graph settings).
+        A setting tab that is not on screen asks only every
+        HIDDEN_LIVE_POLL_MS — it only has to be up to date when it is shown."""
         try:
-            return max(50, int(self._graph_opts.get("live_poll_ms", 300)))
+            ms = max(50, int(self._graph_opts.get("live_poll_ms", 300)))
         except Exception:
-            return 300
+            ms = 300
+        if getattr(self, "_suspended", False):
+            ms = max(ms, HIDDEN_LIVE_POLL_MS)
+        return ms
 
     def _schedule_live_tick(self):
         if not self._live_mode: return
         interval_ms = self._live_poll_ms()
         self._live_countdown_elapsed_ms = 0
-        self._countdown_timer.start()
+        if not getattr(self, "_suspended", False):
+            self._countdown_timer.start()
         self._live_timer.start(interval_ms)
 
     def _live_countdown_tick(self):
@@ -6058,18 +9975,228 @@ class CSSLoggerWidget(QWidget):
             if pv not in row_dict:
                 return False
             value, _ = row_dict[pv]
-            if not self._condition_value_ok(value, cond.get("min"), cond.get("max")):
+            if not self._condition_value_ok(value, cond.get("min"), cond.get("max"),
+                                            cond.get("outside", False)):
                 return False
         return True
 
-    def _condition_value_ok(self, value, vmin, vmax):
+    def _condition_value_ok(self, value, vmin, vmax, outside=False):
         if not isinstance(value, (int, float)):
             return False
-        if vmin is not None and value < vmin:
+        return _cond_value_passes(value, vmin, vmax, outside)
+
+    def _condition_tables(self, samples_by_pv=None, pre_vals=None):
+        """Per active condition: (its samples' times, values, value before them,
+        min, max) — what _condition_mask looks shots up in. Built once per
+        refresh; a condition whose channel has nothing at all is skipped, the
+        same rule the table rows follow."""
+        if not self._conditions:
+            return []
+        sbp = self._samples_by_pv if samples_by_pv is None else samples_by_pv
+        pre = self._pre_window_vals if pre_vals is None else pre_vals
+        tables = []
+        for c in self._conditions:
+            pv = c.get("pv")
+            if not pv:
+                continue
+            c_ts, c_v = _samples_to_ns_arrays(sbp.get(pv) or [])
+            p = pre.get(pv)
+            p_val = (float(p[1]) if p is not None and isinstance(p[1], (int, float))
+                     else None)
+            if not c_ts.size and p_val is None:
+                continue
+            tables.append((c_ts, c_v, p_val, c.get("min"), c.get("max"),
+                           bool(c.get("outside", False))))
+        return tables
+
+    def _condition_mask(self, ts, tables):
+        """Which of the sample times ``ts`` (ns) pass the conditions. Each
+        condition channel is read as the table rows read it: its newest value up
+        to one shot-merge gap after the moment (the energy of a shot is often
+        archived a few ms after the other channels of that shot)."""
+        keep = np.ones(ts.size, dtype=bool)
+        if not tables or not ts.size:
+            return keep
+        gap = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+        for c_ts, c_v, p_val, vmin, vmax, outside in tables:
+            idx = np.searchsorted(c_ts, ts + gap, side="right") - 1
+            v = np.full(ts.size, np.nan if p_val is None else p_val)
+            has = idx >= 0
+            if has.any():
+                v[has] = c_v[idx[has]]
+            keep &= _cond_mask_passes(v, vmin, vmax, outside)
+        return keep
+
+    def _pre_window_ok(self):
+        """Do the values from before the window pass the conditions? (They
+        are drawn from the window's left edge.)"""
+        row = {pv: (p[1], p[2] if len(p) > 2 else "")
+               for pv, p in self._pre_window_vals.items() if p is not None}
+        active = [c for c in self._conditions if c.get("pv") in row]
+        return self._row_matches_conditions(row, active)
+
+    # ── Last shot that passes the Conditions ────────────────────────────────
+
+    def _cond_key(self):
+        return tuple((c["pv"], c.get("min"), c.get("max"),
+                      bool(c.get("outside", False)))
+                     for c in self._conditions if c.get("pv"))
+
+    def _window_start_ns(self):
+        ov = getattr(self, "_plot_window_ns", None)
+        return ov[0] if ov else dt_to_ns(self._dt_from)
+
+    def _last_good_value(self, pv, win_start_ns):
+        """``pv``'s value at the last shot before the window that passed the
+        Conditions, or None (no such shot found, or none hunted for this set
+        of Conditions)."""
+        lg = getattr(self, "_last_good", None)
+        if (not lg or lg.get("ts") is None or lg.get("conds") != self._cond_key()
+                or win_start_ns is None or lg["ts"] >= win_start_ns):
+            return None
+        return lg["vals"].get(pv)
+
+    def _last_good_note(self, win_start_ns):
+        """What the plot must say when its lines come from the last good shot
+        (or when even that could not be found). Empty when the window has rows
+        of its own."""
+        if not self._conditions or self._table_rows:
+            return ""
+        lg = getattr(self, "_last_good", None)
+        if not lg or lg.get("conds") != self._cond_key():
+            return ""
+        if lg.get("hunting"):
+            return ("Nothing in this period passes the Conditions\n"
+                    "Looking back for the last shot that did")
+        if lg.get("ts") is None:
+            days = _LAST_PASS_DEPTH_NS // int(86400e9)
+            return ("Nothing in this period passes the Conditions\n"
+                    f"nor in the {days} days before it")
+        if win_start_ns is None or lg["ts"] >= win_start_ns:
+            return ""
+        when = datetime.fromtimestamp(lg["ts"] / 1e9, TZ_PRAGUE)
+        age_s = max(0, int(time.time() - lg["ts"] / 1e9))
+        age = (f"{age_s // 86400} d {age_s % 86400 // 3600} h" if age_s >= 86400
+               else f"{age_s // 3600} h {age_s % 3600 // 60} min" if age_s >= 3600
+               else f"{age_s // 60} min")
+        return ("Nothing in this period passes the Conditions\n"
+                f"Lines hold the last shot that did: "
+                f"{when:%d.%m.%Y %H:%M:%S} ({age} ago)")
+
+    def _seed_rejected(self):
+        """True when the window's left edge has no value the Conditions accept:
+        a condition channel with no value before the window, or one whose
+        value there fails."""
+        conds = [c for c in self._conditions if c.get("pv")]
+        if not conds:
             return False
-        if vmax is not None and value > vmax:
-            return False
-        return True
+        row = {pv: (p[1], "") for pv, p in self._pre_window_vals.items()
+               if p is not None}
+        if any(c["pv"] not in row for c in conds):
+            return True
+        return not self._row_matches_conditions(row, conds)
+
+    def _maybe_hunt_last_good(self):
+        """After a load (or a change of the Conditions): when the Conditions
+        reject the value the window starts from, find the newest shot before
+        the window that they accept, in the background, and redraw with it
+        held across the window. Without this a period with the laser off drew
+        nothing at all — every shot in it fails the energy conditions, and so
+        does the laser-off value from just before it."""
+        key = self._cond_key()
+        start = self._window_start_ns()
+        if not key or not self._seed_rejected():
+            self._lg_epoch += 1               # nothing needed; stop any hunt
+            self._last_good = None
+            return
+        lg = self._last_good
+        if (lg and lg.get("conds") == key and lg.get("before") == start
+                and not lg.get("failed")):
+            return                            # already found (or being found)
+        self._lg_epoch += 1
+        epoch = self._lg_epoch
+        cancel = lambda: self._lg_epoch != epoch
+        self._last_good = {"conds": key, "before": start, "ts": None,
+                           "vals": {}, "hunting": True}
+        real = list(self._real_pv_names())
+        timeout = self._http_timeout()
+        gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+        sig = _LoadSig()
+        self._lg_sig = sig                    # keep it alive until it fires
+        sig.done.connect(lambda res, e=epoch: self._after_last_good(e, res))
+        sig.progress.connect(self._log)
+
+        def _worker():
+            from cpva_core import cpva_fetch_last_before_many
+            try:
+                t = _last_passing_moment(key, start, gap_ns, timeout, cancel)
+                vals = {}
+                if t is not None and not cancel():
+                    got = cpva_fetch_last_before_many(real, t + gap_ns + 1,
+                                                      timeout, cancel_fn=cancel)
+                    for pv, s in got.items():
+                        v = cpva_decode_value(s)
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            vals[pv] = float(v)
+                sig.done.emit((t, vals, None))
+            except Exception as exc:
+                sig.done.emit((None, {}, str(exc)))
+
+        self._log("The Conditions reject the value this period starts from — "
+                  "looking back for the last shot they accept.")
+        # Started once the window has finished what it is doing now (the end of
+        # a load draws the graph and fills the table right after this call):
+        # its archive reads running alongside made that drawing several times
+        # slower (measured: 11.5 s instead of 1.6 s at the end of a 3-month load).
+        QTimer.singleShot(0, lambda: threading.Thread(
+            target=_worker, daemon=True, name="css-logger-last-good").start())
+
+    def _after_last_good(self, epoch, result):
+        if epoch != self._lg_epoch:
+            return                            # a newer hunt (or none) took over
+        t, vals, err = result
+        lg = dict(self._last_good or {})
+        lg.update(ts=t, vals=dict(vals), hunting=False, failed=bool(err))
+        if t is not None:
+            lg["vals"].update(self._customs_from(lg["vals"]))
+        self._last_good = lg
+        if err:
+            self._log(f"Looking back for the last good shot failed: {err}")
+        elif t is None:
+            self._log("No shot passes the Conditions in this period or the "
+                      f"{_LAST_PASS_DEPTH_NS // int(86400e9)} days before it.")
+        else:
+            self._log("Last shot that passes the Conditions: "
+                      f"{ns_to_local_str(t)} — held across the period.")
+        self._lg_sig = None
+        self._plot_graph()
+
+    def _customs_from(self, vals):
+        """Every custom channel evaluated on one set of real values, in
+        definition order (a later formula can read an earlier one)."""
+        plan, _broken = self._cpv_plan()
+        known = dict(vals)
+        out = {}
+        for name, code, srcs in plan:
+            if code is None:
+                continue
+            ns = {}
+            for letter, pv in srcs:
+                v = known.get(pv)
+                if not isinstance(v, (int, float)):
+                    ns = None
+                    break
+                ns[letter] = v
+            if ns is None:
+                continue
+            try:
+                val = eval(code, _CPV_SAFE_ENV, ns)
+            except Exception:
+                continue
+            if isinstance(val, (int, float)) and not isinstance(val, bool) \
+                    and val == val:
+                out[name] = known[name] = float(val)
+        return out
 
     # ── Master PV filters ────────────────────────────────────────────────────
 
@@ -6090,14 +10217,14 @@ class CSSLoggerWidget(QWidget):
         filtered = [rows[0]]
         for ts_ns, row_dict in rows[1:]:
             _prev_ts, prev_row = filtered[-1]
-            keys = set(prev_row.keys()) | set(row_dict.keys())
-            same_other = all(
-                prev_row.get(pv) == row_dict.get(pv)
-                for pv in keys if pv != master_pv
-            )
-            master_changed = prev_row.get(master_pv) != row_dict.get(master_pv)
-            if master_changed and same_other:
-                continue
+            # The cheap test first: only a row where the master moved can be a
+            # master-only row, and comparing every other channel of every row
+            # was two seconds at the end of a three-month load.
+            if prev_row.get(master_pv) != row_dict.get(master_pv):
+                keys = set(prev_row.keys()) | set(row_dict.keys())
+                if all(prev_row.get(pv) == row_dict.get(pv)
+                       for pv in keys if pv != master_pv):
+                    continue
             filtered.append((ts_ns, row_dict))
         return filtered
 
@@ -6209,7 +10336,7 @@ class CSSLoggerWidget(QWidget):
             if pv in custom_names:
                 disp = pv
             else:
-                disp = self._pv_settings.get(pv, {}).get("display_name", shorten_pv_name(pv))
+                disp = self._col_label(pv)
             out.append((self._col_letter(i), pv, disp))
         return out
 
@@ -6265,9 +10392,9 @@ class CSSLoggerWidget(QWidget):
         all. Problems are collected into ``_cpv_diag`` instead of swallowed."""
         defs = [d for d in self._custom_pvs if d.get("name") and d.get("expr")]
         self._cpv_diag = []
+        self._cpv_short = []           # the same, short enough for INFO
         if not defs:
             return [], set()
-        positional = {lt: pv for lt, pv, _ in self._channel_letters()}
         loaded     = set(self._pv_order)
         plan   = []                    # (name, code, [(letter, source_pv)])
         broken = set()                 # names already reported as not computable
@@ -6276,7 +10403,9 @@ class CSSLoggerWidget(QWidget):
             bindings   = d.get("bindings") or {}
             srcs, missing, unknown = [], [], []
             for letter in _cpv_vars(expr):
-                pv = bindings.get(letter) or positional.get(letter)
+                # The binding only. A letter's place in today's list is not a
+                # fallback: it names a different PV after every preset switch.
+                pv = bindings.get(letter)
                 if not pv:
                     unknown.append(letter)
                     continue
@@ -6287,56 +10416,135 @@ class CSSLoggerWidget(QWidget):
                 self._cpv_diag.append(
                     f"Custom PV '{name}': not computed — "
                     f"{', '.join(missing)} not in the loaded PV list.")
+                self._cpv_short.append(
+                    f"{name}: not computed — "
+                    + ", ".join(f"{m.split(' = ')[0]} = {shorten_pv_name(m.split(' = ', 1)[1])}"
+                                for m in missing)
+                    + " is not in the PV list")
             if unknown:
                 self._cpv_diag.append(
                     f"Custom PV '{name}': not computed — "
-                    f"{', '.join(unknown)} is not a known channel.")
+                    f"{', '.join(unknown)} is not bound to a PV.")
+                self._cpv_short.append(
+                    f"{name}: not computed — {', '.join(unknown)} has no PV")
             try:
                 code = compile(expr, "<cpv>", "eval")
             except Exception as exc:
                 code = None
                 self._cpv_diag.append(
                     f"Custom PV '{name}': invalid expression — {exc}")
+                self._cpv_short.append(f"{name}: the formula is not valid")
             if missing or unknown or code is None:
                 broken.add(name)
             plan.append((name, code, srcs))
         return plan, broken
+
+    def cpv_defs_for_spectra(self) -> list:
+        """The custom PVs as the Spectra tab's shot filter needs them.
+
+        ``[{name, expr, code, srcs: [(letter, source)], problem}]`` — the same
+        letter resolution as ``_cpv_plan`` (each letter's own binding, never its
+        place in the list), but nothing is required to be loaded here: Spectra
+        fetches the sources itself, per shot. A source may be another custom
+        PV's name. ``problem`` is a short sentence when the formula cannot be
+        computed at all (unbound letter, bad expression), else ``""``."""
+        defs = [d for d in self._custom_pvs if d.get("name") and d.get("expr")]
+        if not defs:
+            return []
+        out = []
+        for d in defs:
+            name, expr = d["name"], d["expr"]
+            bindings = d.get("bindings") or {}
+            srcs, unknown = [], []
+            for letter in _cpv_vars(expr):
+                pv = bindings.get(letter)
+                if pv:
+                    srcs.append((letter, pv))
+                else:
+                    unknown.append(letter)
+            problem = ""
+            try:
+                code = compile(expr, "<cpv>", "eval")
+            except Exception:
+                code = None
+                problem = "the formula is not valid"
+            if unknown:
+                problem = f"{', '.join(unknown)} is not bound to a PV"
+            out.append({"name": name, "expr": expr, "code": code,
+                        "srcs": srcs, "problem": problem})
+        return out
 
     def _compute_custom_pvs_in_rows(self, rows):
         """Evaluate every custom PV for each row.
 
         Each formula resolves its variables through its own ``bindings``
         (letter -> PV name), so its values follow the PVs even after the list is
-        reordered or another preset is loaded. A letter with no binding falls
-        back to the old positional lookup. Customs are computed in definition
+        reordered or another preset is loaded. A letter with no binding leaves
+        the custom PV empty (and says so) — it never borrows whichever PV holds
+        that letter today. Customs are computed in definition
         order, so a later custom can read an earlier one — its binding simply
         names that custom channel."""
+        # Whole columns at a time. This used to be one eval() per row per
+        # formula (100 000 rows × 3 formulas ≈ a second on the GUI thread, on
+        # every live table refresh). Each source is read out of the rows once
+        # into an array, and the formula runs once over the arrays.
         plan, broken = self._cpv_plan()
+        self._cpv_cols = {}
         if not plan:
             return
-        SAFE = _CPV_SAFE_ENV
-        errs = {}                      # name -> [row count, first exception]
-        for _ts_ns, row_dict in rows:
-            for name, code, srcs in plan:
-                result = None
-                if code is not None:
-                    ns = {}
-                    for letter, pv in srcs:
-                        v = row_dict.get(pv, (None,))[0]
-                        ns[letter] = v if isinstance(v, (int, float)) else None
-                    try:
-                        result = eval(code, SAFE, ns)
-                    except Exception as exc:
-                        e = errs.setdefault(name, [0, type(exc).__name__])
-                        e[0] += 1
-                row_dict[name] = (result, "")
-        for name, (cnt, first) in errs.items():
-            # A formula with a missing source fails on every row by definition —
-            # it was already reported above, don't repeat it as a row count.
-            if name not in broken:
-                self._cpv_diag.append(
-                    f"Custom PV '{name}': {cnt} of {len(rows)} rows could not be "
-                    f"evaluated ({first}).")
+        n = len(rows)
+        grid = np.array([r[0] for r in rows], dtype=np.int64)
+        cols = {}                      # custom name → its computed column
+        read = {}                      # real PV → its column, read from the rows
+
+        _none = (None,)
+        _nan = float("nan")
+
+        def _column(pv):
+            if pv in cols:
+                return cols[pv]
+            if pv not in read:
+                # Plain comprehensions, no function call per row: this read is
+                # the whole cost of the compute (the formula itself is one
+                # numpy call), so it is kept as tight as Python allows.
+                # (Not np.array(raw, float): that would turn a word value "5"
+                # into the number 5, where the formula must see "no number".)
+                raw = [rd.get(pv, _none)[0] for _t, rd in rows]
+                read[pv] = np.array(
+                    [v if isinstance(v, (int, float)) else _nan for v in raw],
+                    dtype=np.float64)
+            return read[pv]
+
+        for name, code, srcs in plan:
+            if code is None or n == 0:
+                res = np.full(n, np.nan)
+            else:
+                src_cols = {letter: _column(pv) for letter, pv in srcs}
+                res = _cpv_eval_columns(code, src_cols, n)
+                if name not in broken:
+                    # Rows where every source had a number and still no result:
+                    # the formula itself fails there (division by zero, …). The
+                    # first such row is evaluated once more, plainly, to name
+                    # the error.
+                    have = (np.logical_and.reduce([np.isfinite(c) for c in src_cols.values()])
+                            if src_cols else np.ones(n, dtype=bool))
+                    bad_idx = np.flatnonzero(have & ~np.isfinite(res))
+                    if bad_idx.size:
+                        i0 = int(bad_idx[0])
+                        first = "no result"
+                        try:
+                            eval(code, _CPV_SAFE_ENV,
+                                 {k: float(c[i0]) for k, c in src_cols.items()})
+                        except Exception as exc:
+                            first = type(exc).__name__
+                        self._cpv_diag.append(
+                            f"Custom PV '{name}': {bad_idx.size} of {n} rows could "
+                            f"not be evaluated ({first}).")
+            cols[name] = res
+            vals = res.tolist()
+            for (_ts, row_dict), v in zip(rows, vals):
+                row_dict[name] = (None if v != v else v, "")
+        self._cpv_cols = {name: (grid, cols[name]) for name in cols}
 
     def _seed_custom_pv_pre_window(self):
         """Give every custom channel the value it had BEFORE the window starts.
@@ -6379,6 +10587,12 @@ class CSSLoggerWidget(QWidget):
         """Log what the last compute found wrong — once. This runs on every live
         refresh, so an unchanged set of messages is not logged again."""
         msgs = list(getattr(self, "_cpv_diag", []) or [])
+        # The ones that leave a custom PV empty are also said in INFO: a custom
+        # PV whose source is not in the PV list (another preset was loaded)
+        # used to vanish with only a line in the Log.
+        lbl = getattr(self, "_lbl_cpv_info", None)
+        if lbl is not None:
+            lbl.setText("\n".join(getattr(self, "_cpv_short", []) or []))
         sig  = "\n".join(msgs)
         if sig == getattr(self, "_cpv_last_diag", None):
             return
@@ -6415,25 +10629,90 @@ class CSSLoggerWidget(QWidget):
         self._compute_custom_pvs_in_rows(self._table_rows_unfiltered)
         self._emit_custom_pv_diag()
 
+        cpv_cols = getattr(self, "_cpv_cols", {}) or {}
         for d in self._custom_pvs:
             name = d.get("name", "")
             if not name:
                 continue
-            self._samples_by_pv[name] = [
-                (ts, v, u)
-                for ts, row_dict in self._table_rows_unfiltered
-                if name in row_dict
-                for v, u in [row_dict[name]]
-                if isinstance(v, (int, float))
-            ]
+            if name in cpv_cols:
+                grid, res = cpv_cols[name]
+                ok = np.isfinite(res)
+                self._samples_by_pv[name] = [
+                    (t, v, "") for t, v in zip(grid[ok].tolist(), res[ok].tolist())]
+            else:
+                self._samples_by_pv[name] = []
             if self._samples_by_pv[name]:
+                self._numeric_pvs.add(name)
+
+    def _extend_custom_series_live(self):
+        """Append the newest stretch of every custom trace, computed straight
+        from its sources' samples (Live, between two table rebuilds).
+
+        Only the part after the trace's last point is computed, on the
+        sources' own timestamps merged by the same gap rule as the table, so a
+        tick costs a few points per formula. The next table rebuild replaces
+        the whole series with the row-based one, as before.
+        """
+        plan, broken = self._cpv_plan()
+        if not plan:
+            return
+        gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+        pre = self._pre_window_vals or {}
+        _key = lambda s: s[0]
+        for name, code, srcs in plan:
+            if code is None or name in broken or not srcs:
+                continue
+            mine = self._samples_by_pv.get(name)
+            if mine is None:
+                mine = self._samples_by_pv[name] = []
+            if mine:
+                t_tail = mine[-1][0]
+            elif self._table_rows_unfiltered:
+                t_tail = self._table_rows_unfiltered[-1][0]
+            else:
+                t_tail = None
+            # The new moments: every source sample after the tail.
+            new_ts = []
+            for _letter, pv in srcs:
+                s = self._samples_by_pv.get(pv) or []
+                i = 0 if t_tail is None else bisect.bisect_right(s, t_tail, key=_key)
+                new_ts.extend(x[0] for x in s[i:])
+            if not new_ts:
+                continue
+            ts = np.unique(np.asarray(new_ts, dtype=np.int64))
+            if ts.size > 1:
+                ts = ts[np.r_[np.diff(ts) > gap_ns, True]]
+            cols = {}
+            for letter, pv in srcs:
+                s = self._samples_by_pv.get(pv) or []
+                # From the sample holding at the tail onwards: enough to read
+                # the held value at every new moment.
+                i = 0 if t_tail is None else max(
+                    0, bisect.bisect_right(s, t_tail, key=_key) - 1)
+                p = pre.get(pv)
+                cols[letter] = _held_column(ts, s[i:], p[1] if p is not None else None)
+            res = _cpv_eval_columns(code, cols, ts.size)
+            ok = np.isfinite(res)
+            if ok.any():
+                mine.extend((t, v, "") for t, v in zip(ts[ok].tolist(), res[ok].tolist()))
                 self._numeric_pvs.add(name)
 
     # ── Save runtime state ────────────────────────────────────────────────────
 
     def _save_runtime_state(self):
         self.config["pv_list"] = self._real_pv_names()
-        self.config["conditions"]      = copy(self._conditions)
+        self.config["pv_display_names"] = dict(self._pv_display_names)
+        self.config["conditions"]      = [dict(c) for c in self._conditions_view()]
+        self.config["conditions_enabled"] = bool(getattr(self, "_conditions_on", True))
+        self.config["sel_pause_restart"] = bool(getattr(self, "_sel_pause_on", False))
+        self.config["dead_shot_skip"] = bool(getattr(self, "_dead_shot_on", True))
+        self.config["dead_shot_energy_pv"] = getattr(self, "_dead_energy_pv", "")
+        self.config["dead_shot_energy_max"] = float(
+            getattr(self, "_dead_energy_thr", 0.05))
+        self.config["sel_pause_s"]       = float(getattr(self, "_sel_pause_s", 15.0))
+        ed = getattr(self, "_pv_time_cond_editor", None)
+        if ed is not None:
+            self.config["pv_time_conditions"] = ed.conditions()
         self.config["master_pv"]       = self._get_master_pv()
         self.config["master_multiple"] = self._get_master_multiple()
         self.config["avg_target_points"] = self._avg_target_points()
@@ -6476,7 +10755,9 @@ class CSSLoggerWidget(QWidget):
         """The heading for one channel — the name it wears on the graph, so a
         renamed channel is called the same thing everywhere (and in the file)."""
         name = (self._pv_settings.get(pv, {}) or {}).get("display_name", "")
-        return (name or "").strip() or shorten_pv_name(pv)
+        return ((name or "").strip()
+                or (getattr(self, "_pv_display_names", {}).get(pv) or "").strip()
+                or shorten_pv_name(pv))
 
     def _table_pvs(self) -> list:
         """The channels the table (and the export) shows — the ones on the graph.
@@ -6596,14 +10877,106 @@ class CSSLoggerWidget(QWidget):
 
     # ── Axis settings table ─────────────────────────────────────────────────
 
+    def _retry_axis_settings_tv(self):
+        self._axis_tv_refresh_waiting = False
+        try:
+            self._refresh_axis_settings_tv()
+        except RuntimeError:                 # window already closed
+            pass
+
+    def _ordered_for_plot(self, pvs):
+        """`pvs` in the user's own order (rows dragged in the PV table): those in
+        that order first, as dragged; any the user has not placed yet keep their
+        current order and come after them, so a newly added PV lands at the end."""
+        pvs = list(pvs)
+        order = getattr(self, "_plot_order", None) or []
+        if not order:
+            return pvs
+        present = set(pvs)
+        placed = [pv for pv in order if pv in present]
+        seen = set(placed)
+        return placed + [pv for pv in pvs if pv not in seen]
+
+    def _on_axis_rows_dropped(self, rows, before):
+        """Rows of the PV table were dragged to sit above row `before`.
+
+        Only rows of one section move together: an original PV cannot be
+        dropped among the custom ones or the other way round — the divider rows
+        stay where they are. The new order is remembered and the graph is
+        redrawn in it (no reload: the data is already here)."""
+        row_pv = list(getattr(self, "_axis_row_pv", []))
+        custom_names = {d.get("name", "") for d in self._custom_pvs}
+
+        def _section(pv):
+            return pv in custom_names
+
+        moved = [row_pv[r] for r in rows if 0 <= r < len(row_pv) and row_pv[r]]
+        if not moved:
+            return
+        # The section the line sits in is decided by the row just ABOVE it:
+        # a PV row → that PV's section; a divider → the section it heads (the
+        # first divider heads the originals); nothing above → the first section.
+        before = max(0, min(before, len(row_pv)))
+        above = before - 1
+        if above < 0:
+            sect = False
+        elif row_pv[above] is not None:
+            sect = _section(row_pv[above])
+        else:
+            sect = above > 0           # row 0 = "Original PV", later = "Custom PV"
+        moved = [pv for pv in moved if _section(pv) == sect]
+        if not moved:
+            self._lbl_status.setText(
+                "Original and custom PVs stay in their own groups.")
+            return
+        # Position inside the section: count the section's unmoved PVs above the line.
+        sect_rows = [pv for pv in row_pv if pv and _section(pv) == sect]
+        keep = [pv for pv in sect_rows if pv not in moved]
+        at = sum(1 for r in range(min(before, len(row_pv)))
+                 if row_pv[r] and _section(row_pv[r]) == sect
+                 and row_pv[r] not in moved)
+        new_sect = keep[:at] + moved + keep[at:]
+        full = self._ordered_for_plot(self._pv_order)
+        others = [pv for pv in full if _section(pv) != sect]
+        new_full = (others + new_sect) if sect else (new_sect + others)
+        if new_full == full:
+            return
+        self._plot_order = new_full
+        self.config["plot_order"] = list(new_full)
+        self._refresh_axis_settings_tv()
+        # Keep the dragged rows selected where they landed.
+        try:
+            tv = self._axis_tv
+            tv.clearSelection()
+            sm = tv.selectionModel()
+            flags = sm.SelectionFlag.Select | sm.SelectionFlag.Rows
+            for r, pv in enumerate(getattr(self, "_axis_row_pv", [])):
+                if pv in moved:
+                    sm.select(tv.model().index(r, 0), flags)
+        except Exception:
+            pass
+        if self._samples_by_pv:
+            self._schedule_replot()
+
     def _refresh_axis_settings_tv(self):
+        # A cell being typed into (a Display Name, a limit) would lose the
+        # typed text to a refresh — a replot or a live tick can ask for one at
+        # any moment. Wait until the edit is finished.
+        if self._axis_tv.state() == QAbstractItemView.State.EditingState:
+            if not getattr(self, "_axis_tv_refresh_waiting", False):
+                self._axis_tv_refresh_waiting = True
+                QTimer.singleShot(200, self._retry_axis_settings_tv)
+            return
         # Group rows under "Original PV" / "Custom PV" divider rows when custom
         # (derived) PVs exist, so derived channels are clearly separated from real
         # ones. self._axis_row_pv maps each table row → PV name (None for a
         # divider row) so the rest of the code never assumes row == _pv_order idx.
         custom_names = {d.get("name", "") for d in self._custom_pvs}
-        originals = [pv for pv in self._pv_order if pv not in custom_names]
-        customs   = [pv for pv in self._pv_order if pv in custom_names]
+        # Rows follow the user's own order (dragged in this table), which is
+        # also the order of the Y axes on the graph — see _ordered_for_plot.
+        _ordered  = self._ordered_for_plot(self._pv_order)
+        originals = [pv for pv in _ordered if pv not in custom_names]
+        customs   = [pv for pv in _ordered if pv in custom_names]
         plan = []                       # ("header", label) | ("pv", pv)
         if customs:
             plan.append(("header", "Original PV"))
@@ -6625,30 +10998,65 @@ class CSSLoggerWidget(QWidget):
             _grid_on = [pv for pv in self._pv_order
                         if self._pv_settings.get(pv, {}).get("show", True)
                         and self._pv_settings.get(pv, {}).get("grid", False)]
-        # Rebuilding fires itemChanged for every setItem/setCheckState — block it
-        # so the auto-apply handler doesn't run mid-rebuild.
-        self._axis_tv.blockSignals(True)
+        tv = self._axis_tv
+        # The cells are updated in place, not rebuilt: a new item for every
+        # cell made the whole table blink (and jump to the top for a moment)
+        # on every change of a PV or a custom PV. A cell gets a new item only
+        # when it changes kind (divider <-> PV row); otherwise only what
+        # differs is written, and nothing is painted until all of it is done.
+        _KIND = Qt.ItemDataRole.UserRole + 41
+        _DEF_FLAGS = QTableWidgetItem().flags()
+        _ENABLED = Qt.ItemFlag.ItemIsEnabled
+        _BAND_BG, _BAND_FG = QColor("#E3F2FD"), QColor("#0D47A1")
+
+        def _cell(r, c, kind, text="", flags=_DEF_FLAGS, check=None,
+                  color=None, tip=None):
+            it = tv.item(r, c)
+            if it is None or it.data(_KIND) != kind:
+                it = QTableWidgetItem(text)
+                it.setData(_KIND, kind)
+                if kind in ("band", "band_pad"):
+                    it.setBackground(_BAND_BG)
+                if kind == "band":
+                    fnt = it.font(); fnt.setBold(True); it.setFont(fnt)
+                    it.setForeground(_BAND_FG)
+                tv.setItem(r, c, it)
+            elif it.text() != text:
+                it.setText(text)
+            if it.flags() != flags:
+                it.setFlags(flags)
+            # A fresh item has NO check state, which checkState() reports as
+            # Unchecked — skipping it then leaves the cell without a tick box.
+            if check is not None and (
+                    it.data(Qt.ItemDataRole.CheckStateRole) is None
+                    or it.checkState() != check):
+                it.setCheckState(check)
+            if color is not None and it.data(Qt.ItemDataRole.UserRole) != color:
+                it.setData(Qt.ItemDataRole.UserRole, color)
+            if tip is not None and it.toolTip() != tip:
+                it.setToolTip(tip)
+
+        # Writing cells fires itemChanged for every setText/setCheckState —
+        # block it so the auto-apply handler doesn't run mid-refresh.
+        tv.blockSignals(True)
+        _vbar, _hbar = tv.verticalScrollBar(), tv.horizontalScrollBar()
+        _vpos, _hpos = _vbar.value(), _hbar.value()
+        tv.setUpdatesEnabled(False)
         try:
-            self._axis_tv.clearSpans()
-            self._axis_tv.setRowCount(len(plan))
+            tv.clearSpans()
+            if tv.rowCount() != len(plan):
+                tv.setRowCount(len(plan))
             for row_i, (kind, payload) in enumerate(plan):
                 if kind == "header":
-                    hdr = QTableWidgetItem(f"  {payload}")
-                    fnt = hdr.font(); fnt.setBold(True); hdr.setFont(fnt)
-                    hdr.setBackground(QColor("#E3F2FD"))
-                    hdr.setForeground(QColor("#0D47A1"))
-                    hdr.setFlags(Qt.ItemFlag.ItemIsEnabled)   # not selectable/editable
-                    self._axis_tv.setItem(row_i, 0, hdr)
+                    # not selectable/editable
+                    _cell(row_i, 0, "band", f"  {payload}", _ENABLED)
                     # Columns can be dragged around, and a span then paints from
                     # wherever its first column ended up. Give every other cell of
                     # the divider the same blue so the row reads as one solid band
                     # no matter what order the user chose.
                     for col_j in range(1, ncol):
-                        pad = QTableWidgetItem("")
-                        pad.setBackground(QColor("#E3F2FD"))
-                        pad.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                        self._axis_tv.setItem(row_i, col_j, pad)
-                    self._axis_tv.setSpan(row_i, 0, 1, ncol)
+                        _cell(row_i, col_j, "band_pad", "", _ENABLED)
+                    tv.setSpan(row_i, 0, 1, ncol)
                     continue
                 pv  = payload
                 idx = self._pv_order.index(pv)
@@ -6657,39 +11065,43 @@ class CSSLoggerWidget(QWidget):
                 for col_j, col_name in enumerate(_COL):
                     val = s.get(col_name, "")
                     if col_name == "blank":
-                        item = QTableWidgetItem("")
-                        item.setFlags(Qt.ItemFlag.ItemIsEnabled)   # non-editable spacer
-                        self._axis_tv.setItem(row_i, col_j, item)
+                        _cell(row_i, col_j, "blank", "", _ENABLED)   # non-editable spacer
                     elif col_name in ("show", "auto_scale", "grid"):
-                        chk = QTableWidgetItem()
-                        chk.setCheckState(Qt.CheckState.Checked if val else Qt.CheckState.Unchecked)
+                        tip = ""
                         if col_name == "grid":
                             # Name the line style this channel's grid gets, so the
                             # lines on the plot can be matched to their channel.
-                            chk.setToolTip(
-                                f"Grid for this signal — {self._grid_style_name(pv, _grid_on)} lines "
-                                f"in the signal's own colour"
-                                if val else
-                                "Tick to give this signal its own grid (each one "
-                                "gets a different kind of line)")
-                        self._axis_tv.setItem(row_i, col_j, chk)
+                            tip = (f"Grid for this signal — {self._grid_style_name(pv, _grid_on)} lines "
+                                   f"in the signal's own colour"
+                                   if val else
+                                   "Tick to give this signal its own grid (each one "
+                                   "gets a different kind of line)")
+                        _cell(row_i, col_j, "check",
+                              check=(Qt.CheckState.Checked if val
+                                     else Qt.CheckState.Unchecked),
+                              tip=tip)
                     elif col_name == "color":
-                        item = QTableWidgetItem("")
                         color_hex = s.get("color", _GRAPH_COLORS[idx % len(_GRAPH_COLORS)])
-                        item.setData(Qt.ItemDataRole.UserRole, color_hex)
-                        self._axis_tv.setItem(row_i, col_j, item)
+                        _cell(row_i, col_j, "color", color=color_hex)
                     else:
                         if col_name in stats:            # measured, not typed
                             txt = stats[col_name]
                         else:
                             txt = "" if val is None else str(val)
-                        item = QTableWidgetItem(txt)
+                        fl = _DEF_FLAGS
                         if col_name in _AXIS_READONLY_COLS:
-                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                        self._axis_tv.setItem(row_i, col_j, item)
+                            fl = _DEF_FLAGS & ~Qt.ItemFlag.ItemIsEditable
+                        _cell(row_i, col_j, "text", txt, fl)
+            # Adding, removing or editing a PV refreshes the rows; the view
+            # stays where the user had scrolled it.
+            _vbar.setValue(min(_vpos, _vbar.maximum()))
+            _hbar.setValue(min(_hpos, _hbar.maximum()))
         finally:
-            self._axis_tv.blockSignals(False)
+            tv.blockSignals(False)
+            tv.setUpdatesEnabled(True)
         self._autosize_axis_pane()
+        _CustomPVDialog._restore_scroll_later(_vbar, _vpos)
+        _CustomPVDialog._restore_scroll_later(_hbar, _hpos)
 
     # Never let the PV list eat the whole tab: the graph keeps at least this
     # much height, so the buttons above it always stay on screen.
@@ -6740,8 +11152,7 @@ class CSSLoggerWidget(QWidget):
 
         lay = pane.layout()
         m   = lay.contentsMargins()
-        chrome = (m.top() + m.bottom() + lay.spacing() +
-                  self._axis_hdr_label.sizeHint().height())
+        chrome = m.top() + m.bottom()
 
         total = spl.height()
         if total <= 1:                       # not laid out yet
@@ -6808,6 +11219,8 @@ class CSSLoggerWidget(QWidget):
             if gi < len(self._graph_lines) and self._graph_lines[gi]:
                 for ln in self._graph_lines[gi]:
                     ln.set_color(color_hex)
+                if gi < len(self._graph_bands) and self._graph_bands[gi] is not None:
+                    self._graph_bands[gi].set_facecolor(color_hex)
                 if gi < len(self._graph_axes):
                     ax = self._graph_axes[gi]
                     ax.yaxis.label.set_color(color_hex)
@@ -6828,7 +11241,180 @@ class CSSLoggerWidget(QWidget):
                     if item.column() < len(self._axis_tv_cols) else "")
         if col_name in ("color", "cursor_val"):
             return
+        if col_name == "grid":
+            # Grid on/off is only the grid lines: no rebuild, so the view, the
+            # zoom and the toolbar history stay exactly as they are.
+            self._pv_settings.setdefault(row_pv[row], {})["grid"] = (
+                item.checkState() == Qt.CheckState.Checked)
+            self._regrid_in_place()
+            # The tick boxes' tooltips name each grid's line style. Only those
+            # are rewritten: rebuilding the whole PV table here recomputed every
+            # channel's statistics and re-sized the table, which re-sized and
+            # redrew the graph — the "refresh" seen on every Grid tick.
+            QTimer.singleShot(0, self._refresh_grid_tooltips)
+            return
+        # The look of one channel changes on the graph as it is — no rebuild,
+        # so the change shows at once and the zoom and history stay put. Only
+        # what changes the axis layout (Show) still rebuilds.
+        if col_name in self._AXIS_INPLACE_COLS and \
+                self._axis_cell_in_place(row_pv[row], col_name, item):
+            return
         self._apply_axis_settings()
+
+    def _refresh_grid_tooltips(self):
+        """Rewrite only the Grid column's tooltips (see _refresh_axis_settings_tv)."""
+        tv = getattr(self, "_axis_tv", None)
+        cols = list(getattr(self, "_axis_tv_cols", []) or [])
+        if tv is None or "grid" not in cols:
+            return
+        c = cols.index("grid")
+        grid_on = getattr(self, "_grid_pvs_drawn", None) or []
+        tv.blockSignals(True)
+        try:
+            for r, pv in enumerate(getattr(self, "_axis_row_pv", [])):
+                it = tv.item(r, c)
+                if not pv or it is None:
+                    continue
+                on = self._pv_settings.get(pv, {}).get("grid", False)
+                tip = (f"Grid for this signal — {self._grid_style_name(pv, grid_on)} "
+                       f"lines in the signal's own colour" if on else
+                       "Tick to give this signal its own grid (each one gets a "
+                       "different kind of line)")
+                if it.toolTip() != tip:
+                    it.setToolTip(tip)
+        finally:
+            tv.blockSignals(False)
+
+    _AXIS_INPLACE_COLS = ("width", "style", "marker", "marker_size", "alpha",
+                          "ymin", "ymax", "auto_scale", "smooth", "display_name")
+
+    def _axis_cell_in_place(self, pv, col_name, item):
+        """Store one edited PV-table cell and show it on the graph in place.
+        False = the change needs the full rebuild after all."""
+        s = self._pv_settings.setdefault(pv, {})
+        if col_name == "auto_scale":
+            s[col_name] = (item.checkState() == Qt.CheckState.Checked)
+        elif col_name in ("ymin", "ymax", "width", "marker_size"):
+            s[col_name] = self._safe_float(item.text(), s.get(col_name))
+        elif col_name == "alpha":
+            a = self._safe_float(item.text(), s.get("alpha", 100))
+            s[col_name] = 100 if a is None else max(0.0, min(100.0, a))
+        elif col_name == "style":
+            txt = item.text().strip().lower()
+            s[col_name] = txt if txt in _LINE_STYLES else "solid"
+        elif col_name == "marker":
+            txt = item.text().strip()
+            s[col_name] = txt if txt in _MARKER_STYLES else "auto"
+        elif col_name == "smooth":
+            txt = item.text().strip()
+            s[col_name] = int(txt) if txt.isdigit() else 1
+        elif col_name == "display_name":
+            s[col_name] = item.text().strip()
+            self._remember_display_names()
+            self._refresh_pv_time_choices()
+            if self._table_widget.columnCount() > 1:
+                self._populate_table()
+            return self._rename_on_graph_in_place(pv)
+        if self._mpl_canvas is None or pv not in self._graph_pvs:
+            return True                  # not on the graph: nothing to redraw
+        gi = self._graph_pvs.index(pv)
+        if gi >= len(self._graph_lines) or gi >= len(self._graph_axes):
+            return False
+        if col_name in ("ymin", "ymax", "auto_scale"):
+            ok = self._rescale_pv_in_place(gi, pv)
+        elif col_name == "smooth":
+            ok = self._resmooth_pv_in_place(gi, pv)
+        else:
+            ok = self._restyle_pv_in_place(gi, pv)
+        if ok:
+            self._blit_bg = None
+            self._mpl_canvas.draw_idle()
+        return ok
+
+    def _restyle_pv_in_place(self, gi, pv):
+        """Width / line style / points / point size / transparency."""
+        s = self._pv_settings.get(pv, {})
+        lines = self._graph_lines[gi]
+        if not lines:
+            return False
+        n_pts = (self._graph_raw[gi][0].size if gi < len(self._graph_raw) else 0)
+        kw = self._pv_style_kwargs(s, n_pts,
+                                   bool(self._graph_opts.get("line_markers", True)))
+        width = s.get("width", None)
+        alpha = kw.get("alpha", 1.0)
+        if len(lines) == 2:
+            looks = ((lines[0], (width * 0.5) if width is not None else 0.8,
+                      0.3 * alpha),
+                     (lines[1], width if width is not None else 1.8, alpha))
+        else:
+            looks = ((lines[0], width if width is not None else 1.2, alpha),)
+        for ln, lw, a in looks:
+            ln.set_linewidth(lw)
+            ln.set_linestyle(kw["linestyle"])
+            ln.set_marker(kw["marker"])
+            ln.set_markersize(kw["markersize"])
+            ln.set_markerfacecolor(kw.get("markerfacecolor", ln.get_color()))
+            ln.set_alpha(a)
+        band = self._graph_bands[gi] if gi < len(self._graph_bands) else None
+        if band is not None:
+            band.set_alpha(max(0.08, 0.28 * float(alpha)))
+        return True
+
+    def _rescale_pv_in_place(self, gi, pv):
+        """Y min / Y max / Autoscale: the same limits a rebuild would give."""
+        s = self._pv_settings.get(pv, {})
+        if gi >= len(self._graph_env) or gi >= len(self._graph_raw):
+            return False
+        lo_a, hi_a = self._graph_env[gi]
+        values = self._graph_raw[gi][1]
+        if values.size and not np.all(np.isnan(values)):
+            dmin = float(np.nanmin(lo_a)); dmax = float(np.nanmax(hi_a))
+        else:
+            dmin, dmax = 0.0, 1.0
+        autosc = s.get("auto_scale", False)
+        if not autosc:
+            if s.get("ymin") is not None: dmin = s["ymin"]
+            if s.get("ymax") is not None: dmax = s["ymax"]
+        lo, hi = self._band_ylim(gi, len(self._graph_pvs), dmin, dmax, autosc)
+        self._graph_axes[gi].set_ylim(lo, hi)
+        return True
+
+    def _resmooth_pv_in_place(self, gi, pv):
+        """A new averaging length on a trace that is already smoothed. Turning
+        smoothing on or off adds or drops the faint raw line: that rebuilds."""
+        s = self._pv_settings.get(pv, {})
+        eff = s.get("smooth") or 1
+        lines = self._graph_lines[gi]
+        if len(lines) != 2 or eff <= 1 or gi >= len(self._graph_raw):
+            return False
+        times_num, values = self._graph_raw[gi]
+        if values.size < eff:
+            return False
+        lines[1].set_data(times_num, _moving_avg_np(values, eff))
+        disp = s.get("display_name") or shorten_pv_name(pv)
+        lines[1].set_label(f"{disp} (avg {eff})")
+        return True
+
+    def _rename_on_graph_in_place(self, pv):
+        """A new display name: the axis title and the trace label, nothing else."""
+        if self._mpl_canvas is None or pv not in self._graph_pvs:
+            return True
+        gi = self._graph_pvs.index(pv)
+        if gi >= len(self._graph_axes) or gi >= len(self._graph_lines):
+            return False
+        s = self._pv_settings.get(pv, {})
+        disp = s.get("display_name") or shorten_pv_name(pv)
+        ax = self._graph_axes[gi]
+        if self._graph_opts.get("show_axis_titles", True):
+            ax.yaxis.label.set_text(disp)
+        lines = self._graph_lines[gi]
+        if len(lines) == 2:
+            lines[1].set_label(f"{disp} (avg {s.get('smooth') or 1})")
+        elif lines:
+            lines[0].set_label(disp)
+        self._blit_bg = None
+        self._mpl_canvas.draw_idle()
+        return True
 
     @staticmethod
     def _safe_float(txt, fallback=None):
@@ -6878,6 +11464,18 @@ class CSSLoggerWidget(QWidget):
                     s[col_name] = int(txt) if txt.isdigit() else 1
                 else:
                     s[col_name] = item.text().strip()
+        # A Display Name typed here is the PV's name everywhere: the PV list,
+        # the table heading, the next start.
+        names_before = {pv: it.text() for pv, it in
+                        ((self._item_pv(self._pv_list.item(i)), self._pv_list.item(i))
+                         for i in range(self._pv_list.count()))}
+        self._remember_display_names()
+        if any(self._pv_list.item(i).text() != names_before.get(
+                self._item_pv(self._pv_list.item(i)))
+               for i in range(self._pv_list.count())):
+            self._refresh_pv_time_choices()
+            if self._table_widget.columnCount() > 1:
+                self._populate_table()
         # Un-ticking Show takes the channel off the graph AND out of the table,
         # so the two never disagree about what is on screen.
         if self._table_pvs() != cols_before:
@@ -6888,7 +11486,8 @@ class CSSLoggerWidget(QWidget):
         return {
             "show":         True,
             "pv":           pv,
-            "display_name": shorten_pv_name(pv),
+            "display_name": (getattr(self, "_pv_display_names", {}).get(pv)
+                             or shorten_pv_name(pv)),
             "color":        _GRAPH_COLORS[idx % len(_GRAPH_COLORS)],
             "color_auto":   True,   # False once the user hand-picks a color
             "cursor_val":   "",
@@ -6960,7 +11559,12 @@ class CSSLoggerWidget(QWidget):
         samples again for a number that cannot have changed.
         """
         samples = self._samples_by_pv.get(pv) or []
-        key = (pv, len(samples))
+        # The conditions decide which shots count, so they are part of the key.
+        cond_sig = tuple((c.get("pv"), c.get("min"), c.get("max"),
+                          c.get("outside", False),
+                          len(self._samples_by_pv.get(c.get("pv")) or []))
+                         for c in self._conditions)
+        key = (pv, len(samples), cond_sig)
         hit = self._pv_stats_cache.get(key)
         if hit is not None:
             return hit
@@ -6969,13 +11573,27 @@ class CSSLoggerWidget(QWidget):
             if u:
                 unit = str(u)
                 break
-        vals = np.array([v for _ts, v, _u in samples
-                         if isinstance(v, (int, float))], dtype=float)
+        ts_all, vals = _samples_to_ns_arrays(samples)
+        tables = self._condition_tables()
+        if tables and ts_all.size:
+            vals = vals[self._condition_mask(ts_all, tables)]
+        vals = vals[np.isfinite(vals)]
         if vals.size:
+            v_lo, v_hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+            # Thinned samples are interval means: the real extremes are the
+            # minimum/maximum the archiver sent with them (which cover the
+            # rejected shots too, so not while conditions are on).
+            mm = None if tables else self._minmax_by_pv.get(pv)
+            if mm is not None:
+                m_ts, m_lo, m_hi = mm
+                inside = (m_ts >= samples[0][0]) & (m_ts <= samples[-1][0])
+                if inside.any():
+                    v_lo = min(v_lo, float(np.nanmin(m_lo[inside])))
+                    v_hi = max(v_hi, float(np.nanmax(m_hi[inside])))
             out = {"unit": unit,
                    "last":  _fmt_cursor_value(float(vals[-1])),
-                   "min":   _fmt_cursor_value(float(np.nanmin(vals))),
-                   "max":   _fmt_cursor_value(float(np.nanmax(vals))),
+                   "min":   _fmt_cursor_value(v_lo),
+                   "max":   _fmt_cursor_value(v_hi),
                    "mean":  _fmt_cursor_value(float(np.nanmean(vals))),
                    "count": str(vals.size)}
         else:
@@ -7007,21 +11625,40 @@ class CSSLoggerWidget(QWidget):
     def _refresh_xy_choices(self):
         pvs = self._pv_order
         custom_names = {d.get("name", "") for d in self._custom_pvs}
+        old_map = dict(getattr(self, "_xy_choice_map", {}) or {})
+        keep = [old_map.get(c.currentText())
+                for c in (self._xy_x_combo, self._xy_y_combo)]
         choices = []
         self._xy_choice_map = {}
         for p in pvs:
-            label = p if p in custom_names else shorten_pv_name(p)
+            # The channel's own name — the one on the graph and in the PV list.
+            label = p if p in custom_names else self._col_label(p)
+            if label in self._xy_choice_map:      # two channels, one name
+                label = p
             choices.append(label)
             self._xy_choice_map[label] = p
+        label_of = {p: lb for lb, p in self._xy_choice_map.items()}
         # Repopulate without firing the auto-replot signal for every added item.
         for combo in (self._xy_x_combo, self._xy_y_combo):
             combo.blockSignals(True)
             combo.clear()
             combo.addItems(choices)
             combo.blockSignals(False)
-        if len(choices) > 1:
-            self._xy_x_combo.setCurrentIndex(0)
-            self._xy_y_combo.setCurrentIndex(1)
+        # The channels picked before stay picked while they are still there;
+        # only a pick that is gone falls back to the first two channels.
+        # Both picks are set quietly and the cloud is drawn ONCE afterwards —
+        # setting them one by one drew it twice in a row.
+        for combo, pv, default in ((self._xy_x_combo, keep[0], 0),
+                                   (self._xy_y_combo, keep[1], 1)):
+            idx = combo.findText(label_of.get(pv, "\0")) if pv else -1
+            if idx < 0 and len(choices) > default:
+                idx = default
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        if choices:
+            self._on_xy_axis_changed()
 
     def _on_xy_axis_changed(self, _idx=0):
         # Auto-replot when the user picks a different X or Y channel.
@@ -7328,28 +11965,49 @@ class CSSLoggerWidget(QWidget):
     # -- what the tab is being asked for -----------------------------------
 
     def _pv_time_conditions(self):
-        """The condition rows as numbers. A row whose target or tolerance is not
-        a number is reported in the Log and skipped, rather than quietly
-        filtering nothing."""
+        """The condition rows as the plot uses them: channel, on/off and the
+        effective bounds (an open side is ±inf). A box that is not a number is
+        shown red in the row and left out, as an empty box would be."""
+        ed = self._pv_time_cond_editor
+        apply_on = bool(getattr(self, "_pv_time_cond_apply", True))
         out = []
-        for row in self._pv_time_condition_rows:
-            label = row["variable"].currentText()
-            ch    = self._pv_time_choice_map.get(label)
-            if not ch:
-                continue
-            try:
-                target = float(row["target"].text().replace(",", "."))
-                tol    = float(row["tolerance"].text().replace(",", "."))
-            except ValueError:
-                self._log(f"PV Time Plot: condition on {label} skipped — "
-                          f"'{row['target'].text()} ± {row['tolerance'].text()} %' "
-                          f"is not a number.")
-                continue
-            lo, hi = sorted((target * (1 - tol / 100.0), target * (1 + tol / 100.0)))
-            out.append({"label": label, "channel": ch,
-                        "enabled": row["enabled"].isChecked(),
-                        "target": target, "tol": tol, "lo": lo, "hi": hi})
+        for c in ed.conditions():
+            label = ed.label_of(c["pv"])
+            out.append({"label": label, "channel": c["pv"],
+                        "enabled": c["enabled"] and apply_on, "kind": c["kind"],
+                        "lo": -np.inf if c["min"] is None else c["min"],
+                        "hi": np.inf if c["max"] is None else c["max"],
+                        "min": c["min"], "max": c["max"],
+                        "outside": c.get("outside", False),
+                        "key": (c["pv"], c["kind"], c["a"], c["b"]),
+                        "text": _cond_text(c, label)})
         return out
+
+    def _set_pv_time_cond_apply(self, on):
+        """The PV Time Plot's "Apply conditions" tick box."""
+        self._pv_time_cond_apply = bool(on)
+        self.config["pv_time_conditions_on"] = self._pv_time_cond_apply
+        self._pv_time_request_plot()
+
+    def _copy_graph_conditions_to_pv_time(self):
+        """Replace the PV Time Plot's condition rows with the Conditions
+        window's rows, each with its on/off state."""
+        rows = [dict(c) for c in self._conditions_view() if c.get("pv")]
+        if not rows:
+            self._lbl_pv_time_info.setText(
+                "The Conditions window has no rows to copy.")
+            return
+        ed = self._pv_time_cond_editor
+        ed.clear()
+        for c in rows:
+            ed.add_row(c, announce=False)
+        ed._touched()
+
+    def _pv_time_cond_count(self, cond):
+        """``(kept, total)`` shots of the last drawing for one condition on its
+        own; ``None`` when its channel has not been read yet."""
+        counts = getattr(self, "_pv_time_cond_counts", None) or {}
+        return counts.get((cond["pv"], cond["kind"], cond["a"], cond["b"]))
 
     def _pv_time_resolve(self, channels):
         """Split the channels the plot needs into real archiver PVs and the
@@ -7362,8 +12020,6 @@ class CSSLoggerWidget(QWidget):
         never reads the custom-PV definitions while the user is editing them."""
         defs = {d.get("name", ""): d for d in (getattr(self, "_custom_pvs", None) or [])
                 if d.get("name") and d.get("expr")}
-        order = self._real_pv_names() + list(defs)
-        positional = {self._col_letter(i): name for i, name in enumerate(order)}
         real, plan, problems, done = [], [], [], set()
 
         def _add(name, trail):
@@ -7382,9 +12038,9 @@ class CSSLoggerWidget(QWidget):
             bindings = d.get("bindings") or {}
             srcs = []
             for letter in _cpv_vars(d["expr"]):
-                src = bindings.get(letter) or positional.get(letter)
+                src = bindings.get(letter)
                 if not src:
-                    problems.append(f"'{name}': {letter} is not a known channel.")
+                    problems.append(f"'{name}': {letter} is not bound to a PV.")
                     continue
                 _add(src, trail | {name})
                 srcs.append((letter, src))
@@ -7469,10 +12125,19 @@ class CSSLoggerWidget(QWidget):
         self._btn_pv_time_plot.setEnabled(False)
         n_days = len(missing)
         self._lbl_pv_time_info.setText(f"Reading {n_days} day(s) from the archive…")
+        self._pv_time_progress.setValue(0)
+        self._pv_time_progress.show()
 
         self._pv_time_sig = _LoadSig()          # keep a reference until done
         sig = self._pv_time_sig
         sig.progress.connect(self._lbl_pv_time_info.setText)
+
+        def _pct(p):
+            if epoch != self._pv_time_epoch:
+                return                          # a newer Plot owns the bar
+            bar = self._pv_time_progress
+            bar.setValue(max(bar.value(), min(100, int(p))))   # never backwards
+        sig.pct.connect(_pct)
         sig.note.connect(self._log)
         sig.error.connect(self._on_pv_time_error)
 
@@ -7505,9 +12170,19 @@ class CSSLoggerWidget(QWidget):
                                       f"channel(s), day {i} of {n_days}…")
                     d0     = datetime(day.year, day.month, day.day)
                     day_ns = dt_to_ns(d0)
+                    # The bar moves with the part of each day already read,
+                    # not only once per finished day.
+                    last_pct = [-1]
+
+                    def _cover(frac, _i=i):
+                        p = int(((_i - 1) + 0.95 * frac) / n_days * 100)
+                        if p != last_pct[0]:
+                            last_pct[0] = p
+                            sig.pct.emit(p)
                     res, errors, report = cpva_fetch_many_adaptive(
                         pvs, day_ns, dt_to_ns(d0 + timedelta(days=1)),
-                        count=None, max_workers=16, cancel_fn=cancel, log_fn=None)
+                        count=None, max_workers=16, cancel_fn=cancel, log_fn=None,
+                        coverage_fn=_cover)
                     if cancel():
                         return
                     for pv, msg in (errors or {}).items():
@@ -7531,6 +12206,7 @@ class CSSLoggerWidget(QWidget):
                                                              seeds.get(pv))
                         counts.append(f"{shorten_pv_name(pv)} {len(per_pv[pv]['ts'])}")
                     sig.partial.emit((day, per_pv))
+                    sig.pct.emit(int(i / n_days * 100))
                     sig.note.emit(f"PV Time Plot {day:%Y-%m-%d}: "
                                   f"{report.requests} requests · " + ", ".join(counts))
                 sig.done.emit(None)
@@ -7575,6 +12251,7 @@ class CSSLoggerWidget(QWidget):
     def _pv_time_finish(self):
         self._pv_time_busy = False
         self._btn_pv_time_plot.setEnabled(True)
+        self._pv_time_progress.hide()
 
     def _on_pv_time_error(self, tb):
         self._log(f"[pv_time_fetch]\n{tb}")
@@ -7617,7 +12294,13 @@ class CSSLoggerWidget(QWidget):
             if part is None or not len(part["ts"]):
                 cols[pv] = np.full(len(grid), part["seed"] if part else np.nan)
                 continue
-            idx = np.searchsorted(part["ts"], grid, side="right") - 1
+            # A channel outside the basis (the SBW4 energy of a condition) is
+            # often archived a little after the shot's other channels. Reading
+            # it exactly at the shot took the PREVIOUS shot's energy, so a
+            # trigger shot passed on the real shot before it. It is read up to
+            # one merge gap later — the rule the Graph's conditions use.
+            look = 0 if pv in basis else gap
+            idx = np.searchsorted(part["ts"], grid + look, side="right") - 1
             out = np.where(idx >= 0, part["val"][np.maximum(idx, 0)], part["seed"])
             cols[pv] = out
         # Derived channels are evaluated over the whole column at once. The
@@ -7645,17 +12328,24 @@ class CSSLoggerWidget(QWidget):
         """The Y values of one day that pass every switched-on condition."""
         grid, cols = self._pv_time_day_columns(day, req)
         y = cols.get(req["y_ch"])
+        tally = req.setdefault("tally", {})
         if y is None or not len(grid):
             return np.empty(0), np.empty(0, dtype=np.int64), 0
-        keep  = np.isfinite(y)
-        total = int(keep.sum())
+        base  = np.isfinite(y)
+        keep  = base.copy()
+        total = int(base.sum())
         for c in req["conds"]:
-            if not c["enabled"]:
-                continue
             v = cols.get(c["channel"])
             if v is None:
                 continue
-            keep &= np.isfinite(v) & (v >= c["lo"]) & (v <= c["hi"])
+            ok = _cond_mask_passes(np.asarray(v, dtype=np.float64),
+                                   c.get("min"), c.get("max"),
+                                   c.get("outside", False))
+            # How many shots this condition keeps on its own, for its row.
+            k, t = tally.get(c["key"], (0, 0))
+            tally[c["key"]] = (k + int((ok & base).sum()), t + total)
+            if c["enabled"]:
+                keep &= ok
         return y[keep], grid[keep], total
 
     # -- drawing ------------------------------------------------------------
@@ -7663,15 +12353,16 @@ class CSSLoggerWidget(QWidget):
     def _pv_time_draw(self, req):
         y_label, conds = req["y_label"], req["conds"]
         per_day, kept, total = [], 0, 0
+        req["tally"] = {}
         for day in self._pv_time_days:
             vals, ts, n_all = self._pv_time_day_values(day, req)
             total += n_all
             kept  += len(vals)
             per_day.append((day, vals, ts))
+        self._pv_time_cond_counts = dict(req["tally"])
+        self._pv_time_cond_editor.refresh_counts()
 
-        cond_txt = " · ".join(
-            f"{c['label']} {c['target']:g} ±{c['tol']:g} %"
-            for c in conds if c["enabled"]) or "none"
+        cond_txt = " · ".join(c["text"] for c in conds if c["enabled"]) or "none"
 
         if not kept:
             self._clear_pv_time_plot()
@@ -7725,7 +12416,7 @@ class CSSLoggerWidget(QWidget):
                 skipped += 1
                 continue
             values.append(vals)
-            labels.append(day.strftime("%Y-%m-%d"))
+            labels.append(day.strftime("%Y-%m-%d\n%a"))
         if not values:
             ax.text(0.5, 0.5, "No day has two shots to compare.",
                     ha="center", va="center", color="#555", transform=ax.transAxes)
@@ -7746,8 +12437,16 @@ class CSSLoggerWidget(QWidget):
                 part.set_color(colour)
                 part.set_linewidth(1.4 if name == "cmedians" else 0.8)
 
+        # Upright stamps, two lines (date over weekday). When there are more
+        # days than room, only every k-th day is written; the violins all stay.
+        fig = ax.figure
+        ax_w_px = fig.get_figwidth() * fig.dpi * 0.85
+        lbl_px  = 0.62 * 9 * fig.dpi / 72.0 * 10 + 12     # "2026-10-05" + a gap
+        k = max(1, math.ceil(len(labels) * lbl_px / max(1.0, ax_w_px)))
+        shown = [lb if i % k == 0 else "" for i, lb in enumerate(labels)]
         ax.set_xticks(range(1, len(labels) + 1))
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+        ax.set_xticklabels(shown, rotation=0, ha="center", fontsize=9)
+        ax.set_xlim(0.4, len(labels) + 0.6)
         ax.set_ylabel(y_label, fontsize=10)
         ax.set_title(f"{y_label} — daily distribution")
         ax.grid(True, alpha=0.3, axis="y")
@@ -7767,12 +12466,24 @@ class CSSLoggerWidget(QWidget):
         ax.set_ylabel(y_label, fontsize=10)
         ax.set_xlabel("Time")
         ax.set_title(f"{y_label} — every shot")
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+        # Upright two-line stamps (time over date), as many as fit side by side.
+        fig = ax.figure
+        ax_w_px = fig.get_figwidth() * fig.dpi * 0.85
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(
+            minticks=3, maxticks=max(3, int(ax_w_px / 80))))
+        from matplotlib.ticker import FuncFormatter
+
+        def _stamp(x, _pos=None):
+            d = mdates.num2date(x)
+            # A stamp at midnight is a day boundary: the date alone says it.
+            return d.strftime("%m-%d") if (d.hour, d.minute) == (0, 0) \
+                else d.strftime("%H:%M\n%m-%d")
+        ax.xaxis.set_major_formatter(FuncFormatter(_stamp))
         ax.grid(True, alpha=0.3)
         ax.tick_params(colors="#222")
+        ax.tick_params(axis="x", labelrotation=0)
         for lbl in ax.get_xticklabels():
-            lbl.set_rotation(45)
-            lbl.set_horizontalalignment("right")
+            lbl.set_horizontalalignment("center")
 
     def _install_pv_time_toolbar(self, canvas):
         """Same toolbar as the main graph, rebuilt with the canvas it drives."""
@@ -7831,12 +12542,18 @@ class CSSLoggerWidget(QWidget):
         self._preset_combo.blockSignals(False)
 
     def _load_preset(self):
-        idx = self._preset_combo.currentIndex()
+        name = self._preset_combo.currentText()
+        if not name: return
+        # Read the shared file again, so Load brings what another station (or
+        # an older copy still running) saved after this one started.
+        self._presets = _read_presets_file()
+        self._refresh_preset_combo()
+        idx = self._preset_combo.findText(name)
         if idx < 0 or idx >= len(self._presets): return
         p = self._presets[idx]
         self._pv_list.clear()
         for pv in p.get("pvs", []):
-            self._pv_list.addItem(pv)
+            self._pv_list.addItem(self._make_pv_item(pv))
         self._sync_pv_list_customs()   # keep custom rows pinned at the bottom
         self._update_pv_count()
         dt_from = parse_user_datetime(p.get("time_from", ""))
@@ -7861,44 +12578,87 @@ class CSSLoggerWidget(QWidget):
         self._drop_selection_if_outside()
         self._request_reload(delay_ms=0, reason="preset loaded")
 
-    def _save_preset(self):
-        idx = self._preset_combo.currentIndex()
-        if idx < 0:
-            self._save_preset_as(); return
-        pvs  = self._real_pv_names()
-        name = self._presets[idx].get("name", "?")
-        self._presets[idx] = {
-            "name": name, "pvs": pvs,
+    def _store_presets(self, name: str, preset: "dict | None"):
+        """Write one preset change (preset=None deletes it) into the file.
+
+        The file is shared by every station and each running copy holds its own
+        list, so writing that whole list back would undo whatever another
+        station saved since it started. Re-read the file, change only this one
+        name, write, and take the merged list as the new combo content."""
+        presets = _read_presets_file()
+        pos = next((i for i, p in enumerate(presets)
+                    if p.get("name") == name), -1)
+        if preset is None:
+            if pos >= 0:
+                presets.pop(pos)
+        elif pos >= 0:
+            presets[pos] = preset
+        else:
+            presets.append(preset)
+        save_presets([p for p in presets if not p.get("builtin")])
+        self._presets = presets
+        self._refresh_preset_combo()
+        idx = self._preset_combo.findText(name)
+        if preset is not None and idx >= 0:
+            self._preset_combo.blockSignals(True)
+            self._preset_combo.setCurrentIndex(idx)
+            self._preset_combo.blockSignals(False)
+
+    def _current_preset_payload(self, name: str) -> dict:
+        """What Save writes: the PV list and period on screen, plus the master
+        PV and multiple that Load applies — so a save never strips them."""
+        p = {
+            "name": name, "pvs": self._real_pv_names(),
             "time_from": self._dt_from.strftime("%Y-%m-%d %H:%M"),
             "time_to":   self._dt_to.strftime("%Y-%m-%d %H:%M"),
         }
-        save_presets(self._presets)
-        self._log(f"Preset '{name}' saved.")
+        if self._master_pv_edit is not None:
+            p["master_pv"] = self._master_pv_edit.text().strip()
+        if self._master_multiple_edit is not None:
+            p["master_multiple"] = self._master_multiple_edit.text().strip()
+        return p
+
+    def _save_preset(self):
+        idx = self._preset_combo.currentIndex()
+        if idx < 0 or self._presets[idx].get("builtin"):
+            # "Blank" stays blank: saving onto it asks for a new name instead.
+            self._save_preset_as(); return
+        name = self._presets[idx].get("name", "?")
+        # Keys this tab does not edit (e.g. conditions) ride along unchanged.
+        preset = dict(self._presets[idx])
+        preset.update(self._current_preset_payload(name))
+        self._store_presets(name, preset)
+        self._log(f"Preset '{name}' saved ({len(preset['pvs'])} PVs).")
 
     def _save_preset_as(self):
         name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
         if not ok or not name.strip(): return
-        pvs  = self._real_pv_names()
-        self._presets.append({
-            "name": name.strip(), "pvs": pvs,
-            "time_from": self._dt_from.strftime("%Y-%m-%d %H:%M"),
-            "time_to":   self._dt_to.strftime("%Y-%m-%d %H:%M"),
-        })
-        save_presets(self._presets)
-        self._refresh_preset_combo()
-        self._preset_combo.setCurrentIndex(len(self._presets) - 1)
-        self._log(f"Preset '{name.strip()}' created.")
+        name = name.strip()
+        if name == _BLANK_PRESET:
+            QMessageBox.warning(self, "Save preset",
+                                f"'{_BLANK_PRESET}' is the built-in empty preset. "
+                                "Choose another name.")
+            return
+        if any(p.get("name") == name for p in _read_presets_file()):
+            ans = QMessageBox.question(
+                self, "Save preset",
+                f"A preset named '{name}' already exists. Overwrite it?")
+            if ans != QMessageBox.StandardButton.Yes: return
+        preset = self._current_preset_payload(name)
+        self._store_presets(name, preset)
+        self._log(f"Preset '{name}' saved ({len(preset['pvs'])} PVs).")
 
     def _delete_preset(self):
         idx = self._preset_combo.currentIndex()
         if idx < 0 or idx >= len(self._presets): return
         name = self._presets[idx].get("name", "?")
+        if self._presets[idx].get("builtin"):
+            self._lbl_status.setText(f"'{name}' is built in and cannot be deleted.")
+            return
         ans  = QMessageBox.question(
             self, "Delete preset", f"Delete preset '{name}'?")
         if ans != QMessageBox.StandardButton.Yes: return
-        self._presets.pop(idx)
-        save_presets(self._presets)
-        self._refresh_preset_combo()
+        self._store_presets(name, None)
         self._log(f"Preset '{name}' deleted.")
 
     # ── PV list operations ───────────────────────────────────────────────────
@@ -7910,7 +12670,7 @@ class CSSLoggerWidget(QWidget):
             for pv in dlg.selected_pvs:
                 # avoid duplicates
                 if pv not in self._real_pv_names():
-                    self._pv_list.addItem(pv)
+                    self._pv_list.addItem(self._make_pv_item(pv))
                     added = True
             self._sync_pv_list_customs()   # keep custom rows pinned at the bottom
             self._update_pv_count()
@@ -7921,18 +12681,53 @@ class CSSLoggerWidget(QWidget):
                 # load together in one pool, so this is quick).
                 self._request_reload(reason="channel added")
 
-    def _remove_selected_pvs(self):
-        removed = False
-        for item in reversed(self._pv_list.selectedItems()):
-            self._pv_list.takeItem(self._pv_list.row(item))
-            removed = True
-        # Nothing is selected after a Remove. Qt keeps the current row where it
-        # was, so the channel that moved up into the freed place came out
-        # highlighted and the next Remove would have taken it too.
-        self._pv_list.setCurrentRow(-1)
-        self._pv_list.clearSelection()
+    def _paste_pv_names(self):
+        """Add the PV names on the clipboard (one or many — one per line, or
+        split by commas, semicolons, tabs or spaces). Names already in the
+        list are skipped; nothing is checked against the archiver, a wrong
+        name simply loads empty and says so like any other."""
+        text = QApplication.clipboard().text() or ""
+        names = [t for t in re.split(r"[\s,;]+", text) if t]
+        have = set(self._real_pv_names())
+        new = []
+        for pv in names:
+            if pv not in have:
+                have.add(pv)
+                new.append(pv)
+        if not new:
+            self._lbl_status.setText("Nothing to paste — no new PV names on "
+                                     "the clipboard.")
+            return
+        for pv in new:
+            self._pv_list.addItem(self._make_pv_item(pv))
+        self._sync_pv_list_customs()
         self._update_pv_count()
-        if removed:
+        self._lbl_status.setText(
+            f"Pasted {len(new)} PV name{'s' if len(new) != 1 else ''}.")
+        self._request_reload(reason="channel added")
+
+    def _remove_selected_pvs(self):
+        lst = self._pv_list
+        sel = lst.selectedItems()
+        first = min((lst.row(it) for it in sel), default=-1)
+        removed = False
+        for item in sorted(sel, key=lst.row, reverse=True):
+            lst.takeItem(lst.row(item))
+            removed = True
+        # After a Remove the highlight moves to the PV that slid up into the
+        # first freed place, so several PVs can be removed one click after
+        # another. When the last PV went, the one above it is taken instead.
+        # Custom (ƒ) rows sit at the bottom and cannot be selected, so they are
+        # skipped the same way; with no PV left nothing is highlighted.
+        new = first if removed else -1
+        if new >= lst.count():
+            new = lst.count() - 1
+        while new >= 0 and lst.item(new).data(Qt.ItemDataRole.UserRole):
+            new -= 1
+        lst.clearSelection()
+        lst.setCurrentRow(new)
+        self._update_pv_count()
+        if removed and not self._reshape_from_memory():
             # Several rows can go in one click, so the reload is debounced.
             self._request_reload(reason="channel removed")
 
@@ -7944,19 +12739,260 @@ class CSSLoggerWidget(QWidget):
             self._update_pv_count()
             self._request_reload(reason="channel list cleared")
 
+    # A real PV row's text is its NAME (what the graph calls it); the PV itself
+    # rides along in this role. A row added as plain text (older code, tests)
+    # has no role and its text is the PV.
+    _PV_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    @classmethod
+    def _item_pv(cls, item):
+        return item.data(cls._PV_ROLE) or item.text()
+
+    def _make_pv_item(self, pv):
+        it = QListWidgetItem(self._col_label(pv))
+        it.setData(self._PV_ROLE, pv)
+        it.setToolTip(pv)
+        return it
+
+    def _refresh_pv_list_names(self):
+        """Re-read every real row's name — after a rename in the list or in the
+        PV table's Display Name column, so both always say the same."""
+        for i in range(self._pv_list.count()):
+            it = self._pv_list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole):
+                continue                    # ƒ row
+            pv = self._item_pv(it)
+            it.setData(self._PV_ROLE, pv)
+            name = self._col_label(pv)
+            if it.text() != name:
+                it.setText(name)
+            it.setToolTip(pv if name == pv else f"{name}\n{pv}")
+
+    def _remember_display_names(self):
+        """Keep the names the user chose (and only those) for the next start."""
+        changed = False
+        for pv in list(self._pv_order) + self._real_pv_names():
+            s = self._pv_settings.get(pv)
+            if s is None or "display_name" not in s:
+                continue
+            name = (s.get("display_name") or "").strip()
+            auto = shorten_pv_name(pv)
+            if not name:
+                s["display_name"] = auto
+                name = auto
+            if name == auto:
+                changed |= self._pv_display_names.pop(pv, None) is not None
+            elif self._pv_display_names.get(pv) != name:
+                self._pv_display_names[pv] = name
+                changed = True
+        if changed:
+            self.config["pv_display_names"] = dict(self._pv_display_names)
+        self._refresh_pv_list_names()
+
+    def _set_pv_display_name(self, pv, name):
+        name = (name or "").strip() or shorten_pv_name(pv)
+        s = self._pv_settings.setdefault(
+            pv, self._get_pv_default_settings(
+                pv, self._pv_order.index(pv) if pv in self._pv_order else 0))
+        s["display_name"] = name
+        self._remember_display_names()
+        if pv in self._pv_order:
+            self._refresh_axis_settings_tv()
+            if self._table_widget.columnCount() > 1:
+                self._populate_table()
+            self._refresh_xy_choices()
+            self._refresh_pv_time_choices()
+            if not self._rename_on_graph_in_place(pv):
+                self._schedule_replot()
+
+    def _rename_current_pv(self):
+        it = self._pv_list.currentItem()
+        if it is not None:
+            self._on_pv_double_click(it)
+
     def _on_pv_double_click(self, item):
+        """Double-click (or F2) renames the PV: the name shown here, on the
+        graph, in the PV table and in the table export. The PV itself is
+        changed from the right-click menu."""
         if item.data(Qt.ItemDataRole.UserRole):
-            return                         # custom/divider row — not editable here
-        pv, ok = QInputDialog.getText(self, "Edit PV", "PV name:", text=item.text())
-        if ok and pv.strip() and pv.strip() != item.text():
-            item.setText(pv.strip())
-            self._request_reload(reason="channel renamed")
+            self._open_custom_pv_dialog()  # ƒ row → its own editor
+            return
+        pv = self._item_pv(item)
+        name, ok = QInputDialog.getText(
+            self, "Rename PV",
+            f"{pv}\n\nName (empty = automatic, "
+            f"“{shorten_pv_name(pv)}”):",
+            text=self._col_label(pv))
+        if ok:
+            self._set_pv_display_name(pv, name)
+
+    def _change_pv_of_item(self, item):
+        """Point a row at a different archiver PV (the old double-click)."""
+        old = self._item_pv(item)
+        pv, ok = QInputDialog.getText(self, "Change PV", "PV name:", text=old)
+        pv = pv.strip()
+        if not ok or not pv or pv == old:
+            return
+        if pv in self._real_pv_names():
+            QMessageBox.information(self, "Change PV", f"{pv} is already in the list.")
+            return
+        item.setData(self._PV_ROLE, pv)
+        self._refresh_pv_list_names()
+        self._request_reload(reason="channel renamed")
+
+    def _selected_real_rows(self):
+        lst = self._pv_list
+        return sorted(lst.row(it) for it in lst.selectedItems()
+                      if not it.data(Qt.ItemDataRole.UserRole))
+
+    def _move_selected_pvs(self, delta):
+        """Move the selected PVs one place up (−1) or down (+1). Their order is
+        the order of the graph's bands and of the table's columns."""
+        lst = self._pv_list
+        rows = self._selected_real_rows()
+        n_real = len(self._real_pv_names())
+        if not rows or (delta < 0 and rows[0] == 0) or \
+                (delta > 0 and rows[-1] >= n_real - 1):
+            return
+        bar = lst.verticalScrollBar(); pos = bar.value()
+        order = rows if delta < 0 else list(reversed(rows))
+        moved = []
+        for r in order:
+            it = lst.takeItem(r)
+            lst.insertItem(r + delta, it)
+            moved.append(it)
+        lst.clearSelection()
+        for it in moved:
+            it.setSelected(True)
+        lst.setCurrentItem(moved[-1])
+        bar.setValue(pos)
+        lst.scrollToItem(moved[-1])
+        self._apply_pv_list_order()
+
+    def _apply_pv_list_order(self):
+        """The PV list was reordered (Move up/down or a drag): the graph and
+        the table follow it. The order once dragged in the PV table is
+        replaced for the real PVs — otherwise it kept winning and moving a PV
+        in the list no longer moved its band."""
+        real = self._real_pv_names()
+        if getattr(self, "_plot_order", None):
+            customs = {d.get("name", "") for d in self._custom_pvs}
+            rest = [pv for pv in self._ordered_for_plot(self._pv_order)
+                    if pv in customs]
+            self._plot_order = real + rest
+            self.config["plot_order"] = list(self._plot_order)
+        if not self._reshape_from_memory():
+            self._request_reload(reason="channel order changed")
+
+    def _on_pv_list_dropped(self, *_):
+        """A drag inside the PV list finished. Custom (ƒ) rows always stay
+        under the real PVs, so they are put back at the end first."""
+        if getattr(self, "_pv_list_drop_busy", False):
+            return
+        self._pv_list_drop_busy = True
+        try:
+            self._sync_pv_list_customs()
+        finally:
+            self._pv_list_drop_busy = False
+        new = self._real_pv_names()
+        if new != list(getattr(self, "_base_pv_order", None) or new):
+            self._apply_pv_list_order()
+
+    def _reshape_from_memory(self):
+        """Channels were only reordered or removed: rebuild the table and the
+        graph from the data already loaded instead of reading the archive
+        again. Live and a running load still take the reload path.
+        False = not possible here, the caller reloads."""
+        if (getattr(self, "_load_in_flight", False) or self._live_mode
+                or not self._samples_by_pv):
+            return False
+        base_old = list(getattr(self, "_base_pv_order", None) or [])
+        new = self._real_pv_names()
+        if not new or not set(new) <= set(base_old):
+            return False                 # a channel was added: it must be read
+        try:
+            for pv in set(base_old) - set(new):
+                self._samples_by_pv.pop(pv, None)
+                self._minmax_by_pv.pop(pv, None)
+                self._pre_window_vals.pop(pv, None)
+                self._numeric_pvs.discard(pv)
+            self._base_pv_order = list(new)
+            self._pv_order = list(new)
+            # The same steps a finished load runs (see __on_load_finished_inner).
+            rows = self._build_table_rows(
+                {pv: self._samples_by_pv.get(pv, []) for pv in new}, new,
+                self._pre_window_vals)
+            rows = self._remove_master_only_rows(rows)
+            report = getattr(self, "_last_fetch_report", None)
+            rows = self._remove_fake_hour_boundary_rows(
+                rows, boundaries=(report.boundaries if report is not None else None))
+            self._table_rows_unfiltered = rows
+            self._rebuild_custom_pvs()
+            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+            self._table_rows = self._apply_conditions_to_rows(rows)
+            self._resync_pv_colors()
+            self._plot_graph()
+            self._populate_table()
+            self._refresh_xy_choices()
+        except Exception:
+            import traceback
+            self._log(f"[reshape]\n{traceback.format_exc()}")
+            return False
+        return True
+
+    def _copy_selected_pv_names(self):
+        rows = self._selected_real_rows()
+        if not rows and self._pv_list.currentItem() is not None:
+            rows = [self._pv_list.currentRow()]
+        pvs = [self._item_pv(self._pv_list.item(r)) for r in rows
+               if not self._pv_list.item(r).data(Qt.ItemDataRole.UserRole)]
+        if pvs:
+            QApplication.clipboard().setText("\n".join(pvs))
+            self._lbl_status.setText(
+                f"Copied {len(pvs)} PV name{'s' if len(pvs) != 1 else ''}.")
+
+    def _open_pv_list_menu(self, pos):
+        lst = self._pv_list
+        item = lst.itemAt(pos)
+        menu = QMenu(self)
+
+        def _later(fn):
+            # Anything that opens a dialog runs once the menu has closed and
+            # let go of the mouse (a modal under an open QMenu opens late).
+            return lambda: QTimer.singleShot(0, fn)
+
+        if item is not None and item.data(Qt.ItemDataRole.UserRole):
+            menu.addAction("Edit custom PVs", _later(self._open_custom_pv_dialog))
+        elif item is not None:
+            if not item.isSelected():
+                lst.clearSelection(); item.setSelected(True)
+                lst.setCurrentItem(item)
+            many = len(self._selected_real_rows()) > 1
+            a = menu.addAction("Rename\tF2",
+                               _later(lambda: self._on_pv_double_click(item)))
+            a.setEnabled(not many)
+            a = menu.addAction("Change PV",
+                               _later(lambda: self._change_pv_of_item(item)))
+            a.setEnabled(not many)
+            menu.addAction("Copy PV name" + ("s" if many else "") + "\tCtrl+C",
+                           self._copy_selected_pv_names)
+            menu.addAction("Paste PV names\tCtrl+V", self._paste_pv_names)
+            menu.addSeparator()
+            menu.addAction("Move up\tCtrl+Up", lambda: self._move_selected_pvs(-1))
+            menu.addAction("Move down\tCtrl+Down", lambda: self._move_selected_pvs(1))
+            menu.addSeparator()
+            menu.addAction("Remove\tDel", self._remove_selected_pvs)
+        else:
+            menu.addAction("+ Add PV", _later(self._open_pv_browser))
+            menu.addAction("Paste PV names\tCtrl+V", self._paste_pv_names)
+            menu.addAction("Custom PV", _later(self._open_custom_pv_dialog))
+        menu.exec(lst.viewport().mapToGlobal(pos))
 
     def _real_pv_names(self):
         """The real archiver PVs queued for fetching — the only ones sent to the
         archiver, saved into presets, or counted. Custom (derived) PVs are shown
         in the list too but tagged (UserRole set), so they are skipped here."""
-        return [self._pv_list.item(i).text()
+        return [self._item_pv(self._pv_list.item(i))
                 for i in range(self._pv_list.count())
                 if not self._pv_list.item(i).data(Qt.ItemDataRole.UserRole)]
 
@@ -7965,6 +13001,8 @@ class CSSLoggerWidget(QWidget):
         read-only, visually distinct rows so they sit alongside the real PVs.
         Source of truth stays ``self._custom_pvs``; these rows are tagged and
         excluded from every fetch/save path via :meth:`_real_pv_names`."""
+        _bar = self._pv_list.verticalScrollBar()
+        _CustomPVDialog._restore_scroll_later(_bar, _bar.value())
         # Remove any previously-injected divider/custom rows (idempotent).
         for i in range(self._pv_list.count() - 1, -1, -1):
             if self._pv_list.item(i).data(Qt.ItemDataRole.UserRole):
@@ -8028,6 +13066,11 @@ class CSSLoggerWidget(QWidget):
             if self._live_mode and not dlg.ends_at_now():
                 self._stop_live("Live mode off — a fixed period was chosen.")
             self._user_zoomed = False
+            # The dialog's own "Live" button asks for Live mode as well, not
+            # just for a period ending at "now".
+            if dlg.wants_live() and not self._live_mode and self._real_pv_names():
+                self._toggle_live_mode()
+                return
             self._request_reload(delay_ms=0, reason="time window changed")
 
     # ── Conditions dialog ────────────────────────────────────────────────────
@@ -8035,24 +13078,78 @@ class CSSLoggerWidget(QWidget):
     def _open_conditions_dialog(self):
         # Custom channels are filtered exactly like real PVs (they are computed
         # before the conditions run), so they belong in the dropdown too.
-        pvs = self._real_pv_names() + [d["name"] for d in self._custom_pvs
-                                       if d.get("name")]
-        dlg = _ConditionsDialog(self._conditions, pvs, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._conditions = dlg.result_conditions
-            self._cond_last_diag = None     # report the new set's effect again
-            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
-            self._table_rows = self._apply_conditions_to_rows(rows)
-            self._populate_table()
-            # The graph draws from _table_rows as well — without this it would
-            # keep showing the rows the new conditions just discarded.
-            if self._samples_by_pv:
-                self._plot_graph()
-            # …and so does the XY cloud. The Conditions button sits on the XY tab
-            # too, and pressing it there used to change everything except the
-            # plot the user was looking at.
-            self._xy_dirty = True
-            self._xy_refresh_live()
+        choices = [(self._col_label(pv), pv) for pv in self._real_pv_names()]
+        choices += [(d["name"], d["name"]) for d in self._custom_pvs if d.get("name")]
+        dlg = _ConditionsDialog(self._conditions_view(), choices, self,
+                                on_change=self._set_conditions,
+                                count_fn=self._condition_count)
+        dlg.exec()
+
+    def _conditions_view(self):
+        """The rows the editor shows. ``_conditions`` is what filters; when
+        something set it directly (a test, older code) it wins."""
+        allc = list(getattr(self, "_conditions_all", []) or [])
+        on = [(c.get("pv"), c.get("min"), c.get("max")) for c in allc if c.get("enabled", True)]
+        now = [(c.get("pv"), c.get("min"), c.get("max")) for c in self._conditions]
+        if on == now or not getattr(self, "_conditions_on", True):
+            return allc
+        return [_cond_normalize(c) for c in self._conditions]
+
+    def _set_conditions_on(self, on):
+        """The sidebar's "Apply conditions" tick box."""
+        rows = self._conditions_view()      # read while the old state holds
+        self._conditions_on = bool(on)
+        self._set_conditions(rows)
+
+    def _sync_conditions_tick(self):
+        """Tooltip of "Apply conditions": how many rows it switches."""
+        chk = getattr(self, "_chk_cond_on", None)
+        if chk is None:
+            return
+        n = sum(1 for c in getattr(self, "_conditions_all", []) or []
+                if c.get("enabled") and c.get("pv"))
+        chk.setToolTip(
+            f"{n} condition(s) switched on in Conditions. Untick to see every "
+            "shot, including trigger shots and values outside the conditions.")
+
+    def _set_conditions(self, conds):
+        """Apply a new set of condition rows at once: table, graph and XY."""
+        self._conditions_all = [_cond_normalize(c) for c in conds]
+        self._conditions = ([c for c in self._conditions_all if c["enabled"]]
+                            if getattr(self, "_conditions_on", True) else [])
+        self._cond_last_diag = None     # report the new set's effect again
+        self._sync_conditions_tick()
+        rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+        self._table_rows = self._apply_conditions_to_rows(rows)
+        self._populate_table()
+        # The graph draws from _table_rows as well — without this it would
+        # keep showing the rows the new conditions just discarded.
+        if self._samples_by_pv:
+            self._maybe_hunt_last_good()
+            self._plot_graph()
+        # …and so does the XY cloud. The Conditions button sits on the XY tab
+        # too, and pressing it there used to change everything except the
+        # plot the user was looking at.
+        self._xy_dirty = True
+        self._xy_refresh_live()
+
+    def _condition_count(self, cond):
+        """``(kept, total)`` rows of the loaded window for one condition on its
+        own, or ``None`` when nothing is loaded."""
+        rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+        if not rows:
+            return None
+        pv = cond.get("pv")
+        if not pv or pv not in rows[-1][1]:
+            return 0, 0
+        lo, hi = cond.get("min"), cond.get("max")
+        outside = cond.get("outside", False)
+        kept = 0
+        for _ts, row in rows:
+            e = row.get(pv)
+            if e is not None and self._condition_value_ok(e[0], lo, hi, outside):
+                kept += 1
+        return kept, len(rows)
 
     # ── Reference lines ──────────────────────────────────────────────────────
 
@@ -8185,7 +13282,7 @@ class CSSLoggerWidget(QWidget):
         hint = self._REF_PICK_HINTS[stage]
         if stage == 2 and self._ref_pick.get("pv"):
             pv   = self._ref_pick["pv"]
-            name = self._pv_settings.get(pv, {}).get("display_name", shorten_pv_name(pv))
+            name = self._col_label(pv)
             hint += f"      Signal: {name}"
         self._lbl_pick_hint.setText(hint)
         self._pick_bar.setVisible(True)
@@ -8281,7 +13378,7 @@ class CSSLoggerWidget(QWidget):
         except Exception:
             self._cancel_ref_pick()
             return
-        name = self._pv_settings.get(pv, {}).get("display_name", shorten_pv_name(pv))
+        name = self._col_label(pv)
         self._end_ref_pick({"label": name, "pv": pv, "y": y,
                             "color": "#000000", "style": "dashed", "width": 1.2})
 
@@ -8348,26 +13445,38 @@ class CSSLoggerWidget(QWidget):
 
     # ── Custom PV dialog ─────────────────────────────────────────────────────
 
-    def _open_custom_pv_dialog(self):
-        dlg = _CustomPVDialog(self._custom_pvs, self._cpv_dialog_channels(), self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._custom_pvs = dlg.result_pvs
-            save_custom_pvs(self._custom_pvs)
-            self._sync_pv_list_customs()   # reflect new/removed customs in the PV LIST
-            self._update_pv_count()
-            self._cpv_last_diag = None     # report problems for the new set again
-            if self._table_rows_unfiltered:
-                # Recompute customs and re-run the filter pipeline so the new
-                # channels appear with real values everywhere (graph + table).
-                self._rebuild_custom_pvs()
-                rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
-                self._table_rows = self._apply_conditions_to_rows(rows)
-                self._plot_graph()
-                self._refresh_axis_settings_tv()
-                self._populate_table()
-                self._refresh_xy_choices()
-                self._xy_dirty = True
-                self._xy_refresh_live()
+    def open_custom_pv_editor(self, parent=None) -> bool:
+        """The "Add custom" editor, opened from another tab (Spectra's shot
+        filter). True when the user pressed OK."""
+        return self._open_custom_pv_dialog(parent)
+
+    def _open_custom_pv_dialog(self, parent=None) -> bool:
+        # A button's clicked(bool) lands in `parent` — only a widget counts.
+        owner = parent if isinstance(parent, QWidget) else self
+        dlg = _CustomPVDialog(self._custom_pvs, self._cpv_dialog_channels(), owner)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        # Channel names typed over in the dialog: the same Display Name as the
+        # PV table's, so it shows everywhere and is remembered.
+        for pv, name in dlg.result_display_names.items():
+            self._set_pv_display_name(pv, name)
+        self._custom_pvs = dlg.result_pvs
+        save_custom_pvs(self._custom_pvs)
+        self._sync_pv_list_customs()   # reflect new/removed customs in the PV LIST
+        self._update_pv_count()
+        self._cpv_last_diag = None     # report problems for the new set again
+        if self._table_rows_unfiltered:
+            # Recompute customs and re-run the filter pipeline so the new
+            # channels appear with real values everywhere (graph + table).
+            self._rebuild_custom_pvs()
+            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+            self._table_rows = self._apply_conditions_to_rows(rows)
+            self._plot_graph()          # also refreshes the PV table
+            self._populate_table()
+            self._refresh_xy_choices()
+            self._xy_dirty = True
+            self._xy_refresh_live()
+        return True
 
     # ── Table export ─────────────────────────────────────────────────────────
 
@@ -8466,9 +13575,12 @@ class CSSLoggerWidget(QWidget):
         """
         prev = getattr(self, "_export_prog", None)
         if prev is not None and prev.isVisible():
-            QMessageBox.information(
-                self, "Export running",
-                "An export is already running. Cancel it first."); return
+            if getattr(prev, "_finished", False):
+                prev.close()                 # last export's result window
+            else:
+                QMessageBox.information(
+                    self, "Export running",
+                    "An export is already running. Cancel it first."); return
         if self._live_mode:
             self._log("Export started while Live is on — both are reading the "
                       "archive, so switching Live off makes the export quicker.")
@@ -8515,24 +13627,35 @@ class CSSLoggerWidget(QWidget):
             if not prog.isHidden():
                 prog.setValue(max(0, min(100, int(pct))))
 
+        # The result is written into the progress window the user already has
+        # open, never into a new message box: an export can end minutes later,
+        # and a box popping up then takes the keyboard from whatever the user
+        # is typing elsewhere.
+        def _show_result(text):
+            prog._finished = True
+            if prog.isHidden():
+                return
+            prog.setLabelText(text)
+            prog.setCancelButtonText("Close")
+
         def _on_done(payload):
             n_rows, n_slices, cancelled = payload
-            prog.close()
             what = "cancelled after" if cancelled else "wrote"
             self._log(f"Export {what} {n_rows} shots from {n_slices} "
                       f"slice{'' if n_slices == 1 else 's'} → {path}")
             self._lbl_status.setText(
                 f"Export {'cancelled — partial file kept' if cancelled else 'finished'}: "
                 f"{n_rows} shots.")
-            if not cancelled:
-                QMessageBox.information(
-                    self, "Export finished",
-                    f"{n_rows} shots written to\n{path}")
+            if cancelled:
+                prog.close()
+            else:
+                prog.setValue(100)
+                _show_result(f"Finished: {n_rows} shots written to\n{path}")
 
         def _on_error(msg):
-            prog.close()
             self._log(f"Export failed: {msg}")
-            QMessageBox.critical(self, "Export error", msg)
+            self._lbl_status.setText("Export failed — see Log.")
+            _show_result(f"Export failed:\n{msg}")
 
         sig.progress.connect(_on_progress)
         sig.pct.connect(_on_pct)
@@ -8787,112 +13910,528 @@ class _ExportTableDialog(QDialog):
 
 # ── Conditions Dialog ────────────────────────────────────────────────────────
 
-class _ConditionsDialog(QDialog):
-    def __init__(self, conditions, pvs, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Filter Conditions")
-        self.resize(600, 350)
-        self._rows: list = []
-        self.result_conditions: list = []
+_COND_KINDS = (("between", "Between"),
+               ("pct",     "Target ± %"),
+               ("abs",     "Target ± value"),
+               ("above",   "At least"),
+               ("below",   "At most"),
+               ("outside", "Outside"))
 
+
+def _cond_value_passes(v, vmin, vmax, outside=False):
+    """One number against one condition's bounds (``None`` = open side). An
+    "Outside" condition keeps what lies beyond the bounds; with no bounds at
+    all it keeps everything, like an empty Between does."""
+    if outside and vmin is None and vmax is None:
+        return True
+    inside = (vmin is None or v >= vmin) and (vmax is None or v <= vmax)
+    return (not inside) if outside else inside
+
+
+def _cond_mask_passes(v, vmin, vmax, outside=False):
+    """Array version of :func:`_cond_value_passes`; NaN never passes."""
+    ok = np.isfinite(v)
+    if outside and vmin is None and vmax is None:
+        return ok
+    inside = np.ones(v.shape, dtype=bool)
+    with np.errstate(invalid="ignore"):
+        if vmin is not None:
+            inside &= v >= vmin
+        if vmax is not None:
+            inside &= v <= vmax
+    return ok & (~inside if outside else inside)
+
+
+# How far back, and in what steps, the last shot that passes the Conditions is
+# hunted when a period holds none. Six hours of a 5 s channel is ~4 300 raw
+# samples, which the archiver serves in one go; two weeks covers a long
+# shutdown without letting a channel that never passes read for ever.
+_LAST_PASS_STEP_NS  = int(6 * 3600 * 1e9)
+_LAST_PASS_DEPTH_NS = int(14 * 86400 * 1e9)
+
+
+def _last_passing_moment(conds, before_ns, gap_ns, timeout=None, cancel_fn=None,
+                         progress_fn=None, fetch_fn=None):
+    """Newest moment before ``before_ns`` at which every condition passes.
+
+    ``conds`` is ``[(pv, min, max, outside), …]``. Walks back in
+    ``_LAST_PASS_STEP_NS`` steps, reading only the condition channels, and
+    judges each of their sample times the way the table rows do: every
+    condition channel at its newest value up to ``gap_ns`` after that moment.
+    Returns the moment (ns) or None when nothing passes within
+    ``_LAST_PASS_DEPTH_NS`` (or the archiver cannot be read).
+
+    This is what keeps a period with the laser off from drawing nothing: the
+    Conditions reject every shot in it, and the value from just before it is
+    a laser-off value too, so the last value worth showing is older still.
+    """
+    if fetch_fn is None:
+        from cpva_core import cpva_fetch_many_adaptive as fetch_fn
+    pvs = list(dict.fromkeys(c[0] for c in conds))
+    if not pvs:
+        return None
+    hi = int(before_ns)
+    floor = hi - _LAST_PASS_DEPTH_NS
+    while hi > floor:
+        if cancel_fn is not None and cancel_fn():
+            return None
+        lo = max(floor, hi - _LAST_PASS_STEP_NS)
+        if progress_fn is not None:
+            progress_fn(lo)
+        raw, errs, _rep = fetch_fn(pvs, lo, hi, count=None, timeout=timeout,
+                                   cancel_fn=cancel_fn, preflight=False,
+                                   verify=False)
+        if errs and not any(raw.get(pv) for pv in pvs):
+            return None                    # unreadable, not "nothing passes"
+        arrays, cand = {}, []
+        for pv in pvs:
+            pts = []
+            for s in raw.get(pv) or []:
+                t = s.get("time")
+                # The archiver brackets the range: a sample after `hi` is
+                # newer than what is being judged and must not answer.
+                if not t or int(t) >= hi:
+                    continue
+                v = cpva_decode_value(s)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    pts.append((int(t), float(v)))
+            pts.sort()
+            ts = np.array([p[0] for p in pts], dtype=np.int64)
+            arrays[pv] = (ts, np.array([p[1] for p in pts], dtype=np.float64))
+            cand.append(ts[ts >= lo])
+        cand = np.unique(np.concatenate(cand)) if cand else np.empty(0, np.int64)
+        if cand.size:
+            keep = np.ones(cand.size, dtype=bool)
+            for pv, vmin, vmax, outside in conds:
+                c_ts, c_v = arrays[pv]
+                idx = np.searchsorted(c_ts, cand + gap_ns, side="right") - 1
+                v = np.full(cand.size, np.nan)
+                has = idx >= 0
+                if has.any():
+                    v[has] = c_v[idx[has]]
+                keep &= _cond_mask_passes(v, vmin, vmax, outside)
+            if keep.any():
+                return int(cand[keep].max())
+        hi = lo
+    return None
+
+
+def _cond_bounds(kind, a, b):
+    """``(lo, hi)`` of one condition, ``None`` for an open side."""
+    if kind == "pct":
+        if a is None or b is None:
+            return None, None
+        return tuple(sorted((a * (1 - b / 100.0), a * (1 + b / 100.0))))
+    if kind == "abs":
+        if a is None or b is None:
+            return None, None
+        return a - abs(b), a + abs(b)
+    if kind == "above":
+        return a, None
+    if kind == "below":
+        return None, a
+    if a is not None and b is not None and b < a:
+        a, b = b, a
+    return a, b
+
+
+def _cond_normalize(c):
+    """Any stored condition → ``{pv, enabled, kind, a, b, min, max}``.
+
+    ``min`` / ``max`` are the effective bounds and are what every filter reads,
+    so the table, graph, XY, export and the PV Time Plot apply one rule. Old
+    entries load as they were meant: ``{pv, min, max}`` (the Conditions window)
+    as Between, ``{target, tol}`` (the PV Time Plot's rows) as Target ± %."""
+    c = dict(c or {})
+    kind = c.get("kind")
+    if kind not in dict(_COND_KINDS):
+        if "target" in c:
+            kind, a, b = "pct", c.get("target"), c.get("tol")
+        else:
+            kind, a, b = "between", c.get("min"), c.get("max")
+    else:
+        a, b = c.get("a"), c.get("b")
+    lo, hi = _cond_bounds(kind, a, b)
+    return {"pv": c.get("pv", ""), "enabled": bool(c.get("enabled", True)),
+            "kind": kind, "a": a, "b": b, "min": lo, "max": hi,
+            "outside": kind == "outside"}
+
+
+def _cond_text(c, label=None):
+    """A condition as a person would say it: ``Energy 70 ± 10 %``."""
+    name = label or shorten_pv_name(c.get("pv", ""))
+    k, a, b = c.get("kind", "between"), c.get("a"), c.get("b")
+    f = lambda v: "?" if v is None else f"{v:g}"       # noqa: E731
+    if k == "pct":
+        return f"{name} {f(a)} ± {f(b)} %"
+    if k == "abs":
+        return f"{name} {f(a)} ± {f(b)}"
+    if k == "above":
+        return f"{name} ≥ {f(a)}"
+    if k == "below":
+        return f"{name} ≤ {f(a)}"
+    if k == "outside":
+        lo, hi = _cond_bounds(k, a, b)
+        if lo is None and hi is None:
+            return f"{name} any value"
+        if lo is None:
+            return f"{name} > {f(hi)}"
+        if hi is None:
+            return f"{name} < {f(lo)}"
+        return f"{name} outside {f(lo)} … {f(hi)}"
+    if a is None and b is None:
+        return f"{name} has a value"
+    if a is None:
+        return f"{name} ≤ {f(b)}"
+    if b is None:
+        return f"{name} ≥ {f(a)}"
+    return f"{name} {f(a)} … {f(b)}"
+
+
+class _ConditionEditor(QWidget):
+    """The condition rows — one editor for the Conditions window and for the
+    PV Time Plot, so both say and filter the same thing.
+
+    A row: on/off · channel · kind (Between / Target ± % / Target ± value /
+    At least / At most) · the one or two numbers that kind needs · how many
+    rows/shots it keeps on its own · ✕. Every edit is announced through
+    ``changed`` (collapsed over 350 ms), so the caller can apply it at once.
+    ``count_fn(cond) -> (kept, total) | None`` fills the "keeps" column.
+    """
+
+    changed = Signal()
+
+    _FIELD_LABELS = {          # kind → (first box, joiner, second box or None)
+        "between": ("min", "…", "max"),
+        "pct":     ("target", "±", "%"),
+        "abs":     ("target", "±", "±"),
+        "above":   ("min", "", None),
+        "below":   ("max", "", None),
+        "outside": ("min", "…", "max"),
+    }
+
+    def __init__(self, choices, conditions=(), count_fn=None, parent=None,
+                 new_row_enabled=True):
+        super().__init__(parent)
+        self._rows: list = []
+        self._count_fn = count_fn
+        self._new_enabled = bool(new_row_enabled)
+        self._choices: list = []
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(350)
+        self._timer.timeout.connect(self.changed.emit)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(3)
+        self._rows_lay = QVBoxLayout()
+        self._rows_lay.setSpacing(3)
+        outer.addLayout(self._rows_lay)
+        self._lbl_empty = QLabel("No conditions — every row is kept.")
+        self._lbl_empty.setStyleSheet("color:#555555;")
+        outer.addWidget(self._lbl_empty)
+        ctrl = QHBoxLayout()
+        ctrl.setContentsMargins(0, 2, 0, 0)
+        b_add = QPushButton("+ Add condition")
+        b_add.clicked.connect(lambda: self.add_row())
+        self._btn_clear = QPushButton("Remove all")
+        self._btn_clear.clicked.connect(self.clear)
+        ctrl.addWidget(b_add); ctrl.addWidget(self._btn_clear); ctrl.addStretch()
+        outer.addLayout(ctrl)
+
+        self.set_choices(choices)
+        for c in conditions or ():
+            self.add_row(c, announce=False)
+        self._refresh_empty()
+
+    # -- channels ---------------------------------------------------------
+    @staticmethod
+    def _as_pairs(choices):
+        out = []
+        for ch in choices or ():
+            if isinstance(ch, (tuple, list)):
+                out.append((str(ch[0]), str(ch[1])))
+            else:
+                out.append((str(ch), str(ch)))
+        return out
+
+    def set_choices(self, choices):
+        """New channel list; every row keeps its channel (added at the end,
+        marked "not in the list", when it is no longer offered)."""
+        self._choices = self._as_pairs(choices)
+        for rec in self._rows:
+            self._fill_channel_combo(rec["pv"], self._row_pv(rec))
+
+    def _fill_channel_combo(self, cb, pv):
+        cb.blockSignals(True)
+        cb.clear()
+        for label, p in self._choices:
+            cb.addItem(label, p)
+            cb.setItemData(cb.count() - 1, p, Qt.ItemDataRole.ToolTipRole)
+        if pv:
+            i = cb.findData(pv)
+            if i < 0:
+                cb.addItem(f"{shorten_pv_name(pv)} (not in the PV list)", pv)
+                i = cb.count() - 1
+            cb.setCurrentIndex(i)
+        elif cb.count():
+            cb.setCurrentIndex(0)
+        cb.blockSignals(False)
+
+    def combos(self):
+        return [rec["pv"] for rec in self._rows]
+
+    @staticmethod
+    def _row_pv(rec):
+        d = rec["pv"].currentData()
+        return d if d else rec["pv"].currentText().strip()
+
+    # -- rows -------------------------------------------------------------
+    @staticmethod
+    def _num_txt(v):
+        return "" if v is None else f"{v:g}"
+
+    def add_row(self, existing=None, announce=True):
+        c = _cond_normalize(existing) if existing else {
+            "pv": "", "enabled": self._new_enabled, "kind": "between",
+            "a": None, "b": None}
+        row_w = QWidget()
+        rl = QHBoxLayout(row_w)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+        chk = QCheckBox()
+        chk.setChecked(bool(c.get("enabled", True)))
+        chk.setToolTip("Switch this condition on or off without losing it")
+        pv_cb = QComboBox()
+        pv_cb.setMinimumWidth(170)
+        pv_cb.setMaximumWidth(380)
+        pv_cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        pv_cb.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        pv_cb.setMinimumContentsLength(14)
+        kind_cb = QComboBox()
+        for key, text in _COND_KINDS:
+            kind_cb.addItem(text, key)
+        kind_cb.setCurrentIndex(max(0, kind_cb.findData(c.get("kind", "between"))))
+        a_e = QLineEdit(self._num_txt(c.get("a"))); a_e.setFixedWidth(72)
+        join = QLabel(""); join.setFixedWidth(14)
+        join.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        b_e = QLineEdit(self._num_txt(c.get("b"))); b_e.setFixedWidth(72)
+        unit = QLabel(""); unit.setFixedWidth(14)
+        count = QLabel(""); count.setMinimumWidth(120)
+        count.setStyleSheet("color:#333333;")
+        b_del = QPushButton("✕"); b_del.setFixedWidth(26)
+        b_del.setToolTip("Delete this condition")
+        b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;"
+                            "border-radius:3px;}"
+                            "QPushButton:hover{background:#7F0000;}")
+        # The delete button sits right after the numbers it removes, not out at
+        # the far edge of a wide window.
+        for wdg in (chk, pv_cb, kind_cb, a_e, join, b_e, unit, b_del, count):
+            rl.addWidget(wdg)
+        rl.addStretch(1)
+        # A one-number kind hides the second box but keeps its place, so the
+        # columns of every row stay lined up.
+        sp = b_e.sizePolicy(); sp.setRetainSizeWhenHidden(True); b_e.setSizePolicy(sp)
+        rec = {"widget": row_w, "enabled": chk, "pv": pv_cb, "kind": kind_cb,
+               "a": a_e, "b": b_e, "join": join, "unit": unit, "count": count}
+        self._rows.append(rec)
+        self._fill_channel_combo(pv_cb, c.get("pv", ""))
+        self._apply_kind(rec)
+        self._rows_lay.addWidget(row_w)
+
+        chk.toggled.connect(lambda _v: self._touched())
+        pv_cb.currentIndexChanged.connect(lambda _i: self._touched())
+        kind_cb.currentIndexChanged.connect(lambda _i, r=rec: (self._apply_kind(r),
+                                                               self._touched()))
+        # A row that is off and has no numbers yet (a new row, or a saved one
+        # left empty) switches itself on once a number is typed into it —
+        # typing a limit means "use it". A row with limits that the user has
+        # switched off by hand stays off.
+        rec["auto_on"] = not chk.isChecked() and (
+            existing is None or (c.get("a") is None and c.get("b") is None))
+        chk.clicked.connect(lambda _v, r=rec: r.__setitem__("auto_on", False))
+
+        def _typed(txt, r=rec):
+            if r.get("auto_on") and txt.strip():
+                r["auto_on"] = False
+                r["enabled"].setChecked(True)
+            self._touched()
+        a_e.textChanged.connect(_typed)
+        b_e.textChanged.connect(_typed)
+        b_del.clicked.connect(lambda: self.remove_row(rec))
+        self._refresh_empty()
+        if announce:
+            self._touched()
+        return rec
+
+    def _apply_kind(self, rec):
+        kind = rec["kind"].currentData() or "between"
+        first, joiner, second = self._FIELD_LABELS[kind]
+        rec["a"].setPlaceholderText(first)
+        rec["join"].setText(joiner if second else "")
+        rec["b"].setVisible(second is not None)
+        rec["b"].setPlaceholderText(second or "")
+        rec["unit"].setText("%" if kind == "pct" else "")
+        tips = {"between": "Kept when the value is between min and max "
+                           "(leave one empty for an open side)",
+                "pct":     "Kept when the value is within ± that many percent "
+                           "of the target",
+                "abs":     "Kept when the value is within ± that amount of "
+                           "the target",
+                "above":   "Kept when the value is at least this",
+                "below":   "Kept when the value is at most this",
+                "outside": "Kept when the value is below min or above max "
+                           "(leave one empty for one side only)"}
+        rec["kind"].setToolTip(tips[kind])
+
+    def remove_row(self, rec):
+        if rec not in self._rows:
+            return
+        self._rows.remove(rec)
+        rec["widget"].hide()
+        self._rows_lay.removeWidget(rec["widget"])
+        rec["widget"].deleteLater()
+        self._refresh_empty()
+        self._touched()
+
+    def clear(self):
+        for rec in list(self._rows):
+            self._rows.remove(rec)
+            rec["widget"].hide()
+            self._rows_lay.removeWidget(rec["widget"])
+            rec["widget"].deleteLater()
+        self._refresh_empty()
+        self._touched()
+
+    def _refresh_empty(self):
+        self._lbl_empty.setVisible(not self._rows)
+        self._btn_clear.setEnabled(bool(self._rows))
+
+    def _touched(self):
+        self._mark_bad()
+        self._timer.start()
+
+    # -- values -----------------------------------------------------------
+    @staticmethod
+    def _parse(txt):
+        txt = (txt or "").strip().replace(",", ".")
+        if not txt:
+            return None, True
+        try:
+            return float(txt), True
+        except ValueError:
+            return None, False
+
+    def _row_condition(self, rec):
+        pv = self._row_pv(rec)
+        if not pv:
+            return None
+        kind = rec["kind"].currentData() or "between"
+        a = self._parse(rec["a"].text())[0]
+        b = (None if self._FIELD_LABELS[kind][2] is None
+             else self._parse(rec["b"].text())[0])
+        return _cond_normalize({"pv": pv, "enabled": rec["enabled"].isChecked(),
+                                "kind": kind, "a": a, "b": b})
+
+    def _mark_bad(self):
+        for rec in self._rows:
+            for key in ("a", "b"):
+                _v, ok = self._parse(rec[key].text())
+                rec[key].setStyleSheet("" if ok else
+                                       "QLineEdit{background:#FFEBEE;color:#111;"
+                                       "border:1px solid #C62828;}")
+                rec[key].setToolTip("" if ok else "Not a number — ignored")
+
+    def conditions(self):
+        """Every row that names a channel, switched on or not."""
+        return [c for c in (self._row_condition(r) for r in self._rows) if c]
+
+    def active_conditions(self):
+        return [c for c in self.conditions() if c["enabled"]]
+
+    def label_of(self, pv):
+        for label, p in self._choices:
+            if p == pv:
+                return label
+        return shorten_pv_name(pv)
+
+    def refresh_counts(self):
+        """Fill each row's "keeps N of M" from ``count_fn``."""
+        for rec in self._rows:
+            c = self._row_condition(rec)
+            res = self._count_fn(c) if (c and self._count_fn) else None
+            if res is None:
+                rec["count"].setText("")
+                rec["count"].setToolTip("")
+                continue
+            kept, total = res
+            if total <= 0:
+                rec["count"].setText("no data")
+                rec["count"].setToolTip("This channel has no values here, so "
+                                        "nothing can be judged")
+                continue
+            pct = 100.0 * kept / total
+            rec["count"].setText(f"keeps {kept:,} of {total:,}")
+            rec["count"].setToolTip(f"On its own this condition keeps {pct:.1f} %")
+            rec["count"].setStyleSheet("color:#B71C1C;font-weight:600;" if kept == 0
+                                       else "color:#333333;")
+
+
+class _ConditionsDialog(QDialog):
+    """The Conditions window. Edits apply as they are made (``on_change``),
+    so the graph, table and XY behind it show the effect at once."""
+
+    def __init__(self, conditions, pvs, parent=None, on_change=None, count_fn=None):
+        super().__init__(parent)
+        self.setWindowTitle("Conditions")
+        self.resize(760, 360)
+        self._on_change = on_change
         lay = QVBoxLayout(self)
-        lbl = QLabel("Rows are kept only if every condition PV is present and "
-                     "its value lies within [Min, Max]; anything outside is "
-                     "discarded from the table, graph and export. Leave Min or "
-                     "Max blank for an open bound. A condition on a PV with no "
-                     "data in the loaded window is skipped, not applied.")
-        lbl.setStyleSheet("color:#555;")
+        lbl = QLabel("A row is kept only when every condition that is switched "
+                     "on holds for it. Changes apply at once to the graph, the "
+                     "table, the XY plot and the export. A condition on a PV "
+                     "with no data in the loaded window is skipped.")
+        lbl.setStyleSheet("color:#444444;")
         lbl.setWordWrap(True)
         lay.addWidget(lbl)
 
-        # Column header row
-        head = QHBoxLayout(); head.setContentsMargins(0, 0, 0, 0)
-        h_pv  = QLabel("PV");  h_pv.setStyleSheet("font-weight:700;color:#1565C0;")
-        h_min = QLabel("Min"); h_min.setStyleSheet("font-weight:700;color:#1565C0;"); h_min.setFixedWidth(90)
-        h_max = QLabel("Max"); h_max.setStyleSheet("font-weight:700;color:#1565C0;"); h_max.setFixedWidth(90)
-        head.addWidget(h_pv, stretch=1); head.addWidget(h_min); head.addWidget(h_max)
-        head.addSpacing(30)
-        lay.addLayout(head)
-
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        inner  = QWidget()
-        self._inner_lay = QVBoxLayout(inner)
-        self._inner_lay.setSpacing(4)
-        self._inner_lay.addStretch()
-        scroll.setWidget(inner)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        holder = QWidget()
+        hl = QVBoxLayout(holder); hl.setContentsMargins(0, 0, 0, 0)
+        self.editor = _ConditionEditor(pvs, conditions, count_fn=count_fn)
+        hl.addWidget(self.editor)
+        hl.addStretch()
+        scroll.setWidget(holder)
         lay.addWidget(scroll, stretch=1)
+        self.editor.changed.connect(self._changed)
+        self.editor.refresh_counts()
 
-        self._pvs = pvs
-        for c in conditions:
-            self._add_row(pvs, c)
-
-        ctrl = QHBoxLayout()
-        b_add = QPushButton("+ Add"); b_add.clicked.connect(lambda: self._add_row(pvs))
-        b_clear = QPushButton("Clear all"); b_clear.clicked.connect(self._clear_all)
-        ctrl.addWidget(b_add); ctrl.addWidget(b_clear); ctrl.addStretch()
-        lay.addLayout(ctrl)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self._close)
+        buttons.accepted.connect(self._close)
         lay.addWidget(buttons)
 
-    @staticmethod
-    def _num_str(v):
-        if v is None:
-            return ""
-        return str(v)
+    @property
+    def result_conditions(self):
+        return self.editor.conditions()
 
-    def _add_row(self, pvs, existing=None):
-        row_w = QWidget()
-        rl    = QHBoxLayout(row_w); rl.setContentsMargins(0,0,0,0)
-        pv_cb = QComboBox()
-        pv_cb.setEditable(True); pv_cb.addItems(pvs)
-        if existing: pv_cb.setCurrentText(existing.get("pv", ""))
-        min_e = QLineEdit(self._num_str(existing.get("min")) if existing else "")
-        min_e.setFixedWidth(90); min_e.setPlaceholderText("min")
-        max_e = QLineEdit(self._num_str(existing.get("max")) if existing else "")
-        max_e.setFixedWidth(90); max_e.setPlaceholderText("max")
-        b_del = QPushButton("✕"); b_del.setFixedWidth(26)
-        b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;border-radius:3px;}")
-        b_del.clicked.connect(lambda: self._remove_row(row_w, rec))
-        rl.addWidget(pv_cb, stretch=1); rl.addWidget(min_e); rl.addWidget(max_e)
-        rl.addWidget(b_del)
-        rec = {"widget": row_w, "pv": pv_cb, "min": min_e, "max": max_e}
-        self._rows.append(rec)
-        # Insert before the stretch
-        self._inner_lay.insertWidget(self._inner_lay.count() - 1, row_w)
+    def _changed(self):
+        if self._on_change is not None:
+            self._on_change(self.editor.conditions())
+        self.editor.refresh_counts()
 
-    def _remove_row(self, row_w, rec):
-        self._rows.remove(rec)
-        row_w.deleteLater()
-
-    def _clear_all(self):
-        for rec in list(self._rows):
-            self._remove_row(rec["widget"], rec)
-
-    def _accept(self):
-        def _parse(txt):
-            txt = txt.strip()
-            if not txt:
-                return None
-            try:
-                return float(txt)
-            except ValueError:
-                return None
-        result = []
-        for r in self._rows:
-            pv = r["pv"].currentText().strip()
-            if not pv:
-                continue
-            result.append({
-                "pv":  pv,
-                "min": _parse(r["min"].text()),
-                "max": _parse(r["max"].text()),
-            })
-        self.result_conditions = result
+    def _close(self):
+        # A change still waiting out the 350 ms collapse is applied, not lost.
+        if self.editor._timer.isActive():
+            self.editor._timer.stop()
+            self._changed()
         self.accept()
+
+    def reject(self):
+        self._close()
 
 
 # ── Reference Lines Dialog ──────────────────────────────────────────────────
@@ -8907,7 +14446,7 @@ class _RefLinesDialog(QDialog):
     def __init__(self, ref_lines, pv_choices=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Reference Lines")
-        self.resize(900, 360)
+        self.resize(1010, 360)
         self._rows: list = []
         self._pv_choices = list(pv_choices or [])
         self.result_lines: list = []
@@ -8924,7 +14463,8 @@ class _RefLinesDialog(QDialog):
         heads.setContentsMargins(0, 0, 0, 0)
         for text, width in (("", 52), ("Label", 140), ("Signal", 210),
                             ("Y value", 90), ("", 30), ("Colour", 40),
-                            ("Style", 100), ("Width", 60), ("", 26)):
+                            ("Style", 100), ("Width", 60), ("Crossing", 80),
+                            ("", 26)):
             h = QLabel(text)
             h.setFixedWidth(width)
             h.setStyleSheet("font-weight:700;color:#1565C0;")
@@ -9003,15 +14543,25 @@ class _RefLinesDialog(QDialog):
         w_e = QLineEdit(str(existing.get("width", 1.2))); w_e.setFixedWidth(60)
         w_e.setPlaceholderText("Width")
 
+        # Which side of the line counts as crossing it, for Limit crossings.
+        cross_cb = QComboBox(); cross_cb.setFixedWidth(80)
+        cross_cb.addItems(list(_REF_CROSSING))
+        ci = cross_cb.findText(str(existing.get("crossing", "above")))
+        cross_cb.setCurrentIndex(ci if ci >= 0 else 0)
+        cross_cb.setToolTip("Limit crossings lists the times the signal went "
+                            "above (or below) this line")
+
         b_del = QPushButton("✕"); b_del.setFixedWidth(26)
         b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;border-radius:3px;}")
 
-        for w in (b_up, b_dn, lbl_e, pv_cb, y_e, b_pick, col_btn, style_cb, w_e, b_del):
+        for w in (b_up, b_dn, lbl_e, pv_cb, y_e, b_pick, col_btn, style_cb, w_e,
+                  cross_cb, b_del):
             rl.addWidget(w)
         rl.addStretch()
 
         rec = {"widget": row_w, "label": lbl_e, "pv": pv_cb, "y": y_e,
-               "color": col_hex, "btn": col_btn, "style": style_cb, "width": w_e}
+               "color": col_hex, "btn": col_btn, "style": style_cb, "width": w_e,
+               "crossing": cross_cb}
         col_btn.setStyleSheet(f"background:{col_hex};border-radius:3px;")
         col_btn.clicked.connect(lambda: self._pick_color(col_btn, rec))
         b_del.clicked.connect(lambda: self._remove_row(row_w, rec))
@@ -9072,6 +14622,7 @@ class _RefLinesDialog(QDialog):
                 "color": rec["color"] or "#000000",
                 "style": rec["style"].currentText(),
                 "width": max(0.2, width if width else 1.2),
+                "crossing": rec["crossing"].currentText(),
             })
         return result, bad
 
@@ -9086,6 +14637,119 @@ class _RefLinesDialog(QDialog):
                 + ", ".join(f"line {n}" for n in bad))
         self.result_lines = result
         self.accept()
+
+
+# ── Limit crossings window ───────────────────────────────────────────────────
+
+def _fmt_duration_ns(ns):
+    s = max(0.0, ns / 1e9)
+    if s < 60:
+        return f"{s:.1f} s"
+    if s < 3600:
+        return f"{int(s // 60)} min {int(s % 60)} s"
+    if s < 86400:
+        return f"{int(s // 3600)} h {int(s % 3600 // 60)} min"
+    return f"{int(s // 86400)} d {int(s % 86400 // 3600)} h"
+
+
+class _LimitCrossingsDialog(QDialog):
+    """Every stretch in which a signal was over (or under) one of its reference
+    lines. Double-click a row to show that moment in the graph."""
+
+    zoom_to = Signal(object, object)          # (start ns, end ns)
+
+    _HEAD = ("Line", "Signal", "Start", "End", "Duration", "Peak", "Peak at",
+             "Samples")
+
+    def __init__(self, cond_note="", parent=None):
+        # Opened at the click, empty, and filled by set_result() when the
+        # search ends — so no window ever appears on its own later.
+        super().__init__(parent)
+        self.setWindowTitle("Limit crossings")
+        self.resize(1000, 460)
+        # Every colour set here: this PC runs Windows in dark mode, and an
+        # unpainted dialog comes out black behind dark text.
+        self.setStyleSheet(
+            "QDialog{background:#f3f3f3;}"
+            "QLabel{color:#111;background:transparent;}"
+            "QPushButton{background:#ffffff;color:#111;border:1px solid #9aa3ad;"
+            "border-radius:3px;padding:3px 14px;}"
+            "QPushButton:hover{background:#e8f0fb;}")
+        self._rows = []
+        lay = QVBoxLayout(self)
+        top = self._top = QLabel("Looking for limit crossings")
+        top.setStyleSheet("font-weight:700;color:#111;")
+        lay.addWidget(top)
+        if cond_note:
+            lay.addWidget(QLabel(cond_note))
+
+        tv = self._tv = QTableWidget(0, len(self._HEAD))
+        tv.setHorizontalHeaderLabels(list(self._HEAD))
+        tv.verticalHeader().setVisible(False)
+        tv.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tv.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tv.setAlternatingRowColors(True)
+        # Light cells, dark text, a header that reads as a header — never left
+        # to the (dark) system theme.
+        tv.setStyleSheet(
+            "QTableWidget{background:#ffffff;alternate-background-color:#f4f6f8;"
+            "color:#111;gridline-color:#d6d6d6;"
+            "selection-background-color:#cfe3fb;selection-color:#111;}"
+            "QHeaderView::section{background:#e3e6ea;color:#111;font-weight:600;"
+            "border:1px solid #c8ccd2;padding:3px 6px;}")
+        tv.horizontalHeader().setStretchLastSection(True)   # no dead strip
+        tv.cellDoubleClicked.connect(self._on_double_click)
+        lay.addWidget(tv, stretch=1)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(QLabel("Double-click a row to show it in the graph."))
+        bottom.addStretch()
+        b_close = QPushButton("Close"); b_close.clicked.connect(self.close)
+        bottom.addWidget(b_close)
+        lay.addLayout(bottom)
+
+    def set_progress(self, text):
+        if not self._rows:
+            self._top.setText(text)
+
+    def set_result(self, res):
+        self._rows = rows = res["rows"]
+        n = len(rows)
+        approx = sum(1 for r in rows if not r["exact"])
+        head = (f"{n} crossing{'' if n == 1 else 's'} of "
+                f"{res['lines']} reference line{'' if res['lines'] == 1 else 's'}")
+        if approx:
+            head += (f"  ·  {approx} only to the thinned interval "
+                     f"(marked ≈, see the Log tab)")
+        self._top.setText(head)
+        tv = self._tv
+        tv.setRowCount(n)
+        for i, r in enumerate(rows):
+            mark = "" if r["exact"] else "≈ "
+            end = r["end"]
+            cells = (
+                r["line"] + ("  ↑" if r["side"] == "above" else "  ↓"),
+                shorten_pv_name(r["pv"]),
+                mark + ns_to_local_str(r["start"])[:19],
+                (mark + ns_to_local_str(end)[:19]) if end else "still over at the end",
+                mark + _fmt_duration_ns((end or r.get("open_until") or r["start"])
+                                        - r["start"]),
+                _fmt_cursor_value(r["peak"]),
+                mark + ns_to_local_str(r["peak_at"])[:19],
+                str(r["samples"]) if r["exact"] else "",
+            )
+            for j, text in enumerate(cells):
+                it = QTableWidgetItem(text)
+                if j in (4, 5, 7):
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                        | Qt.AlignmentFlag.AlignVCenter)
+                tv.setItem(i, j, it)
+        tv.resizeColumnsToContents()
+
+    def _on_double_click(self, row, _col):
+        if 0 <= row < len(self._rows):
+            r = self._rows[row]
+            self.zoom_to.emit(r["start"], r["end"] or r.get("open_until") or r["start"])
 
 
 # ── Graph settings dialog ────────────────────────────────────────────────────
@@ -9153,16 +14817,17 @@ class _GraphSettingsDialog(QDialog):
 
         self.w_titles = _check(o.get("show_axis_titles", True),
                                "Rotated PV name next to each Y axis")
-        self.w_gap    = _spin(0, 60, o.get("axis_gap_px", 4), "px",
+        _d = _GRAPH_OPTS_DEFAULTS
+        self.w_gap    = _spin(0, 60, o.get("axis_gap_px", _d["axis_gap_px"]), "px",
                               tip="Whitespace between an axis title and the axis "
                                   "to its left — this is the gap that made the "
                                   "columns wide")
-        self.w_pad    = _spin(-8, 40, o.get("label_pad_px", 4), "px",
+        self.w_pad    = _spin(-8, 40, o.get("label_pad_px", _d["label_pad_px"]), "px",
                               tip="Gap between an axis title and its own tick "
                                   "numbers. Negative values pull the title into "
                                   "the empty margin around the rotated numbers, "
                                   "which is the last bit of slack there is.")
-        self.w_outer  = _spin(0, 80, o.get("outer_margin_px", 6), "px",
+        self.w_outer  = _spin(0, 80, o.get("outer_margin_px", _d["outer_margin_px"]), "px",
                               tip="Whitespace left of the outermost axis title")
         self.w_yticks = _spin(2, 12, o.get("y_ticks_max", 6),
                               tip="Upper bound; fewer are used if they would overlap")
@@ -9178,7 +14843,7 @@ class _GraphSettingsDialog(QDialog):
 
         # Time axis. "Every" overrides the automatic spacing; the list is the same
         # set of round steps the automatic choice picks from.
-        self.w_xticks = _spin(2, 24, o.get("x_ticks_max", 8),
+        self.w_xticks = _spin(2, 24, o.get("x_ticks_max", 12),
                               tip="Upper bound on how many time stamps are drawn "
                                   "across the plot (ignored when a fixed spacing "
                                   "is chosen below)")
@@ -9314,6 +14979,120 @@ class _GraphSettingsDialog(QDialog):
         self.accept()
 
 
+class _MarginsDialog(QDialog):
+    """Margins and spacing of the graph, applied as soon as a number changes.
+
+    Replaces matplotlib's own "subplots" dialog, whose horizontal / vertical
+    spacing sliders space several separate plots apart — this graph is one plot
+    with stacked bands, so they did nothing. These are the gaps that exist here.
+    Same stored keys as Graph settings, so the two dialogs always agree."""
+
+    changed = Signal(dict)
+
+    def __init__(self, opts: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Margins and spacing")
+        self.original_opts = {k: opts.get(k, _GRAPH_OPTS_DEFAULTS[k])
+                              for k in self._KEYS}
+        lay = QVBoxLayout(self)
+
+        def _spin(vmin, vmax, val, tip):
+            w = QSpinBox(); w.setRange(vmin, vmax); w.setValue(int(round(val)))
+            w.setSuffix(" px"); w.setFixedWidth(80); w.setToolTip(tip)
+            return w
+
+        def _pct(vmin, vmax, frac, tip=""):
+            w = QDoubleSpinBox(); w.setRange(vmin, vmax); w.setDecimals(1)
+            w.setSingleStep(0.5); w.setSuffix(" %"); w.setFixedWidth(80)
+            w.setValue(round(frac * 100.0, 1))
+            if tip: w.setToolTip(tip)
+            return w
+
+        def _group(title, rows):
+            gb = QGroupBox(title)
+            g = QGridLayout(gb); g.setVerticalSpacing(4)
+            for r, (text, widget) in enumerate(rows):
+                g.addWidget(QLabel(text), r, 0)
+                g.addWidget(widget, r, 1)
+            g.setColumnStretch(0, 1)
+            lay.addWidget(gb)
+
+        o = self.original_opts
+        self.w_pad = _spin(-8, 40, o["label_pad_px"],
+                           "Gap between a Y-axis title and its own numbers. "
+                           "Negative values pull the title closer.")
+        self.w_gap = _spin(0, 60, o["axis_gap_px"],
+                           "Gap between a Y-axis title and the axis to its left")
+        self.w_outer = _spin(0, 80, o["outer_margin_px"],
+                             "Gap left of the outermost Y-axis title")
+        _group("Y axes", [("Title ↔ numbers", self.w_pad),
+                          ("Gap between Y axes", self.w_gap),
+                          ("Left edge", self.w_outer)])
+
+        self.w_mright = _pct(0, 30, float(o["margin_right"]))
+        self.w_mtop = _pct(0, 40, 1.0 - float(o["margin_top"]))
+        self.w_mbot = _pct(2, 40, float(o["margin_bottom"]),
+                           "Must stay tall enough for the time axis labels")
+        self.w_band = _pct(0, 45, float(o["band_pad_frac"]),
+                           "Empty space above and below each PV's trace "
+                           "inside its own band")
+        _group("Plot margins", [("Right gap", self.w_mright),
+                                ("Top gap", self.w_mtop),
+                                ("Bottom gap", self.w_mbot),
+                                ("Gap inside band", self.w_band)])
+
+        for w in (self.w_pad, self.w_gap, self.w_outer):
+            w.valueChanged.connect(self._emit)
+        for w in (self.w_mright, self.w_mtop, self.w_mbot, self.w_band):
+            w.valueChanged.connect(self._emit)
+
+        row = QHBoxLayout()
+        b_def = QPushButton("Defaults")
+        b_def.setToolTip("Put every value here back to the program's default")
+        b_def.clicked.connect(lambda: self._load(_GRAPH_OPTS_DEFAULTS))
+        b_undo = QPushButton("Undo changes")
+        b_undo.setToolTip("Back to the values from when this window was opened")
+        b_undo.clicked.connect(lambda: self._load(self.original_opts))
+        b_close = QPushButton("Close")
+        b_close.clicked.connect(self.close)
+        row.addWidget(b_def); row.addWidget(b_undo); row.addStretch(1)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+
+    _KEYS = ("label_pad_px", "axis_gap_px", "outer_margin_px", "margin_right",
+             "margin_top", "margin_bottom", "band_pad_frac")
+
+    def collect(self) -> dict:
+        return {
+            "label_pad_px":    self.w_pad.value(),
+            "axis_gap_px":     self.w_gap.value(),
+            "outer_margin_px": self.w_outer.value(),
+            "margin_right":    round(self.w_mright.value() / 100.0, 5),
+            "margin_top":      round(1.0 - self.w_mtop.value() / 100.0, 5),
+            "margin_bottom":   round(self.w_mbot.value() / 100.0, 5),
+            "band_pad_frac":   round(self.w_band.value() / 100.0, 5),
+        }
+
+    def _emit(self, *_):
+        self.changed.emit(self.collect())
+
+    def _load(self, src):
+        widgets = (self.w_pad, self.w_gap, self.w_outer, self.w_mright,
+                   self.w_mtop, self.w_mbot, self.w_band)
+        for w in widgets:
+            w.blockSignals(True)
+        self.w_pad.setValue(int(src["label_pad_px"]))
+        self.w_gap.setValue(int(src["axis_gap_px"]))
+        self.w_outer.setValue(int(src["outer_margin_px"]))
+        self.w_mright.setValue(round(float(src["margin_right"]) * 100, 1))
+        self.w_mtop.setValue(round((1.0 - float(src["margin_top"])) * 100, 1))
+        self.w_mbot.setValue(round(float(src["margin_bottom"]) * 100, 1))
+        self.w_band.setValue(round(float(src["band_pad_frac"]) * 100, 1))
+        for w in widgets:
+            w.blockSignals(False)
+        self._emit()
+
+
 # ── Custom PV Dialog ─────────────────────────────────────────────────────────
 
 class _CustomPVDialog(QDialog):
@@ -9339,6 +15118,8 @@ class _CustomPVDialog(QDialog):
         self.resize(900, 780)
         self._rows: list = []
         self.result_pvs: list = []
+        # {pv: name} for the Channel names typed over in the top table.
+        self.result_display_names: dict = {}
         # Owned by the dialog, so a queued rebuild cannot fire on a table that
         # has already been destroyed (Cancel while the user was still typing).
         self._bind_timer = QTimer(self)
@@ -9380,24 +15161,39 @@ class _CustomPVDialog(QDialog):
             ref_tbl = QTableWidget(len(channels), 4)
             ref_tbl.setHorizontalHeaderLabels(["Var", "Channel", "PV name", "State"])
             ref_tbl.verticalHeader().setVisible(False)
-            ref_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            # The Channel name of a real PV can be typed over right here (the
+            # same Display Name as in the PV table). Everything else is
+            # read-only — the letters follow the list, they are not a setting.
+            ref_tbl.setEditTriggers(QAbstractItemView.EditTrigger.AllEditTriggers)
             ref_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
             # Without this the first cell wears a stray focus box.
             ref_tbl.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             ref_tbl.setMaximumHeight(186)
-            ref_tbl.setStyleSheet(self._tbl_css)
+            ref_tbl.setStyleSheet(
+                self._tbl_css
+                + "QTableWidget QLineEdit{background:#ffffff;color:#111111;"
+                  "border:1px solid #1565C0;padding:0 2px;}")
             ref_tbl.verticalHeader().setDefaultSectionSize(24)
+            custom_names = {d.get("name", "") for d in (custom_pvs or [])}
+            _ro = ~Qt.ItemFlag.ItemIsEditable
             for r, (letter, pv, disp, loaded) in enumerate(channels):
                 it_l = QTableWidgetItem(letter)
                 it_l.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                cells = [it_l, QTableWidgetItem(disp), QTableWidgetItem(pv),
+                it_d = QTableWidgetItem(disp)
+                it_d.setData(Qt.ItemDataRole.UserRole, pv)
+                cells = [it_l, it_d, QTableWidgetItem(pv),
                          QTableWidgetItem("loaded" if loaded else "not loaded")]
                 for c, it in enumerate(cells):
+                    # A custom PV is renamed in its Name box below.
+                    if c != 1 or pv in custom_names:
+                        it.setFlags(it.flags() & _ro)
                     if not loaded:
                         # Text only — the row must stay readable on the light
                         # table background.
                         it.setForeground(QColor("#B71C1C"))
                     ref_tbl.setItem(r, c, it)
+            ref_tbl.itemChanged.connect(self._on_channel_renamed)
+            self._ref_tbl = ref_tbl
             ref_tbl.setColumnWidth(0, 46)
             ref_tbl.setColumnWidth(1, 190)
             ref_tbl.setColumnWidth(3, 84)
@@ -9420,6 +15216,7 @@ class _CustomPVDialog(QDialog):
         # below must not squeeze it down to a couple of visible rows.
         scroll.setMinimumHeight(210)
         lay.addWidget(scroll, stretch=1)
+        self._formula_scroll = scroll
 
         for cpv in custom_pvs:
             self._add_row(cpv)
@@ -9456,6 +15253,26 @@ class _CustomPVDialog(QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
+    def _on_channel_renamed(self, item):
+        """A Channel name typed over in the top table: remembered for OK, and
+        the bindings table's tooltips follow it at once."""
+        if item.column() != 1:
+            return
+        pv = item.data(Qt.ItemDataRole.UserRole)
+        if not pv:
+            return
+        name = item.text().strip()
+        if not name:
+            # Empty = back to the automatic name, shown as such.
+            name = shorten_pv_name(pv)
+            tbl = item.tableWidget()
+            tbl.blockSignals(True)
+            item.setText(name)
+            tbl.blockSignals(False)
+        self._disp_by_pv[pv] = name
+        self.result_display_names[pv] = name
+        self._queue_bindings_refresh()
+
     # ── Bindings table ──────────────────────────────────────────────────────
 
     def _queue_bindings_refresh(self):
@@ -9471,6 +15288,12 @@ class _CustomPVDialog(QDialog):
         tbl = getattr(self, "_bind_tbl", None)
         if tbl is None:      # queued from _add_row before the table was built
             return
+        # The rebuild empties the table, which throws the view back to the
+        # top — after every pick, keystroke and removal. Put it back where the
+        # user was (clamped by Qt if the table got shorter).
+        bar = tbl.verticalScrollBar()
+        pos = bar.value()
+        self._restore_scroll_later(bar, pos)
         tbl.setRowCount(0)
         # Only channels that actually have a letter can be picked — a letter is
         # how the expression names them. Already-saved custom PVs are in here
@@ -9572,7 +15395,10 @@ class _CustomPVDialog(QDialog):
         b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;border-radius:3px;}")
         b_del.clicked.connect(lambda: self._remove_row(row_w, rec))
         rl.addWidget(name_e); rl.addWidget(expr_e); rl.addWidget(warn); rl.addWidget(b_del)
-        rec = {"widget": row_w, "name": name_e, "expr": expr_e, "warn": warn}
+        # orig_name: the name the entry was saved under, so a rename can be
+        # carried into the customs that are built on this one.
+        rec = {"widget": row_w, "name": name_e, "expr": expr_e, "warn": warn,
+               "orig_name": (existing.get("name", "") if existing else "")}
         self._rows.append(rec)
         expr_e.textChanged.connect(lambda _t, r=rec: self._refresh_row_state(r))
         # The bindings table lists a row per letter per formula, so both the
@@ -9601,8 +15427,30 @@ class _CustomPVDialog(QDialog):
         rec["warn"].setVisible(bad)
         rec["warn"].setToolTip("\n".join(lines) if bad else "")
 
+    @staticmethod
+    def _restore_scroll_later(bar, pos):
+        """Set ``bar`` back to ``pos`` now and once more after the pending
+        relayout (the range is only known once the rows are measured)."""
+        if pos <= 0:
+            return                          # at the top already: nothing to keep
+
+        def _set():
+            # Only undo a jump to an end — never fight the user's own scroll.
+            try:
+                v = bar.value()
+                if v != pos and (v == 0 or v == bar.maximum()):
+                    bar.setValue(min(pos, bar.maximum()))
+            except RuntimeError:            # dialog already closed
+                pass
+        QTimer.singleShot(0, _set)
+        QTimer.singleShot(30, _set)
+
     def _remove_row(self, row_w, rec):
         self._rows.remove(rec)
+        bar = self._formula_scroll.verticalScrollBar()
+        self._restore_scroll_later(bar, bar.value())
+        row_w.hide()
+        self._inner_lay.removeWidget(row_w)
         row_w.deleteLater()
         self._queue_bindings_refresh()
 
@@ -9613,6 +15461,15 @@ class _CustomPVDialog(QDialog):
             expr, bindings = _cpv_from_display(r["expr"].text(), self._pv_by_letter)
             if name and expr:
                 out.append({"name": name, "expr": expr, "bindings": bindings})
+        # A custom built on another custom is bound to that one's NAME, so a
+        # rename here would leave it reading a channel that no longer exists.
+        renamed = {r["orig_name"]: r["name"].text().strip() for r in self._rows
+                   if r.get("orig_name") and r["name"].text().strip()
+                   and r["name"].text().strip() != r["orig_name"]}
+        if renamed:
+            for d in out:
+                d["bindings"] = {lt: renamed.get(pv, pv)
+                                 for lt, pv in d["bindings"].items()}
         self.result_pvs = out
         self.accept()
 
@@ -9688,12 +15545,26 @@ def _icon_app_id(prefix, ico_path):
 _APP_ID_PREFIX = "ELI.CSSLogger"
 
 
+def _app_version():
+    """Version of the running build, e.g. "v1.4.2", or "" when run from source.
+
+    The builder names every exe "CSS Logger vX.Y.Z.exe", so the running exe's
+    own file name is the one place that always tells the truth — also for an
+    older version started from the archive.
+    """
+    if not getattr(sys, "frozen", False):
+        return ""
+    m = re.search(r"\s(v\d+(?:\.\d+)*)$", pathlib.Path(sys.executable).stem)
+    return m.group(1) if m else ""
+
+
 # ── Combined main window ─────────────────────────────────────────────────────
 
 class CPVASuiteWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CSS Logger")
+        ver = _app_version()
+        self.setWindowTitle(f"CSS Logger {ver}" if ver else "CSS Logger (source)")
         icon_path = _icon_file()
         if icon_path:
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -9710,18 +15581,73 @@ class CPVASuiteWindow(QMainWindow):
             "QTabBar::tab:selected{background:#1565C0;color:white;border-radius:4px 4px 0 0;}"
             "QTabBar::tab:!selected{background:#E3F2FD;color:#1565C0;}"
         )
-        self._css_logger = CSSLoggerWidget()
-        tabs.addTab(self._css_logger, "  CSS Logger  ")
+        # The CSS Logger is a row of setting tabs (logger_tabs.py), each one a
+        # complete CSSLoggerWidget with its own channels, conditions and window.
+        from logger_tabs import LoggerTabs
+        self._logger_tabs = LoggerTabs(lambda st: CSSLoggerWidget(tab_state=st))
+        tabs.addTab(self._logger_tabs, "  CSS Logger  ")
         try:
             from sp_t import SpectraWidget
             self._spectra = SpectraWidget()
+            # The shot filter offers the same custom PVs (formulas) as the CSS
+            # Logger tab — one list, one editor, one custom_pvs.json. Whichever
+            # setting tab is on screen answers.
+            self._spectra.set_custom_pv_host(
+                lambda *a, **k: self._logger_tabs.active().cpv_defs_for_spectra(*a, **k),
+                lambda *a, **k: self._logger_tabs.active().open_custom_pv_editor(*a, **k),
+                _CPV_SAFE_ENV)
             tabs.addTab(self._spectra, "  Spectra  ")
         except Exception as exc:
             err_w = QLabel(f"Spectra tab unavailable:\n{exc}")
             err_w.setAlignment(Qt.AlignmentFlag.AlignCenter)
             err_w.setStyleSheet("color:#B71C1C;font-size:13px;")
             tabs.addTab(err_w, "  Spectra (error)  ")
+
+        # The tab row: main tabs | a separator and the setting tabs (only while
+        # the CSS Logger is on screen). QTabWidget gives a corner widget exactly
+        # its size hint, so the strip asks for the whole gap after the main tabs.
+        class _TabRowStrip(QWidget):
+            def sizeHint(self):
+                base = super().sizeHint()
+                bar = tabs.tabBar()
+                w = tabs.width() - bar.sizeHint().width() - 2
+                return QSize(max(self.minimumSizeHint().width(), w),
+                             max(base.height(), bar.sizeHint().height()))
+
+        strip = _TabRowStrip()
+        strip_lay = QHBoxLayout(strip)
+        strip_lay.setContentsMargins(6, 0, 0, 0)
+        strip_lay.setSpacing(6)
+        logger_box = QWidget()
+        box_lay = QHBoxLayout(logger_box)
+        box_lay.setContentsMargins(0, 0, 0, 0)
+        box_lay.setSpacing(6)
+        sep = QFrame()
+        sep.setFixedSize(1, 18)
+        sep.setStyleSheet("background: #9aa6b6;")
+        box_lay.addWidget(sep, 0, Qt.AlignmentFlag.AlignVCenter)
+        strip_lay.addWidget(logger_box, 0, Qt.AlignmentFlag.AlignBottom)
+        strip_lay.addStretch(1)
+        tabs.setCornerWidget(strip, Qt.Corner.TopRightCorner)
+        self._logger_tabs.move_chrome_into(box_lay)
+
+        def _sync_tab_row(idx):
+            on = tabs.widget(idx) is self._logger_tabs
+            logger_box.setVisible(on)
+            self._logger_tabs.set_outer_visible(on)
+            # The bold current tab changes the main bar's width: re-ask.
+            strip.updateGeometry()
+
+        tabs.currentChanged.connect(_sync_tab_row)
+        _sync_tab_row(tabs.currentIndex())
+        self._main_tabs = tabs
         self.setCentralWidget(tabs)
+
+    @property
+    def _css_logger(self):
+        """The first setting tab: it owns the config file, as the one CSS
+        Logger did before there were tabs."""
+        return self._logger_tabs.first()
 
     def _restore_geometry(self):
         try:
@@ -9750,7 +15676,13 @@ class CPVASuiteWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            self._css_logger._save_runtime_state()
+            # Every tab's setting goes to logger_tabs.json; the config file
+            # keeps what it always held (graph options, looks, …), from the
+            # first tab — never built just for this.
+            self._logger_tabs.save()
+            built = self._logger_tabs.loggers()
+            if built:
+                built[0]._save_runtime_state()
         except Exception:
             pass
         # Stop live streaming and any analysis still fetching, so the background
@@ -9760,10 +15692,9 @@ class CPVASuiteWindow(QMainWindow):
         except Exception:
             pass
         try:
-            # A running table export writes to a file — let it notice the window
-            # is gone instead of finishing into a dead dialog.
-            self._css_logger._export_epoch = getattr(
-                self._css_logger, "_export_epoch", 0) + 1
+            # Live, loads, and a running table export (which writes to a file
+            # and must notice the window is gone) — in every tab.
+            self._logger_tabs.shutdown()
         except Exception:
             pass
         try:

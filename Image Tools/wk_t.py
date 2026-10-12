@@ -6393,6 +6393,7 @@ class WorkshopWidget(QWidget):
     def open_files(self, paths):
         """Open image files straight into the Workshop (Open button and drag & drop)."""
         added = 0
+        failed: list = []
         for path in paths:
             p = Path(path)
             if p.suffix.lower() not in (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"):
@@ -6406,9 +6407,14 @@ class WorkshopWidget(QWidget):
                 self.receive_image(a, p.name, source_path=p)
                 added += 1
             except Exception as e:
-                QMessageBox.warning(self, "Open error", f"Could not open {p.name}:\n{e}")
+                failed.append(f"{p.name}: {e}")
         if added:
             self._say(f"Opened {added} file(s).")
+        # One box for all of them — dropping ten bad files used to mean ten boxes in
+        # a row.
+        if failed:
+            QMessageBox.warning(self, "Open error",
+                                "Could not open:\n" + "\n".join(failed))
 
     def _open_dialog(self):
         # Several files at once, because dropping several onto the picture has always
@@ -7019,7 +7025,14 @@ class WorkshopWidget(QWidget):
         if um and um > 0:
             self._sensor_default_um = float(um)
             self._ui_state["sensor_um"] = float(um)
-            self._save_ui_state()
+            # Written once the typing stops, not on every keystroke / arrow step.
+            t = getattr(self, "_sensor_save_timer", None)
+            if t is None:
+                t = self._sensor_save_timer = QTimer(self)
+                t.setSingleShot(True)
+                t.setInterval(400)
+                t.timeout.connect(self._save_ui_state)
+            t.start()
 
     def _apply_default_sensor_scale(self, slot):
         """Every new image starts with a pixel size already in force — the camera's own,
@@ -7052,9 +7065,9 @@ class WorkshopWidget(QWidget):
         value shown but not in force is a trap."""
         if getattr(self, "_sensor_guard", False) or um <= 0:
             return
-        self._remember_sensor_default(um)
         slot = self._slot()
         if slot is None:
+            self._remember_sensor_default(um)   # _set_pixel_size does it otherwise
             return
         self._set_pixel_size(um, False,
                              f"One pixel is {um:.3f} µm — {1000.0 / um:.1f} px per mm.")

@@ -28,6 +28,9 @@ SPFE Values/testing/_*.png
 Dev Tools/build_usage.json
 Dev Tools/copy_manager_state.ini
 
+# --- Code graph (graphify): built on C:\Dev\graphify, never in the repo ---
+graphify-out/
+
 # --- Testovací / lokální data ---
 Counter of shots/data/
 Time Converter/test_data/

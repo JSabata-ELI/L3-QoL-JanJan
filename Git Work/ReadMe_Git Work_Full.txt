@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-24  (git_work.py, 1988 lines)
+Verified against source: 2026-10-05  (git_work.py, 1995 lines)
 -----------------------------------------------------------------
 Short version: ReadMe_Git Work.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

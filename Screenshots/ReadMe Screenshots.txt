@@ -36,7 +36,8 @@ PICKING CAMERAS
 
   Cameras that do not exist at this workstation are greyed out —
   hover one to see where it does exist. The workstation is
-  recognised automatically from the computer's name.
+  recognised automatically from the computer's name, however it is
+  spelled ("L3-OPR03", "L3OPR3" and "opr3" are all OPR-03).
 
   Presets tick a whole set at once. "Config presets" opens the list:
   add one with New, delete any of them with Remove, rename it by
@@ -121,7 +122,9 @@ THE PREVIEW
   colours it arrived in — a colour camera stays in colour, whatever
   you do with contrast, brightness or gamma. Grayscale deliberately
   drops the colour; everything after it paints false colours over the
-  grey values.
+  grey values. The palettes are the same as in Image Tools. Binary and
+  False Colors show an archive picture exactly as the NI window does,
+  so the tone controls are greyed out on those two.
 
   Images you cropped or drew on are also written out as a separate
   file with "_annotated" in the name, so the untouched original is

@@ -41,8 +41,15 @@ HOW TO BUILD IT
 
 HOW IT REACHES THE OTHER PROGRAMS
 
-  Dev Tools -> Copy Manager -> "Build internal", then
-  "Deploy internal".
+  1. Dev Tools -> Builder tab: tick "Internal Builder" and press
+     "BUILD selected". This uses the .spec file.
+  2. Dev Tools -> Copy Manager tab: tick the programs that should
+     get the new folder and press "Deploy Libraries".
+
+  Careful: "Deploy Libraries" also DELETES every file in a program's
+  support folder that the shared one does not have. A file that a
+  program's own build put there is gone, and cannot be put back from
+  here.
 
   Extractor is the older manual way of doing the same thing.
 

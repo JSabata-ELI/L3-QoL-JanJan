@@ -10,33 +10,53 @@
     "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-09-23 11:10:30",
-  "time_to": "2026-09-23 12:10:30",
+  "time_from": "2026-10-08 10:19:23",
+  "time_to": "2026-10-08 15:19:23",
   "http_timeout": 10.0,
   "conditions": [
     {
       "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+      "enabled": true,
+      "kind": "between",
+      "a": 5.0,
+      "b": 150.0,
       "min": 5.0,
-      "max": 150.0
+      "max": 150.0,
+      "outside": false
     },
     {
       "pv": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+      "enabled": true,
+      "kind": "between",
+      "a": 0.2,
+      "b": 100.0,
       "min": 0.2,
-      "max": 100.0
+      "max": 100.0,
+      "outside": false
     },
     {
       "pv": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+      "enabled": true,
+      "kind": "between",
+      "a": 0.021,
+      "b": 1.0,
       "min": 0.021,
-      "max": 1.0
+      "max": 1.0,
+      "outside": false
     },
     {
       "pv": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+      "enabled": true,
+      "kind": "between",
+      "a": 0.15,
+      "b": 40.0,
       "min": 0.15,
-      "max": 40.0
+      "max": 40.0,
+      "outside": false
     }
   ],
   "master_pv": "L3-PFWP6-MTR03-1:RawPos",
-  "master_multiple": "1000",
+  "master_multiple": "",
   "suite_geometry": [
     4489,
     -142,
@@ -48,13 +68,13 @@
     "font_size": 11,
     "tick_font_delta": -1,
     "cursor_font_delta": 0,
-    "axis_gap_px": 6,
-    "label_pad_px": 5,
-    "outer_margin_px": 8,
+    "axis_gap_px": 3,
+    "label_pad_px": -5,
+    "outer_margin_px": 4,
     "show_axis_titles": true,
     "y_ticks_max": 6,
     "y_minor_ticks": false,
-    "x_ticks_max": 8,
+    "x_ticks_max": 12,
     "x_tick_seconds": 0,
     "x_time_format": "auto",
     "margin_right": 0.015,
@@ -68,5 +88,45 @@
     "live_graph_min_ms": 300,
     "live_table_ms": 1500
   },
-  "style_presets": {}
+  "style_presets": {},
+  "x_ticks_default_12": true,
+  "y_axis_tight_v1": true,
+  "pv_display_names": {},
+  "pv_time_conditions": [
+    {
+      "pv": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+      "enabled": false,
+      "kind": "between",
+      "a": null,
+      "b": null,
+      "min": null,
+      "max": null,
+      "outside": false
+    }
+  ],
+  "y_axis_spacing_v2": true,
+  "conditions_enabled": true,
+  "sel_pause_restart": false,
+  "sel_pause_s": 15.0,
+  "dead_shot_skip": true,
+  "dead_shot_energy_pv": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+  "dead_shot_energy_max": 0.05,
+  "loupe_mag": 10,
+  "plot_order": [
+    "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+    "L3-PFWP6-MTR03-1:RawPos",
+    "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+    "L3-PM03-023:Energy",
+    "L3-PM03-025:Energy",
+    "L3-VCS-LN36:OPEN",
+    "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+    "Sum of Green [J]",
+    "Beta/Green [%]",
+    "PCC1 Eff [%]",
+    "Split Ratio [%]",
+    "PTM1/PAP1",
+    "Comp. Beta Output [J]",
+    "Back Reflection Ratio [%]"
+  ]
 }

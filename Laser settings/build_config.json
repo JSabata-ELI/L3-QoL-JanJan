@@ -1,0 +1,32 @@
+{
+  "_comment": "Read by Dev Tools/b_t.py at build time. All four tab modules are listed as hidden imports because main.py loads them by name (__import__ on a variable), which PyInstaller cannot see - without these the program starts with red 'tab could not be built' pages. in_t is still on the list although its page is no longer on the tab bar: it is built and kept alive, because main.log() writes into it. ov_t is on it twice over - ft_t imports ov_t._Row for the preview of the list. The ls_* modules are listed with them so their own imports are followed from a known root. The Qt exclusions are the same ones Image Tools and Announcer use; nothing here touches QML, Quick or 3D. No extra_files: the settings live in %APPDATA%\\LaserSettings and there is nothing beside the exe to ship but icon.ico, which the builder adds by itself.",
+  "collect_all": [],
+  "hidden_imports": [
+    "ov_t",
+    "st_t",
+    "in_t",
+    "ft_t",
+    "dm_t",
+    "dw_t",
+    "ls_core",
+    "ls_cpva",
+    "ls_dm",
+    "ls_engine",
+    "ls_log",
+    "ls_screen",
+    "ls_ui"
+  ],
+  "exclude_modules": [
+    "PySide6.QtQml",
+    "PySide6.QtQuick",
+    "PySide6.QtQuick3D",
+    "PySide6.QtQuickControls2",
+    "PySide6.QtQuickWidgets",
+    "PySide6.Qt3DAnimation",
+    "PySide6.Qt3DCore",
+    "PySide6.Qt3DExtras",
+    "PySide6.Qt3DInput",
+    "PySide6.Qt3DLogic",
+    "PySide6.Qt3DRender"
+  ]
+}

@@ -396,6 +396,12 @@ DEFAULT_SETTINGS = {
     # A web session dies of being UNUSED, so this is what turns a paste good for
     # one timeout into one good until the portal restarts.
     "okbase_keepalive_min": 10,
+    # The morning "no lunch ordered for today" message (okbase_menu.
+    # lunch_reminder_due). Blank address = the work account above.
+    "okbase_remind_enabled": True,
+    "okbase_remind_hour": 8,
+    "okbase_remind_email": "",
+    "okbase_remind_sent_day": "",   # written by the app/listener, not typed
     # shared PV list: the list itself, and the shared part of these settings,
     # live on the scratch share (see shared_pvs.py) so every copy of the app
     # monitors the same PVs with the same limits and pacing. These four keys are
@@ -422,7 +428,8 @@ SHARE_LOCAL_ONLY_KEYS = (
     "okbase_session_cookie", "okbase_canteen_id", "okbase_user_id",
     "okbase_filter", "okbase_timeout_s", "okbase_refresh_hour",
     "okbase_keepalive_min", "okbase_account", "okbase_order_emails",
-    "okbase_order_codes",
+    "okbase_order_codes", "okbase_remind_enabled", "okbase_remind_hour",
+    "okbase_remind_email", "okbase_remind_sent_day",
 )
 
 
@@ -452,6 +459,10 @@ def shared_settings_subset(settings: dict) -> dict:
 # whole list dozens of times. Coalescing needs no changes at persist()'s many
 # call sites.
 SHARED_WRITE_DEBOUNCE_MS = 2000
+# The LOCAL config is coalesced too, but briefly: a write + fsync on the UI
+# thread on every tick of a checkbox made a burst of clicks stutter. Shutdown
+# flushes it synchronously, so nothing is lost on close.
+LOCAL_WRITE_DEBOUNCE_MS = 400
 
 # --- long-run memory watch --------------------------------------------------
 # This app is meant to be left running for weeks, and the thing that fails
@@ -533,12 +544,18 @@ def _migrate_settings(settings: dict) -> None:
     settings.pop("webex_room_id", None)
 
 
+_PROVISIONED_KEYS: Optional[frozenset] = None
+
+
 def save_config(data: dict) -> None:
     # Never write provisioned channel settings to disk: they are supplied by the
     # build and would otherwise be sitting in a plain JSON next to the exe (and
-    # would shadow a later rebuild's values).
-    prov = notify_provision.load()
-    skip = set(prov) | set(okbase_menu.OKBASE_KEYS)
+    # would shadow a later rebuild's values). The blob belongs to the build and
+    # cannot change while the program runs, so it is decoded once per session.
+    global _PROVISIONED_KEYS
+    if _PROVISIONED_KEYS is None:
+        _PROVISIONED_KEYS = frozenset(notify_provision.load())
+    skip = set(_PROVISIONED_KEYS) | set(okbase_menu.OKBASE_KEYS)
     settings = {k: v for k, v in (data.get("settings") or {}).items()
                 if k not in skip}
     data = {**data, "settings": settings}
@@ -1828,6 +1845,30 @@ def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     return "\n".join(lines)
 
 
+# The table model's data() runs for every cell and every role on each repaint,
+# about 2000 calls for one look at the table. PySide resolves a short enum name
+# such as Qt.DisplayRole through a slow fallback (~2.5 µs per use, measured),
+# and data() used 15-20 of them per call: a whole-table repaint took ~180 ms of
+# pure name lookups. Resolved once here instead.
+_R_DISPLAY = Qt.ItemDataRole.DisplayRole
+_R_TOOLTIP = Qt.ItemDataRole.ToolTipRole
+_R_FG = Qt.ItemDataRole.ForegroundRole
+_R_BG = Qt.ItemDataRole.BackgroundRole
+_R_ALIGN = Qt.ItemDataRole.TextAlignmentRole
+_R_FONT = Qt.ItemDataRole.FontRole
+_R_CHECK = Qt.ItemDataRole.CheckStateRole
+_ALIGN_CENTER = int(Qt.AlignmentFlag.AlignCenter)
+_ALIGN_LEFT_V = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+_CHECKED = Qt.CheckState.Checked
+_UNCHECKED = Qt.CheckState.Unchecked
+_F_ENABLED = Qt.ItemFlag.ItemIsEnabled
+_F_DROP = Qt.ItemFlag.ItemIsDropEnabled
+_F_HEADER = _F_ENABLED | _F_DROP
+_F_PV = (_F_ENABLED | Qt.ItemFlag.ItemIsSelectable
+         | Qt.ItemFlag.ItemIsDragEnabled | _F_DROP)
+_F_PV_CHECK = _F_PV | Qt.ItemFlag.ItemIsUserCheckable
+
+
 class PVTableModel(QAbstractTableModel):
     """Flat PV list rendered with per-group (and per-subgroup) header rows.
 
@@ -1907,22 +1948,18 @@ class PVTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return len(COLS)
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+    def headerData(self, section, orientation, role=_R_DISPLAY):
+        if role == _R_DISPLAY and orientation == Qt.Orientation.Horizontal:
             return COLS[section]
         return None
 
     def flags(self, index):
         if not index.isValid():
-            return Qt.ItemIsDropEnabled
+            return _F_DROP
         kind, _ = self._display[index.row()]
         if kind in ("header", "subheader"):
-            return Qt.ItemIsEnabled | Qt.ItemIsDropEnabled
-        base = (Qt.ItemIsEnabled | Qt.ItemIsSelectable
-                | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
-        if index.column() == COL_ON:
-            base |= Qt.ItemIsUserCheckable
-        return base
+            return _F_HEADER
+        return _F_PV_CHECK if index.column() == COL_ON else _F_PV
 
     # --- drag & drop reordering ---------------------------------------
     def supportedDropActions(self):
@@ -1966,7 +2003,7 @@ class PVTableModel(QAbstractTableModel):
         # (unimplemented, no-op) removeRows without touching our data.
         return True
 
-    def data(self, index, role=Qt.DisplayRole):
+    def data(self, index, role=_R_DISPLAY):
         if not index.isValid():
             return None
         kind, ref = self._display[index.row()]
@@ -1975,54 +2012,54 @@ class PVTableModel(QAbstractTableModel):
         if kind in ("header", "subheader"):
             if col == COL_SHOW:
                 shown = [p.show_in_graph for p in self._header_pvs(kind, ref)]
-                if role == Qt.DisplayRole:
+                if role == _R_DISPLAY:
                     return EYE_GLYPH if any(shown) else EYE_OFF_GLYPH
-                if role == Qt.ForegroundRole:
+                if role == _R_FG:
                     if all(shown):
                         return EYE_ON_FG
                     return EYE_MIXED_FG if any(shown) else EYE_OFF_FG
-                if role == Qt.TextAlignmentRole:
-                    return int(Qt.AlignCenter)
-                if role == Qt.ToolTipRole:
+                if role == _R_ALIGN:
+                    return _ALIGN_CENTER
+                if role == _R_TOOLTIP:
                     what = "group" if kind == "header" else "subgroup"
                     return (f"Click to show/hide every PV of this {what} "
                             "in the graph.")
-            if role == Qt.DisplayRole and col == COL_NAME:
+            if role == _R_DISPLAY and col == COL_NAME:
                 arrow = "▸" if self._collapse_key(kind, ref) in self.collapsed \
                     else "▾"
                 if kind == "header":
                     return f"{arrow} " + (ref or UNGROUPED_LABEL)
                 return f"      {arrow} {ref[1]}"
-            if role == Qt.ToolTipRole and col == COL_NAME:
+            if role == _R_TOOLTIP and col == COL_NAME:
                 return "Click to collapse/expand."
-            if role == Qt.BackgroundRole:
+            if role == _R_BG:
                 return SUBGROUP_HEADER_BG if kind == "subheader" \
                     else GROUP_HEADER_BG
-            if role == Qt.ForegroundRole:
+            if role == _R_FG:
                 return GROUP_HEADER_FG
-            if role == Qt.FontRole and col == COL_NAME:
+            if role == _R_FONT and col == COL_NAME:
                 f = QFont()
                 f.setBold(kind == "header")
                 f.setItalic(kind == "subheader")
                 return f
-            if role == Qt.TextAlignmentRole:
-                return int(Qt.AlignVCenter | Qt.AlignLeft)
+            if role == _R_ALIGN:
+                return _ALIGN_LEFT_V
             return None
 
         pv = ref
         rt = self.runtime.get(pv.name)
 
-        if role == Qt.CheckStateRole and col == COL_ON:
-            return Qt.Checked if pv.enabled else Qt.Unchecked
+        if role == _R_CHECK and col == COL_ON:
+            return _CHECKED if pv.enabled else _UNCHECKED
         if col == COL_SHOW:
-            if role == Qt.DisplayRole:
+            if role == _R_DISPLAY:
                 return EYE_GLYPH if pv.show_in_graph else EYE_OFF_GLYPH
-            if role == Qt.ForegroundRole:
+            if role == _R_FG:
                 return EYE_ON_FG if pv.show_in_graph else EYE_OFF_FG
-            if role == Qt.TextAlignmentRole:
-                return int(Qt.AlignCenter)
+            if role == _R_ALIGN:
+                return _ALIGN_CENTER
 
-        if role == Qt.ToolTipRole:
+        if role == _R_TOOLTIP:
             if col == COL_SHOW:
                 return "Click to show/hide this PV in the graph."
             if col == COL_ALARM_STATUS:
@@ -2081,7 +2118,7 @@ class PVTableModel(QAbstractTableModel):
         # Reading is live but nothing is watching it — flag that in the cell.
         stopped = not self.monitoring and pv.enabled
 
-        if role == Qt.BackgroundRole and col == COL_STATE:
+        if role == _R_BG and col == COL_STATE:
             # Same paint for both "not live" states, since they mean the same
             # thing to whoever is looking: do not trust this cell.
             if self.stale or frozen:
@@ -2093,14 +2130,14 @@ class PVTableModel(QAbstractTableModel):
             if stopped:
                 return QColor(STOPPED_COLOR)
             return _STATE_BG[level]
-        if role == Qt.ForegroundRole and col == COL_STATE:
+        if role == _R_FG and col == COL_STATE:
             if self.stale or level in (AlertLevel.WARNING, AlertLevel.ALARM) \
                     or level is None or stopped or frozen:
                 return QColor("white")
             return QColor(SUCCESS)
         # The value itself is real but no longer moving: italics mark it as
         # "last known", the tooltip says since when.
-        if role == Qt.FontRole and frozen and col in (COL_VALUE, COL_UPDATED):
+        if role == _R_FONT and frozen and col in (COL_VALUE, COL_UPDATED):
             f = QFont()
             f.setItalic(True)
             return f
@@ -2108,16 +2145,16 @@ class PVTableModel(QAbstractTableModel):
         # Alarm-status cell: paint red only when a send failed, so a lost alert
         # stands out; other states use plain text.
         if col == COL_ALARM_STATUS and rt is not None:
-            if role == Qt.BackgroundRole and rt.notify_status == "failed":
+            if role == _R_BG and rt.notify_status == "failed":
                 return QColor(ALARM_COLOR)
-            if role == Qt.ForegroundRole and rt.notify_status == "failed":
+            if role == _R_FG and rt.notify_status == "failed":
                 return QColor("white")
 
-        if role == Qt.TextAlignmentRole and col in (
+        if role == _R_ALIGN and col in (
                 COL_VALUE, COL_UNITS, COL_STATE, COL_ALARM_STATUS) + THR_COLS:
-            return int(Qt.AlignCenter)
+            return _ALIGN_CENTER
 
-        if role == Qt.DisplayRole:
+        if role == _R_DISPLAY:
             if col in (COL_ON, COL_SHOW):
                 return None
             if col == COL_NAME:
@@ -2208,12 +2245,15 @@ class PVTableModel(QAbstractTableModel):
             for p in pvs:
                 p.show_in_graph = target
         else:
+            pvs = [ref]
             ref.show_in_graph = not ref.show_in_graph
-        self.refresh_all()       # eyes on parent/child rows update too
+        self.refresh_pvs(pvs)    # eyes on parent/child rows update too
         win = self.parent()
         if isinstance(win, MonitorWidget):
             win.persist()
-            win.graph.redraw()
+            # Redraws only when the drawn curves really change (All PVs view);
+            # with one PV selected the eye changes nothing on the graph.
+            win.graph.refresh_data()
 
     def toggle_collapse(self, row: int):
         """Fold/unfold a group or subgroup header row."""
@@ -2230,6 +2270,22 @@ class PVTableModel(QAbstractTableModel):
         if self._display:
             self.dataChanged.emit(self.index(0, 0),
                                   self.index(len(self._display) - 1, len(COLS) - 1))
+
+    def refresh_pvs(self, pvs):
+        """Repaint only the rows of ``pvs`` and the (sub)group headers above
+        them (their eye / state roll-up), not the whole table."""
+        names = {p.name for p in pvs}
+        groups = {p.group for p in pvs}
+        subs = {(p.group, p.subgroup) for p in pvs}
+        last = len(COLS) - 1
+        for r, (kind, ref) in enumerate(self._display):
+            if ((kind == "pv" and ref.name in names)
+                    or (kind == "header" and ref in groups)
+                    or (kind == "subheader" and ref in subs)):
+                self.dataChanged.emit(self.index(r, 0), self.index(r, last))
+
+    def refresh_pv(self, pv):
+        self.refresh_pvs([pv])
 
 
 # ---------------------------------------------------------------------------
@@ -2652,7 +2708,13 @@ class PVBrowserDialog(QDialog):
             "Type to filter the full CPVA channel list below. Space-separated "
             "words must all match (AND); * matches any run of characters. "
             "Example: 'temp * L3' shows channels containing both 'temp' and 'L3'.")
-        self.search.textChanged.connect(self._apply_filter)
+        # Filtered once typing pauses, not per keystroke: each pass scans the
+        # whole channel list and refills up to 2000 rows.
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(150)
+        self._filter_timer.timeout.connect(self._apply_filter)
+        self.search.textChanged.connect(lambda _t: self._filter_timer.start())
         lay.addWidget(self.search)
 
         self.list = QListWidget()
@@ -3422,13 +3484,16 @@ def _webex_mention_hint() -> QLabel:
 
 
 class WebexRoomsWidget(QWidget):
-    """Editable On/Name/Room ID/Listen table — one bot broadcasting to N rooms.
+    """Editable On/Name/Room ID/food/Listen table — one bot broadcasting to N rooms.
 
     Only one row may have "Listen" checked (two-way commands are read from a
-    single designated room); checking one unchecks the others.
+    single designated room); checking one unchecks the others. The "/food" box
+    of that row decides whether the canteen exists in that room at all
+    (okbase_menu.food_in_listen_room).
     """
 
-    COLS = ["On", "Name", "Room ID", "Listen for commands"]
+    COLS = ["On", "Name", "Room ID", "/food", "Listen for commands"]
+    FOOD_COL, LISTEN_COL = 3, 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3443,7 +3508,16 @@ class WebexRoomsWidget(QWidget):
         self.table.setColumnWidth(1, 149)  # ~75% of the old stretched width
         hh.setSectionResizeMode(2, QHeaderView.Interactive)
         self.table.setColumnWidth(2, 99)   # ~50% of the old stretched width
-        hh.setSectionResizeMode(3, QHeaderView.Stretch)  # takes the freed-up space, so the full label fits
+        hh.setSectionResizeMode(self.FOOD_COL, QHeaderView.Interactive)
+        self.table.setColumnWidth(self.FOOD_COL, 48)
+        hh.setSectionResizeMode(self.LISTEN_COL, QHeaderView.Stretch)  # takes the freed-up space, so the full label fits
+        food_head = self.table.horizontalHeaderItem(self.FOOD_COL)
+        if food_head is not None:
+            food_head.setToolTip(
+                "Ticked: in this room the bot answers /food, posts the morning "
+                "lunch reminder and lists /food in /help. Unticked: none of "
+                "that — /food only says it is not available here. Counts for "
+                "the room that listens for commands.")
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setMinimumHeight(110)
@@ -3464,7 +3538,8 @@ class WebexRoomsWidget(QWidget):
         lay.addLayout(row)
 
     def _add_row(self, name: str = "", room_id: str = "", enabled: bool = True,
-                listen: bool = False, start_edit: bool = False):
+                listen: bool = False, start_edit: bool = False,
+                food: bool = True):
         r = self.table.rowCount()
         self.table.insertRow(r)
 
@@ -3486,6 +3561,15 @@ class WebexRoomsWidget(QWidget):
             self.table.setCurrentItem(name_item)
             self.table.editItem(name_item)
 
+        food_chk = QCheckBox()
+        food_chk.setChecked(food)
+        food_cell = QWidget()
+        fl = QHBoxLayout(food_cell)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.setAlignment(Qt.AlignCenter)
+        fl.addWidget(food_chk)
+        self.table.setCellWidget(r, self.FOOD_COL, food_cell)
+
         listen_chk = QCheckBox()
         listen_chk.setChecked(listen)
         listen_chk.toggled.connect(
@@ -3495,13 +3579,13 @@ class WebexRoomsWidget(QWidget):
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setAlignment(Qt.AlignCenter)
         ll.addWidget(listen_chk)
-        self.table.setCellWidget(r, 3, listen_cell)
+        self.table.setCellWidget(r, self.LISTEN_COL, listen_cell)
 
     def _on_listen_toggled(self, cb: QCheckBox, checked: bool):
         if not checked:
             return
         for r in range(self.table.rowCount()):
-            cell = self.table.cellWidget(r, 3)
+            cell = self.table.cellWidget(r, self.LISTEN_COL)
             other = cell.findChild(QCheckBox) if cell else None
             if other is not None and other is not cb and other.isChecked():
                 other.setChecked(False)
@@ -3514,7 +3598,8 @@ class WebexRoomsWidget(QWidget):
         self.table.setRowCount(0)
         for r in rooms:
             self._add_row(r.get("name", ""), r.get("room_id", ""),
-                          bool(r.get("enabled", True)), bool(r.get("listen", False)))
+                          bool(r.get("enabled", True)), bool(r.get("listen", False)),
+                          food=bool(r.get("food", True)))
 
     def rows(self) -> list[dict]:
         out = []
@@ -3527,12 +3612,15 @@ class WebexRoomsWidget(QWidget):
                 continue
             name_item = self.table.item(r, 1)
             name = (name_item.text().strip() if name_item else "") or room_id
-            listen_cell = self.table.cellWidget(r, 3)
+            listen_cell = self.table.cellWidget(r, self.LISTEN_COL)
             listen_chk = listen_cell.findChild(QCheckBox) if listen_cell else None
+            food_cell = self.table.cellWidget(r, self.FOOD_COL)
+            food_chk = food_cell.findChild(QCheckBox) if food_cell else None
             out.append({
                 "name": name, "room_id": room_id,
                 "enabled": on_chk.isChecked() if on_chk else True,
                 "listen": listen_chk.isChecked() if listen_chk else False,
+                "food": food_chk.isChecked() if food_chk else True,
             })
         return out
 
@@ -3541,6 +3629,11 @@ class WebexRoomsWidget(QWidget):
 
     def listen_room_id(self) -> str:
         return next((r["room_id"] for r in self.rows() if r["listen"]), "")
+
+
+class _TestSendSignals(QObject):
+    """Result of a Settings "Send test" button, sent back from its worker."""
+    done = Signal(object)
 
 
 class _OkbaseSignInSignals(QObject):
@@ -3977,6 +4070,31 @@ class SettingsDialog(QDialog):
             "day. One tiny request each time. Range 1-120 min.")
         self.okbase_keep.setValue(int(s.get("okbase_keepalive_min", 10)))
         ff.addRow("Keep sign-in alive (min)", self.okbase_keep)
+        remind_row = QWidget()
+        rr = QHBoxLayout(remind_row)
+        rr.setContentsMargins(0, 0, 0, 0)
+        self.okbase_remind = QCheckBox("On working days from")
+        self.okbase_remind.setToolTip(
+            "Once a day: if today has a menu, ordering is still open and you "
+            "have nothing ordered, the bot posts a message in the listen room "
+            "that mentions you. Nothing on days without a menu or once "
+            "ordering has closed.")
+        self.okbase_remind.setChecked(bool(s.get("okbase_remind_enabled", True)))
+        rr.addWidget(self.okbase_remind)
+        self.okbase_remind_hour = _NoWheelSpinBox()
+        self.okbase_remind_hour.setRange(0, 23)
+        self.okbase_remind_hour.setSuffix(":00")
+        self.okbase_remind_hour.setValue(int(s.get(
+            "okbase_remind_hour", okbase_menu.REMIND_HOUR_DEFAULT)))
+        rr.addWidget(self.okbase_remind_hour)
+        rr.addStretch(1)
+        ff.addRow("Lunch not ordered", remind_row)
+        self.okbase_remind_email = QLineEdit(s.get("okbase_remind_email", ""))
+        self.okbase_remind_email.setPlaceholderText("same as Work account")
+        self.okbase_remind_email.setToolTip(
+            "The Webex address the reminder mentions. Empty = the Work account "
+            "above.")
+        ff.addRow("Mention", self.okbase_remind_email)
         self.okbase_url = QLineEdit(s.get("okbase_base_url", ""))
         self.okbase_url.setPlaceholderText(okbase_menu.BASE_DEFAULT)
         self.okbase_url.setToolTip(
@@ -4351,11 +4469,44 @@ class SettingsDialog(QDialog):
             self.test_status.setText(f"✗ {name} failed: {err}")
             self.test_status.setStyleSheet(f"color:{DANGER};")
 
+    def _run_test(self, client, name: str):
+        """Send a channel test on a worker thread.
+
+        It used to run here on the UI thread, where an unreachable server held
+        the whole dialog for the full timeout (10 s and more for SMTP)."""
+        btn = self.sender()
+        btn = btn if isinstance(btn, QPushButton) else None
+        if btn is not None:
+            btn.setEnabled(False)
+        self.test_status.setText(f"Sending {name} test…")
+        self.test_status.setStyleSheet("color:#333;")
+        sig = _TestSendSignals(self)
+        sig.done.connect(lambda res, b=btn: self._on_test_done(res, name, b))
+
+        def job():
+            try:
+                ok, err = bool(client.send_test()), client.last_error
+            except Exception as e:  # noqa: BLE001
+                ok, err = False, str(e)
+            try:
+                sig.done.emit((ok, err))
+            except RuntimeError:
+                pass                # the dialog was closed meanwhile
+
+        threading.Thread(target=job, daemon=True,
+                         name=f"test-{name.lower()}").start()
+
+    def _on_test_done(self, result, name: str, btn):
+        ok, err = result
+        if btn is not None:
+            btn.setEnabled(True)
+        self._show_test(ok, name, err)
+
     def _test_teams(self):
         from alerting import TeamsClient
         c = TeamsClient(self.webhook.text().strip(),
                         float(self._win.settings["http_timeout_s"]))
-        self._show_test(c.send_test(), "Teams", c.last_error)
+        self._run_test(c, "Teams")
 
     def _test_email(self):
         from alerting import EmailNotifier
@@ -4366,7 +4517,7 @@ class SettingsDialog(QDialog):
             from_addr=self.email_from.text().strip(),
             recipients=self.email_contacts.enabled_addresses(),
             timeout=float(self._win.settings["http_timeout_s"]))
-        self._show_test(c.send_test(), "Email", c.last_error)
+        self._run_test(c, "Email")
 
     def _test_webex(self):
         from alerting import WebexNotifier
@@ -4377,7 +4528,7 @@ class SettingsDialog(QDialog):
             room_ids=self.webex_rooms.enabled_room_ids(),
             listen_room_id=self.webex_rooms.listen_room_id(),
             timeout=float(self._win.settings["http_timeout_s"]))
-        self._show_test(c.send_test(), "Webex", c.last_error)
+        self._run_test(c, "Webex")
 
     # --- canteen sign-in ----------------------------------------------
     def _okbase_trial(self) -> dict:
@@ -4696,6 +4847,9 @@ class SettingsDialog(QDialog):
                 self.okbase_cookie.text().strip()),
             "okbase_refresh_hour": self.okbase_hour.value(),
             "okbase_keepalive_min": self.okbase_keep.value(),
+            "okbase_remind_enabled": self.okbase_remind.isChecked(),
+            "okbase_remind_hour": self.okbase_remind_hour.value(),
+            "okbase_remind_email": self.okbase_remind_email.text().strip(),
         }
         # What a pasted cURL brought with it: who the person is, which canteen,
         # and the one request body the portal accepts. Only written when a paste
@@ -5508,9 +5662,25 @@ class GraphPanel(QWidget):
                          "graph can be zoomed or panned further back.")
         older.triggered.connect(lambda: self._win.extend_backfill())
 
+    def _apply_grid(self):
+        # grid(False, alpha=…) switches the grid ON (matplotlib treats line
+        # properties as a request for a grid), so "off" must carry none.
+        if self._grid_on:
+            self.ax.grid(True, alpha=0.3)
+        else:
+            self.ax.grid(False)
+
     def _set_grid_on(self, on: bool):
+        """Grid lines change nothing else, so they are switched on the drawn
+        figure instead of rebuilding it."""
         self._grid_on = on
-        self.redraw()
+        if self._plot_sig is None:
+            self.redraw()
+            return
+        self._apply_grid()
+        self._plot_sig = self._layout_sig()
+        self._blit_bg = None
+        self.canvas.draw_idle()
 
     # --- legend placement -------------------------------------------------
 
@@ -6007,7 +6177,7 @@ class GraphPanel(QWidget):
             handles += h
             labels += l
         self._legend = self._draw_legend(handles, labels)
-        self.ax.grid(self._grid_on, alpha=0.3)
+        self._apply_grid()
         # _series hands over plain floats now, so matplotlib no longer infers
         # a date axis from the data and would label the ticks as bare numbers.
         # _ns_to_num is anchored on the same epoch date2num uses, so saying so
@@ -6128,14 +6298,22 @@ class GraphPanel(QWidget):
             return
         snap = []
         by_name = {p.name: p for p in self._win.pvs}
-        for name, label, color, line in self._curve_rows:
+        prev = self._snap_series
+        changed = len(prev) != len(self._curve_rows)
+        for i, (name, label, color, line) in enumerate(self._curve_rows):
             pv = by_name.get(name)
             xs, ys = self._series(pv) if pv is not None else (_EMPTY_V, _EMPTY_V)
             if xs.size == 0:
                 self.redraw()      # curve lost its data: shape changed after all
                 return
-            line.set_data(xs, ys)
+            # _series hands back the very same arrays while a PV's history is
+            # unchanged, so identity says whether this curve has anything new.
+            if changed or prev[i][0] is not xs or prev[i][1] is not ys:
+                changed = True
+                line.set_data(xs, ys)
             snap.append((xs, ys, color, label))
+        if not changed:
+            return                 # no new samples: the picture is already right
         # The cursor value box reads this cache, and its text artists are keyed
         # by position in it — same curves in the same order, so they still fit.
         self._snap_series = snap
@@ -6590,6 +6768,8 @@ def _menu_job(sig: _MenuSignals, settings: dict, mode: str):
         "load"   read the saved copy from disk (no portal, no credentials)
         "fetch"  sign in and read the portal, then write the copy
         "ping"   touch the portal so a borrowed session does not idle out
+        "remind" read this week live and decide the morning lunch reminder;
+                 the verdict comes back as {"lunch": verdict} in the cache slot
 
     A plain daemon thread rather than the thread pool, on purpose: this both
     talks to the portal and writes the scratch share, and QThreadPool waits for
@@ -6604,6 +6784,11 @@ def _menu_job(sig: _MenuSignals, settings: dict, mode: str):
             cookies = out.get("cookies", "")
         elif mode == "ping":
             cookies, err = okbase_menu.keepalive(settings)
+        elif mode == "remind":
+            out = {}
+            verdict, err = okbase_menu.check_lunch_today(settings, session_out=out)
+            cookies = out.get("cookies", "")
+            cache = {"lunch": verdict} if verdict else {}
         else:
             cache = okbase_menu.load_cache(settings)
     except Exception as e:  # noqa: BLE001 - must never reach the UI thread
@@ -6658,6 +6843,9 @@ class MonitorWidget(QWidget):
         self._shared_timer = QTimer(self)
         self._shared_timer.setSingleShot(True)
         self._shared_timer.timeout.connect(self._flush_shared_write)
+        self._local_timer = QTimer(self)
+        self._local_timer.setSingleShot(True)
+        self._local_timer.timeout.connect(self._flush_local_write)
         self._shared_sig = _SharedWriteSignals()
         self._shared_sig.done.connect(self._on_shared_write_done)
 
@@ -6752,6 +6940,9 @@ class MonitorWidget(QWidget):
         self._menu_busy = False
         self._menu_started: Optional[datetime] = None   # when the running job began
         self._menu_refreshed_day = ""    # ISO date of the last successful fetch
+        # Day the lunch reminder was decided — a backstop for okbase.json, so a
+        # failed write cannot turn into a message every ten minutes.
+        self._lunch_checked_day = ""
         self._menu_error = ""            # why the last attempt failed, for the chat
         self._menu_reply_pending = False  # a /food is waiting for the read
         self._menu_reply_args = ""
@@ -7088,13 +7279,26 @@ class MonitorWidget(QWidget):
         self._update_status()
 
     def persist(self):
-        """Save locally (always, instant) and publish to the share (debounced)."""
+        """Save locally (debounced briefly) and publish to the share
+        (debounced longer)."""
+        timer = getattr(self, "_local_timer", None)
+        if timer is None:
+            self._flush_local_write()
+        else:
+            timer.start(LOCAL_WRITE_DEBOUNCE_MS)
+        self._schedule_shared_write()
+
+    def _flush_local_write(self):
+        """Write the local config now (the snapshot is taken here, so the
+        newest state always wins)."""
+        timer = getattr(self, "_local_timer", None)
+        if timer is not None:
+            timer.stop()
         save_config({
             "version": 1,
             "settings": self.settings,
             "pvs": [pv.to_dict() for pv in self.pvs],
         })
-        self._schedule_shared_write()
 
     # --- shared PV list publishing --------------------------------------
     def _schedule_shared_write(self):
@@ -7157,6 +7361,7 @@ class MonitorWidget(QWidget):
             self._mem_timer.stop()
         self._stop_cmd_listener()
         self.persist()
+        self._flush_local_write()       # the debounced local save, now
         self._shared_timer.stop()       # don't let the debounce race the close
         self._flush_shared_write(blocking=True)
 
@@ -7182,24 +7387,54 @@ class MonitorWidget(QWidget):
         for r, (kind, ref) in enumerate(self.model._display):
             if kind != "pv" or not (ref.gate_pvs and ref.profiles):
                 continue
-            pv = ref
-            rt = self.runtime.get(pv.name)
-            if rt is not None and rt.dep_view is not None and not (
-                    -1 <= rt.dep_view < len(pv.profiles)):
-                rt.dep_view = None    # rules changed under a stale pin
-            combo = _NoWheelComboBox()
-            combo.addItem("")         # 'Automatic (…)' — text kept fresh below
-            combo.addItem("Global")
-            for i, prof in enumerate(pv.profiles):
-                combo.addItem(_profile_item_text(pv, i, prof))
-            view = rt.dep_view if rt is not None else None
-            combo.setCurrentIndex(
-                0 if view is None else (1 if view == -1 else view + 2))
-            combo.currentIndexChanged.connect(
-                lambda idx, name=pv.name: self._on_dep_combo_changed(name, idx))
-            self.table.setIndexWidget(self.model.index(r, DEP_COL), combo)
-            self._dep_combos[pv.name] = combo
+            self._make_dep_combo(ref, r)
         self._refresh_dep_combos()
+        self._fit_dep_column()
+
+    def _make_dep_combo(self, pv: PVConfig, row: int):
+        """Build one PV's rule dropdown and put it in its table cell."""
+        rt = self.runtime.get(pv.name)
+        if rt is not None and rt.dep_view is not None and not (
+                -1 <= rt.dep_view < len(pv.profiles)):
+            rt.dep_view = None    # rules changed under a stale pin
+        combo = _NoWheelComboBox()
+        combo.addItem("")         # 'Automatic (…)' — text kept fresh below
+        combo.addItem("Global")
+        for i, prof in enumerate(pv.profiles):
+            combo.addItem(_profile_item_text(pv, i, prof))
+        view = rt.dep_view if rt is not None else None
+        combo.setCurrentIndex(
+            0 if view is None else (1 if view == -1 else view + 2))
+        combo.setToolTip(
+            "Threshold set in force for this PV.\n"
+            "Automatic — the first rule whose dependency conditions match "
+            "wins; otherwise the Global limits.\n"
+            "Pick a rule to pin its limits unconditionally, or pick "
+            "Global to force the global limits. Your choice sticks until "
+            "you change it.")
+        combo.currentIndexChanged.connect(
+            lambda idx, name=pv.name: self._on_dep_combo_changed(name, idx))
+        self.table.setIndexWidget(self.model.index(row, DEP_COL), combo)
+        self._dep_combos[pv.name] = combo
+        return combo
+
+    def _rebuild_dep_combo(self, pv: PVConfig):
+        """Re-create (or remove) just this PV's rule dropdown after its rules
+        were edited — the other rows keep theirs."""
+        row = next((r for r, (kind, ref) in enumerate(self.model._display)
+                    if kind == "pv" and ref is pv), None)
+        old = self._dep_combos.pop(pv.name, None)
+        if row is None:
+            return
+        idx = self.model.index(row, DEP_COL)
+        if old is not None:
+            self.table.setIndexWidget(idx, None)   # deletes the old widget
+        if pv.gate_pvs and pv.profiles:
+            self._make_dep_combo(pv, row)
+            self._refresh_dep_combos([pv])
+        self._fit_dep_column()
+
+    def _fit_dep_column(self):
         # Width: widest dropdown, but never narrower than the plain-text rows
         # (PVs with a dependency PV but no rules still render text there).
         w = max([c.sizeHint().width() for c in self._dep_combos.values()]
@@ -7222,30 +7457,28 @@ class MonitorWidget(QWidget):
         return ((active.get("label") or "").strip()
                 or _profile_rule_text(pv, active) or "rule")
 
-    def _refresh_dep_combos(self):
-        """Keep every dropdown's 'Automatic (…)' text and styling in sync with
+    def _refresh_dep_combos(self, pvs=None):
+        """Keep the dropdowns' 'Automatic (…)' text and styling in sync with
         the rule currently in force (called after each poll and on pin
-        changes)."""
-        for pv in self.pvs:
+        changes). Only what actually changed is touched: a stylesheet set on
+        every poll restyled every dropdown in the table for nothing."""
+        for pv in (self.pvs if pvs is None else pvs):
             combo = self._dep_combos.get(pv.name)
             if combo is None:
                 continue
             rt = self.runtime.get(pv.name)
-            combo.setItemText(
-                0, f"Automatic ({self._active_limits_label(pv, rt)})")
+            text = f"Automatic ({self._active_limits_label(pv, rt)})"
+            if combo.itemText(0) != text:
+                combo.setItemText(0, text)
             view = rt.dep_view if rt is not None else None
             pinned = view is not None
+            if combo.property("_dep_pinned") is pinned:
+                continue
+            combo.setProperty("_dep_pinned", pinned)
             color = " color:#0D47A1;" if pinned else ""
             weight = " font-weight:600;" if pinned else ""
             combo.setStyleSheet(
                 "QComboBox { padding:1px 6px;" + color + weight + " }")
-            combo.setToolTip(
-                "Threshold set in force for this PV.\n"
-                "Automatic — the first rule whose dependency conditions match "
-                "wins; otherwise the Global limits.\n"
-                "Pick a rule to pin its limits unconditionally, or pick "
-                "Global to force the global limits. Your choice sticks until "
-                "you change it.")
 
     def _on_dep_combo_changed(self, name: str, idx: int):
         rt = self.runtime.get(name)
@@ -7253,9 +7486,10 @@ class MonitorWidget(QWidget):
         if rt is None or pv is None:
             return
         rt.dep_view = None if idx == 0 else (-1 if idx == 1 else idx - 2)
-        rt.active_profile = self._match_profile(pv)
-        self._refresh_dep_combos()
-        self.model.refresh_all()
+        self._reevaluate_pv(pv, rt)   # State shows the pinned limits at once
+        self._refresh_dep_combos([pv])
+        self.model.refresh_pv(pv)
+        self.graph.refresh_data()
         if rt.dep_view is None:
             self._log(f"{pv.display_name}: limits follow the active rule "
                       "(Default).")
@@ -7458,11 +7692,17 @@ class MonitorWidget(QWidget):
         if not pv:
             QMessageBox.information(self, "Edit PV", "Select a PV first.")
             return
+        before = (pv.name, pv.display_name, pv.group, pv.subgroup)
         dlg = PVEditDialog(self, pv)
         if dlg.exec() == QDialog.Accepted:
-            self._recluster()
-            self.model.reset()
-            self.graph.refresh_combo()
+            if (pv.name, pv.display_name, pv.group, pv.subgroup) != before:
+                # Its place in the table or its name changed: rebuild the rows.
+                self._recluster()
+                self.model.reset()
+                self.graph.refresh_combo()
+                self.graph.refresh_data()
+            else:
+                self._apply_pv_edit(pv)   # same row: update it in place
             self.persist()
             self._log(f"Updated {pv.display_name}.")
 
@@ -7493,12 +7733,13 @@ class MonitorWidget(QWidget):
         """Popup limits editor (default set + conditional rules) for one PV.
 
         Same underlying data as the full PV editor, so edits made here also show
-        up there. Dependency/rule changes take effect on the next poll."""
+        up there. The new limits are judged against the current reading at
+        once; a new dependency PV's value arrives with the next poll."""
         if pv is None:
             return
         dlg = ThresholdsPopup(self, pv)
         if dlg.exec() == QDialog.Accepted:
-            self.model.reset()
+            self._apply_pv_edit(pv)
             self.persist()
             self._log(f"Updated limits for {pv.display_name}.")
 
@@ -8125,6 +8366,43 @@ class MonitorWidget(QWidget):
                           f"poll pass was skipped. Use 'Load older data from "
                           f"archive' to fill it in.")
 
+    def _reevaluate_pv(self, pv: PVConfig, rt: Optional[PVRuntime] = None,
+                       now: Optional[int] = None):
+        """Work out which limits are in force for ``pv`` and how its current
+        reading sits against them; returns those limits.
+
+        The poll runs this for every PV. An edit runs it straight away for the
+        one PV it touched, so the State column shows the new verdict at once
+        instead of up to a poll interval later. Never raises an alert itself."""
+        if rt is None:
+            rt = self.runtime.get(pv.name)
+            if rt is None:
+                return pv.thresholds()
+        if now is None:
+            now = api.now_ns()
+        val = rt.current_value
+        rt.active_profile = self._match_profile(pv)
+        thr = (pv.profile_thresholds(rt.active_profile)
+               if rt.active_profile is not None else pv.thresholds())
+        # A different threshold set than last pass? Hold alerting for a
+        # while — the value cannot be in the new band yet.
+        self._check_limits_change(pv, rt, now)
+        # Plain severity of this reading, kept up to date even while
+        # monitoring is off so the State column stays truthful.
+        rt.live_level = (_raw_severity(val, thr)
+                         if val is not None and thr.is_active() else
+                         AlertLevel.OK if val is not None else None)
+        return thr
+
+    def _apply_pv_edit(self, pv: PVConfig):
+        """Show an edit of one PV's settings at once, touching only that PV:
+        its verdict, its table row, its rule dropdown and the graph lines."""
+        self._reevaluate_pv(pv)
+        self._rebuild_dep_combo(pv)
+        self.model.refresh_pv(pv)
+        self._update_status()
+        self.graph.refresh_data()
+
     def _on_poll(self, results: dict):
         now = api.now_ns()
         # A pass came back: this is the one place that proves the program is
@@ -8162,17 +8440,7 @@ class MonitorWidget(QWidget):
             # Before any threshold work: decide whether this reading is still
             # live at all, so an alert raised below can say if it is not.
             self._update_frozen(pv, rt, now)
-            rt.active_profile = self._match_profile(pv)
-            thr = (pv.profile_thresholds(rt.active_profile)
-                   if rt.active_profile is not None else pv.thresholds())
-            # A different threshold set than last pass? Hold alerting for a
-            # while — the value cannot be in the new band yet.
-            self._check_limits_change(pv, rt, now)
-            # Plain severity of this reading, kept up to date even while
-            # monitoring is off so the State column stays truthful.
-            rt.live_level = (_raw_severity(val, thr)
-                             if val is not None and thr.is_active() else
-                             AlertLevel.OK if val is not None else None)
+            thr = self._reevaluate_pv(pv, rt, now)
             if not self._monitoring:
                 continue
             if pv.enabled and thr.is_active() and not rt.in_grace(now):
@@ -8768,7 +9036,12 @@ class MonitorWidget(QWidget):
         due = (now.date().isoformat() != self._menu_refreshed_day
                and now.hour >= int(self.settings.get("okbase_refresh_hour", 6) or 0))
         # A fetch is a keepalive too — it is a request on the same session — so
-        # the two never both run on one tick.
+        # the two never both run on one tick. The lunch reminder goes first: it
+        # is the one with a deadline, and the menu fetch takes the next tick.
+        if (self._lunch_checked_day != now.date().isoformat()
+                and okbase_menu.lunch_reminder_due(self.settings, now)):
+            self._start_menu_job("remind")
+            return
         self._start_menu_job("fetch" if due else "ping")
 
     def _start_menu_job(self, mode: str):
@@ -8835,6 +9108,9 @@ class MonitorWidget(QWidget):
         mode, cache, cookies, err = result
         was_refresh = mode == "fetch"
         self._remember_session(cookies)
+        if mode == "remind":
+            self._on_lunch_verdict((cache or {}).get("lunch", ""), err)
+            cache = {}
         if cache:
             self._menu_cache = cache
             if was_refresh:
@@ -8850,7 +9126,7 @@ class MonitorWidget(QWidget):
         elif mode == "load":
             self._log("Canteen menu: nothing saved yet.")
 
-        if mode in ("fetch", "ping"):
+        if mode in ("fetch", "ping", "remind"):
             # What the last contact with the portal did, so /food status and the
             # Settings dialog can both say it rather than guessing.
             self._menu_error = err
@@ -8888,6 +9164,25 @@ class MonitorWidget(QWidget):
             suffix = self._menu_reply_suffix
             self._menu_reply_suffix = ""
             self._reply(self._food_reply(self._menu_reply_args) + suffix)
+
+    def _on_lunch_verdict(self, verdict: str, err: str):
+        """Post the morning reminder if today has nothing ordered.
+
+        A failed read decides nothing: the day is not marked, so the next tick
+        asks again.
+        """
+        if not verdict:
+            self._log(f"Canteen menu: could not check today's order — {err}")
+            return
+        now = datetime.now()
+        self._lunch_checked_day = now.date().isoformat()
+        problem = okbase_menu.mark_lunch_reminded(now)
+        if problem:
+            self._log(f"Canteen menu: could not record the lunch check — {problem}")
+        if verdict == okbase_menu.REMIND_SEND:
+            self._reply(okbase_menu.lunch_reminder_text(self.settings, now))
+        else:
+            self._log(f"Canteen menu: lunch check for today — {verdict}.")
 
     def _food_status(self) -> str:
         """What the canteen menu is doing, what worked and what did not."""
@@ -9470,7 +9765,10 @@ class MonitorWidget(QWidget):
             elif cmd == "/plot":
                 self._cmd_plot(pc)
             elif cmd in ("/food", "/menu", "/lunch"):
-                self._cmd_food(pc, email)
+                if okbase_menu.food_in_listen_room(self.settings):
+                    self._cmd_food(pc, email)
+                else:
+                    self._reply(okbase_menu.FOOD_OFF_HERE)
             elif cmd == "/datawatchdog":
                 if args and args[0].lower() in ("on", "off"):
                     enabled = args[0].lower() == "on"
@@ -9953,9 +10251,10 @@ class MonitorWidget(QWidget):
         in okbase_menu, and is handed over rather than written twice.
         """
         asked = topic.strip().lstrip("/").split(";")[0].strip()
+        food = okbase_menu.food_in_listen_room(self.settings)
         if bot_commands.help_topic(asked) == "" \
                 and asked.split()[0].lower() in ("food", "menu", "lunch"):
-            return okbase_menu.FOOD_HELP
+            return okbase_menu.FOOD_HELP if food else okbase_menu.FOOD_OFF_HERE
         # Tagging is not a command, so its page cannot be a constant: it has to
         # carry the bot's real name to be worth anything.
         if bot_commands.is_mention_topic(asked):
@@ -9965,8 +10264,9 @@ class MonitorWidget(QWidget):
         if body:
             return body
         topics = ", ".join(f"`{t}`" for t in bot_commands.help_topics())
+        topics += ", `food`" if food else ""
         return (f"I have no separate page for '{asked}'. Try `/help <command>` "
-                f"with one of: {topics}, `food`, `mention`.\n\nOr `/help` on "
+                f"with one of: {topics}, `mention`.\n\nOr `/help` on "
                 f"its own for the whole list of commands.")
 
     def _cmd_help(self) -> str:
@@ -9980,6 +10280,13 @@ class MonitorWidget(QWidget):
         <command>` pages, which is what those pages are for; the lunch-ordering
         section lives on `/help food`, under okbase_menu.FOOD_HELP.
         """
+        # A room with the canteen switched off (Settings → Webex rooms, "/food")
+        # hears nothing about it, not even that it exists.
+        food = okbase_menu.food_in_listen_room(self.settings)
+        food_line = (
+            "- `/food [today|tomorrow|week|friday|27.8.]` — the canteen menu, "
+            "answered even when the app is closed; ordering lunch is "
+            "`/help food`\n") if food else ""
         # The mention rule goes first, and with the bot's real name in it when the
         # listener has already asked Webex for it.
         return (
@@ -10010,14 +10317,12 @@ class MonitorWidget(QWidget):
             "the live graph in the app's own window, not a picture in the "
             "chat; `/graph` takes a single PV\n"
             "- `/run` — start the app when it is closed\n"
-            "- `/food [today|tomorrow|week|friday|27.8.]` — the canteen menu, "
-            "answered even when the app is closed; ordering lunch is "
-            "`/help food`\n"
+            + food_line +
             "\n"
             "**`/help <command>`** is the long version — the examples and what "
             "to watch out for. Pages: "
             + ", ".join(f"`{t}`" for t in bot_commands.help_topics())
-            + ", `food`, `mention`.")
+            + (", `food`" if food else "") + ", `mention`.")
 
     def _status_line(self, p: PVConfig) -> str:
         rt = self.runtime.get(p.name)
@@ -10120,6 +10425,8 @@ class MonitorWidget(QWidget):
         portal that merely did not answer says nothing.
         """
         if not self.settings.get("okbase_enabled"):
+            return ""
+        if not okbase_menu.food_in_listen_room(self.settings):
             return ""
         if not okbase_menu.is_expired(getattr(self, "_menu_error", "")):
             return ""

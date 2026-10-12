@@ -399,7 +399,15 @@ class AlarmWindow(QWidget):
             speed = max(0.25, min(4.0, DEFAULT_INTERVAL_S / interval)) \
                 if interval > 0 else 1.0
             self._phase += GRADIENT_STEP * speed * (_TICK_MS / GRADIENT_INTERVAL_MS)
-            changed = True
+            # Drawn at the rainbow's own rate, not at every 20 ms tick: each
+            # frame converts a window-sized picture and Windows re-composes
+            # the whole translucent window, and 50 a second of that was most
+            # of the program's thread for as long as the alarm was up.
+            now = time.monotonic()
+            if changed or now - getattr(self, "_drawn_at", 0.0) \
+                    >= GRADIENT_INTERVAL_MS / 1000.0:
+                self._drawn_at = now
+                changed = True
         elif cycle == "rainbow_blink" and lit and changed:
             self._blink_hue = (self._blink_hue + RAINBOW_BLINK_STEP_DEG) % 360.0
             changed = True
@@ -825,13 +833,18 @@ class _BadgeStrip(QWidget):
         it, about ninety thousand times in a couple of hours.
         """
         badges = list(badges)
-        if badges == getattr(self, "_said", None):
+        # "Unchanged" also means "still on screen": the circle hides the strip
+        # when watching stops, and the same sentences on the next start must
+        # bring it back rather than be taken as already shown.
+        if badges == getattr(self, "_said", None) \
+                and self.isVisible() == bool(badges):
             return
         self._said = list(badges)
         while len(self._labels) < len(badges):
             lbl = QLabel(self)
             lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
             lbl.setWordWrap(False)
+            lbl.setProperty("badgeLook", None)
             self._labels.append(lbl)
             self._lay.addWidget(lbl)
         for i, lbl in enumerate(self._labels):
@@ -842,22 +855,29 @@ class _BadgeStrip(QWidget):
                 if state == C.STATE_TRIP:
                     ground, ink = "#cc2200", "#ffffff"
                 lbl.setText(f"  {text}  ")
-                lbl.setStyleSheet(
-                    f"QLabel {{ background: {ground}; color: {ink};"
-                    f" border: 1px solid {ink}; border-radius: 3px;"
-                    f" padding: 3px 6px; }}")
-                lbl.show()
-            else:
+                # The sentence carries the live number, so it differs on almost
+                # every pass; the colours do not. A stylesheet is re-parsed only
+                # when the label's colours really change.
+                look = f"{ground}|{ink}"
+                if lbl.property("badgeLook") != look:
+                    lbl.setProperty("badgeLook", look)
+                    lbl.setStyleSheet(
+                        f"QLabel {{ background: {ground}; color: {ink};"
+                        f" border: 1px solid {ink}; border-radius: 3px;"
+                        f" padding: 3px 6px; }}")
+                if lbl.isHidden():
+                    lbl.show()
+            elif not lbl.isHidden():
                 lbl.hide()
         if badges:
             self.adjustSize()
             # Only when it is not already up: `show()` + `raise_()` on a
             # topmost window is a SetWindowPos every time, and it was being
-            # asked for twice a second with nothing to change.
+            # asked for on every pass with nothing to change.
             if not self.isVisible():
                 self.show()
-            self.raise_()
-        else:
+                self.raise_()
+        elif self.isVisible():
             self.hide()
 
 
@@ -938,29 +958,50 @@ class HudWindow(QWidget):
         self.setMask(QRegion(1, 1, self._D + 4, self._D + 4,
                              QRegion.RegionType.Ellipse))
 
+    def is_placing(self):
+        return self._placing
+
     def set_colour(self, name):
+        # While it is being placed the circle is green and alone; the watch's
+        # own colour and the windows beside it come back with the real thing.
+        if self._placing:
+            return
         self._light.set_colour(name)
 
     def set_badges(self, badges):
+        if self._placing:
+            return
+        was_up, was_size = self._badges.isVisible(), self._badges.size()
         self._badges.set_badges(badges)
-        self._place_badges()
+        # Placed again only when it appeared or changed size — not on every
+        # pass, each of which asked Windows for the screens again.
+        if self._badges.isVisible() and (not was_up
+                                         or self._badges.size() != was_size):
+            self._place_badges()
 
     def set_no_data(self, on):
         """Put the red exclamation mark beside the circle, or take it away.
 
         Nothing is written next to it. It says one thing — the readings have
         stopped arriving — and the log holds the details.
+
+        Does nothing when nothing changed: this is called on every pass, and it
+        used to re-place the mark and `raise_()` it — a topmost window — each
+        time, as if it were appearing for the first time.
         """
+        if self._placing:
+            return
         if not on:
-            if self._no_data is not None:
+            if self._mark_visible():
                 self._no_data.hide()
-            self._place_badges()
+                self._place_badges()
+            return
+        if self._mark_visible():
             return
         if self._no_data is None:
             self._no_data = _NoDataMark()
         self._place_mark()
-        if not self._no_data.isVisible():
-            self._no_data.show()
+        self._no_data.show()
         self._no_data.raise_()
         self._place_badges()
 
@@ -1060,7 +1101,7 @@ class HudWindow(QWidget):
         self._placing_from = [self.x(), self.y()]
         self._badges.hide()
         self._hide_mark()
-        self.set_colour("green")
+        self._light.set_colour("green")     # `set_colour` is shut while placing
         self.show_panel()
         self.setToolTip(self._PLACING_TIP)
         # Windows only obeys a move request from the window in front, so the

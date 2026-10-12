@@ -90,7 +90,7 @@ def _fake_samples(channel, a_ns, b_ns, timeout=None, count=None, **kw):
     return out
 
 
-def _fake_last_before(channel, before_ns, timeout=None, cancel_fn=None):
+def _fake_last_before(channel, before_ns, timeout=None, cancel_fn=None, **kw):
     if channel == PV_SLOW:
         return {"time": int(before_ns) - 5 * 86400 * _NS, "value": 12.5,
                 "metaData": {"units": "J"}}
@@ -99,7 +99,7 @@ def _fake_last_before(channel, before_ns, timeout=None, cancel_fn=None):
 
 
 def _fake_last_before_many(channels, before_ns, timeout=None, max_workers=8,
-                           progress_fn=None, cancel_fn=None):
+                           progress_fn=None, cancel_fn=None, **kw):
     out = {}
     for ch in channels:
         s = _fake_last_before(ch, before_ns)
@@ -298,8 +298,12 @@ def test_export_writes_every_shot():
            "basis": [PV_SHOT], "source": "archive",
            "conditions": False, "comma": False}
     w._export_from_archive(path, cfg)
-    ok = _pump_until(lambda: not w._export_prog.isVisible(), 120)
+    # The result is written into the progress window (no message box later).
+    ok = _pump_until(lambda: getattr(w._export_prog, "_finished", False), 120)
     check("the export finished", ok)
+    check("its window says so instead of a new box",
+          w._export_prog.labelText().startswith("Finished"),
+          w._export_prog.labelText())
 
     with open(path, newline="", encoding="utf-8-sig") as f:
         first = f.readline()
@@ -340,7 +344,7 @@ def test_export_multiple_slices_has_no_seam_duplicates():
     cfg = {"channels": [PV_SHOT], "basis": [PV_SHOT], "source": "archive",
            "conditions": False, "comma": False}
     w._export_from_archive(path, cfg)
-    ok = _pump_until(lambda: not w._export_prog.isVisible(), 600)
+    ok = _pump_until(lambda: getattr(w._export_prog, "_finished", False), 600)
     check("the multi-slice export finished", ok)
     with open(path, newline="", encoding="utf-8-sig") as f:
         f.readline()

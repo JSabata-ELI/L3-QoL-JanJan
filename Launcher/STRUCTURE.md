@@ -47,13 +47,14 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 ### Program groups
 | Constant | Programs |
 |----------|----------|
-| `SCRIPTS` | Image Tools, Screenshots, Time Converter, Announcer, CSS Logger, Chiller log |
+| `SCRIPTS` | Image Tools, Screenshots, Announcer, CSS Logger, Chiller log |
 | `PARTS` | Launcher |
 | `IN_PROGRESS` | Calibrations |
 | `NOT_WORKING_CORRECTLY` | Counter of Shots |
 | `PERSONAL` | Copy Manager, Builder, Internal Builder, Dev Tools, Git Work |
 | *(everything else)* | External |
 | `SUBSUMED` | **not shown at all** — Image Finder, Image Slider, Shot finder (Image Tools), Spectra (CSS Logger), Builder, Copy manager (Dev Tools) |
+| `RETIRED` | **not shown at all** — Time Converter (retired, nothing replaces it) |
 
 `SUBSUMED` is not a group: `scan_programs()` skips those folders before a card is
 ever built. Each of them became a tab of a bigger program, so the folder left on
@@ -80,8 +81,10 @@ user move a program to another group (or reset it) and the choice is persisted.
 | `pick_exe(exes, program_name, ver_folder)` | Picks the right exe out of a folder |
 | `_build_version_list(exes, program_dir)` | Dropdown content: current exes (newest first) + `scan_archive_versions()` |
 | `scan_archive_versions(program_dir)` | Archived versions from `archive/` |
-| `find_readme_or_none(program_dir, name)` | Case/separator-insensitive ReadMe lookup (`README_PREFIX`) — the **short** doc |
-| `find_readme_full_or_none(program_dir, name)` | The **detailed** companion doc. Accepts `readme_<name>_full`, `readme_<name>_details` or `manual_<name>`, same normalisation. |
+| `find_docs(program_dir, name)` | `(readme, readme_full)` from **one** folder listing (the folder is on a share). ReadMe = `readme_<name>`; Details = `readme_<name>_full`, `readme_<name>_details` or `manual_<name>`; case/separators/extension ignored |
+| `find_readme_or_none` / `find_readme_full_or_none` | Thin wrappers over `find_docs` |
+| `_dist_candidates(root, name)` | Every dist folder a program's builds may sit in (`root/dist`, `root.parent/dist`, Dev Tools' `dist_root`) — shared by the scan and the version poll |
+| `_devtools_dist_root()` | Dev Tools' build folder from its config; cached until the config file's mtime changes |
 | `find_icon_for_program(program_dir, exe)` | `icon.ico` next to the exe |
 
 ### Versions and naming
@@ -119,10 +122,17 @@ user move a program to another group (or reset it) and the choice is persisted.
 
 ### Update indicator
 - `_schedule_version_poll()` → `self.after(10000, ...)` — 10 s poll
-- `_poll_versions()` / `_scan_program_versions()` — background rescan per program
-- `_apply_version_updates(updates, refreshed)` — a program is highlighted only if
-  the on-disk version differs from `acknowledged_versions[name]`
-- `_acknowledge_update(name)` — ✓ button or a successful launch; writes the config
+- `_poll_versions()` / `_scan_program_versions()` — background rescan, all programs
+  in parallel (`ThreadPoolExecutor`, 16), same dist folders as the first scan
+  (`_dist_candidates`)
+- `_apply_version_updates(updates, refreshed, gen)` — a program is highlighted only if
+  the on-disk version differs from `acknowledged_versions[name]`. A result from a
+  poll that started before another source was loaded (`gen != _scan_gen`) is
+  dropped. Only buttons whose highlight flipped are restyled
+  (`_set_update_style`); a card that gained its first older version is rebuilt
+  alone (`_replace_card`) so it gets a 🔽.
+- `_acknowledge_update(name)` — ✓ button or a successful launch; writes the config;
+  restyles that one button
 - On startup `_apply_programs()` re-flags anything whose version no longer matches
   the acknowledged one
 
@@ -175,7 +185,7 @@ Routes, in order:
    console, so an import failure would otherwise be completely silent.
 
 If `_temp_latest` already exists routes 2 and 3 are refused (a previous swap did
-not finish); the broom button and every scan offer to restore it.
+not finish); the broom button offers to restore it (every scan marks the button).
 
 ### Maintenance helpers
 | Function | Description |
@@ -184,17 +194,42 @@ not finish); the broom button and every scan offer to restore it.
 | `prompt_move_misplaced(parent, list)` | Summary dialog, Move / Skip |
 | `find_programs_in_swap_state(programs)` | Programs with a leftover `archive/_temp_latest/` |
 | `prompt_restore_swap_state(parent, stuck)` | Offers to move the latest files back |
-| `_run_cleanup()` | 🧹 Clean button — runs both checks on demand |
+| `_run_cleanup()` | 🧹 Clean button — runs both checks, opens the dialogs, then re-marks the button with what is left |
+| `_mark_clean_button(count)` | `🧹 Clean (n)` in `Alert.TButton` (amber; the vista theme draws it as an orange frame), or plain |
 
-Both checks also run automatically after a scan (`_apply_programs`, delayed 200 /
-400 ms).
+Both checks run in the scan's worker thread (`refresh` → `_apply_programs(..., tidy)`)
+and **never open a dialog by themselves** — a modal with `grab_set()` after every
+scan took the keyboard from whatever the user was typing into. The result only
+marks the Clean button and is named in the status line (which wraps instead of
+being cut). A failed scan is reported in the status line, not a message box.
 
 ### UI (tkinter)
 - `Launcher(tk.Tk)` — main window; source radio buttons, 📋 Notes, ⚙ Set paths,
   🧹 Clean, scrollable body, status bar
 - `ScrollableFrame(ttk.Frame)` — canvas-based scroll area used for the card grid
 - Collapsible group sections (`_rebuild_buttons`, `_build_group_content`,
-  `_toggle_group`); column count adapts to width (`_calc_group_cols`)
+  `_toggle_group`); always `GROUP_COLS` = 2 columns
+- **Only a new scan rebuilds the window** (`_rebuild_buttons`). Everything else
+  changes the widgets in place:
+  - a header + grid exist for every group in `GROUP_ORDER`; `_pack_groups()`
+    shows the non-empty ones in order, `_update_group_header()` sets arrow + count
+  - cards: `_build_card()` makes one (unplaced), `_regrid(gkey)` places a group's
+    cards in name order; `_prog_cells` / `_prog_buttons` map name → card / button
+  - move to group: `_drop_card` + `_regrid(old)`, `_add_card` + `_regrid(new)`
+    (a never-opened group builds its cards lazily when opened)
+  - button width follows the longest name in the open groups;
+    `_apply_btn_width()` re-sizes existing buttons instead of rebuilding
+  - 🔽 menu is filled by `postcommand` (`_fill_version_menu`) when it opens
+  - no `<Configure>` binding on the root (it fires for every child widget)
+- Mouse wheel: `ScrollableFrame._on_mousewheel` scrolls only for events from the
+  main window; `_guard_wheel_on_value_widgets()` prefixes the class bindings of
+  `TCombobox`/`TSpinbox`/`Spinbox`/`Scale`/`TScale` with
+  `if {[focus] ne "%W"} continue`, so a value changes only in the focused field
+  and over any other field the list scrolls
+- ⚙ Set paths: the hint for each path is in the dialog itself (no separate info
+  box); a chosen folder is selected and loaded straight away
+- Tests: `testing/test_inplace_updates.py` (hidden via `testing/hidden_tk.py`);
+  `testing/bench_render.py <out.png>` renders the window without taking focus
 - Card = program button (name + version, amber + ↑ when an update is pending),
   ReadMe, Details, ✓ acknowledge, 📂 folder, 🔽 archived-version dropdown,
   right-click group menu

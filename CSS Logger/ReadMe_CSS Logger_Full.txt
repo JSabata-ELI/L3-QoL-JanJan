@@ -2,12 +2,13 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19
-  (main.py 6138 lines, cpva_core.py 749, sp_t.py 1729)
+Verified against source: 2026-10-05
+  (main.py 11440 lines, cpva_core.py 1651, sp_t.py 10414,
+   daypicker.py 1078)
 -----------------------------------------------------------------
 Short version: Readme CSS logger.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
-Spectra tab:   ../Spectra/ReadMe_Spectra_Full.txt
+Spectra tab:   ReadMe_Spectra tab_Full.txt (same folder)
 -----------------------------------------------------------------
 
 
@@ -33,7 +34,36 @@ read that one table.
 
 The window has two tabs. This document is about the CSS Logger tab.
 The Spectra tab is a different tool with its own documentation, in
-the Spectra folder.
+this same folder: ReadMe_Spectra tab.txt and ReadMe_Spectra
+tab_Full.txt.
+
+SETTING TABS. The CSS Logger itself can be open several times over,
+one tab per setting. Its tabs sit in the same row as "CSS Logger" and
+"Spectra", after a thin line, and show only while the CSS Logger is
+on screen. Each tab is a whole CSS Logger with its own values,
+preset, conditions, time window and Live — e.g. the Operation preset
+in one, a hand-picked set of values in another, the Operation preset
+plus the ramping values in a third.
+
+  +             a new tab, starting as a copy of the tab you are on;
+                change what you need in it.
+  ×             closes that tab (the last one cannot be closed).
+  double-click  renames a tab. A first tab is named after its preset.
+  drag          reorders the tabs.
+
+Only the tab on screen draws. The others keep themselves up to date in
+the background: in Live they ask the archive for new values every 10
+seconds (instead of several times a second) and collect them without
+redrawing; open one and it fetches up to "now" at once and draws what
+it gathered. While the Spectra tab is on screen, every setting tab
+works this way.
+
+The tabs — names, values, conditions, period or "Live" with its span —
+are remembered per user in %APPDATA%\CSS Logger\logger_tabs.json and
+come back at the next start: the one you were on at once, the others
+one by one a few seconds later, already loading in the background.
+Graph settings, styles and the like stay shared by all tabs, as do
+the presets and the custom PVs.
 
 
 =================================================================
@@ -62,16 +92,20 @@ many at a time.
 
 Two consequences worth knowing:
 
-  - No period is too long. A year works. It may take a while, the
-    line under the graph counts the requests, and "Stop loading" is
-    there if you change your mind.
+  - No period is too long. Three months of the Operation preset take
+    10-30 seconds the first time, depending on how busy the archive is.
+    The progress bar moves with the share of the period already read
+    (not with the number of requests, which used to hold it on one
+    number for minutes), the INFO section on the left says how far back
+    it has got and about how long is left, and "Stop loading" is there
+    if you change your mind.
   - Nothing is skipped. Earlier versions asked one hour at a time and
     threw away every hour between 22:00 and 06:00 on the assumption
     that nothing is recorded overnight — without saying so, so a
     period over a night came back with holes in it. That is gone.
 
 WHEN SOMETHING CANNOT BE READ. A signal that could only be read in
-part still shows what there was, and the line under the graph names
+part still shows what there was, and INFO on the left names
 it and says how many hours are missing; the Log lists the exact
 stretches. If nothing at all came back, it says so in those words —
 it never reports an unanswered archive as an empty one.
@@ -82,9 +116,55 @@ two days looks like it has no data at all — the archive only stores a
 sample when something happens. With it, a flat line is drawn as a
 flat line, which is what actually happened.
 
+This look-back has a limit: about 20 seconds in all, and a handful of
+requests per signal, reaching up to 30 days back. It used to have
+none — on a slow or refusing archive it kept halving its search down
+to single minutes, and a three-month load stood still at "92 %" until
+the program had to be closed (October 2026). A value whose earlier
+sample is not found in time simply starts where its first sample in
+the window is, and the Log says which values that was.
+
+THE DAY CACHE. A day that is over never changes in the archive, so
+once anyone has read it, it is kept: on the scratch share, in
+Software\CPVA cache, one small file per value per month (three months
+of eight values: about 3 MB). The next load of a period — by you or
+anyone else at another station — reads those days from there and asks
+the archive only for today and for days nobody has read yet. INFO and
+the Log say how many came from the cache. A day is kept only when it
+was read without a gap, and only at the detail it was read with: a
+shorter period asks for more detail, and then the archive is asked
+again and the finer day replaces the coarser one. When the share is
+not reachable the program simply reads everything from the archive.
+
 THINNING. For a long window the program can ask the archiver for a
 reduced version of the data rather than every single sample. That is
 what makes a month-long load possible at all.
+
+Each thinned point stands for a stretch of time and carries three
+numbers: the average of that stretch, and the lowest and the highest
+value really recorded in it. The curve is the average; the light band
+around it runs from lowest to highest. So thinning never hides a
+spike: measured on the SBW4 energy over a year, the averages peak at
+86 while the band reaches 2263 — a real shot on 10.09., which the
+old average-only curve did not show at all. This is how CS Studio's
+Data Browser does it too ("Optimized" data, "Area" trace).
+
+ZOOMING READS AGAIN. Zoom in (right-drag, the magnifier, the arrows)
+and the stretch on screen is read from the archive again, as finely as
+the point count allows. Zoom to about an hour and every recorded
+sample comes back, so "when exactly and how much" has an exact answer.
+The zoom, Back/Forward and the selection all stay while this happens.
+Computed values (custom PVs) keep the detail of the first load.
+
+WHEN A SIGNAL IS READ WHOLE. A signal that writes very little — a
+motor position, a valve — is read sample by sample even over a long
+period, because thinning would turn its steps into averages it never
+stood on. That is decided on the WHOLE period: a meter writing 300
+samples an hour is little for three days and far too much for two
+months (460 000 samples per signal). Judging it by the hour once sent
+eight energy meters raw over two months and ran the PC out of memory.
+If a signal turns out bigger than expected while it is being read, the
+read stops at 400 000 samples and it is thinned instead.
 
 
 =================================================================
@@ -93,14 +173,28 @@ what makes a month-long load possible at all.
 
 3.1 THE TIME WINDOW
 
-    "Set time window" gives each end of the period its own choice of
-    an absolute date and time, or a relative quick pick — the last
-    hour, the last 24 hours, now.
+    "Set time window" is laid out like the one in CS Studio: two panes
+    side by side, Start and End, each with two tabs. "Absolute" is a
+    calendar, a clock and the quick times Now / 00:00 / 12:00.
+    "Relative" is a span counted from now — years, months, days,
+    hours, minutes, seconds — with "Before now" and a Now button.
+    The window always keeps the same size, whichever tab is open.
 
-    THE BLUE LINE AT THE BOTTOM IS THE ANSWER. It spells out the two
-    moments OK will hand back, and it is the one thing worth reading
-    before pressing OK: each end is taken from the tab that is on
-    top, so a date typed on the absolute side while the relative side
+    The quick spans on the Relative tab — 30 min, 1 h, 2 h, 6 h,
+    12 h, 1 day, 3 days, 7 days — mean on the Start pane "that long
+    ago up to now" (End is set to now as well, so Live keeps going);
+    on the End pane they set how long before now the period ends.
+
+    "Live", the fourth quick button on the Absolute End tab, is the
+    one-click way into Live mode: End switches to its Relative tab
+    at "now" and Start to "- 1 hours". Start can still be changed
+    afterwards. OK then turns Live mode on — as long as End is still
+    "now"; move End away from now and OK gives a fixed period instead.
+
+    THE "Start Time" / "End Time" FIELDS AT THE BOTTOM ARE THE ANSWER.
+    They spell out what OK will hand back, and they are the one thing
+    worth reading before pressing OK: each end is taken from the tab
+    that is open, so a date picked on Absolute while the Relative tab
     is showing is not what you get.
 
     Turning the calendar to another month (◀ ▶, the month name, the
@@ -110,6 +204,14 @@ what makes a month-long load possible at all.
     and with the clock boxes untouched OK handed back the period you
     started from. A months-long request came back as the last hour.
 
+    "Live mode" sits right next to the Time window button, the same
+    size: the two together decide which stretch of time is shown.
+    Under them is the period in use: From and To, and
+    whether Live is on. In Live mode From reads "now − 30 d" (or 6 h,
+    1 d 6 h, …) — the span really on screen. It used to keep the span
+    Live had started with, so after picking a month it still said
+    "now − 1 h".
+
     The end of the period is also what decides live mode. "Now" on
     the relative side means "keep up with the clock", and Live stays
     on. Any fixed end means "show me that stretch of the past", and
@@ -117,7 +219,17 @@ what makes a month-long load possible at all.
 
 3.2 THE VALUE LIST
 
-    "Browse" opens the channel browser. The full list of archived
+    The list shows each value by its NAME — the same name the graph,
+    the table and the export use. Hover over a row for the full PV.
+    Double-click (or F2) renames it; leave the box empty to go back to
+    the automatic name. A name you give is remembered for next time,
+    and typing a Display Name in the table under the graph does the
+    same. Right-click a row for Rename, Change PV (point the row at a
+    different archived channel), Copy PV name, Move up / Move down
+    (Ctrl+Up / Ctrl+Down — the order is the order of the bands on the
+    graph) and Remove (Delete key).
+
+    "+ Add PV" opens the channel browser. The full list of archived
     channels — about ten thousand of them — is downloaded once and
     then filtered as you type, so typing is instant.
 
@@ -126,23 +238,42 @@ what makes a month-long load possible at all.
     and "*023*l3*" find the same thing. Asterisk and question mark
     also work if you want to be explicit.
 
+    "Custom PV" defines a value calculated from the loaded ones — see
+    section 5. It is the only place to do so; the tabs no longer have
+    their own "Add custom PV" button.
+
     "Remove" drops the selected entries, the bin clears the list.
-    Nothing is left selected afterwards: the entry that moves up into
-    the freed place used to come out highlighted, so pressing Remove
-    twice took a value you had not chosen.
+    Afterwards the entry that moved up into the freed place is
+    selected, so pressing Remove again takes the next one. When the
+    last entry went, the one above it is selected instead; with the
+    list empty nothing is. Calculated (ƒ) rows are never selected.
 
 3.3 PRESETS
 
-    A named list of values. Load, Save, Save as new, delete. A
+    A named list of values. Load, Save, Save as new, and the red
+    Delete button beside the preset list (it asks first). A
     recurring question — "the four chiller temperatures and the shot
     energy" — becomes two clicks instead of five searches.
+
+    "Blank" is built in and always first: it has no values, so picking
+    it empties the PV list (custom values stay defined). It is not
+    stored in the presets file, so it can be neither saved over —
+    Save on it asks for a new name — nor deleted, and no other preset
+    may take its name. The program still opens on the "Operation"
+    preset (or the first saved one), never on Blank.
+
+    The presets file is shared by every computer running the program.
+    Save changes only the preset you saved (the values, period, master
+    PV and multiple), so a copy open elsewhere cannot undo it, and Load
+    always reads the file afresh. Save as new under a name that already
+    exists asks before overwriting — two presets never share a name.
 
 3.4 FETCHING IS AUTOMATIC
 
     There is no "Load data" button. Anything that changes what ought
     to be on screen fetches the data itself, with a progress bar:
 
-      - a value added through Browse, removed, renamed, or the whole
+      - a value added through Add +, removed, renamed, or the whole
         list cleared
       - a different period
       - a different preset
@@ -154,13 +285,21 @@ what makes a month-long load possible at all.
     is always one set.
 
     IT DRAWS WHILE IT LOADS. The period is read from the present
-    backwards, and the graph and the table are redrawn every second
-    or so with whatever has arrived. On a long period the picture
-    fills in from the right-hand edge instead of leaving you looking
-    at an empty plot and a progress bar. "Stop loading", beside the
-    bar, keeps everything already drawn and tells you what is
-    missing; it is there because a year is a fair thing to ask for
-    and changing your mind halfway should not cost you the wait.
+    backwards, whole days at a time — every value of a day before the
+    next older day; a long period in at most 16 steps of several days
+    (three months: 15 steps of 6 days). The graph is redrawn with what
+    has arrived every few seconds: never sooner than three times what
+    the last redraw took, so the window always has time to answer, and
+    not in the last tenth, when the full picture is moments away. The
+    days not read yet are greyed and marked "loading" — exactly those
+    days, for every value. While it loads, a value that changes rarely
+    (a motor position) may not have its last earlier value yet, so
+    rows with the Conditions on can be missing next to the grey part;
+    they appear when the load ends. The table is filled from the first
+    piece and once more at the end. "Stop loading", beside the bar,
+    keeps everything already drawn and tells you what is missing; it
+    is there because a year is a fair thing to ask for and changing
+    your mind halfway should not cost you the wait.
 
     The reason there is no button: it could only ever do what the
     program already knows it has to do, and a button that must be
@@ -217,6 +356,24 @@ what makes a month-long load possible at all.
         finishing in the background, so the program would keep
         working for a while after you told it to stop.
 
+      - Custom (calculated) values keep up with the GRAPH clock, not
+        the table clock. They are worked out from the table, so they
+        used to stand still between two table rebuilds while the real
+        curves moved on — and a rebuild that fell due on a poll which
+        happened to bring nothing was skipped AND postponed, so with
+        quiet signals they could lag for many seconds. Now the newest
+        stretch of every custom curve is computed straight from the
+        values it is made of on each graph refresh, and a due rebuild
+        runs as soon as there is anything to merge.
+
+      - Each value keeps its own "newest sample I have". Before, every
+        value was cut at the newest moment of ANY value, so a sample of
+        a slower signal that reached the archive a moment after a
+        faster signal's newer one was thrown away for good. Each poll
+        now also looks five seconds further back, and keeps only what
+        is newer than that value's own last sample, so nothing is
+        lost and nothing is counted twice.
+
 3.6 THINNING THE ROWS
 
     Master PV      the ramp master, used to recognise rows that are
@@ -228,6 +385,59 @@ what makes a month-long load possible at all.
     On a dataset where the archive recorded ten times more often than
     the experiment changed, this is the difference between a readable
     graph and a solid block of ink.
+
+    Skip zero-energy shots at same waveplate
+                   on to start with. A shot whose energy (the channel
+                   in the Energy box, the SBW4 energy to start with) is
+                   below the number beside it, while the Master PV —
+                   the waveplate — stands where it stood on the shot
+                   before, is a trigger shot or a dropout. It is left
+                   out of the selection statistics, and it does not
+                   count as firing for "Restart after pause". A low
+                   energy right after the waveplate moved is a real
+                   reading at the new setting and is counted. Untick
+                   it to count every shot — for instance to look at
+                   the trigger shots themselves. The graph draws every
+                   shot either way. The energy channel and the Master
+                   PV must both be in the PV list.
+
+3.7 INFO, AND THE CONTROLS ABOVE IT
+
+    INFO, at the very bottom of the left side, is what the program is
+    doing right now. It sits under the part of the left side that
+    scrolls, so it is always on screen, however short the window —
+    loading and how far it has got, how much arrived, Live polling,
+    errors, what could not be read. It used to be a grey line along
+    the bottom of the window. Below it, in grey, a note about the graph
+    (for example that zoom/pan is switched on), and in orange every
+    custom value that cannot be computed and why — typically after
+    switching preset, when a letter of the formula points to a value
+    that is not in the new PV list. Before, such a value simply
+    vanished with only a line in the Log.
+
+    Between Master PV and INFO are the controls that used to sit in a
+    row above the graph, grouped by what they act on:
+
+      DATA FILTER   Conditions, Limit crossings
+      GRAPH         Reference lines, Graph settings, View ▾, Clean graph,
+                    Font, Avg to
+      SELECTION     Clear selection
+
+    They are described in 4.3a.
+
+3.8 SPEED
+
+    The program holds a great many small pieces of data — every
+    archived sample is one. Python's memory clean-up, left at its
+    default, looked through all of them every few hundred new objects,
+    and that was most of the time a refresh took: measured on a custom
+    value over 60 000 rows next to a million samples, 300 ms before,
+    about 65 ms after the clean-up was told to run less often. Custom
+    values are also computed over whole columns at once instead of row
+    by row, the signal list under the graph is rebuilt once per load
+    instead of twice, and while a long period loads, a new picture is
+    only prepared once the window has finished drawing the previous
+    one, so redraws can no longer pile up behind each other.
 
 
 =================================================================
@@ -266,11 +476,43 @@ what makes a month-long load possible at all.
     above about twenty visible curves, where they would be a solid
     wall of numbers.
 
+    When the graph shows more than one day, the time under the axis
+    also carries the date. (The full date and time used to be written
+    at the top right of the graph as well; that label is gone.)
+
     SELECTION. Drag with the LEFT button to get statistics for that
     interval: one card per value with the number of samples (N), the
     average (Avg), the spread (Std), the smallest (Min), the largest
     (Max) and the distance between those two (P-P). The numbers can be
-    selected and copied.
+    selected and copied. The cards follow the graph's order of signals.
+
+    THE COUNT IS OF REAL SHOTS. N and the other numbers come from each
+    value's own recorded samples inside the region — never from the
+    curve on screen. The curve of a long period is thinned to a few
+    thousand points whose boundaries shift with every live refresh, so
+    counting it gave a number that wandered (709, 710, 709) without a
+    single shot being added or lost.
+
+    The strip of cards is exactly as tall as the cards themselves — no
+    empty band under them — and grows to at most about half of the
+    graph area (two rows of cards are always shown whole); past that a
+    scroll bar appears. The switch at the right
+    of its heading: "All" every card, "One row" only the first row
+    (the rest one scroll away), "Hide" no cards, just the heading line.
+    The choice is remembered.
+
+    PLACING THE EDGES. On a two-hour graph one pixel is several seconds,
+    so the first shot after a short pause is hard to hit by hand. Three
+    helps:
+      - An edge let go a few pixels from the first shot after a pause
+        (or the last shot before one) lands exactly on that shot. Only
+        a real pause counts — clearly longer than the usual spacing of
+        the shots — and the edge never jumps over another shot.
+      - Start and End in the heading show the two edges. Type a time
+        and press Enter, or press -1 / +1 to move that edge one shot
+        earlier or later.
+      - The loupe (see 4.3) magnifies the graph around the mouse while
+        you drag.
 
     Avg, Min and Max are in the signal's own units. Std and P-P are
     given as A PERCENTAGE OF THE AVERAGE, to hundredths — that is the
@@ -293,49 +535,149 @@ what makes a month-long load possible at all.
     heading, so the numbers are never quietly taken for the whole
     selection.
 
+    LIVE SELECTION. Drag out past the right-hand edge of the graph
+    (anywhere beyond the last few pixels) and the selection follows
+    the data: its start stays where you put it, its end sits on the
+    newest point and moves on with every new one, so the statistics
+    always include the latest value. The heading then says "end
+    follows the newest point". It stays that way through redraws until
+    you drag a new selection or press Clear selection. A selection
+    that ends inside the graph stays exactly where it is. With the
+    view zoomed into the past (the newest data off to the right) the
+    edge is just the edge and the selection does not follow.
+
+    A live selection counts EVERY shot since its start, however long
+    ago that was. The graph keeps showing its own span (say the last
+    30 minutes); the selection keeps its own copy of the shots, so a
+    selection started at 10:00 still counts from 10:00 at 11:00 while
+    the graph shows 10:30 – 11:00. The heading then adds "(starts left
+    of the graph)". Before, the live window threw old shots away and
+    the count stopped growing once the start was older than the graph.
+
+    A selection over a stretch with no shots shows its cards at once,
+    with N 0 and dashes, and a live one says it is live straight away
+    — its end follows the clock until the first shot comes. Before,
+    nothing appeared until data arrived.
+
+    RESTART AFTER PAUSE (sidebar, DATA FILTER). Tick it and set the
+    seconds (15 s to start with): when firing stops for longer than
+    that and then starts again, a live selection begins again at the
+    first shot after the pause. Shooting every 5 s, a 15 s pause, then
+    shooting again — the selection now covers only the new run. The
+    heading says when it restarted and how long the pause was, and the
+    Log keeps a line for each restart. A selection that does not
+    follow the newest point works the same way, except that its blue
+    band stays where you put it: the numbers count from the first shot
+    after the newest pause inside it, and the heading says "counted
+    from …". Dead shots (3.6) do not count as firing. With conditions on, a shot is a
+    sample of a condition value that passes them (the energies), so a
+    housekeeping value that keeps ticking through the pause does not
+    hide it.
+
     ZOOM. Drag with the RIGHT button to zoom in on that stretch of
-    time. The magnifier button does the same thing with a box; while
+    time. It does not start a selection — before, matplotlib let every
+    button drive the statistics selection, so a right-drag did both.
+    The magnifier button does the same thing with a box; while
     it is pressed in, the left button zooms instead of taking
     statistics.
 
 4.3 THE PICTURE BUTTONS (the graph toolbar)
 
-    The same toolbar the Spectra tab uses, so both behave alike:
+    One white bar of flat icon buttons in three groups, split by thin
+    lines — the look of matplotlib's own graph toolbar, so it reads as
+    part of the graph. A button the mouse is over gets a pale blue
+    tint; a pressed-in one a stronger light blue, icon still black.
 
+    VIEW
     house       back to the whole period. This also hands the view
                 back to the program, so live mode may scroll it again.
     arrows      the previous / next view. One shared history: a zoom
                 made with the right button lands in it too, so there
-                is never a second "back" that disagrees.
+                is never a second "back" that disagrees. Greyed out
+                when there is no view to go to.
+    NAVIGATE
     cross       pan — drag the plot around.
     magnifier   zoom by drawing a box. Pressed in, it takes the left
                 button over from the statistics selection; press it
-                again and the selection comes back.
-    sliders     how far the plot sits from the edges. What you set
-                here is kept, otherwise the next redraw would put the
-                stored margins straight back. The LEFT margin stays
-                automatic: it is worked out from how many values have
-                their own axis, and there is no room to spare there.
-    disk        save the graph as a picture.
+                again and the selection comes back. Pan / Zoom stay
+                pressed in through a redraw.
+    window      the LOUPE. A small magnified picture of the spot under
+                the mouse follows it over the graph. It shows ONE
+                value: the one whose line is drawn nearest the mouse
+                (it switches as the mouse moves to another line). The
+                patch shown is N times smaller than the loupe in both
+                directions — time and value — so it is the graph
+                magnified evenly, redrawn from the data (sharp, not a
+                blown-up picture), in the line's own colour and style.
+                Grey dashed cross-hair at the mouse; above it the
+                value's name, the exact time (to the millisecond) and
+                the value there. It keeps working while a
+                selection is being dragged and shows the blue band
+                with its edges, so an edge can be put on the right
+                second of a two-hour graph. "10×" next to it picks N
+                (5, 10, 20, 50). It never takes the keyboard and lets
+                every click through to the graph.
+    GRAPH
+    sliders     MARGINS AND SPACING — a small window, changes show at
+                once: gap between a Y-axis title and its numbers, gap
+                between Y axes, left edge, right / top / bottom gap,
+                gap inside a band. "Undo changes" goes back to the
+                values from when it was opened, "Defaults" to the
+                program's. Same settings as in Graph settings. The
+                gaps are in real screen pixels at any window size; when
+                the window or the split changes, the graph is laid out
+                again (before, a graph narrower than about 970 px drew
+                every gap smaller than set). "Gap inside band" also
+                applies to values with Autoscale ticked.
+                (It replaces matplotlib's own "subplots" window, whose
+                horizontal / vertical spacing spaces several separate
+                plots apart — this graph is one plot, so they did
+                nothing.)
+    disk        "Save graph": the graph as PNG / PDF / SVG, without
+                the blue band and the table, even while a selection is
+                on screen. "Save graph with selection": the selected
+                region is saved with its statistics, as a table under
+                the graph (title line, then one row per PV in its own
+                colour: N, Avg, Std, Min, Max, P-P). Either way
+                the picture gets a heading on top: the period shown,
+                the moment it was saved, and the names of the values
+                in their trace colours. The file name offered is made
+                of the period and the save time, e.g. "CSS Logger
+                2026-10-07 141500 to 161500 (saved 2026-10-07
+                161722).png", so saved graphs sort by themselves.
 
-    matplotlib's own "Customize" is deliberately removed: it knows
-    nothing about the stacked axes and would fight every setting made
-    in Graph settings.
+    Behind the bar sits matplotlib's own toolbar, hidden: it is bound to
+    one canvas and rebuilt with every redraw, and the bar's buttons only
+    press its buttons. The icons are matplotlib's own pictures, but
+    re-inked black by the program for every button state — left to
+    matplotlib, a dark Windows theme turns them white on white. The
+    loupe has no matplotlib picture; its icon is drawn by the program.
 
-    Note on the icons: matplotlib tints them ONCE, when the toolbar is
-    built, and only if it thinks the background is dark — on a dark
-    Windows theme they come out white on white and read as blank
-    buttons. So the toolbar is built inside a light-coloured holder
-    first. Anything that rebuilds this toolbar must keep doing that.
-
-4.3a THE OTHER BUTTONS
+4.3a THE OTHER BUTTONS (on the left, above INFO — see 3.7)
 
     Clean graph       empties the plot but keeps the frame.
     Clear selection   removes the blue region and its statistics.
-    View              reset the view, type axis limits in by hand, or
-                      switch every grid off at once. It is a button
+    View ▾            a menu: "Reset view", "Clear selection" (the
+                      same as the button; greyed out while nothing is
+                      selected), "Axis limits" to type the ranges in
+                      by hand, and "Hide all grids". It is a button
                       and not a right-click menu because right-drag on
                       the graph is the zoom.
+
+    Axis limits (in View)
+        The time range as a date and a clock, From and To, to the
+        second — it used to be a bare number (days since 1970), which
+        nobody can type. OK zooms to it, and Back returns.
+
+        The vertical range is set per signal, because every signal has
+        its own axis: pick the signal from the list (its colour is
+        shown beside the name), then type Y min and Y max. An empty box
+        shows the signal's own data range in grey and means "follow the
+        data". Several signals can be set before OK. These are the same
+        numbers as the Y min / Y max cells in the list under the graph,
+        so they stay after the next redraw — the old dialog set one
+        unnamed axis and the next refresh put it back. "Fit to data"
+        empties both boxes for the signal shown.
 
     Reference lines
         Horizontal lines at heights you choose — a limit, a target, a
@@ -352,11 +694,19 @@ what makes a month-long load possible at all.
         colour (black to start with), a style and a thickness. Lines
         can be moved up and down the list with the arrows, or deleted
         with the red cross. The name is written next to the line in
-        the graph, so a line is never anonymous.
+        the graph, so a line is never anonymous. "Crossing" says which
+        side of the line is over the limit — above (the default),
+        below, or off — for Limit crossings.
 
-        "Add by clicking in the graph" places a line by eye instead of
-        by typing a number. It is two steps and the program says which
-        one you are on:
+        "+ Add line" adds an empty row to fill in by hand. A row needs
+        a Y value; one left without it is not kept.
+
+        "+ Add by clicking in the graph" places a line by eye instead
+        of by typing a number. The ⊹ button on each row starts the same
+        thing. Either way the window closes for the clicks, keeps what
+        you have typed so far, and the placed line is added at the
+        bottom of the list as a new row. It is two steps and the
+        program says which one you are on:
 
           Step 1  Click the vertical axis of the signal you want — its
                   numbers down the left-hand side — or click its
@@ -370,10 +720,34 @@ what makes a month-long load possible at all.
         statistics and dragging to zoom are switched off so a click
         cannot do two things at once; both come back afterwards.
 
+    Limit crossings
+        Every stretch in which a signal was over one of its reference
+        lines, over the whole loaded period: the line, the signal, the
+        start and end, how long, the peak and when it came, and how
+        many samples were over. Double-click a row and the graph zooms
+        to it.
+
+        It works in two steps. The thinned data's band says WHERE a
+        crossing can be — its highest value is the recorded one, so no
+        crossing is missed. Only those stretches are then read sample
+        by sample, which gives the exact times at a small cost: a year
+        of SBW4 with a line at 100 took 1.4 s and found two crossings.
+        When a signal is over the line so often that this would mean
+        reading more than a week of raw data, the times are given to
+        the thinned stretch instead, marked ≈, and the Log says so;
+        zoom in or shorten the period for exact ones. Conditions are
+        not applied here — every archived sample counts.
+
     Conditions
-        Minimum and maximum per value. A row survives only if every
-        condition value is present AND inside its range; everything
-        else is dropped from the table, the graph AND the export.
+        One row per condition: a tick to switch it on or off without
+        losing it, the value, and the kind — Between (min … max, either
+        may be left empty), Target ± %, Target ± value, At least, At
+        most. Beside each row: how many of the loaded rows it keeps on
+        its own (red when none). A box that is not a number turns red
+        and is ignored. Changes apply at once — the window only has
+        Close. A row survives only if every switched-on condition value
+        is present AND passes; everything else is dropped from the
+        table, the graph AND the export.
 
         Two deliberate details:
           - If the whole window fails the conditions, the table stays
@@ -382,6 +756,17 @@ what makes a month-long load possible at all.
             the conditions and counts the rows they threw away — and
             the XY tab says the same instead of blaming the two
             channels you picked. The Log has it too.
+          - THE GRAPH STILL SHOWS THE LAST GOOD VALUE. With the laser
+            off, every shot of the window fails the energy conditions,
+            and so does the value from just before the window — the
+            graph used to come up empty. The program now looks back
+            (up to 14 days) for the last shot that passes the
+            conditions and draws every signal as a flat line at its
+            value from that shot. A yellow note at the top of the
+            graph says so and gives that shot's date, time and age,
+            so an old value is never mistaken for a fresh one. The
+            same last good shot is where a line starts at the left
+            edge whenever the value just before the window fails.
           - A condition on a value that has no data at all in this
             window is skipped, and logged. Otherwise one absent
             value would reject every row on its own and look like a
@@ -389,11 +774,23 @@ what makes a month-long load possible at all.
 
         Computed values can be used as condition values.
 
-    Add custom PV
-        A new signal calculated from the loaded ones — see section 5.
+        APPLY CONDITIONS (the tick box under the Conditions button)
+        switches all of them on or off in one go, keeping the rows.
+        Off shows every shot — trigger shots, ramps, everything outside
+        the limits — and on filters again.
+
+        The conditions now hold everywhere the data is shown. In Live
+        mode every refresh used to draw the raw samples again, so a
+        rejected shot (SBW4 under 0.15, say) was back on the graph a
+        moment after the filter had removed it. Also fixed: the value
+        from before the window is not drawn when it fails, the shaded
+        min–max band no longer reaches down to rejected values, and the
+        Min / Max / Mean / Count in the settings table count only the
+        shots that pass.
 
     Graph settings
-        Fonts. The spacing of the axis columns. The time stamps
+        Fonts. The spacing of the axis columns (they now start packed
+        closer: 3 px between a title and the axis to its left). The time stamps
         along the bottom: how many, or a fixed spacing from one
         second to one day, and whether they show seconds. The plot
         margins, as percentages of the picture. The cursor boxes.
@@ -408,6 +805,12 @@ what makes a month-long load possible at all.
         without repeating the date under every stamp. Over a few
         months the year joins the date, because a year-long period
         would otherwise open and close on the same "09-02".
+
+        "How many" is at most 12 to start with (it was 8): the round
+        spacing is one step finer, an hour stamped every 5 minutes
+        instead of every 10, a day every 2 hours instead of 3. A value
+        of 8 saved by an older version is moved to 12 once; set it
+        again by hand and it stays.
 
         Both ends of the period are always stamped, and an automatic
         stamp landing too close to one of them is dropped rather than
@@ -430,10 +833,12 @@ what makes a month-long load possible at all.
         returns, so no space is wasted either way.
 
     Font / Avg to
-        The font size, and how many points the curves are averaged
+        The font size, and how many points the curves are thinned
         down to before drawing. A million samples cannot be drawn as
         a million points; the question is only whether the reduction
-        is done deliberately.
+        is done deliberately. Each drawn point keeps the lowest and
+        highest value behind it (the light band), so the thinning
+        changes the detail, never the extremes.
 
 4.4 THE SIGNAL LIST BELOW THE GRAPH
 
@@ -455,6 +860,10 @@ what makes a month-long load possible at all.
     F11 and docking it again starts over from the default split,
     because the list is rebuilt with it.
 
+    It can be dragged taller only as far as it has rows to show, and
+    never past half of the height: the graph always keeps the other
+    half. Beyond that the list scrolls.
+
     Line style is solid, dashed, dotted, dash-dot or none. Point style
     is auto, none, or one of ● ○ ▲ ■ ✕ +, with its own size. "Auto" is
     what the program has always done: a small dot, but only while the
@@ -473,6 +882,11 @@ what makes a month-long load possible at all.
     says it a second time, which still works where two colours sit
     close together. The tooltip on the tick box names the pattern that
     signal has been given.
+
+    Ticking or unticking Grid (or "Hide all grids" in View ▾) only
+    switches the grid lines. The graph is not rebuilt, so the zoom, the
+    view and Back / Forward stay exactly as they were; it used to
+    redraw everything and jump back to the full period.
 
     The upright time lines are shared and drawn once, faintly, in
     grey: every signal shares one time axis, so there is nothing to
@@ -503,13 +917,29 @@ what makes a month-long load possible at all.
     Count is the quickest way to find a signal that is not recording:
     it reads 0.
 
+    THE ORDER OF THE SIGNALS
+
+    Drag a row up or down with the left button. After a few pixels a
+    blue line shows where it will land; let go and the row moves there,
+    the graph redraws with its Y axes in the new order (no reload — the
+    data is already here) and the moved row stays selected. Several
+    selected rows move together. Original PVs and custom PVs each stay
+    in their own group under their divider row.
+
+    This order belongs to the table and the graph only. The PV list on
+    the left keeps its own order (that list decides what is loaded).
+    The order is remembered between runs (plot_order in the settings
+    file); a PV that has never been placed comes after the placed ones.
+    A signal keeps its colour when it moves.
+
     THE COLUMNS THEMSELVES
 
-    Drag a heading sideways to put that column where you want it.
+    Drag a heading sideways to put that column where you want it. A
+    blue upright line shows where it will land when you let go.
     Right-click the headings for a list of every column with a tick
-    next to the ones on screen. "Reset columns" — the button above the
-    list, and the last entry in that menu — puts the order, the widths
-    and the selection back to how they started.
+    next to the ones on screen. "Reset columns" — on the left-hand
+    side under PV TABLE, and the last entry in that menu — puts the
+    order, the widths and the selection back to how they started.
 
     When there are more columns than fit, the list scrolls sideways
     rather than squeezing everything into nothing. The signal name and
@@ -517,12 +947,30 @@ what makes a month-long load possible at all.
 
     SAVED LOOKS
 
-    The "Styles" button keeps the whole appearance of the graph under
+    The "Styles" button (left-hand side, under PV TABLE) keeps the whole appearance of the graph under
     a name: every signal's colour, line style, point style, size,
     transparency, range and smoothing, all the reference lines, and
-    the column layout. Load brings it back, Delete removes it, and
-    Export / Import write it to a file so it can be carried to another
-    PC.
+    the column layout. Its menu:
+
+      Save current look as   asks for a name; an existing name asks
+                             before it is replaced
+      Load ▸                 brings a saved look back
+      Delete ▸               removes one, after asking
+      Export to file         writes the current look to a file, so it
+                             can be carried to another PC
+      Import from file       reads such a file
+      Reset columns          the column order, widths and selection
+                             back to how they started
+
+    Load and Delete are greyed out until at least one look has been
+    saved; Import only puts a look on screen, it does not save it.
+    Every look in the lists is one you saved — there are no built-in
+    ones.
+
+    The line under the button, "Loaded style:", names the look last
+    loaded, saved or imported (an imported one shows its file name and
+    "(file)"). It says "none" after a fresh start and after the look on
+    screen has been deleted from the list.
 
     Nothing is saved by itself. Close the program and the current
     colours, styles and reference lines are gone — only the looks you
@@ -531,15 +979,16 @@ what makes a month-long load possible at all.
     Edits are collected and drawn once, when you stop clicking, so
     ticking six boxes costs one redraw rather than six.
 
-    The list is exactly as tall as the number of values it holds, so
-    two values do not leave a huge empty table above the graph. It
-    grows only until the graph is down to its minimum height, and
-    then scrolls.
-
 4.5 THE POPOUT
 
     F11 puts the graph in its own resizable window; Ctrl+F11 makes it
     fullscreen. The same shortcut docks it back.
+
+    The window has no title bar. Press the left button anywhere on the
+    graph and drag to move the window; drag the dark frame round it (or
+    a corner) to make it bigger or smaller. Because the left button
+    moves the window here, the left-drag statistics selection does not
+    work in this window — dock it back for that. Right-drag still zooms.
 
 4.6 A SMALL BUT IMPORTANT DETAIL
 
@@ -547,7 +996,20 @@ what makes a month-long load possible at all.
     because the pointer happens to be over it. A field only reacts to
     the wheel once you have clicked into it; otherwise the scroll
     goes to the panel underneath, which is what you meant. Scrolling
-    past a settings row used to silently change it.
+    past a settings row used to silently change it. Tabs and
+    calendars never react to the wheel at all: the wheel over a
+    calendar used to flip the month and move the chosen day.
+
+    Changing how a signal looks in the PV table (Width, Style, Points,
+    Size, Alpha, Y min / Y max, Autoscale, Smooth, Display Name) shows
+    on the graph at once, without redrawing it, and a zoomed view
+    stays zoomed. Moving a PV up or down or removing it uses the data
+    already loaded; only a NEW PV is read from the archive.
+
+    Nothing pops up on its own later. Limit crossings opens its
+    window at the click and fills it when the search ends. A long
+    export writes its result ("Finished" or the error) into its own
+    progress window and the Log tab instead of a new message box.
 
 
 =================================================================
@@ -587,7 +1049,11 @@ what makes a month-long load possible at all.
 
     Available channels
         The automatic letter assignment for the list exactly as it is
-        loaded now. Read-only — it follows the list.
+        loaded now — the letters follow the list. The Channel name of
+        a real PV can be typed over here (double-click it); it is the
+        same Display Name as in the PV table and is used everywhere
+        after OK. An emptied name goes back to the automatic one. A
+        custom PV is renamed in its Name box instead.
 
     What each letter means
         One row per letter per formula, with the value behind it.
@@ -603,6 +1069,34 @@ what makes a month-long load possible at all.
     would be the one behaviour capable of producing a wrong number
     that looks right.
 
+    The same goes for a letter typed while no value had that letter:
+    it stands for nothing until you pick a value for it, and the
+    formula stays empty until then.
+
+    Renaming a formula keeps every formula built on it working — the
+    new name is carried into them when you press OK.
+
+5.5 SBW4 HAS TWO NAMES
+
+    The SBW4 energy is archived under two names that take turns:
+    HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy and L3-SBW4-PM311:Energy.
+    Whichever of the two is in the PV list, every day is read under
+    the HAPLS name first; a day with nothing under it is read under
+    the L3 name — while the load runs, not after it. The result is
+    shown as the one SBW4 line, so every formula built on SBW4
+    (Beta/Green, Comp. Beta Output, Back Reflection Ratio) covers both.
+    The Log says how many days came from the L3 name.
+
+    "Nothing under it" includes a day the archive makes up: asked for
+    a thinned day a name holds nothing for, it answers with a flat
+    line of 144 points of one value instead of with nothing. That flat
+    line hid the L3 name's real data for 12.-29.08.2026 until October
+    2026; it is now recognised and the other name is asked. A day
+    neither name holds is left empty.
+
+    Both names in the list as two separate values: each is read
+    exactly as named.
+
 
 =================================================================
 6. THE OTHER TABS
@@ -615,6 +1109,7 @@ what makes a month-long load possible at all.
     answer. Pick the two from the lists at the top; the plot redraws
     as soon as either changes. It has the same picture buttons as the
     main graph, and dragging a rectangle with the right button zooms.
+    "Clean XY" removes the points and keeps the frame.
 
     PAIRING THE TWO UP. A point needs a value for both at the same
     moment, and the two are rarely recorded at the very same instant —
@@ -695,19 +1190,46 @@ what makes a month-long load possible at all.
     add points of its own and the same number would be counted into
     the distribution several times over.
 
-    CONDITIONS are target ± percent, one row each, and each row can be
-    switched off without losing it. A row starts switched off, because
-    a filter that appears already active would empty the plot for no
-    stated reason. The caption always says which conditions were in
-    force and how many shots of how many survived them.
+    CONDITIONS use the same rows as the Conditions window (section
+    on Conditions above): on/off tick, value, kind (Between, Target
+    ± %, Target ± value, At least, At most, Outside) and how many
+    shots each row keeps on its own. "+ Add condition" adds a row. A
+    new row starts switched off, because a filter that appears already
+    active would empty the plot for no stated reason; it switches
+    itself on as soon as you type a number into it. The same goes for a
+    saved row that is off and has no numbers yet — before, such a row
+    stayed off when a limit was typed in, so an SBW4 0.15 J limit typed
+    into it never filtered and the trigger shots stayed on the plot. A
+    row with limits that you switched off yourself stays off. The rows
+    are kept for next time. The caption always says which conditions
+    were in force and how many shots of how many survived them.
+
+    "Apply conditions" above the rows switches all of them off and on
+    again without losing them. "Copy from Graph conditions" replaces
+    the rows with those of the Conditions window.
+
+    A condition value (the SBW4 energy, say) is read up to 137 ms
+    after the shot, as in the Graph tab: it is often archived a few ms
+    after the shot's other values, and reading it exactly at the shot
+    used to give the previous shot's energy.
+
+    IT REDRAWS BY ITSELF. Changing the value, the days, the mode or a
+    condition redraws the plot a moment later — no button to press.
+    "Refresh" draws again on request (for example to pick up today's
+    newest shots). The dates along the bottom are written upright,
+    date over weekday; with many days only every second or third is
+    written.
 
     WHAT IT COSTS. A day of eight channels is about fifty requests and
     two or three seconds; a week is read while you watch, a month is
-    worth starting and leaving alone. Every day that has been read
+    worth starting and leaving alone. While days are being read, a
+    green bar under the plot shows how far the reading has got (it
+    moves within each day, not only when a day is finished); it
+    disappears when the plot is drawn. Every day that has been read
     stays in memory for as long as the program runs, per channel, so
     changing the Y value, adding a condition or retyping a target
     redraws at once. Only a day — or a channel — that has not been
-    read yet is fetched, and pressing Plot again in the middle of a
+    read yet is fetched, and pressing Refresh in the middle of a
     long read keeps everything already fetched.
 
     A CHANNEL THAT REPORTS RARELY (a waveplate, a valve) can have its
@@ -745,7 +1267,8 @@ what makes a month-long load possible at all.
     What the program did, and every problem it decided not to shout
     about: conditions that were skipped, formulas that could not be
     computed, the live window being shortened, rows dropped by a
-    filter. When a result surprises you, read this first.
+    filter. When a result surprises you, read this first. "Clear log"
+    empties it.
 
 
 =================================================================
@@ -832,11 +1355,17 @@ so if Live mode is on the two are competing; the Log says so.
 =================================================================
 
   the main settings file      window state, the last time range, the
-                              conditions, the master value and the
-                              graph settings
+  (cpva_explorer_config.json) conditions, the master value, the graph
+                              settings, and the saved looks from the
+                              "Styles" button
   the presets file            named value lists
+  (cpva_presets.json)
   the conditions presets      named filter sets
+  (cpva_conditions_presets.json)
   the computed values file    the formulas and their bindings
+  (custom_pvs.json)
+  derived_pvs.json            left over from an earlier version;
+                              nothing reads it any more
   the ramping folder          old local records and the named setups.
                               No tab reads them any more; the PV Time
                               tab goes to the archive instead
@@ -915,8 +1444,9 @@ particular load is saved.
       overlap the region at all.
 
   A long load is very slow
-      It is thousands of one-hour requests. Reduce the window, reduce
-      the list, or let the thinning do its work.
+      A busy signal over a long period still means many requests
+      (section 2). Reduce the window, reduce the list, or let the
+      thinning do its work.
 
   Nothing loads at all
       The archiver is not reachable from this computer. Nothing will
@@ -950,12 +1480,12 @@ particular load is saved.
       worth reporting.
 
   A long period seems not to load
-      Watch the line under the graph: it counts the requests and
-      estimates the time left, and the picture fills in from the
-      right as the data arrives. If it ends with a warning that some
-      signals are incomplete, the Log lists the stretches that could
-      not be read. "Nothing could be read" means the archive was not
-      answering.
+      Watch INFO on the left (section 3.7): it says how far back the
+      reading has got and about how long is left, and the picture
+      fills in from the right as the data arrives. If it ends with a
+      warning that some signals are incomplete, the Log lists the
+      stretches that could not be read. "Nothing could be read"
+      means the archive was not answering.
 
   Scrolling changed a setting
       It should not any more — see section 4.6. If it still does,

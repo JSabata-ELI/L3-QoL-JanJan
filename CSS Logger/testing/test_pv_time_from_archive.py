@@ -75,8 +75,7 @@ def main():
     # Y = sbw4, condition off (the default target 70 has nothing to do with it)
     idx = next(i for i, l in enumerate(labels) if "SBW4" in l.upper())
     w._pv_time_y_combo.setCurrentIndex(idx)
-    for row in w._pv_time_condition_rows:
-        row["enabled"].setChecked(False)
+    w._pv_time_cond_editor.clear()
 
     w._pv_time_days = _workdays(2)
     w._refresh_pv_time_days_label()
@@ -104,10 +103,11 @@ def main():
     assert not w._pv_time_busy, "the second Plot went back to the archiver"
 
     # A condition on a channel that is already in memory must not refetch.
-    row = w._pv_time_condition_rows[0]
-    row["variable"].setCurrentIndex(idx)
-    row["target"].setText("5")
-    row["tolerance"].setText("80")
+    row = w._pv_time_cond_editor.add_row()
+    row["kind"].setCurrentIndex(row["kind"].findData("pct"))
+    row["pv"].setCurrentIndex(idx)
+    row["a"].setText("5")
+    row["b"].setText("80")
     row["enabled"].setChecked(True)
     w._plot_pv_time()
     _pump(app, 0.5)
@@ -118,9 +118,9 @@ def main():
 
     # A condition on a channel NOT read yet: only that channel is fetched.
     other = next(i for i, l in enumerate(labels) if "PTM1 -" in l)
-    row["variable"].setCurrentIndex(other)
-    row["target"].setText("60")
-    row["tolerance"].setText("90")
+    row["pv"].setCurrentIndex(other)
+    row["a"].setText("60")
+    row["b"].setText("90")
     row["enabled"].setChecked(True)
     t2 = time.monotonic()
     w._plot_pv_time()

@@ -1,5 +1,5 @@
 {
   "collect_all": [],
-  "hidden_imports": ["daypicker"],
+  "hidden_imports": ["daypicker", "logger_tabs", "cpva_cache"],
   "extra_files": ["cpva_presets.json", "cpva_explorer_config.json"]
 }

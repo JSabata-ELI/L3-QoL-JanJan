@@ -20,6 +20,7 @@ import cpva_client as cpva  # noqa: E402
 CHANNELS = [
     ("PTM1", "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy"),
     ("SBW4", "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"),
+    ("Back_Ref", "L3-PM03-023:Energy"),
 ]
 SHOT_PERIOD_S = 0.30      # the camera's frame spacing in the same window
 

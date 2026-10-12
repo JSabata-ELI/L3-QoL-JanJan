@@ -450,8 +450,56 @@ load-bearing:
   deliberately blanked is not resurrected.
 - `shutdown()` commits the open editor, flushes `_pending` into
   `pending_edits.json` (local, instant, replayed by the next `sync`) and only
-  then waits up to two seconds for the writer. The writer is a daemon thread and
-  dies with the interpreter, so the queue file is what makes closing safe.
+  then waits up to two seconds for the writer and the typed-write queue. Both
+  are daemon threads and die with the interpreter, so the queue file is what
+  makes closing safe.
+- **The queue file has its own lock** (`Store._pending_io`), not `_io_lock`.
+  `queue_edits` runs on the UI thread at every commit; behind `_io_lock` it
+  waited for whatever share CSV / workbook rewrite was running, and the window
+  froze for seconds while the operator tabbed to the next cell.
+  `_forget_pending` drops a column only while it still holds the value that was
+  sent, because a newer value may now be queued in between.
+- **Campaign names and values typed into a not-yet-recorded column** go through
+  `_side_job` — one worker thread, in order, never refused — not through `_run`.
+  A second cell typed into the same new column before the first is read back
+  is written as a correction (`update_values`), not as a second record.
+
+### Nothing is rebuilt that can be changed in place
+
+- `_refresh_today` compares `_signature(day, columns)` (every stamp, slot,
+  source and value of the shown day) with the table it built last
+  (`_shown_sig`). Unchanged → `_recolour(table)`: the same items get new
+  colours and tooltips (`_repaint_moment`), which is all a grown history can
+  change. Changed → `_fill_table` with updates off, then the scroll position is
+  put back (and the picked cell, on the same day). Start-up used to rebuild the
+  table three or four times; each one threw the view back to the top.
+- A new reference range or yellow width (`_use_references`, References → Save)
+  only recolours, on the day table and on an open View day table.
+  `_queue_edits` refreshes `_shown_sig` so a typed value is not later taken for
+  a change.
+- `_refresh_day_list` does nothing while the View day window is hidden;
+  `_open_view_day` fills it with `force=True`.
+- The campaign box reads `Store.campaigns_cached()` — never the share on the UI
+  thread. `campaigns()`, `set_campaign` and `_sync_campaigns` (all background)
+  refresh the cache. Before this every Previous / Next read the share's JSON.
+- `history_for` compares ISO day strings instead of `strptime` per row
+  (40 ms → 2 ms per old day on a year of rows); `_parts()` is computed once.
+- Open folder touches the share on a thread: a share that has gone away answers
+  after many seconds.
+
+### Nothing opens by itself; the wheel changes nothing unclicked
+
+- The slot timer calls `_on_record_slot(slot, auto=True)`, and
+  `_guard_fields(quiet=True)` reports a missing field file or missing PV names
+  in the status line and the log — never a `QMessageBox` nobody asked for.
+- `main.py` installs `_WheelGuard` on the application — the same guard as CSS
+  Logger's: a spin box, combo box or slider reacts to the wheel only after a
+  click on it, while the pointer stays on it; otherwise the scroll goes to the
+  panel under it. Inside CSS Logger that program's own guard does the job. The
+  only such field today is the year box of the Pick days calendar.
+- A Detail link is looked up in `fields.rows` (one per table row). It used to be
+  looked up in `_table_lines()` — one entry per NUMBER — and opened nothing, or
+  another row's link, below the first X/Y/SUM quantity.
 
 A `PENDING` column has no `_ROLE_STAMP`; typing into one goes to
 `_create_manual_column`, which builds a `source="manual"` record for that slot
