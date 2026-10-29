@@ -2,7 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05  (remote_launcher.py, 802 lines)
+Verified against source: 2026-10-15  (remote_launcher.py, 808 lines)
+  Program folder: 5.4 MB in 226 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_Diagnostic Webex listener.txt ("ReadMe" button)
 Code map:      STRUCTURE.md  (in the Diagnostic folder)

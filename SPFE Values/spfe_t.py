@@ -68,7 +68,7 @@ def _import_daypicker():
     Three locations are searched because a built app has no single answer. Next
     to this file means _internal, and _internal never survives the trip to the
     share: copying a program there does not bring its _internal at all, and
-    "Deploy Libraries" (Dev Tools/cm_t.py) fills the destination's one from a
+    "Deploy Libraries" (Dev Tools/dt_core.py) fills the destination's one from a
     single shared runtime library, deleting whatever that library does not have.
     daypicker.py is not in it and cannot be. The copy compiled into the exe
     (build_config.json -> hidden_imports) and the loose file the deploy drops

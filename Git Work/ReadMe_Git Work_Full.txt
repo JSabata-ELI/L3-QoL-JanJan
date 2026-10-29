@@ -2,7 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05  (git_work.py, 1995 lines)
+Verified against source: 2026-10-15  (git_work.py, 2147 lines)
+  Program folder: 190 kB in 5 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_Git Work.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

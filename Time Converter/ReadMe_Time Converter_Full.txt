@@ -2,7 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05  (tc.py, 626 lines)
+Verified against source: 2026-10-15  (tc.py, 707 lines)
+  Program folder: 102 kB in 5 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: Readme Time Converter.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

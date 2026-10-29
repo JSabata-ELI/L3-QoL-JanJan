@@ -308,6 +308,11 @@ SLAVE_SYNC_MAX_NS = 3_000_000_000   # how far a slave camera's nearest frame may
                             # frozen picture next to three moving ones, with nothing saying
                             # why. 3 s still refuses a genuinely unrelated moment, and the
                             # tile's own "~" label now says when it is a neighbour.
+# The cap is enforced in CHUNKS: a list may run this far over it before the oldest
+# frames go, all at once. Trimming back to exactly the cap on every arrival copied the
+# whole list (and the merged timeline, cap x cameras long) on every new frame, forever,
+# once the cap was first reached ~18 min into a 3.3 Hz run.
+ONLINE_TRIM_SLACK = 300
 ONLINE_MAX_ITEMS = 3_600    # max frames kept PER CAMERA *while live mode is ON*
                             # (~18 min at 3.3 Hz). Deliberately small: live mode is
                             # for watching the latest frames, and keeping tens of
@@ -406,7 +411,7 @@ def _import_daypicker():
     Three locations are searched because a built app has no single answer. Next to
     this file means _internal, and _internal never survives the trip to the
     share: copying a program there does not bring its _internal at all, and
-    "Deploy Libraries" (Dev Tools/cm_t.py) fills the destination's one from a
+    "Deploy Libraries" (Dev Tools/dt_core.py) fills the destination's one from a
     single shared runtime library, deleting whatever that library does not have.
     daypicker.py is not in it and cannot be. The copy compiled into the exe
     (build_config.json -> hidden_imports) and the loose file the deploy drops
@@ -664,20 +669,30 @@ def pv_registry_to_dict() -> dict:
                           if lo is not None or hi is not None}}
 
 
-def pv_registry_from_dict(data: dict) -> None:
+def pv_registry_from_dict(data: dict) -> "dict[str, str]":
     """Load a saved registry, validating every entry.
 
     The validation is the point of this being one function: a name that clashes with a
     read PV, a channel that is gone, a label for a PV nothing on screen can edit — each
     of those reads to the operator as "the programme shows the wrong number", never as a
-    bad config file."""
+    bad config file.
+
+    An added PV that is a preset's channel under another name (SBW4's HAPLS name) is
+    FOLDED into that preset: its formulas are re-bound to the preset, and its name and
+    alarm limits move over when the preset has none of its own. Returns the folded
+    names, old → preset (empty when nothing was folded)."""
+    folded: "dict[str, str]" = {}
     if not isinstance(data, dict):
-        return
+        return folded
     _custom = data.get("pv_custom")
     if isinstance(_custom, dict):
         PV_CUSTOM_CHANNELS.clear()
         for _n, _ch in _custom.items():
             if isinstance(_ch, str) and _ch.strip() and str(_n) not in PV_CHANNEL_MAP:
+                _preset = pv_preset_for_channel(_ch)
+                if _preset is not None:
+                    folded[str(_n)] = _preset
+                    continue
                 PV_CUSTOM_CHANNELS[str(_n)] = _ch.strip()
 
     # A formula whose name clashes with a read PV is dropped: pv_channel_for() would win
@@ -698,7 +713,8 @@ def pv_registry_from_dict(data: dict) -> None:
             PV_DERIVED.append({
                 "name": _nm, "expr": _ex,
                 "unit": str(_d.get("unit") or ""),
-                "bindings": {str(k): str(v) for k, v in _bnd.items()}
+                "bindings": {str(k): folded.get(str(v), str(v))
+                             for k, v in _bnd.items()}
                             if isinstance(_bnd, dict) else {},
             })
             _taken.add(_nm)
@@ -713,6 +729,11 @@ def pv_registry_from_dict(data: dict) -> None:
         for _n, _lbl in _labels.items():
             if isinstance(_lbl, str) and _lbl.strip() and str(_n) in _known:
                 PV_LABELS[str(_n)] = _lbl.strip()
+        for _old, _preset in folded.items():
+            _lbl = _labels.get(_old)
+            if (isinstance(_lbl, str) and _lbl.strip() and _lbl.strip() != _preset
+                    and _preset not in PV_LABELS):
+                PV_LABELS[_preset] = _lbl.strip()
 
     # Units typed for added PVs, and only for ones that still exist: a unit left behind
     # by a removed channel would print itself onto whatever took its name.
@@ -739,6 +760,14 @@ def pv_registry_from_dict(data: dict) -> None:
             _lo, _hi = _coerce_limit(_lim.get("min")), _coerce_limit(_lim.get("max"))
             if _lo is not None or _hi is not None:
                 PV_LIMITS[str(_n)] = (_lo, _hi)
+        for _old, _preset in folded.items():
+            _lim = _limits.get(_old)
+            if _preset in PV_LIMITS or not isinstance(_lim, dict):
+                continue
+            _lo, _hi = _coerce_limit(_lim.get("min")), _coerce_limit(_lim.get("max"))
+            if _lo is not None or _hi is not None:
+                PV_LIMITS[_preset] = (_lo, _hi)
+    return folded
 
 
 def pv_registry_save() -> None:
@@ -760,7 +789,8 @@ def pv_registry_load(fallback: "dict | None" = None) -> None:
         data = json.loads(PV_REGISTRY_PATH.read_text(encoding="utf-8"))
     except Exception:
         data = None
-    pv_registry_from_dict(data if isinstance(data, dict) else (fallback or {}))
+    if pv_registry_from_dict(data if isinstance(data, dict) else (fallback or {})):
+        pv_registry_save()      # the folded duplicate stays gone from the file
 
 
 def pv_migrate_preset_recipes(enabled: "list[str]", hidden: "set[str]") -> "list[str]":
@@ -778,11 +808,8 @@ def pv_migrate_preset_recipes(enabled: "list[str]", hidden: "set[str]") -> "list
     The saved ORDER is kept and a name this module does not know is passed through
     untouched — the Image Finder's selection may hold CSV-only columns, and ordering the
     result by pv_all_names() here would silently drop them."""
-    picked, seen = [], set()
-    for n in enabled:                       # de-duplicate, keep the saved order
-        if n not in seen:
-            seen.add(n)
-            picked.append(n)
+    # SBW4 saved under its other name as an added PV is the SBW4 preset now — one row.
+    picked = pv_fold_selection(list(enabled), hidden)   # also de-duplicates
     added = False
     for name, rd in PV_PRESET_RECIPES.items():
         if name not in picked or pv_derived_def(name) is not None:
@@ -812,6 +839,57 @@ def pv_channel_for(name: str) -> "str | None":
     """Archiver channel for a PV panel name — preset or user-added. None for a
     derived PV, which is computed rather than read."""
     return PV_CHANNEL_MAP.get(name) or PV_CUSTOM_CHANNELS.get(name)
+
+
+def pv_preset_for_channel(channel: str) -> "str | None":
+    """The preset that reads this archiver channel — under its own name OR under
+    another name of the same measurement (cpva.channel_aliases: SBW4's HAPLS and L3
+    names). None when no preset reads it.
+
+    One measurement, one row: picking SBW4's other name is picking SBW4. Every read
+    of the preset already asks both names (HAPLS first, L3 when HAPLS holds nothing —
+    cpva.read_order), so a second row would only read the same numbers twice."""
+    channel = (channel or "").strip()
+    if not channel:
+        return None
+    for n, ch in PV_CHANNEL_MAP.items():
+        if ch == channel or channel in cpva.channel_aliases(ch):
+            return n
+    return None
+
+
+def pv_fold_name(name: str) -> str:
+    """The name a saved PV name stands for now: an added PV that is really a preset's
+    channel (or its other name) becomes that preset; everything else is unchanged.
+    An added PV is keyed by its own channel, so the name alone is enough even after
+    the registry has already dropped it."""
+    if name in PV_CHANNEL_MAP:
+        return name
+    return pv_preset_for_channel(PV_CUSTOM_CHANNELS.get(name) or name) or name
+
+
+def pv_fold_selection(names: "list[str]", hidden: "set[str]") -> "list[str]":
+    """Fold every saved name onto the preset it stands for (pv_fold_name), keeping the
+    saved order and dropping the duplicate this makes. `hidden` is updated in place:
+    the folded row is shown when either of the two rows was shown."""
+    picked = set(names)
+    out: list = []
+    for n in names:
+        f = pv_fold_name(n)
+        if f != n:
+            was_shown = n not in hidden
+            hidden.discard(n)
+            if f in picked:
+                if was_shown:
+                    hidden.discard(f)
+            elif was_shown:
+                hidden.discard(f)
+            else:
+                hidden.add(f)
+            picked.add(f)
+        if f not in out:
+            out.append(f)
+    return out
 
 
 def pv_label_for(name: str) -> str:
@@ -1305,6 +1383,22 @@ PV_ARCHIVER_MAX_WAIT_S = 20.0
 # so a late sample still snaps it back to this shot's own.
 PV_SKIPPED_SHOT_GRACE_S = 2.0
 
+# ── live mode: a feed, not a pairing ─────────────────────────────────────────
+# Decided 13.10.2026 with the user. Following the live edge, the camera stores ~3
+# frames/s and the archiver answers in 1–7 s, so pairing every new frame with its own
+# sample left the numbers seconds behind the picture and the dots on all the time.
+# There the panel shows the NEWEST value the archiver holds, polled this often, NOT
+# matched to the frame on screen. The moment the view leaves the live edge (arrows,
+# slider, Live mode off) every value is matched to its own frame exactly again.
+PV_LIVE_POLL_MS = 1000
+# How far back one poll asks; a channel with nothing in it (a setting, or a value
+# written only on change) is answered by look-back instead.
+PV_LIVE_WINDOW_S = 60
+# A feed that has not answered for this long says so (grey dot): stale numbers
+# must never pass for current ones. 20 s, not less: from the office one poll was
+# measured taking over 10 s (single requests up to 7 s), which is slow, not dead.
+PV_LIVE_STALE_S = 20.0
+
 # ── keeping the panel alive over a whole shift ───────────────────────────────
 # The panel is single-flight: while a fetch is in flight no new one starts. That is
 # correct, and it is also a single point of failure — anything that stops a worker
@@ -1338,6 +1432,10 @@ TRIPS_MAX = 50
 # A PV the archiver will not answer for is NOT a trip. A trip means "the beam did
 # something out of limits", and "ERR" says nothing about the beam — it says the read
 # failed. The panel already shows that on the row itself and in the corner badge.
+# The same goes for camera faults (unreadable image, lag, folder gone): they stay on
+# the tile's red dot and tooltip and do NOT open a trip. Trips are for the energy
+# limits only (user rule, 26.10.2026). True brings the camera trips back.
+CAM_FAULT_TRIPS = False
 
 # One short phrase per live-health fault (the five reasons _live_health returns), for
 # the trip row. _live_health's own tooltip is the fuller sentence with the filename and
@@ -1453,10 +1551,9 @@ def _pv_last_known_ex(channel: str, ts_ns: int,
     (see the measured lag above). How long to keep asking is the CALLER's decision —
     it is the one that knows how long it has been waiting, and elapsed time here would
     have to come from the local clock, which is 25 s off the archiver's.
-    "far" → nothing inside the strict window, and the nearest reading of a channel
-    archived more slowly than the frames is returned instead (see _pv_wide_window_ns).
-    It is a real reading of a real moment, it is simply not this frame's, so the caller
-    must print the offset next to it.
+Nothing inside the window once the archiver has had time to write it → the last
+    sample before the frame, status "ok" with no sample timestamp: the archiver writes
+    only on change, so that IS the frame's value (13.10.2026).
 
     The third element is the timestamp of the sample the value came from — None when
     there is no value. It is what lets the panel say HOW far off the reading is
@@ -1472,21 +1569,27 @@ def _pv_last_known_ex(channel: str, ts_ns: int,
     is_step = cpva.is_step_channel(channel)
     if res.status == "pending":
         return None, "pending", None
+    if res.status == "held":
+        # A quiet channel (nothing written for far longer than its own cadence).
+        # The archiver writes only on CHANGE, so its last sample is the value at
+        # this frame — shown as the frame's own, no dot (13.10.2026).
+        return res.value, "ok", None
     if res.status in ("stale", "error"):
         return res.value, res.status, (None if is_step else res.ts_ns)
     if res.value is None and res.status == "not_found" and not is_step:
-        # Nothing per-shot to be had. If this channel is simply archived more slowly
-        # than the camera stores frames, the nearest reading is the only candidate
-        # there is — show it, and let the caller label the offset.
-        wide = _pv_wide_window_ns(channel, ts_ns)
-        if wide > own:
-            near = cpva.lookup_near(channel, int(ts_ns), window_ns=wide,
-                                    prefer=_PV_PREFER,
-                                    pending_if_uncovered=False,
-                                    today_ttl=0.0 if fresh else _PV_TODAY_CACHE_TTL,
-                                    timeout=CPVA_HTTP_TIMEOUT)
-            if near.value is not None:
-                return near.value, "far", near.ts_ns
+        # Nothing inside this frame's window, and the archiver has had time to write
+        # it (cpva.may_still_publish). The archiver writes only on CHANGE (SBW4 with
+        # the laser off: two noise levels, gaps of 0.3–20 s; GDD: hours), so nothing
+        # written means nothing changed: the last sample before the frame IS the
+        # frame's value. Shown as its own reading — no orange "older shot" dot, which
+        # stayed on permanently for every on-change channel (13.10.2026).
+        back = cpva.value_at_or_before(channel, int(ts_ns),
+                                       today_ttl=0.0 if fresh else _PV_TODAY_CACHE_TTL,
+                                       timeout=CPVA_HTTP_TIMEOUT)
+        if back.value is not None:
+            return back.value, "ok", None
+        if back.status == "error":
+            return None, "error", None
         return None, "not_found", None
     # A SETTING reports no sample timestamp at all. Its value between two changes is
     # not an old reading of anything — it is what the machine was set to for this
@@ -1523,7 +1626,16 @@ def pv_offset_label(sample_ts_ns: "int | None", frame_ts_ns: "int | None",
     if abs(delta) <= max(cpva.PV_EXACT_MATCH_NS, int(own_window_ns or 0)):
         return ""
     off = delta / 1e9
-    return f" ({off:+.1f} s)" if abs(off) < 10.0 else f" ({off:+.0f} s)"
+    if abs(off) < 10.0:
+        return f" ({off:+.1f} s)"
+    if abs(off) < 120.0:
+        return f" ({off:+.0f} s)"
+    # A held setting can be hours old: "(-11745 s)" is not readable.
+    if abs(off) < 2 * 3600.0:
+        return f" ({off / 60:+.0f} min)"
+    if abs(off) < 2 * 86400.0:
+        return f" ({off / 3600:+.1f} h)"
+    return f" ({off / 86400:+.0f} days)"
 
 
 # A value-state dot inside a burned-in PV line: a private-use character naming the
@@ -4324,9 +4436,7 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             if measuring and stats_out is not None:
                 stats_out.update(_diff_stats_from(_reference_diff(
                     lin8.astype(np.float32), ref_image, sub_threshold)))
-            if is_cyclic:
-                return _rgb_to_qimage(_ni_binary_rgb(arr16, full_scale))
-            return _rgb_to_qimage(_ni_false_colors_rgb(arr16, full_scale))
+            return _ni_rgb32_image(arr16, full_scale, binary=is_cyclic)
         if not doing_diff:
             # The whole display pipeline on the FULL-PRECISION data: absolute scale bent
             # by gamma, then the contrast gain, then the brightness offset, rounded to 8
@@ -4418,6 +4528,39 @@ def _palette_normalize(arr: np.ndarray) -> np.ndarray:
         return arr
     return np.clip((arr.astype(np.float32) - lo) * (255.0 / (hi - lo)),
                    0, 255).astype(np.uint8)
+
+
+# (binary?, full_scale) -> 65536-entry uint32 table: every stored 16-bit value straight to
+# its packed RGB32 pixel. Only a handful of full_scale values ever occur (one per bit
+# depth the archiver brackets to), so the dict stays tiny; the cap is only a backstop.
+_NI_RGB32_TABLES: dict = {}
+
+
+def _ni_rgb32_table(full_scale: float, binary: bool) -> np.ndarray:
+    key = (bool(binary), float(full_scale))
+    table = _NI_RGB32_TABLES.get(key)
+    if table is None:
+        values = np.arange(65536, dtype=np.uint16)
+        rgb = (_ni_binary_rgb(values, full_scale) if binary
+               else _ni_false_colors_rgb(values, full_scale)).astype(np.uint32)
+        table = (np.uint32(0xFF000000) | (rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2])
+        if len(_NI_RGB32_TABLES) >= 16:
+            _NI_RGB32_TABLES.clear()
+        _NI_RGB32_TABLES[key] = table
+    return table
+
+
+def _ni_rgb32_image(arr16: np.ndarray, full_scale: float, binary: bool) -> QImage:
+    """(h, w) uint16 stored values -> RGB32 QImage in ONE lookup.
+
+    Same colours as _rgb_to_qimage(_ni_binary_rgb(...)) pixel for pixel (checked in
+    testing/test_ni_rgb32_table.py), but the old route made about six full-frame passes
+    — a float copy, the index, an (h, w, 3) array, a zeroed (h, w, 4) array, four channel
+    copies and tobytes — on every live Binary frame of every camera. Here the whole value
+    -> pixel mapping is precomputed once, so a frame is a single gather."""
+    h, w = arr16.shape[:2]
+    out = np.ascontiguousarray(_ni_rgb32_table(full_scale, binary)[arr16])
+    return QImage(out.data, w, h, w * 4, QImage.Format.Format_RGB32).copy()
 
 
 def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
@@ -5072,6 +5215,17 @@ _GEOM_LEN = {"cross": 2, "circle": 4, "square": 4}
 _ROT_KNOB_GAP = 22
 
 
+# ── Own look ─────────────────────────────────────────────────────────────────
+# One mark may look different from the rest of its kind (Overlay settings →
+# "Cross 2"). Its look rides along the same way the angle does: a dict as the
+# LAST element, after the angle (which is then always written, 0 included) —
+# (x, y, a, {look}). Keys are the style keys without the kind prefix: "color"
+# (#AARRGGBB text, so the tuple stays plain data), "thick", "size" (cross),
+# "outline", "outline_color", "outline_w". A mark without one follows the
+# kind's style.
+LOOK_KEYS = ("color", "thick", "size", "outline", "outline_color", "outline_w")
+
+
 def mark_core(kind: str, geom) -> tuple:
     """The shape alone, without the angle."""
     return tuple(geom[:_GEOM_LEN[kind]])
@@ -5079,16 +5233,58 @@ def mark_core(kind: str, geom) -> tuple:
 
 def mark_angle(kind: str, geom) -> float:
     n = _GEOM_LEN[kind]
-    return float(geom[n]) if len(geom) > n else 0.0
+    if len(geom) > n and not isinstance(geom[n], dict):
+        return float(geom[n])
+    return 0.0
 
 
-def with_angle(kind: str, core, angle: float) -> tuple:
-    """Shape + angle, normalised to (-180, 180]; 0 leaves the tuple short."""
+def mark_look(kind: str, geom) -> dict:
+    """This mark's own look ({} = the kind's style)."""
+    if len(geom) > _GEOM_LEN[kind] and isinstance(geom[-1], dict):
+        return dict(geom[-1])
+    return {}
+
+
+def with_angle(kind: str, core, angle: float, look: "dict | None" = None) -> tuple:
+    """Shape + angle, normalised to (-180, 180]; 0 leaves the tuple short unless
+    the mark has its own `look`, which then follows the angle."""
     a = float(angle) % 360.0
     if a > 180.0:
         a -= 360.0
     core = tuple(core[:_GEOM_LEN[kind]])
+    look = {k: v for k, v in (look or {}).items() if k in LOOK_KEYS}
+    if look:
+        return core + (round(a, 3) if abs(a) > 1e-9 else 0.0, look)
     return core + ((round(a, 3),) if abs(a) > 1e-9 else ())
+
+
+def with_look(kind: str, geom, look: "dict | None") -> tuple:
+    """`geom` with its own look replaced (None / {} = follow the kind's style)."""
+    return with_angle(kind, mark_core(kind, geom), mark_angle(kind, geom), look)
+
+
+def mark_effective_style(kind: str, geom, style: dict) -> dict:
+    """The kind's style keys (`{kind}_color`, …) with this mark's own look on top."""
+    out = {f"{kind}_{k}": style.get(f"{kind}_{k}") for k in LOOK_KEYS}
+    out["cross_size"] = style.get("cross_size", 18)
+    for k, v in mark_look(kind, geom).items():
+        if k in ("color", "outline_color"):
+            c = QColor(str(v))
+            if c.isValid():
+                out[f"{kind}_{k}"] = c
+        elif k == "size":
+            out["cross_size"] = int(v)
+        elif k == "outline":
+            out[f"{kind}_outline"] = bool(v)
+        else:
+            out[f"{kind}_{k}"] = int(v)
+    return out
+
+
+def mark_cross_size(geom, default: int) -> int:
+    """A cross's arm length — its own if it has one."""
+    v = mark_look("cross", geom).get("size") if geom is not None else None
+    return int(v) if v else int(default)
 
 
 def zoom_full_rect(ir, zoom_norm, pw: int, ph: int) -> QRect:
@@ -5335,17 +5531,22 @@ def draw_marks(p, rect, marks, style, *, pen_min_w: int = 0,
         lst = marks.get(kind) or ()
         if not lst:
             continue
-        colour = style.get(f"{kind}_color") or QColor(255, 255, 255, 230)
-        base_thick = max(1, int(style.get(f"{kind}_thick", 2) or 2))
-        thick = max(base_thick, int(pen_min_w))
-        # Outline: a wider stroke in a contrasting colour UNDER the mark's own, so
-        # the line shows on a blown-out core and on a black field alike. Its width
-        # grows with the pen on a big saved frame, so it keeps its proportion.
-        outline = bool(style.get(f"{kind}_outline", False))
-        o_w = max(1, int(style.get(f"{kind}_outline_w", 1) or 1))
-        o_w = max(1, int(round(o_w * thick / base_thick)))
-        o_col = style.get(f"{kind}_outline_color") or QColor(0, 0, 0, 230)
+        kind_csize = csize
         for i, geom in enumerate(lst):
+            # The kind's style, or the mark's own look where it has one.
+            st = mark_effective_style(kind, geom, style) if mark_look(kind, geom) \
+                else style
+            csize = int(st.get("cross_size", kind_csize) or kind_csize)
+            colour = st.get(f"{kind}_color") or QColor(255, 255, 255, 230)
+            base_thick = max(1, int(st.get(f"{kind}_thick", 2) or 2))
+            thick = max(base_thick, int(pen_min_w))
+            # Outline: a wider stroke in a contrasting colour UNDER the mark's own, so
+            # the line shows on a blown-out core and on a black field alike. Its width
+            # grows with the pen on a big saved frame, so it keeps its proportion.
+            outline = bool(st.get(f"{kind}_outline", False))
+            o_w = max(1, int(st.get(f"{kind}_outline_w", 1) or 1))
+            o_w = max(1, int(round(o_w * thick / base_thick)))
+            o_col = st.get(f"{kind}_outline_color") or QColor(0, 0, 0, 230)
             is_sel = (selected == (kind, i))
             if is_sel:
                 _stroke_mark(p, rect, kind, geom,
@@ -5403,7 +5604,9 @@ def draw_marks(p, rect, marks, style, *, pen_min_w: int = 0,
         # 1, 2, … as its "Cross 1", "Cross 2" list.
         if numbers:
             for i, geom in enumerate(lst):
-                _draw_mark_number(p, _mark_number_anchor(rect, kind, geom, csize), i + 1)
+                cs = mark_cross_size(geom, kind_csize) if kind == "cross" else kind_csize
+                _draw_mark_number(p, _mark_number_anchor(rect, kind, geom, cs), i + 1)
+        csize = kind_csize
 
 
 # The look of the marks when nothing else has been chosen. Outline ON: a 1 px black
@@ -6448,8 +6651,10 @@ class _SCHistogramDialog(QDialog):
     _sig_hist_ready = Signal(list, int, float, float, list)  # (counts, bit_depth, lo, hi, bin_edges)
     _sig_hist_error = Signal(str)
 
-    def __init__(self, img_path: "Path", current_threshold: int,
-                 bit_depth: int, parent=None):
+    def __init__(self, img_path: "Path | None", current_threshold: int,
+                 bit_depth: int, parent=None, arr: "np.ndarray | None" = None):
+        """`arr` is a frame already in memory (the Workshop's); it is used instead
+        of reading `img_path`, and its full scale is `bit_depth` as given."""
         super().__init__(parent)
         self.setWindowTitle("Threshold — Histogram")
         self.setMinimumSize(500, 300)
@@ -6457,6 +6662,7 @@ class _SCHistogramDialog(QDialog):
 
         # ── state ─────────────────────────────────────────────────────────────
         self._img_path  = img_path
+        self._arr       = arr
         self._threshold = int(current_threshold)
         self._bit_depth = int(bit_depth)
 
@@ -6526,14 +6732,19 @@ class _SCHistogramDialog(QDialog):
     # ── background worker ─────────────────────────────────────────────────────
     def _bg_load(self):
         try:
-            from PIL import Image as _PIL
-            img = _PIL.open(str(self._img_path))
-            if img.mode in ("I", "I;16", "I;16B"):
-                arr = np.asarray(img.convert("I"), dtype=np.float32)
+            if self._arr is not None:
+                arr = np.asarray(self._arr, dtype=np.float32)
+                peak = float(arr.max())
+                bd   = int(self._bit_depth)
             else:
-                arr = np.asarray(img.convert("L"), dtype=np.float32)
-            peak = float(arr.max())
-            bd   = 65535 if peak > 255 else 255
+                from PIL import Image as _PIL
+                img = _PIL.open(str(self._img_path))
+                if img.mode in ("I", "I;16", "I;16B"):
+                    arr = np.asarray(img.convert("I"), dtype=np.float32)
+                else:
+                    arr = np.asarray(img.convert("L"), dtype=np.float32)
+                peak = float(arr.max())
+                bd   = 65535 if peak > 255 else 255
             lo   = float(arr.min())
             hi   = float(peak)
             # Use 256 bins over the actual data range for good visual resolution
@@ -6599,13 +6810,18 @@ class _SCExclusionEditor(QDialog):
 
     def __init__(self, preview_pm: "QPixmap", orig_shape: "tuple[int,int]",
                  img_path: "Path | None" = None, existing_mask: "np.ndarray | None" = None,
-                 parent=None):
+                 parent=None, arr: "np.ndarray | None" = None,
+                 bit_depth: "float | None" = None):
+        """`arr` + `bit_depth`: a frame already in memory (the Workshop's), used by
+        Auto-detect instead of reading `img_path`."""
         super().__init__(parent)
         self.setWindowTitle("Exclusion editor — left-drag: paint   right-drag: erase")
         self.setMinimumSize(1200, 1000)
         self._orig_h, self._orig_w = orig_shape
         self._orig_pm = preview_pm
         self._img_path = img_path
+        self._arr = arr
+        self._arr_bit_depth = bit_depth
         self._existing_mask = existing_mask
         self._brush_size = 20
 
@@ -6710,21 +6926,27 @@ class _SCExclusionEditor(QDialog):
 
     def _auto_detect_hot(self):
         """Mark pixels above threshold % of sensor max value as excluded."""
-        if self._img_path is None:
+        if self._arr is not None:
+            arr = np.asarray(self._arr, dtype=np.float32)
+        elif self._img_path is None:
             return
-        try:
-            from PIL import Image as _PIL
-            pil = _PIL.open(str(self._img_path))
-            if pil.mode in ("I", "I;16", "I;16B"):
-                arr = np.asarray(pil.convert("I"), dtype=np.float32)
-            else:
-                arr = np.asarray(pil.convert("L"), dtype=np.float32)
-        except Exception:
-            return
+        else:
+            try:
+                from PIL import Image as _PIL
+                pil = _PIL.open(str(self._img_path))
+                if pil.mode in ("I", "I;16", "I;16B"):
+                    arr = np.asarray(pil.convert("I"), dtype=np.float32)
+                else:
+                    arr = np.asarray(pil.convert("L"), dtype=np.float32)
+            except Exception:
+                return
 
         # Determine bit depth from actual max value in image
-        arr_max = float(arr.max())
-        bit_depth = 65535.0 if arr_max > 255 else 255.0
+        if self._arr is not None and self._arr_bit_depth:
+            bit_depth = float(self._arr_bit_depth)
+        else:
+            arr_max = float(arr.max())
+            bit_depth = 65535.0 if arr_max > 255 else 255.0
         pct = self._hot_pct_sb.value() / 100.0
         thr_val = bit_depth * pct
         hot_mask_orig = arr >= thr_val   # H_orig × W_orig bool
@@ -7041,89 +7263,10 @@ class _SCTask(QRunnable):
             self._signals.finished.emit(None)
             return
 
-        arr_max = float(arr.max())
-        bit_depth = 65535.0 if arr_max > 255 else 255.0
-
-        # Threshold is in raw pixel units (0–65535 for 16-bit, 0–255 for 8-bit)
-        thr = float(self._threshold)
-        mask = arr > thr
-
-        # Fill holes so that dark regions INSIDE the beam boundary are included.
-        # Strategy: closing (dilate→fill_holes→erode) ensures the beam edge is
-        # connected before filling, so even beams with thin dark gaps get filled.
-        try:
-            from scipy.ndimage import binary_fill_holes, binary_dilation, binary_erosion
-            # Closing radius — large enough to bridge typical interference gaps
-            struct = np.ones((7, 7), dtype=bool)
-            mask_closed = binary_dilation(mask, structure=struct)
-            mask_closed = binary_fill_holes(mask_closed)
-            mask_closed = binary_erosion(mask_closed, structure=struct)
-            # Combine: original threshold mask OR the filled interior
-            mask = mask | mask_closed
-        except ImportError:
-            pass  # scipy not available — threshold-only mask
-
-        # Apply user-drawn exclusion regions
-        n_excluded = 0
-        if self._exclusion_mask is not None:
-            excl = self._exclusion_mask
-            # Resize exclusion mask to image resolution if needed
-            if excl.shape != arr.shape:
-                from PIL import Image as _PIL2
-                pil_excl = _PIL2.fromarray(excl.astype(np.uint8) * 255, "L")
-                pil_excl = pil_excl.resize((arr.shape[1], arr.shape[0]), _PIL2.NEAREST)
-                excl = np.asarray(pil_excl) > 127
-            n_excluded = int(excl.sum())
-            mask = mask & ~excl
-
-        # Pixels available for measurement (excluded zones are absent, not zero)
-        n_valid = arr.size - n_excluded
-
-        # For preview, normalise to 8-bit for display only
-        arr_8bit = np.clip(arr / bit_depth * 255.0, 0, 255).astype(np.uint8)
+        result, arr_8bit, mask = spatial_contrast(
+            arr, self._threshold, self._exclusion_mask)
         self._signals.preview.emit(self._make_preview_pixmap(arr_8bit, mask))
-
-        beam = arr[mask]
-        if beam.size == 0:
-            self._signals.finished.emit({
-                "error": "No pixels above threshold — lower the threshold.",
-                "mean": None, "min": None, "max": None,
-                "sc": None, "n_beam": 0, "n_total": n_valid,
-                "threshold": self._threshold,
-                "bit_depth": int(bit_depth),
-            })
-            return
-
-        mean_val = float(beam.mean())
-        min_val  = float(beam.min())
-        max_val  = float(beam.max())
-        sc       = max_val / mean_val if mean_val > 0 else float("inf")
-
-        # Top-N pixel coordinates (y, x) sorted by descending intensity in original array
-        h_full, w_full = arr.shape
-        ys_all, xs_all = np.where(mask)
-        if ys_all.size > 0:
-            vals = arr[ys_all, xs_all]
-            order = np.argsort(vals)[::-1]
-            top_ys = ys_all[order].tolist()
-            top_xs = xs_all[order].tolist()
-        else:
-            top_ys, top_xs = [], []
-
-        self._signals.finished.emit({
-            "error":      None,
-            "mean":       mean_val,
-            "min":        min_val,
-            "max":        max_val,
-            "sc":         sc,
-            "n_beam":     int(mask.sum()),
-            "n_total":    n_valid,
-            "threshold":  self._threshold,
-            "bit_depth":  int(bit_depth),
-            "img_shape":  (h_full, w_full),
-            "top_xs":     top_xs,
-            "top_ys":     top_ys,
-        })
+        self._signals.finished.emit(result)
 
     @staticmethod
     def otsu_threshold_raw(arr_raw: "np.ndarray", bit_depth: float) -> int:
@@ -7152,6 +7295,105 @@ class _SCTask(QRunnable):
                 max_var = var
                 thr_8 = t
         return int(round(thr_8 / 255.0 * bit_depth))
+
+
+def spatial_contrast(arr: "np.ndarray", threshold: float,
+                     exclusion_mask: "np.ndarray | None" = None,
+                     bit_depth: "float | None" = None):
+    """Spatial Contrast of one frame: SC = Max / Mean over the beam.
+
+    The beam is every pixel above `threshold` (raw counts), closed and hole-filled
+    so dark gaps inside the beam count, minus the `exclusion_mask` (True =
+    excluded; resized to the frame if it was drawn on another size). Shared by the
+    Image Slider (_SCTask, from a file) and the Workshop (from the frame in memory).
+
+    `bit_depth` is the frame's full scale; None guesses it the way the Slider always
+    has (65535 when any pixel is above 255, else 255).
+
+    Returns (result dict, 8-bit copy for the preview, beam mask)."""
+    arr = np.asarray(arr, dtype=np.float32)
+    if bit_depth is None:
+        bit_depth = 65535.0 if float(arr.max()) > 255 else 255.0
+    bit_depth = float(bit_depth)
+
+    # Threshold is in raw pixel units (0–65535 for 16-bit, 0–255 for 8-bit)
+    thr = float(threshold)
+    mask = arr > thr
+
+    # Fill holes so that dark regions INSIDE the beam boundary are included.
+    # Strategy: closing (dilate→fill_holes→erode) ensures the beam edge is
+    # connected before filling, so even beams with thin dark gaps get filled.
+    try:
+        from scipy.ndimage import binary_fill_holes, binary_dilation, binary_erosion
+        # Closing radius — large enough to bridge typical interference gaps
+        struct = np.ones((7, 7), dtype=bool)
+        mask_closed = binary_dilation(mask, structure=struct)
+        mask_closed = binary_fill_holes(mask_closed)
+        mask_closed = binary_erosion(mask_closed, structure=struct)
+        # Combine: original threshold mask OR the filled interior
+        mask = mask | mask_closed
+    except ImportError:
+        pass  # scipy not available — threshold-only mask
+
+    # Apply user-drawn exclusion regions
+    n_excluded = 0
+    if exclusion_mask is not None:
+        excl = exclusion_mask
+        # Resize exclusion mask to image resolution if needed
+        if excl.shape != arr.shape:
+            from PIL import Image as _PIL2
+            pil_excl = _PIL2.fromarray(excl.astype(np.uint8) * 255, "L")
+            pil_excl = pil_excl.resize((arr.shape[1], arr.shape[0]), _PIL2.NEAREST)
+            excl = np.asarray(pil_excl) > 127
+        n_excluded = int(excl.sum())
+        mask = mask & ~excl
+
+    # Pixels available for measurement (excluded zones are absent, not zero)
+    n_valid = arr.size - n_excluded
+
+    # For preview, normalise to 8-bit for display only
+    arr_8bit = np.clip(arr / bit_depth * 255.0, 0, 255).astype(np.uint8)
+
+    beam = arr[mask]
+    if beam.size == 0:
+        return ({
+            "error": "No pixels above threshold — lower the threshold.",
+            "mean": None, "min": None, "max": None,
+            "sc": None, "n_beam": 0, "n_total": n_valid,
+            "threshold": threshold,
+            "bit_depth": int(bit_depth),
+        }, arr_8bit, mask)
+
+    mean_val = float(beam.mean())
+    min_val  = float(beam.min())
+    max_val  = float(beam.max())
+    sc       = max_val / mean_val if mean_val > 0 else float("inf")
+
+    # Top-N pixel coordinates (y, x) sorted by descending intensity in original array
+    h_full, w_full = arr.shape
+    ys_all, xs_all = np.where(mask)
+    if ys_all.size > 0:
+        vals = arr[ys_all, xs_all]
+        order = np.argsort(vals)[::-1]
+        top_ys = ys_all[order].tolist()
+        top_xs = xs_all[order].tolist()
+    else:
+        top_ys, top_xs = [], []
+
+    return ({
+        "error":      None,
+        "mean":       mean_val,
+        "min":        min_val,
+        "max":        max_val,
+        "sc":         sc,
+        "n_beam":     int(mask.sum()),
+        "n_total":    n_valid,
+        "threshold":  threshold,
+        "bit_depth":  int(bit_depth),
+        "img_shape":  (h_full, w_full),
+        "top_xs":     top_xs,
+        "top_ys":     top_ys,
+    }, arr_8bit, mask)
 
 
 def pointing_time_ticks(ts_lo: int, ts_hi: int, n_ticks: int = 7,
@@ -9104,6 +9346,19 @@ hour_end_hm = daypicker.hour_end_hm
 seg_bounds_ns = daypicker.seg_bounds_ns
 
 
+def _prague_today():
+    """Today's Prague date. A function of its own so a test can pin the clock."""
+    return datetime.now(TZ_PRAGUE).date()
+
+
+def live_hour_seg(day, hour: int) -> "PickSeg":
+    """The window live mode re-picks by itself (new day, restored live tab): just the
+    one hour, e.g. 07:00–08:00. Never "to 23:59" (user rule, 27.10.2026) — the later
+    hours arrive through live mode, which keeps the window's end open."""
+    h = max(0, min(23, int(hour)))
+    return PickSeg(day, h, 0, *hour_end_hm(h))
+
+
 def utc_hour_cells_for_window(start_ns: int, end_ns: int) -> "list[tuple[int, int, int, int]]":
     """UTC (year, month, day, hour) folder coordinates covering [start_ns, end_ns).
     The archive tree is year/month/day/hour in UTC (see axis_from_hour_folder_exact),
@@ -9501,30 +9756,43 @@ def get_pdxm1_grid_config(cam_name: str) -> Pdxm1GridConfig:
     return cfg
 
 
-# ---------------- REFERENCE RECTANGLE (PCW3_NF) ----------------
-# Some cameras have a permanent reference square configured in the camera software
-# itself.  That square is drawn only by the live camera display and is NOT part of the
-# archived PNG, so the Slider would never show it.  We re-draw it here, on screen only.
+# ---------------- REFERENCE FRAMES (any camera) ----------------
+# The camera software draws permanent reference rectangles on its live display. They
+# are NOT part of the archived PNG, so the Slider would never show them. We re-draw
+# them here, on screen only.
+#
+# Every camera can hold several frames: ones set by hand (PCW3_NF's measured square is
+# the first of these) and ones read off the camera program's window
+# (is_window_read.py). Nothing ever overwrites another frame: a new read is a new
+# entry. Each frame has its own Show switch.
 
 _CAM_REF_RECT_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_ref_rects.json"
 
-# Cameras that carry a reference rectangle: regex -> config key.
-_REF_RECT_CAMS = (
-    (re.compile(r'PCW3.*NF', re.IGNORECASE), "PCW3_NF"),
-)
+# Camera short names whose saved entry uses an older key, kept so that entry is found.
+_REF_RECT_OLD_KEYS = {"PCW3NF": "PCW3_NF"}
+# The camera whose hand-measured square exists before anyone saves anything.
+_REF_RECT_DEFAULT_KEY = "PCW3_NF"
+
+_CAM_NAME_RX = re.compile(r'^C\d+-\d+[-_](.+?)(?:-_-IMG|_IMG)?$', re.IGNORECASE)
 
 
-def _ref_rect_key(cam_name: str) -> str:
-    """Config key for a camera's reference rectangle, or '' if it has none.
+def ref_cam_short_name(cam_name: str) -> str:
+    """A camera's short name without separators, e.g. 'PCW3NF'.
 
-    Matches both spellings of the name: the display form 'C03-081_PCW3_NF' and the
+    Both spellings give the same answer: the display form 'C03-081_PCW3_NF' and the
     archive folder form 'C03-081-PCW3NF-_-IMG'."""
     if not cam_name:
         return ""
-    for rx, key in _REF_RECT_CAMS:
-        if rx.search(cam_name):
-            return key
-    return ""
+    name = cam_name.strip()
+    m = _CAM_NAME_RX.match(name)
+    core = m.group(1) if m else name
+    return re.sub(r'[^0-9A-Za-z]', '', core).upper()
+
+
+def _ref_rect_key(cam_name: str) -> str:
+    """Config key for a camera's reference frames ('' for no camera name)."""
+    short = ref_cam_short_name(cam_name)
+    return _REF_RECT_OLD_KEYS.get(short, short)
 
 
 def _load_cam_ref_rects() -> dict:
@@ -9546,7 +9814,7 @@ def _save_cam_ref_rects(data: dict):
 
 @_dataclass
 class CamRefRectConfig:
-    """One permanent reference rectangle, in fractions [0,1] of the full frame."""
+    """One permanent reference frame, in fractions [0,1] of the full frame."""
     # Measured off the camera screenshots (1024x1024 frame): 344,166 -> 868,684.
     left:   float = 0.336
     top:    float = 0.162
@@ -9558,52 +9826,104 @@ class CamRefRectConfig:
     # Unlike the diode grid this starts ON: the reference belongs on the picture the
     # first time anyone opens the camera.  Whoever does not want it turns it off.
     show: bool = True
+    # Which frame this is: a stable id, the name shown in the list, where it came
+    # from ("hand" or "window") and, for a read, when it was read ("26.10.2026 14:05").
+    id: str = "hand-1"
+    name: str = "Measured by hand"
+    source: str = "hand"
+    read_at: str = ""
 
 
-_REF_RECT_FIELDS = ("left", "top", "right", "bottom", "color", "width", "alpha", "show")
+_REF_RECT_FIELDS = ("left", "top", "right", "bottom", "color", "width", "alpha", "show",
+                    "id", "name", "source", "read_at")
 
 
-def get_ref_rect_config(cam_name: str) -> "CamRefRectConfig | None":
-    """Reference rectangle for a camera, or None if the camera has none."""
-    key = _ref_rect_key(cam_name)
-    if not key:
-        return None
+def new_ref_frame_id() -> str:
+    import uuid
+    return uuid.uuid4().hex[:10]
+
+
+def _ref_frame_from_dict(d: dict) -> "CamRefRectConfig":
     cfg = CamRefRectConfig()
-    saved = _load_cam_ref_rects()
-    d = saved.get(key)
-    if isinstance(d, dict):
-        for f in _REF_RECT_FIELDS:
-            if f in d:
-                setattr(cfg, f, d[f])
+    for f in _REF_RECT_FIELDS:
+        if f in d:
+            setattr(cfg, f, d[f])
     return cfg
 
 
-def save_ref_rect_config(cam_name: str, cfg: "CamRefRectConfig"):
+def _ref_entry(data: dict, key: str) -> dict:
+    """A camera's saved entry in today's form: {"frames": [...], ...}.
+
+    An entry from before several frames existed (the fields of one rectangle at the
+    top level) becomes that one rectangle, named "Measured by hand", unchanged. A
+    camera that has a measured default but nothing saved gets that default."""
+    d = data.get(key)
+    if isinstance(d, dict) and isinstance(d.get("frames"), list):
+        return d
+    if isinstance(d, dict) and "left" in d:
+        old = {f: d[f] for f in _REF_RECT_FIELDS if f in d}
+        return {"frames": [_asdict(_ref_frame_from_dict(old))]}
+    if key == _REF_RECT_DEFAULT_KEY:
+        return {"frames": [_asdict(CamRefRectConfig())]}
+    return {"frames": []}
+
+
+def get_ref_frames(cam_name: str) -> "list[CamRefRectConfig]":
+    """Every reference frame of a camera, shown or not (empty list: none)."""
+    key = _ref_rect_key(cam_name)
+    if not key:
+        return []
+    entry = _ref_entry(_load_cam_ref_rects(), key)
+    return [_ref_frame_from_dict(f) for f in entry["frames"] if isinstance(f, dict)]
+
+
+def get_ref_frame_extras(cam_name: str) -> dict:
+    """What is remembered for reading this camera's window: 'window_title' and
+    'picture_area' (both may be missing)."""
+    key = _ref_rect_key(cam_name)
+    if not key:
+        return {}
+    entry = _ref_entry(_load_cam_ref_rects(), key)
+    return {k: v for k, v in entry.items() if k != "frames"}
+
+
+def save_ref_frames(cam_name: str, frames: "list[CamRefRectConfig]",
+                    extras: "dict | None" = None):
+    """Write the camera's whole frame list. `extras` (window_title, picture_area)
+    replaces what is remembered; None keeps it."""
     key = _ref_rect_key(cam_name)
     if not key:
         return
     data = _load_cam_ref_rects()
-    data[key] = _asdict(cfg)
+    entry = _ref_entry(data, key)
+    if extras is not None:
+        entry = {k: v for k, v in extras.items() if k != "frames"}
+    entry["frames"] = [_asdict(f) for f in frames]
+    data[key] = entry
     _save_cam_ref_rects(data)
 
 
-def save_ref_rect_show(cam_name: str, show: bool):
-    """Remember ONLY the on/off switch, right when it is clicked.
+def save_ref_frame_show(cam_name: str, frame_id: str, show: bool):
+    """Remember ONLY one frame's on/off switch, right when it is clicked.
 
-    The switch is not part of what Cancel takes back: once the rectangle has been
+    The switch is not part of what Cancel takes back: once a frame has been
     switched off it stays off — through Cancel, through the window's X, and through
     every later session — until the same tick box switches it on again. The position
-    and the line style still wait for OK, so Cancel undoes those."""
+    and the line style still wait for OK, so Cancel undoes those. A frame that has
+    not been saved yet (added in the open window) has nothing to remember."""
     key = _ref_rect_key(cam_name)
     if not key:
         return
     data = _load_cam_ref_rects()
-    d = data.get(key)
-    if not isinstance(d, dict):
-        d = _asdict(CamRefRectConfig())
-    d["show"] = bool(show)
-    data[key] = d
-    _save_cam_ref_rects(data)
+    entry = _ref_entry(data, key)
+    hit = False
+    for f in entry["frames"]:
+        if isinstance(f, dict) and f.get("id", "hand-1") == frame_id:
+            f["show"] = bool(show)
+            hit = True
+    if hit:
+        data[key] = entry
+        _save_cam_ref_rects(data)
 
 
 def _draw_outlined_text(p, rect, align_flags, text, font, fill_color, outline_px: int):
@@ -9900,7 +10220,7 @@ class Pdxm1GridConfigDialog(QDialog):
             img_view._pdxm1_cfg_override = self._cfg
             img_view.update()
         self.setWindowTitle(f"Grid Config — {self._key}")
-        self.resize(520, 840)
+        self.resize(560, 620)
         self.setStyleSheet("""
             QDialog, QWidget#pdxm1_cfg_root { background-color: #f0f0f0; }
             QLabel      { color: #111111; background: transparent; }
@@ -9913,11 +10233,41 @@ class Pdxm1GridConfigDialog(QDialog):
         """ + _CHECKBOX_STYLE)
         self._build_ui()
 
+    # Which of the two folding groups are open — kept for the session, so the dialog
+    # comes back the way it was left. Both start folded: most visits are "grid on/off"
+    # or a divider drag, and the dozen styling controls only crowded those out.
+    _section_open = {"layout": False, "style": False}
+
     def _build_ui(self):
         lay = QVBoxLayout(self)
         cfg = self._cfg
 
-        # ── Grid structure ──
+        # ── Always visible: grid on/off, then the draggable preview ──
+        top_row = QHBoxLayout()
+        self._show_cb = QCheckBox("Show grid")
+        self._show_cb.setChecked(cfg.show)
+        self._show_cb.stateChanged.connect(self._on_show_toggled)
+        top_row.addWidget(self._show_cb)
+        top_row.addStretch()
+        lay.addLayout(top_row)
+
+        hint = QLabel("Drag the yellow dividers to set column widths and row heights.")
+        hint.setStyleSheet("font-size: 10px; color: #444;")
+        lay.addWidget(hint)
+        self._preview = _GridPreviewWidget(cfg, self)
+        self._preview.setMinimumHeight(220)
+        self._preview.changed.connect(self._live_update)
+        lay.addWidget(self._preview, 1)
+
+        def _section(title, key):
+            sec = CollapsibleSection(title, key, expanded=self._section_open.get(key, False))
+            sec.toggled.connect(
+                lambda k, on: Pdxm1GridConfigDialog._section_open.__setitem__(k, on))
+            lay.addWidget(sec)
+            return sec
+
+        # ── Folding group 1: grid layout ──
+        sec_layout = _section("Grid layout", "layout")
         struct_row = QHBoxLayout()
         struct_row.addWidget(QLabel("Columns:"))
         self._ncols_sb = QSpinBox(); self._ncols_sb.setRange(1, 20); self._ncols_sb.setValue(cfg.n_cols)
@@ -9932,20 +10282,7 @@ class Pdxm1GridConfigDialog(QDialog):
         cb_rev.stateChanged.connect(lambda v: self._set_cfg_and_refresh(col_reversed=bool(v)))
         struct_row.addWidget(cb_rev)
         struct_row.addStretch()
-        self._show_cb = QCheckBox("Show grid")
-        self._show_cb.setChecked(cfg.show)
-        self._show_cb.stateChanged.connect(self._on_show_toggled)
-        struct_row.addWidget(self._show_cb)
-        lay.addLayout(struct_row)
-
-        # ── Draggable grid preview ──
-        hint = QLabel("Drag yellow dividers to adjust column widths / row heights:")
-        hint.setStyleSheet("font-size: 10px; color: #aaa;")
-        lay.addWidget(hint)
-        self._preview = _GridPreviewWidget(cfg, self)
-        self._preview.setMinimumHeight(220)
-        self._preview.changed.connect(self._live_update)
-        lay.addWidget(self._preview, 1)
+        sec_layout.body_layout.addLayout(struct_row)
 
         btn_eq_cols = QPushButton("Equal columns")
         btn_eq_rows = QPushButton("Equal rows")
@@ -9953,9 +10290,10 @@ class Pdxm1GridConfigDialog(QDialog):
         btn_eq_rows.clicked.connect(self._reset_row_dividers)
         eq_row = QHBoxLayout()
         eq_row.addWidget(btn_eq_cols); eq_row.addWidget(btn_eq_rows); eq_row.addStretch()
-        lay.addLayout(eq_row)
+        sec_layout.body_layout.addLayout(eq_row)
 
-        # ── Appearance ──
+        # ── Folding group 2: how the lines and the cell labels look ──
+        sec_style = _section("Lines and labels", "style")
         app_row = QHBoxLayout()
         app_row.addWidget(QLabel("Line width:"))
         self._lw_sb = QSpinBox(); self._lw_sb.setRange(1, 10); self._lw_sb.setValue(cfg.line_width)
@@ -9974,7 +10312,7 @@ class Pdxm1GridConfigDialog(QDialog):
         self._lc_btn.clicked.connect(self._pick_line_color)
         app_row.addWidget(self._lc_btn)
         app_row.addStretch()
-        lay.addLayout(app_row)
+        sec_style.body_layout.addLayout(app_row)
 
         font_row = QHBoxLayout()
         font_row.addWidget(QLabel("Font size (0=auto):"))
@@ -9994,7 +10332,7 @@ class Pdxm1GridConfigDialog(QDialog):
         self._fc_btn.clicked.connect(self._pick_font_color)
         font_row.addWidget(self._fc_btn)
         font_row.addStretch()
-        lay.addLayout(font_row)
+        sec_style.body_layout.addLayout(font_row)
 
         outline_row = QHBoxLayout()
         outline_row.addWidget(QLabel("Font outline (px, 0=none):"))
@@ -10002,7 +10340,7 @@ class Pdxm1GridConfigDialog(QDialog):
         self._fo_sb.valueChanged.connect(lambda v: self._set_cfg_and_refresh(font_outline=v))
         outline_row.addWidget(self._fo_sb)
         outline_row.addStretch()
-        lay.addLayout(outline_row)
+        sec_style.body_layout.addLayout(outline_row)
 
         # ── OK/Cancel ──
         btn_row = QHBoxLayout()
@@ -10110,91 +10448,400 @@ class Pdxm1GridConfigDialog(QDialog):
         _save_pdxm1_grid_configs(data)
 
 
+def _import_window_read():
+    """Load the camera-window reader (sibling is_window_read.py) on first use.
+
+    The same three places as daypicker, for the same reason: the copy compiled into
+    the exe (build_config.json -> hidden_imports), the file next to this one, and a
+    loose file beside the exe."""
+    import sys as _sys
+    import importlib
+    import importlib.util as _ilu
+    mod = _sys.modules.get("is_window_read")
+    if mod is not None:
+        return mod
+    if getattr(_sys, "frozen", False):
+        try:
+            return importlib.import_module("is_window_read")
+        except ImportError:
+            pass
+    for _d in (str(Path(__file__).resolve().parent),
+               getattr(_sys, "_MEIPASS", ""),
+               os.path.dirname(os.path.abspath(_sys.executable))):
+        if not _d:
+            continue
+        p = os.path.join(_d, "is_window_read.py")
+        if not os.path.isfile(p):
+            continue
+        spec = _ilu.spec_from_file_location("is_window_read", p)
+        mod = _ilu.module_from_spec(spec)
+        _sys.modules["is_window_read"] = mod    # register BEFORE exec
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            _sys.modules.pop("is_window_read", None)
+            raise
+        return mod
+    raise ImportError("is_window_read.py was not found")
+
+
+# Colours handed to new frames in turn, so frames shown together tell apart.
+_REF_FRAME_COLOURS = ("#ffffff", "#00e5ff", "#ffd600", "#76ff03", "#ff4081", "#ff9100")
+
+# A window showing a picture FILE of the camera (an image viewer, Explorer) is never
+# the camera program, even when the file is named after the camera.
+_PICTURE_FILE_RX = re.compile(r'\.(png|jpe?g|bmp|tiff?|gif)\b', re.IGNORECASE)
+
+
+def _next_frame_colour(frames) -> str:
+    used = {f.color.lower() for f in frames}
+    for c in _REF_FRAME_COLOURS:
+        if c not in used:
+            return c
+    return _REF_FRAME_COLOURS[len(frames) % len(_REF_FRAME_COLOURS)]
+
+
+def match_camera_windows(windows, short_name: str) -> list:
+    """The (handle, title) pairs whose title holds the camera's short name, compared
+    without spaces, dashes or underscores ('PCW3NF' matches 'C03-081 PCW3_NF')."""
+    if not short_name:
+        return []
+    out = []
+    for hwnd, title in windows:
+        if _PICTURE_FILE_RX.search(title or ""):
+            continue
+        if short_name in re.sub(r'[^0-9A-Za-z]', '', title or "").upper():
+            out.append((hwnd, title))
+    return out
+
+
+def _rgb_to_qimage(arr) -> QImage:
+    h, w = arr.shape[:2]
+    buf = np.ascontiguousarray(arr[:, :, :3])
+    return QImage(buf.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+
+
+class _WindowShotView(QWidget):
+    """The photographed camera window, with the camera picture outlined in blue and
+    the frame found in red. Dragging with the left mouse button marks the camera
+    picture by hand; `area_drawn` then carries it, in window pixels."""
+
+    area_drawn = Signal(object)
+
+    _MAX_W, _MAX_H = 960, 600
+
+    def __init__(self, qimg: QImage, parent=None):
+        super().__init__(parent)
+        self._img = qimg
+        self._area = None
+        self._rect = None
+        self._drag0 = None
+        self._drag1 = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        s = min(1.0, self._MAX_W / max(1, qimg.width()), self._MAX_H / max(1, qimg.height()))
+        self.setFixedSize(max(1, int(qimg.width() * s)), max(1, int(qimg.height() * s)))
+
+    def set_marks(self, area, rect):
+        self._area, self._rect = area, rect
+        self.update()
+
+    def _scale(self) -> float:
+        return self.width() / max(1, self._img.width())
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.drawImage(self.rect(), self._img)
+            s = self._scale()
+            if self._area is not None:
+                x0, y0, x1, y1 = self._area
+                pen = QPen(QColor("#1e64ff")); pen.setWidth(2)
+                p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(QRectF(x0 * s, y0 * s, (x1 - x0) * s, (y1 - y0) * s))
+            if self._rect is not None:
+                l, t, r, b = self._rect
+                pen = QPen(QColor("#ff1744")); pen.setWidth(2)
+                p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(QRectF(l * s, t * s, (r - l) * s, (b - t) * s))
+            if self._drag0 is not None and self._drag1 is not None:
+                pen = QPen(QColor("#1e64ff")); pen.setWidth(2)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(QRectF(self._drag0, self._drag1).normalized())
+        finally:
+            p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag0 = self._drag1 = event.position()
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._drag0 is not None:
+            self._drag1 = event.position()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or self._drag0 is None:
+            return
+        r = QRectF(self._drag0, event.position()).normalized()
+        self._drag0 = self._drag1 = None
+        s = self._scale()
+        x0 = max(0, int(round(r.left() / s)))
+        y0 = max(0, int(round(r.top() / s)))
+        x1 = min(self._img.width(), int(round(r.right() / s)))
+        y1 = min(self._img.height(), int(round(r.bottom() / s)))
+        self.update()
+        if x1 - x0 >= 16 and y1 - y0 >= 16:
+            self.area_drawn.emit((x0, y0, x1, y1))
+
+
+class RefFrameReadDialog(QDialog):
+    """What one read of the camera window found, to check before it is added."""
+
+    def __init__(self, result, frame_w, frame_h, window_title: str, reader, parent=None):
+        super().__init__(parent)
+        self._res = result
+        self._fw, self._fh = frame_w, frame_h
+        self._reader = reader
+        self.hand_area = None
+        self.setWindowTitle("Read from camera window")
+        self.setStyleSheet(parent.styleSheet() if parent is not None else "")
+        lay = QVBoxLayout(self)
+        src = QLabel(f"Window: {window_title}")
+        src.setWordWrap(True)
+        lay.addWidget(src)
+        self._view = _WindowShotView(_rgb_to_qimage(result.image), self)
+        self._view.area_drawn.connect(self._on_area_drawn)
+        lay.addWidget(self._view, 0, Qt.AlignmentFlag.AlignHCenter)
+        legend = QLabel("Blue: the camera picture.   Red: the frame found.\n"
+                        "Blue box wrong? Drag over the camera picture with the mouse "
+                        "and it is read again.")
+        legend.setWordWrap(True)
+        lay.addWidget(legend)
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        lay.addWidget(self._status)
+        btns = QDialogButtonBox()
+        self._add_btn = btns.addButton("Add this frame", QDialogButtonBox.ButtonRole.AcceptRole)
+        btns.addButton(QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        self._show_result()
+
+    @property
+    def fractions(self):
+        return self._res.fractions
+
+    def _show_result(self):
+        self._view.set_marks(self._res.area, self._res.rect)
+        fr = self._res.fractions
+        if fr is not None:
+            self._status.setStyleSheet("color: #1b5e20; font-weight: 600;")
+            self._status.setText("Found: left {:.1f} %, top {:.1f} %, right {:.1f} %, "
+                                 "bottom {:.1f} %.".format(*(v * 100.0 for v in fr)))
+        else:
+            self._status.setStyleSheet("color: #b71c1c; font-weight: 600;")
+            self._status.setText(self._res.problem or "Nothing was found.")
+        self._add_btn.setEnabled(fr is not None)
+
+    def _on_area_drawn(self, area):
+        self.hand_area = tuple(area)
+        self._res = self._reader.read_image(self._res.image, self._fw, self._fh,
+                                            area=self.hand_area)
+        self._show_result()
+
+
 class CamRefRectDialog(QDialog):
-    """Switch the permanent reference rectangle on/off and fine-tune its position.
+    """The camera's reference frames: which are shown, their names, their position.
 
-    Opened by a right-click on a camera that has one (today: PCW3_NF).  Edges are kept
-    as fractions of the frame, so they survive a change of camera resolution; the pixel
-    readout beside each box is for the 1024x1024 frames the camera writes today."""
+    Opened by a right-click on any camera's picture (diodes open their grid
+    instead). A frame comes either by hand or from the camera program's window
+    (is_window_read.py); a new one is always ADDED, nothing is overwritten. Edges
+    are kept as fractions of the frame, so they survive a change of resolution.
 
-    _PIX_REF = 1024  # frame side the pixel readout is computed for
+    A Show tick is saved the moment it is clicked; everything else waits for OK,
+    and Cancel puts the frames back as they were."""
 
     def __init__(self, cam_name: str, img_view=None, parent=None):
         super().__init__(parent)
         self._cam_name = cam_name
         self._key = _ref_rect_key(cam_name)
-        self._cfg = get_ref_rect_config(cam_name) or CamRefRectConfig()
+        self._short = ref_cam_short_name(cam_name)
         self._img_view = img_view
-        self._orig_cfg = CamRefRectConfig(**_asdict(self._cfg))
-        if img_view is not None:
-            img_view._ref_rect_override = self._cfg
-            img_view.update()
-        self.setWindowTitle(f"Reference frame — {self._key}")
+        self._frames = get_ref_frames(cam_name)
+        self._orig = [CamRefRectConfig(**_asdict(f)) for f in self._frames]
+        self._saved_ids = {f.id for f in self._frames}
+        self._extras = dict(get_ref_frame_extras(cam_name))
+        self._windows: list = []
+        self._loading = False
+        self.setWindowTitle(f"Reference frames — {self._display_name()}")
         self.setStyleSheet("""
             QDialog     { background-color: #f0f0f0; }
             QLabel      { color: #111111; background: transparent; }
             QDoubleSpinBox, QSpinBox { color: #111111; background-color: #ffffff;
                           border: 1px solid #aaaaaa; padding: 1px 3px; }
+            QComboBox   { color: #111111; background-color: #ffffff;
+                          border: 1px solid #aaaaaa; padding: 2px 6px; }
+            QComboBox QAbstractItemView { color: #111111; background-color: #ffffff;
+                          selection-background-color: #cfe3ff; selection-color: #111111; }
             QPushButton { color: #111111; background-color: #e0e0e0;
                           border: 1px solid #aaaaaa; padding: 3px 10px; }
             QPushButton:hover   { background-color: #d0d0d0; }
             QPushButton:pressed { background-color: #c0c0c0; }
+            QPushButton:disabled { color: #9a9a9a; background-color: #ececec;
+                          border: 1px solid #cccccc; }
+            QTableWidget { background: #ffffff; color: #111111; gridline-color: #d6d6d6;
+                          border: 1px solid #aaaaaa; }
+            QTableWidget::item:selected { background: #cfe3ff; color: #111111; }
+            QTableWidget::indicator { width: 16px; height: 16px; border: 2px solid #4a4a4a;
+                          border-radius: 3px; background: #ffffff; }
+            QTableWidget::indicator:checked { border: 2px solid #2d7dff; background: #2d7dff; }
+            QTableWidget QLineEdit { color: #111111; background: #ffffff; }
+            QHeaderView::section { background: #d9d9d9; color: #111111; font-weight: 600;
+                          border: 0; border-right: 1px solid #b5b5b5;
+                          border-bottom: 1px solid #8f8f8f; padding: 3px 6px; }
         """ + _CHECKBOX_STYLE)
         self._build_ui()
+        self._fill_table(0)
+        self._refresh_windows()
+        self._live_update()
+
+    # ── layout ───────────────────────────────────────────────────────────────
+    def _display_name(self) -> str:
+        n = self._cam_name or ""
+        for tail in ("-_-IMG", "_IMG"):
+            if n.upper().endswith(tail.upper()):
+                n = n[: -len(tail)]
+        return n
 
     def _build_ui(self):
-        from PySide6.QtWidgets import QDoubleSpinBox, QGridLayout
         lay = QVBoxLayout(self)
 
-        self._show_cb = QCheckBox("Show reference frame")
-        self._show_cb.setChecked(self._cfg.show)
-        self._show_cb.stateChanged.connect(self._on_show_toggled)
-        lay.addWidget(self._show_cb)
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["Show", "Name", "From", "Colour"])
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(3, 64)
+        self._table.setIconSize(QSize(36, 16))
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                    | QAbstractItemView.EditTrigger.EditKeyPressed)
+        self._table.setMinimumWidth(560)
+        self._table.setMinimumHeight(150)
+        self._table.itemChanged.connect(self._on_item_changed)
+        self._table.itemSelectionChanged.connect(self._on_selection)
+        lay.addWidget(self._table)
+
+        self._empty_lbl = QLabel("This camera has no reference frames yet.")
+        self._empty_lbl.setStyleSheet("color: #555555; font-style: italic;")
+        lay.addWidget(self._empty_lbl)
+
+        row = QHBoxLayout()
+        self._add_btn = QPushButton("Add by hand")
+        self._add_btn.setToolTip("A new frame set by hand: a copy of the selected one, "
+                                 "or the middle of the picture")
+        self._add_btn.clicked.connect(self._add_by_hand)
+        row.addWidget(self._add_btn)
+        self._ren_btn = QPushButton("Rename")
+        self._ren_btn.clicked.connect(self._rename)
+        row.addWidget(self._ren_btn)
+        self._del_btn = QPushButton("Delete")
+        self._del_btn.clicked.connect(self._delete)
+        row.addWidget(self._del_btn)
+        row.addStretch()
+        lay.addLayout(row)
+
+        rd = QHBoxLayout()
+        rd.addWidget(QLabel("Camera window:"))
+        self._win_combo = QComboBox()
+        self._win_combo.setMinimumWidth(300)
+        self._win_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._win_combo.currentIndexChanged.connect(self._on_window_choice)
+        rd.addWidget(self._win_combo, 1)
+        self._refresh_btn = QPushButton("Refresh list")
+        self._refresh_btn.setToolTip("List the windows open on this computer again")
+        self._refresh_btn.clicked.connect(self._refresh_windows)
+        rd.addWidget(self._refresh_btn)
+        self._read_btn = QPushButton("Read from camera window")
+        self._read_btn.setToolTip("Photograph the camera program's window on this computer "
+                                  "and add the white frame it shows as a new frame")
+        self._read_btn.clicked.connect(self._read_window)
+        rd.addWidget(self._read_btn)
+        lay.addLayout(rd)
+
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setVisible(False)
+        lay.addWidget(self._status)
+
+        # The selected frame's settings; hidden while there is no frame to set.
+        self._edit_box = QWidget()
+        outer = lay
+        lay = QVBoxLayout(self._edit_box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._edit_box)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #b5b5b5;")
+        lay.addWidget(sep)
+
+        self._edit_head = QLabel("Selected frame — position in the picture (% of width / height):")
+        self._edit_head.setStyleSheet("font-weight: 600;")
+        lay.addWidget(self._edit_head)
 
         grid = QGridLayout()
-        grid.addWidget(QLabel("Position in the picture (% of width / height):"), 0, 0, 1, 3)
         self._edge_sb = {}
         self._edge_px = {}
-        for row, (fld, label) in enumerate(
-                (("left", "Left:"), ("top", "Top:"),
-                 ("right", "Right:"), ("bottom", "Bottom:")), start=1):
-            grid.addWidget(QLabel(label), row, 0)
+        for i, (fld, label) in enumerate((("left", "Left:"), ("top", "Top:"),
+                                          ("right", "Right:"), ("bottom", "Bottom:"))):
+            r, c = divmod(i, 2)
+            grid.addWidget(QLabel(label), r, c * 3)
             sb = QDoubleSpinBox()
             sb.setRange(0.0, 100.0)
             sb.setDecimals(1)
             sb.setSingleStep(0.1)
             sb.setSuffix(" %")
-            sb.setValue(getattr(self._cfg, fld) * 100.0)
             sb.valueChanged.connect(lambda v, f=fld: self._on_edge_changed(f, v))
-            grid.addWidget(sb, row, 1)
+            grid.addWidget(sb, r, c * 3 + 1)
             px = QLabel("")
-            grid.addWidget(px, row, 2)
+            px.setMinimumWidth(70)
+            grid.addWidget(px, r, c * 3 + 2)
             self._edge_sb[fld] = sb
             self._edge_px[fld] = px
         lay.addLayout(grid)
 
         style_row = QHBoxLayout()
         style_row.addWidget(QLabel("Line width:"))
-        self._lw_sb = QSpinBox(); self._lw_sb.setRange(1, 8); self._lw_sb.setValue(self._cfg.width)
-        self._lw_sb.valueChanged.connect(lambda v: self._set_cfg(width=int(v)))
+        self._lw_sb = QSpinBox(); self._lw_sb.setRange(1, 8)
+        self._lw_sb.valueChanged.connect(lambda v: self._set_cur(width=int(v)))
         style_row.addWidget(self._lw_sb)
         style_row.addWidget(QLabel("  Opacity:"))
-        self._la_sb = QSpinBox(); self._la_sb.setRange(20, 255); self._la_sb.setValue(self._cfg.alpha)
-        self._la_sb.valueChanged.connect(lambda v: self._set_cfg(alpha=int(v)))
+        self._la_sb = QSpinBox(); self._la_sb.setRange(20, 255)
+        self._la_sb.valueChanged.connect(lambda v: self._set_cur(alpha=int(v)))
         style_row.addWidget(self._la_sb)
         style_row.addWidget(QLabel("  Colour:"))
         self._lc_btn = QPushButton("")
         self._lc_btn.setFixedWidth(46)
-        self._lc_btn.setStyleSheet(f"background:{self._cfg.color}; border:1px solid #888888;")
         self._lc_btn.clicked.connect(self._pick_color)
         style_row.addWidget(self._lc_btn)
         style_row.addStretch()
         lay.addLayout(style_row)
+        self._edit_widgets = [self._edit_head, self._lw_sb, self._la_sb, self._lc_btn,
+                              *self._edge_sb.values(), *self._edge_px.values()]
+        lay = outer
 
         btn_row = QHBoxLayout()
-        btn_reset = QPushButton("Reset to measured default")
-        btn_reset.clicked.connect(self._reset_all)
-        btn_row.addWidget(btn_reset)
+        self._reset_btn = QPushButton("Reset to measured default")
+        self._reset_btn.clicked.connect(self._reset_all)
+        btn_row.addWidget(self._reset_btn)
         btn_row.addStretch()
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._on_accept)
@@ -10202,85 +10849,324 @@ class CamRefRectDialog(QDialog):
         btn_row.addWidget(btns)
         lay.addLayout(btn_row)
 
+    # ── the table ────────────────────────────────────────────────────────────
+    def _cur_row(self) -> int:
+        rows = self._table.selectionModel().selectedRows() if self._table.selectionModel() else []
+        return rows[0].row() if rows else -1
+
+    def _cur(self) -> "CamRefRectConfig | None":
+        r = self._cur_row()
+        return self._frames[r] if 0 <= r < len(self._frames) else None
+
+    @staticmethod
+    def _from_text(f) -> str:
+        if f.source == "window":
+            return f"Camera window, {f.read_at}" if f.read_at else "Camera window"
+        return "By hand"
+
+    @staticmethod
+    def _swatch(colour: str) -> QIcon:
+        """A colour chip with a dark rim, so a white frame is not white on white."""
+        pm = QPixmap(36, 16)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
+        try:
+            p.setPen(QPen(QColor("#444444"), 1))
+            p.setBrush(QColor(colour))
+            p.drawRect(0, 0, 35, 15)
+        finally:
+            p.end()
+        return QIcon(pm)
+
+    def _fill_table(self, select: int = -1):
+        self._loading = True
+        try:
+            self._table.setRowCount(len(self._frames))
+            for r, f in enumerate(self._frames):
+                show = QTableWidgetItem("")
+                show.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                              | Qt.ItemFlag.ItemIsSelectable)
+                show.setCheckState(Qt.CheckState.Checked if f.show else Qt.CheckState.Unchecked)
+                self._table.setItem(r, 0, show)
+                name = QTableWidgetItem(f.name)
+                name.setFlags(Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsEnabled
+                              | Qt.ItemFlag.ItemIsSelectable)
+                self._table.setItem(r, 1, name)
+                src = QTableWidgetItem(self._from_text(f))
+                src.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self._table.setItem(r, 2, src)
+                chip = QTableWidgetItem(self._swatch(f.color), "")
+                chip.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                chip.setToolTip(f.color)
+                self._table.setItem(r, 3, chip)
+        finally:
+            self._loading = False
+        self._empty_lbl.setVisible(not self._frames)
+        if self._frames:
+            r = select if 0 <= select < len(self._frames) else 0
+            self._table.selectRow(r)
+        self._on_selection()
+
+    def _on_item_changed(self, item):
+        if self._loading:
+            return
+        r = item.row()
+        if not (0 <= r < len(self._frames)):
+            return
+        f = self._frames[r]
+        if item.column() == 0:
+            f.show = item.checkState() == Qt.CheckState.Checked
+            # Written straight away: only this tick box may switch a frame on, so
+            # leaving the window any other way must not bring it back.
+            for o in self._orig:
+                if o.id == f.id:
+                    o.show = f.show
+            if f.id in self._saved_ids:
+                save_ref_frame_show(self._cam_name, f.id, f.show)
+            self._live_update()
+        elif item.column() == 1:
+            name = item.text().strip()
+            if name:
+                f.name = name
+            else:
+                self._loading = True
+                item.setText(f.name)
+                self._loading = False
+
+    def _on_selection(self):
+        f = self._cur()
+        has = f is not None
+        for w in self._edit_widgets:
+            w.setEnabled(has)
+        self._edit_box.setVisible(has)
+        self._ren_btn.setEnabled(has)
+        self._del_btn.setEnabled(has)
+        self._reset_btn.setVisible(has and self._key == _REF_RECT_DEFAULT_KEY
+                                   and f.source == "hand")
+        if not has:
+            for px in self._edge_px.values():
+                px.setText("")
+            return
+        for fld, sb in self._edge_sb.items():
+            sb.blockSignals(True); sb.setValue(getattr(f, fld) * 100.0); sb.blockSignals(False)
+        self._lw_sb.blockSignals(True); self._lw_sb.setValue(int(f.width)); self._lw_sb.blockSignals(False)
+        self._la_sb.blockSignals(True); self._la_sb.setValue(int(f.alpha)); self._la_sb.blockSignals(False)
+        self._lc_btn.setStyleSheet(f"background:{f.color}; border:1px solid #888888;")
         self._refresh_px_labels()
-        self.adjustSize()
 
-    # ── helpers ──────────────────────────────────────────────────────────────
+    # ── frame size and pixel readout ─────────────────────────────────────────
+    def _frame_size(self):
+        pix = getattr(self._img_view, "_pix", None) if self._img_view is not None else None
+        try:
+            if pix is not None and not pix.isNull():
+                return pix.width(), pix.height()
+        except Exception:
+            pass
+        return None, None
+
     def _refresh_px_labels(self):
+        f = self._cur()
+        fw, fh = self._frame_size()
         for fld, lbl in self._edge_px.items():
-            lbl.setText(f"= {int(round(getattr(self._cfg, fld) * self._PIX_REF))} px")
+            side = fw if fld in ("left", "right") else fh
+            if f is None or not side:
+                lbl.setText("")
+            else:
+                lbl.setText(f"= {int(round(getattr(f, fld) * side))} px")
 
+    # ── editing the selected frame ───────────────────────────────────────────
     def _live_update(self):
         if self._img_view is not None:
-            self._img_view._ref_rect_override = self._cfg
+            self._img_view._ref_rect_override = list(self._frames)
             self._img_view.update()
 
-    def _set_cfg(self, **kw):
+    def _set_cur(self, **kw):
+        f = self._cur()
+        if f is None:
+            return
         for k, v in kw.items():
-            setattr(self._cfg, k, v)
+            setattr(f, k, v)
         self._live_update()
 
     def _on_edge_changed(self, field: str, value: float):
-        setattr(self._cfg, field, value / 100.0)
+        f = self._cur()
+        if f is None:
+            return
+        setattr(f, field, value / 100.0)
         # Keep the rectangle non-degenerate: a dragged edge pushes its partner along.
-        if self._cfg.right <= self._cfg.left:
+        if f.right <= f.left:
             if field == "left":
-                self._cfg.right = min(1.0, self._cfg.left + 0.005)
-                self._sync_box("right")
+                f.right = min(1.0, f.left + 0.005); self._sync_box("right")
             else:
-                self._cfg.left = max(0.0, self._cfg.right - 0.005)
-                self._sync_box("left")
-        if self._cfg.bottom <= self._cfg.top:
+                f.left = max(0.0, f.right - 0.005); self._sync_box("left")
+        if f.bottom <= f.top:
             if field == "top":
-                self._cfg.bottom = min(1.0, self._cfg.top + 0.005)
-                self._sync_box("bottom")
+                f.bottom = min(1.0, f.top + 0.005); self._sync_box("bottom")
             else:
-                self._cfg.top = max(0.0, self._cfg.bottom - 0.005)
-                self._sync_box("top")
+                f.top = max(0.0, f.bottom - 0.005); self._sync_box("top")
         self._refresh_px_labels()
         self._live_update()
 
     def _sync_box(self, field: str):
+        f = self._cur()
         sb = self._edge_sb[field]
         sb.blockSignals(True)
-        sb.setValue(getattr(self._cfg, field) * 100.0)
+        sb.setValue(getattr(f, field) * 100.0)
         sb.blockSignals(False)
 
     def _pick_color(self):
-        from PySide6.QtWidgets import QColorDialog
-        c = QColorDialog.getColor(QColor(self._cfg.color), self, "Reference frame colour")
+        f = self._cur()
+        if f is None:
+            return
+        c = QColorDialog.getColor(QColor(f.color), self, "Reference frame colour")
         if c.isValid():
-            self._cfg.color = c.name()
-            self._lc_btn.setStyleSheet(f"background:{self._cfg.color}; border:1px solid #888888;")
+            f.color = c.name()
+            self._lc_btn.setStyleSheet(f"background:{f.color}; border:1px solid #888888;")
+            chip = self._table.item(self._cur_row(), 3)
+            if chip is not None:
+                chip.setIcon(self._swatch(f.color))
+                chip.setToolTip(f.color)
             self._live_update()
 
-    def _on_show_toggled(self, state: int):
-        self._cfg.show = bool(state)
-        # Written straight away: only this tick box may switch the rectangle on, so
-        # leaving the window any other way must not bring it back (save_ref_rect_show).
-        self._orig_cfg.show = self._cfg.show
-        save_ref_rect_show(self._cam_name, self._cfg.show)
-        self._live_update()
-
     def _reset_all(self):
-        keep_show = self._cfg.show      # the default is ON; the switch keeps its state
-        self._cfg = CamRefRectConfig()
-        self._cfg.show = keep_show
-        for fld, sb in self._edge_sb.items():
-            sb.blockSignals(True)
-            sb.setValue(getattr(self._cfg, fld) * 100.0)
-            sb.blockSignals(False)
-        self._lw_sb.blockSignals(True); self._lw_sb.setValue(self._cfg.width); self._lw_sb.blockSignals(False)
-        self._la_sb.blockSignals(True); self._la_sb.setValue(self._cfg.alpha); self._la_sb.blockSignals(False)
-        self._show_cb.blockSignals(True); self._show_cb.setChecked(self._cfg.show); self._show_cb.blockSignals(False)
-        self._lc_btn.setStyleSheet(f"background:{self._cfg.color}; border:1px solid #888888;")
-        self._refresh_px_labels()
+        f = self._cur()
+        if f is None:
+            return
+        d = CamRefRectConfig()
+        for fld in ("left", "top", "right", "bottom", "color", "width", "alpha"):
+            setattr(f, fld, getattr(d, fld))
+        self._fill_table(self._cur_row())
         self._live_update()
 
+    # ── adding, renaming, deleting ───────────────────────────────────────────
+    def _status_msg(self, text: str, ok: bool):
+        self._status.setStyleSheet("color: #1b5e20; font-weight: 600;" if ok
+                                   else "color: #b71c1c; font-weight: 600;")
+        self._status.setText(text)
+        self._status.setVisible(bool(text))
+
+    def _add_frame(self, f):
+        self._frames.append(f)
+        self._fill_table(len(self._frames) - 1)
+        self._live_update()
+
+    def _add_by_hand(self):
+        base = self._cur()
+        n = sum(1 for f in self._frames if f.source == "hand") + 1
+        f = CamRefRectConfig(
+            left=base.left if base else 0.25, top=base.top if base else 0.25,
+            right=base.right if base else 0.75, bottom=base.bottom if base else 0.75,
+            color=_next_frame_colour(self._frames), width=base.width if base else 1,
+            alpha=200, show=True, id=new_ref_frame_id(), name=f"By hand {n}",
+            source="hand", read_at="")
+        self._add_frame(f)
+        self._status_msg(f"Added “{f.name}”. Press OK to keep it.", True)
+
+    def _rename(self):
+        r = self._cur_row()
+        if r >= 0:
+            self._table.editItem(self._table.item(r, 1))
+
+    def _delete(self):
+        r = self._cur_row()
+        if r < 0:
+            return
+        f = self._frames[r]
+        ans = QMessageBox.question(
+            self, "Delete frame",
+            f"Delete the frame “{f.name}”?\n\nIt is gone once you press OK; "
+            "Cancel brings it back.")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del self._frames[r]
+        self._fill_table(min(r, len(self._frames) - 1))
+        self._live_update()
+        self._status_msg(f"Deleted “{f.name}”.", True)
+
+    # ── reading the camera window ────────────────────────────────────────────
+    def _refresh_windows(self):
+        try:
+            self._windows = _import_window_read().list_windows()
+        except Exception:
+            self._windows = []
+        want = self._extras.get("window_title") or ""
+        self._win_combo.blockSignals(True)
+        self._win_combo.clear()
+        self._win_combo.addItem(f"Automatic — title contains {self._short}")
+        sel = 0
+        for i, (_h, t) in enumerate(self._windows, start=1):
+            self._win_combo.addItem(t)
+            if t == want:
+                sel = i
+        self._win_combo.setCurrentIndex(sel)
+        self._win_combo.blockSignals(False)
+
+    def _on_window_choice(self, idx: int):
+        if idx <= 0:
+            self._extras.pop("window_title", None)
+        elif idx - 1 < len(self._windows):
+            self._extras["window_title"] = self._windows[idx - 1][1]
+
+    def _read_window(self):
+        try:
+            W = _import_window_read()
+        except Exception as exc:
+            self._status_msg(f"The window reader could not be loaded: {exc}", False)
+            return
+        idx = self._win_combo.currentIndex()
+        name = self._display_name()
+        if idx <= 0:
+            matches = match_camera_windows(W.list_windows(), self._short)
+            if not matches:
+                self._status_msg(
+                    f"The window of camera {name} was not found on this computer. "
+                    "The camera program must be open on this PC, not minimised. If its "
+                    f"window title does not contain “{self._short}”, pick the window in "
+                    "the list.", False)
+                return
+            if len(matches) > 1:
+                self._status_msg(
+                    f"{len(matches)} windows have “{self._short}” in their title: "
+                    + "; ".join(t for _h, t in matches)
+                    + ". Pick the right one in the list.", False)
+                return
+            hwnd, title = matches[0]
+        else:
+            title = self._win_combo.currentText()
+            hwnd = W.find_window(title)
+            if hwnd is None:
+                self._status_msg(f"The window “{title}” is not open on this computer "
+                                 "any more (or it is minimised).", False)
+                return
+        area = None
+        if self._extras.get("picture_area_window") == title and self._extras.get("picture_area"):
+            area = tuple(self._extras["picture_area"])
+        fw, fh = self._frame_size()
+        res = W.read_window(hwnd, fw, fh, area)
+        if res.image is None:
+            self._status_msg(res.problem or "The window could not be read.", False)
+            return
+        dlg = RefFrameReadDialog(res, fw, fh, title, W, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or dlg.fractions is None:
+            self._status_msg("Nothing was added.", False)
+            return
+        if dlg.hand_area is not None:
+            self._extras["picture_area"] = list(dlg.hand_area)
+            self._extras["picture_area_window"] = title
+        l, t, r, b = dlg.fractions
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        f = CamRefRectConfig(left=l, top=t, right=r, bottom=b,
+                             color=_next_frame_colour(self._frames), width=1, alpha=200,
+                             show=True, id=new_ref_frame_id(),
+                             name=f"Camera window {now}", source="window", read_at=now)
+        self._add_frame(f)
+        self._status_msg(f"Added “{f.name}”. Press OK to keep it.", True)
+
+    # ── leaving ──────────────────────────────────────────────────────────────
     def _on_accept(self):
         if self._img_view is not None:
             self._img_view._ref_rect_override = None
-            self._img_view.ref_rect_cfg = self._cfg
+            self._img_view.ref_rect_cfg = list(self._frames)
             self._img_view.update()
         self.accept()
 
@@ -10289,12 +11175,12 @@ class CamRefRectDialog(QDialog):
         # that way out used to leave the live preview hanging on the picture.
         if self._img_view is not None:
             self._img_view._ref_rect_override = None
-            self._img_view.ref_rect_cfg = self._orig_cfg
+            self._img_view.ref_rect_cfg = list(self._orig)
             self._img_view.update()
         super().reject()
 
     def save_config(self):
-        save_ref_rect_config(self._cam_name, self._cfg)
+        save_ref_frames(self._cam_name, self._frames, self._extras)
 
 
 # ---------------- CAMERA LAYOUT CONFIG ----------------
@@ -12880,6 +13766,9 @@ class ImageView(QWidget):
     # drag places the same mark on all of them. Geometry is normalized (0..1), so
     # "the same place" holds across different sensor sizes.
     overlay_edited = Signal(str)
+    # Left double-click on the picture with no drawing tool armed: lift this camera
+    # out to fill the monitor (Viewer._solo_toggle).
+    double_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -12939,10 +13828,10 @@ class ImageView(QWidget):
         self.pdxm1_cam_name: str = ''   # full camera name used to look up per-type grid config
         self._pdxm1_cfg_override = None  # set by Pdxm1GridConfigDialog for live preview
 
-        # Permanent reference rectangle (PCW3_NF): drawn on screen only, never saved
-        # into exported frames.  None = this camera has none.
-        self.ref_rect_cfg: "CamRefRectConfig | None" = None
-        self._ref_rect_override = None   # set by CamRefRectDialog for live preview
+        # Permanent reference frames: drawn on screen only, never saved into exported
+        # frames.  A list; empty = this camera has none.
+        self.ref_rect_cfg: "list[CamRefRectConfig]" = []
+        self._ref_rect_override = None   # a list, set by CamRefRectDialog for live preview
 
         # Zoom: normalized rect (ln, tn, rn, bn) inside the source image, or None = no zoom
         self._zoom_norm: "tuple[float,float,float,float] | None" = None
@@ -13102,7 +13991,9 @@ class ImageView(QWidget):
         lst = self.marks.get(kind) or ()
         thick = {"circle": self.circle_thick, "square": self.square_thick}.get(kind, 2)
         for i in range(len(lst) - 1, -1, -1):
-            if mark_hit(ir, kind, lst[i], pos, cross_size=self.cross_size, thick=thick):
+            t = int(mark_look(kind, lst[i]).get("thick") or thick)
+            if mark_hit(ir, kind, lst[i], pos,
+                        cross_size=mark_cross_size(lst[i], self.cross_size), thick=t):
                 return i
         return None
 
@@ -13168,7 +14059,7 @@ class ImageView(QWidget):
         g = self.selected_geom()
         if g is None:
             return {}
-        return mark_handles(ir, self._sel[0], g, self.cross_size)
+        return mark_handles(ir, self._sel[0], g, mark_cross_size(g, self.cross_size))
 
     def _hit_handle(self, pos: QPointF, handles: dict) -> str:
         r = self._handle_radius() + 3
@@ -13192,7 +14083,7 @@ class ImageView(QWidget):
             # Moving a turned cross keeps its turn.
             old = self.marks["cross"][self._sel[1]]
             self.marks["cross"][self._sel[1]] = with_angle(
-                "cross", g, mark_angle("cross", old))
+                "cross", g, mark_angle("cross", old), mark_look("cross", old))
         self.update()
         self.overlay_edited.emit("cross")
 
@@ -13265,6 +14156,16 @@ class ImageView(QWidget):
         self._drag_start = pos
         self._drag_pending_new = True
 
+    def mouseDoubleClickEvent(self, event):
+        # With a drawing tool armed a double-click stays what it always was — a second
+        # press on the picture (Qt's default hands it to mousePressEvent).
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._draw_mode not in MARK_KINDS):
+            self.double_clicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     _DRAG_PX = 4
 
     def mouseMoveEvent(self, event):
@@ -13327,7 +14228,7 @@ class ImageView(QWidget):
                     ang = math.degrees(math.atan2(-dy, dx)) - 90.0
                     if shift:
                         ang = round(ang / 15.0) * 15.0
-                    lst[i] = with_angle(mode, core, ang)
+                    lst[i] = with_angle(mode, core, ang, mark_look(mode, lst[i]))
                     self.update()
                     self.overlay_edited.emit(mode)
             return
@@ -13392,7 +14293,8 @@ class ImageView(QWidget):
                 ry_n = abs(pos.y() - cy_px) / ir.height()
                 if shift: rx_n = ry_n
 
-            lst[i] = with_angle("circle", (cx, cy, rx_n, ry_n), ang)
+            lst[i] = with_angle("circle", (cx, cy, rx_n, ry_n), ang,
+                                mark_look("circle", lst[i]))
             self.update()
             self.overlay_edited.emit("circle")
 
@@ -13444,7 +14346,8 @@ class ImageView(QWidget):
                 tx, ty = _turn(ncx, ncy, mcx, mcy, ang)
                 sx_, sy_ = (tx - ncx) / ir.width(), (ty - ncy) / ir.height()
                 ln, rn, tn, bn = ln + sx_, rn + sx_, tn + sy_, bn + sy_
-            lst[i] = with_angle("square", (ln, tn, rn, bn), ang)
+            lst[i] = with_angle("square", (ln, tn, rn, bn), ang,
+                                mark_look("square", lst[i]))
             self.update()
             self.overlay_edited.emit("square")
 
@@ -13486,14 +14389,14 @@ class ImageView(QWidget):
                         ))
             else:
                 # Single click (no drag): the camera's own settings window.
-                # Diodes get the reference grid; PCW3_NF gets its reference rectangle;
-                # every other camera has nothing to configure, so nothing opens.
+                # Diodes get the reference grid; every other camera its reference
+                # frames (hand-made or read off the camera program's window).
                 cam_name = getattr(self, 'pdxm1_cam_name', '')
                 if _is_diode_cam(cam_name):
                     dlg = Pdxm1GridConfigDialog(cam_name, img_view=self, parent=self)
                     if dlg.exec() == QDialog.DialogCode.Accepted:
                         dlg.save_config()
-                elif _ref_rect_key(cam_name):
+                elif cam_name:
                     dlg = CamRefRectDialog(cam_name, img_view=self, parent=self)
                     if dlg.exec() == QDialog.DialogCode.Accepted:
                         dlg.save_config()
@@ -13761,11 +14664,17 @@ class ImageView(QWidget):
                                     Qt.AlignmentFlag.AlignCenter, lbl,
                                     gfont, fc, _gcfg.font_outline)
 
-        # Permanent reference rectangle (PCW3_NF).  The camera software draws it on the
-        # live screen but it is not in the archived frame, so we re-draw it here.
-        _rcfg = self._ref_rect_override if self._ref_rect_override is not None else self.ref_rect_cfg
-        if (_rcfg is not None and _rcfg.show and img_rect is not None
-                and not self._pix.isNull()):
+        # Permanent reference frames.  The camera software draws them on the live
+        # screen but they are not in the archived frame, so we re-draw them here.
+        _rframes = self._ref_rect_override if self._ref_rect_override is not None else self.ref_rect_cfg
+        if _rframes is None:
+            _rframes = []
+        elif not isinstance(_rframes, (list, tuple)):
+            _rframes = [_rframes]
+        for _rcfg in _rframes:
+            if not (_rcfg is not None and _rcfg.show and img_rect is not None
+                    and not self._pix.isNull()):
+                continue
             # Fractions are of the FULL frame; remap through the zoom crop so the
             # rectangle stays on the same sensor pixels when the tile is zoomed.
             ln, tn = _rcfg.left, _rcfg.top
@@ -14134,6 +15043,7 @@ class ImageView(QWidget):
 class CameraView(QWidget):
     """Jeden panel v multi-camera gridu — ImageView + label + výběr."""
     clicked = Signal(int)  # camera index
+    double_clicked = Signal(int)  # camera index — lift it out to fill the monitor
 
     # Three states, because there are three genuinely different situations and folding
     # the middle one into either neighbour is what made this label useless:
@@ -14231,6 +15141,8 @@ class CameraView(QWidget):
         self.img_view = ImageView(self)
         self.img_view.bg_color = QColor("#222")
         lay.addWidget(self.img_view, 1)
+        self.img_view.double_clicked.connect(self._on_double_click)
+        self._solo = False
 
         self._update_border()
 
@@ -14477,7 +15389,41 @@ class CameraView(QWidget):
         self._selected = sel
         self._update_border()
 
+    def _on_double_click(self):
+        """The first click of the pair already toggled the selection (a press is a
+        click on a tile); the toggle is undone so a double-click leaves it as it was.
+        Not while lifted out — there a click selects nothing."""
+        if not self._solo:
+            self.clicked.emit(self.cam_index)
+        self.double_clicked.emit(self.cam_index)
+
+    def mouseDoubleClickEvent(self, event):
+        # The frame and the name bar (the labels pass their clicks up to here).
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._on_double_click()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def set_solo(self, on: bool):
+        """Lifted out to fill a monitor: black all round, no tile frame — only the
+        picture and its name bar."""
+        self._solo = bool(on)
+        if on:
+            self._solo_bg = QColor(self.img_view.bg_color)
+            self.img_view.bg_color = QColor("#000000")
+            self.layout().setContentsMargins(0, 0, 0, 0)
+            self.setStyleSheet("CameraView { border: none; background: #000000; }")
+        else:
+            self.img_view.bg_color = QColor(getattr(self, "_solo_bg", QColor("#222")))
+            self.layout().setContentsMargins(3, 6, 3, 3)
+            self._update_border()
+        self.img_view._scaled = None
+        self.img_view.update()
+
     def _update_border(self):
+        if self._solo:
+            return
         if self._selected:
             self.setStyleSheet(
                 "CameraView { border: 3px solid #2d7dff; border-radius: 3px; background: #1a2a3a; }")
@@ -14490,7 +15436,8 @@ class CameraView(QWidget):
         # Grid config dialog is opened by ImageView.mouseReleaseEvent on single right-click.
         if self._tile_mouse(self, event):
             return
-        self.clicked.emit(self.cam_index)
+        if not self._solo:
+            self.clicked.emit(self.cam_index)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -14621,8 +15568,20 @@ class CameraView(QWidget):
         act = menu.addAction("Auto-arrange cameras")
         act.setToolTip("Forget the arrangement made by dragging and let the program "
                        "size the cameras again")
-        if menu.exec(gpos) is act:
+        iv = getattr(self, 'img_view', None)
+        cam_name = getattr(iv, 'pdxm1_cam_name', '') if iv is not None else ''
+        act_ref = None
+        if cam_name and not _is_diode_cam(cam_name):
+            act_ref = menu.addAction("Reference frames")
+            act_ref.setToolTip("Frames drawn on this camera: set by hand or read from "
+                               "the camera program's window")
+        picked = menu.exec(gpos)
+        if picked is act:
             grid.reset_layout_to_auto()
+        elif act_ref is not None and picked is act_ref:
+            dlg = CamRefRectDialog(cam_name, img_view=iv, parent=self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                dlg.save_config()
         return True
 
     def _tile_mouse(self, obj, event) -> bool:
@@ -14897,7 +15856,12 @@ class _AutoLayoutContainer(QWidget, _TileDragHost):
 
     def detach(self):
         """Drop the aspect subscriptions before this container is replaced, so a
-        stale instance can never re-position tiles that now belong to a new one."""
+        stale instance can never re-position tiles that now belong to a new one.
+        Once only: focus mode and the lifted-out camera detach before the rebuild
+        does, and a second disconnect makes PySide print a warning."""
+        if getattr(self, "_detached", False):
+            return
+        self._detached = True
         for v in self._views:
             try:
                 v.img_view.frame_aspect_changed.disconnect(self._apply)
@@ -14927,13 +15891,15 @@ class _AutoLayoutContainer(QWidget, _TileDragHost):
 
 class MultiCameraGrid(QWidget):
     """
-    Grid zobrazení pro 2–4 kamery.
-    Layout:
-      - vertikální snímky (h > w): 4×1 (vedle sebe)
-      - čtvercové / horizontální:  2×2
-    Layout se volí automaticky: PDxM1 kamery → pravý sloupec (portrét), ostatní → levá strana (2×N).
+    The Image Slider's camera tiles.
+
+    Arrangement: a hand-made / preset one (_FreeLayoutContainer) when there is one,
+    otherwise the searched automatic one (_AutoLayoutContainer → compute_camera_layout),
+    which picks the split giving the most picture area — so 4 square cameras come out
+    2×2 or 1×4 depending on the shape of the free space, not by a fixed rule.
     """
     camera_selected = Signal(int)  # index naposledy kliknuté kamery
+    camera_double_clicked = Signal(int)  # lift this camera out to fill the monitor
     # (camera index, shape) — a tile's overlay was just dragged by the user.
     # Re-emitted from every tile so the panel can mirror it onto the other
     # selected cameras (see ImageView.overlay_edited).
@@ -14948,6 +15914,9 @@ class MultiCameraGrid(QWidget):
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setSpacing(4)
         self._reg_container: "QWidget | None" = None  # sub-grid for regular cams in mixed layout
+        # Indices of the cameras lifted out into a window of their own (double-click,
+        # see Viewer._pop_toggle). Left out of the grid until they come back.
+        self._popped: set[int] = set()
         self._overlay_store: dict[str, dict] = {}  # cam_name → overlay state
         self._layout_config = None  # CamLayoutConfig or None
         # Callable → style dict for a new tile's marks; set by the Viewer.
@@ -14999,6 +15968,9 @@ class MultiCameraGrid(QWidget):
             cv.hide()
             cv.deleteLater()
         self._cam_views.clear()
+        # New tiles: none of them is lifted out (a window still holding an old tile
+        # closes itself when that tile is deleted — see Viewer._pop_tile_gone).
+        self._popped = set()
         if self._reg_container is not None:
             self._reg_container.hide()
             self._reg_container.deleteLater()
@@ -15008,6 +15980,7 @@ class MultiCameraGrid(QWidget):
         for i, name in enumerate(cam_names):
             cv = CameraView(i, name, self)
             cv.clicked.connect(self._on_cam_clicked)
+            cv.double_clicked.connect(self.camera_double_clicked)
             cv.img_view.overlay_edited.connect(
                 lambda shape, _i=i: self.overlay_edited.emit(_i, shape))
             self._cam_views.append(cv)
@@ -15022,8 +15995,8 @@ class MultiCameraGrid(QWidget):
             cv.img_view.pdxm1_cam_name  = name
             cv.img_view.show_pdxm1_grid = (_is_diode_cam(name)
                                            and get_pdxm1_grid_config(name).show)
-            # Permanent reference rectangle (None for cameras that have none).
-            cv.img_view.ref_rect_cfg = get_ref_rect_config(name)
+            # Permanent reference frames (empty for cameras that have none).
+            cv.img_view.ref_rect_cfg = get_ref_frames(name)
 
         self._selected_idx = 0
         self._selected_set = set()
@@ -15089,6 +16062,10 @@ class MultiCameraGrid(QWidget):
         when the same cameras are opened again, and the editor opens on it instead of on
         an auto arrangement. The grid is NOT rebuilt: the tiles are already where they
         belong, and rebuilding would re-parent them out from under the mouse."""
+        if self._popped:
+            # Arranged while a camera is lifted out: those positions are for N-1 tiles,
+            # and storing them would replace the real N-camera arrangement for good.
+            return
         self._layout_config = CamLayoutConfig(entries=list(entries))
         names = getattr(self, '_cam_names_list', [])
         if len(names) == len(entries):
@@ -15159,6 +16136,20 @@ class MultiCameraGrid(QWidget):
         if n == 0:
             return
 
+        # Cameras lifted out into their own window (double-click) are not placed here;
+        # the rest re-tile automatically over the whole area until they come back.
+        if self._popped:
+            views = [cv for cv in self._cam_views if cv.cam_index not in self._popped]
+            self._grid.setSpacing(0)
+            if not views:
+                return
+            container = _AutoLayoutContainer(views, parent=self)
+            self._reg_container = container
+            self._grid.addWidget(container, 0, 0, 1, 1)
+            self._grid.setRowStretch(0, 1)
+            self._grid.setColumnStretch(0, 1)
+            return
+
         # ── Custom layout (user-configured, continuous positions) ────────────
         cfg = self._layout_config
         if cfg is not None and cfg.entries and len(cfg.entries) >= n:
@@ -15211,6 +16202,9 @@ class MultiCameraGrid(QWidget):
         if 0 <= idx < len(self._cam_views):
             return self._cam_views[idx].img_view
         return None
+
+    def is_popped(self, idx: int) -> bool:
+        return idx in self._popped
 
     def set_cam_timestamp(self, cam_idx: int, text: str, stale: bool = False,
                           approx: bool = False):
@@ -16649,6 +17643,11 @@ class PvConfigDialog(QDialog):
                     - (0 if self._show_kind else self._W_KIND), 540)
 
         hidden = {str(n) for n in (hidden or ())}
+        # An added PV that is a preset under another name (SBW4's HAPLS name) is that
+        # preset: one row, read under both names (see pv_preset_for_channel).
+        custom = {n: ch for n, ch in dict(custom).items()
+                  if pv_preset_for_channel(ch) is None}
+        enabled = pv_fold_selection([str(n) for n in enabled], hidden)
         # A preset is in the list exactly when it was picked. No second tick anywhere.
         self._preset_in: "dict[str, bool]" = {n: (n in enabled) for n in PV_CHANNEL_MAP}
         self._custom: "dict[str, str]" = dict(custom)          # name → channel, ordered
@@ -16936,10 +17935,15 @@ class PvConfigDialog(QDialog):
             self._set_idle_status()
 
     def _suggestions(self) -> "list[tuple[str, str]]":
-        """(display, channel) pairs: presets first, then every other channel."""
-        sugg = [(f"{n}   ({ch})", ch) for n, ch in PV_CHANNEL_MAP.items()]
-        preset_chs = set(PV_CHANNEL_MAP.values())
-        sugg += [(ch, ch) for ch in self._all_channels if ch not in preset_chs]
+        """(display, channel) pairs: presets first, then every other channel.
+
+        A preset is listed with EVERY name it is read under (SBW4: the HAPLS and the L3
+        name), so a search for either finds the preset — and the other name is not
+        offered as a channel of its own, which is how SBW4 ended up as two rows."""
+        sugg = [(f"{n}   ({' · '.join(cpva.read_order(ch))})", ch)
+                for n, ch in PV_CHANNEL_MAP.items()]
+        sugg += [(ch, ch) for ch in self._all_channels
+                 if pv_preset_for_channel(ch) is None]
         return sugg
 
     def _set_idle_status(self):
@@ -17132,12 +18136,29 @@ class PvConfigDialog(QDialog):
                if rd.get("hide_source") and self._preset_in.get(src) else ""))
 
     # ── adding and removing PVs ──────────────────────────────────────────────
+    def _open_eye(self, name: str):
+        """Show one picked PV. Its Show box is ticked too, not only _shown: the next
+        rebuild reads the boxes back (_sync_row_state) and would shut it again."""
+        self._shown[name] = True
+        for row in self._rows:
+            if row["ent"]["name"] == name:
+                try:
+                    row["chk"].setChecked(True)
+                except RuntimeError:
+                    pass
+
     def _add_preset(self, name: str):
         """Put a house PV in the list. Already there → say so rather than doing nothing
         visible."""
         self._sync_row_state()
         if self._preset_in.get(name):
-            self._status.setText(f'"{name}" is already in the list.')
+            # Same as an added channel: picked again with its eye shut → shown.
+            if not self._shown.get(name, True):
+                self._open_eye(name)
+                self._status.setText(f'"{name}" was already in the list — now shown.')
+                self._rebuild_picked_tables()
+            else:
+                self._status.setText(f'"{name}" is already in the list.')
             return
         self._preset_in[name] = True
         self._shown.setdefault(name, True)
@@ -17149,10 +18170,11 @@ class PvConfigDialog(QDialog):
         if not channel:
             return
         self._sync_row_state()
-        preset = next((n for n, ch in PV_CHANNEL_MAP.items() if ch == channel), None)
+        preset = pv_preset_for_channel(channel)
         if preset is not None:
-            # The channel a preset already reads: add THE PRESET, never a second row
-            # reading the very same channel under a different name and no unit.
+            # The channel a preset already reads — or the other name of the same
+            # measurement (SBW4: HAPLS / L3): add THE PRESET, never a second row
+            # reading the very same numbers under a different name and no unit.
             self._search.clear()
             self._results.setRowCount(0)
             self._sync_results_visible()
@@ -17161,7 +18183,15 @@ class PvConfigDialog(QDialog):
             self._search.setFocus()
             return
         if channel in self._custom:
-            self._status.setText(f'"{channel}" is already in the list.')
+            # Picked again while its eye is shut: the operator went looking for it,
+            # so they want to SEE it. Leaving it in "Read, not on the picture" meant
+            # OK changed nothing visible (in the Shot Finder: no row at all).
+            if not self._shown.get(channel, True):
+                self._open_eye(channel)
+                self._status.setText(f'"{channel}" was already in the list — '
+                                     'now shown.')
+            else:
+                self._status.setText(f'"{channel}" is already in the list.')
         else:
             self._custom[channel] = channel
             self._shown[channel] = True
@@ -17528,13 +18558,24 @@ class PvConfigDialog(QDialog):
                        f"{src} again.")
             else:
                 on = bool(self._preset_in.get(name))
-                tip = (f"{PV_CHANNEL_MAP[name]}\n"
+                tip = (self._read_order_tip(PV_CHANNEL_MAP[name]) + "\n"
                        + ("In the list and read. Untick to remove it."
                           if on else "Tick to add it to the list."))
             cb.blockSignals(True)
             cb.setChecked(on)
             cb.blockSignals(False)
             cb.setToolTip(tip)
+
+    @staticmethod
+    def _read_order_tip(channel: str) -> str:
+        """The archiver name(s) a channel is read under, in the order they are asked."""
+        names = cpva.read_order(channel)
+        if len(names) < 2:
+            return channel
+        return (f"Read from {names[0]}\n"
+                + "".join(f"and, when that holds nothing, from {n}\n"
+                          for n in names[1:])
+                + "— the same measurement under two archiver names, one row.")
 
     def _later(self, fn):
         """Run fn once the signal that asked for it has been delivered."""
@@ -17638,10 +18679,11 @@ class PvConfigDialog(QDialog):
             # The PV column carries what the row actually reads: the archiver channel.
             # Elided in the MIDDLE — a channel's tail (":Energy") is the half that says
             # what it is.
-            pv_text = ent["pv"] or "—"
+            # A channel with two archiver names (SBW4) shows the one asked FIRST.
+            pv_text = cpva.read_order(ent["pv"])[0] if ent["pv"] else "—"
             pv_lbl.setText(QFontMetrics(pv_lbl.font()).elidedText(
                 pv_text, Qt.TextElideMode.ElideMiddle, 210))
-            pv_lbl.setToolTip(pv_text)
+            pv_lbl.setToolTip(self._read_order_tip(ent["pv"]) if ent["pv"] else pv_text)
             self._cell(grid, row, 2, pv_lbl)
 
         name_edit = None
@@ -18041,6 +19083,11 @@ SHOT_ENERGY_POLL_MS = 1500
 # How far back each poll asks. Wide on purpose: the window is set by THIS PC's clock,
 # and one workstation was measured 25 s off the archiver's.
 SHOT_ENERGY_WINDOW_S = 90
+# A reading is a laser pulse only above this (J). Measured 13.10.2026 with the laser
+# off: SBW4 reads 0.016–0.026 J of meter noise, archived whenever it flips between
+# two levels — every flip counted as a shot, and a 10 s quiet spell in the noise
+# reset the count while the camera kept storing frames. Real shots are ~12 J.
+SHOT_ENERGY_MIN_J = 0.5
 
 
 _SHOT_NS = 1_000_000_000
@@ -18058,6 +19105,13 @@ _SHOT_HOLE_MAX = 6
 # Without energies, a camera counts toward the shot rate while its newest frame is
 # no older than this behind the newest frame of any source.
 _SHOT_QUORUM_KEEP_NS = 1800 * _SHOT_NS
+# The energies stop deciding when the newest moment is this far past their newest
+# pulse — _SHOT_HOLE_MAX + 1 shots, never less than this (the energy poll trails
+# the files by its own period). Low power, measured 13.10.2026: the archiver keeps
+# answering, but PTM1 and SBW4 hold only meter noise (−1.7 J, 0.02 J) while every
+# triggered camera stores a frame per shot. Waiting for a pulse froze the count; the
+# next archiver hiccup then counted 5 minutes of frames at once (190 → 580).
+_SHOT_SILENT_MIN_NS = 10 * _SHOT_NS
 
 
 class _ShotSource:
@@ -18114,9 +19168,13 @@ class ShotCounter:
         hole of whole missing shots (the archive drops a reading now and then), and
         only on the beat of that hole. So a camera that keeps storing frames after the
         laser has stopped — several do, at the very same 5 s — adds nothing.
-      * Without the energies (the archiver does not answer), the shot rate is the one
-        most sources repeat at, and a moment is a shot when at least half of the
-        sources on that rate saw it (one camera alone: every frame).
+      * Without the energies — the archiver does not answer, or it answers without a
+        pulse (low power: the meters read noise) while the cameras keep seeing shots —
+        the frames decide. The shot rate is the one most sources repeat at, and a
+        moment is a shot when at least half of the open cameras on that rate saw it
+        (one camera alone: every frame). It waits until every camera of the run (those
+        that saw the last shots) has got that far; a run camera that has stopped means
+        the laser has stopped, and what the others store meanwhile is never counted.
       * Anything clearly faster than the shot rate (a camera running free at 3.3 Hz or
         10 Hz beside 5 s shots) never counts, whichever camera is on screen.
 
@@ -18143,6 +19201,8 @@ class ShotCounter:
         self._energy_ok_at = None      # monotonic seconds of the last energy reply
         self._newest_counted = None
         self._gap_cache = None
+        self._cams = None              # the open cameras (None: every one seen)
+        self._run_seen: "dict[str, int]" = {}  # camera → newest counted moment it saw
 
     # ── run and sources ──────────────────────────────────────────────────────
     def _expire(self, now: float):
@@ -18160,6 +19220,15 @@ class ShotCounter:
     def set_main(self, name):
         """The camera on screen. Kept for the tooltip; it has no say in what counts."""
         self.main = name
+
+    def set_cameras(self, names):
+        """The cameras open right now. A closed camera stops sending frames; without
+        this it would look like a camera the laser stopped."""
+        self._cams = set(names)
+
+    def _open_cam(self, name: str) -> bool:
+        return (not name.startswith("pv:")
+                and (self._cams is None or name in self._cams))
 
     def energy_answered(self, now: float):
         """The energy poll got an answer (empty or not): the energies decide."""
@@ -18190,7 +19259,21 @@ class ShotCounter:
     def _energy_judges(self, now: float) -> bool:
         if self._energy_ok_at is None or now - self._energy_ok_at > _SHOT_ENERGY_ALIVE_S:
             return False
-        return any(s.energy for s in self._src.values())
+        if not any(s.energy for s in self._src.values()):
+            return False
+        return not self._energies_silent()
+
+    def _energies_silent(self) -> bool:
+        """The cameras have gone on well past the newest energy pulse (or there was
+        none): the energies have nothing to say about these moments."""
+        if not self._shots:
+            return False
+        e_new = next((r for r in reversed(self._shots)
+                      if self._info[r].e_t is not None), None)
+        if e_new is None:
+            return True
+        quiet = max((_SHOT_HOLE_MAX + 1) * self._gap(), _SHOT_SILENT_MIN_NS)
+        return self._shots[-1] - e_new > quiet
 
     def _gap(self) -> int:
         if self._gap_cache is None:
@@ -18232,9 +19315,28 @@ class ShotCounter:
         see a moment for it to be a shot."""
         newest = max((s.newest or 0) for s in self._src.values()) if self._src else 0
         cut = newest - _SHOT_QUORUM_KEEP_NS
+        # An energy channel takes part only while it reads pulses (the archiver
+        # stopped answering); a silent one would only raise the bar.
+        live_e = not self._energies_silent()
         members = {n for n, s in self._src.items()
-                   if s.newest is not None and s.newest >= cut and self._on_rate(s)}
+                   if s.newest is not None and s.newest >= cut and self._on_rate(s)
+                   and (self._open_cam(n) if not s.energy else live_e)}
         return members, max(1, len(members) // 2)
+
+    def _run_cams(self) -> "dict[str, int]":
+        """The open cameras that saw the last shots → how far each has got: its
+        newest frame. As stamped — a file is written after its shot, and a delay
+        learnt from a lone camera's own frames can be a whole shot off."""
+        if self._newest_counted is None:
+            return {}
+        since = self._newest_counted - 3 * self._gap()
+        out = {}
+        for n, r in self._run_seen.items():
+            s = self._src.get(n)
+            if r >= since and s is not None and s.newest is not None \
+                    and self._open_cam(n) and self._on_rate(s):
+                out[n] = s.newest
+        return out
 
     # ── adding stamps ────────────────────────────────────────────────────────
     def add_energy(self, channel: str, ts_list, now: float) -> bool:
@@ -18321,7 +19423,19 @@ class ShotCounter:
         if not self._open:
             return False
         judge = self._energy_judges(now)
-        quorum = None if judge else self._quorum()
+        quorum = run = None
+        stop_at = None
+        if not judge:
+            quorum = self._quorum()
+            run = self._run_cams()
+            if run and self._shots:
+                # A run camera with nothing for _SHOT_HOLE_MAX shots while others go
+                # on: the laser stopped there. A camera running free stores on.
+                behind = self._shots[-1] - _SHOT_HOLE_MAX * self._gap()
+                gone = [p for p in run.values() if p < behind]
+                if gone:
+                    stop_at = min(gone) + self._tol()
+        tol = self._tol()
         opened = False
         keep = []
         for ref in self._open:
@@ -18331,8 +19445,13 @@ class ShotCounter:
             if judge:
                 ok = sh.e_t is not None or self._fills_hole(ref)
             else:
+                if stop_at is not None and ref > stop_at:
+                    continue                # after the laser stopped: never a shot
                 members, need = quorum
                 ok = sum(1 for n in sh.by if n in members) >= need
+                if ok and any(p < ref - tol for p in run.values()):
+                    keep.append(ref)        # a run camera has not got this far yet
+                    continue
             if ok:
                 opened |= self._count(ref, sh)
             else:
@@ -18359,6 +19478,9 @@ class ShotCounter:
 
     def _count(self, ref: int, sh: _Shot) -> bool:
         sh.counted = True
+        for n in sh.by:
+            if not n.startswith("pv:") and ref >= self._run_seen.get(n, ref):
+                self._run_seen[n] = ref
         late = (self._last_arrival is None and self._newest_counted is not None
                 and ref < self._newest_counted)
         self._newest_counted = max(self._newest_counted or ref, ref)
@@ -18472,15 +19594,30 @@ class PvValueTable(QTableWidget):
 
     eye_clicked = Signal(str)          # PV name whose eye was clicked
     row_double_clicked = Signal(str)   # name of the row double-clicked (not on the eye)
+    # The master eye in the header asks for a new hidden set (every listed name that
+    # should be off the picture); the host stores it as it stores a single eye.
+    hidden_set_requested = Signal(object)
 
     ROW_H = 20
 
     def __init__(self, parent=None):
         super().__init__(0, 3, parent)
-        # Column 0 is the eye. It carries no title: at 24 px a word would be elided to
-        # "…", i.e. the one control in this table would be the unreadable part. The
-        # glyph plus its tooltip is the label.
-        self.setHorizontalHeaderLabels(["", "PV", "Value"])
+        # Column 0 is the eye. Its title is the master eye (the same glyph as the
+        # rows, never a word — at 24 px a word would be elided to "…"): one click
+        # hides every PV, the next click brings back the ones that were shown,
+        # a double-click shows them all.
+        self.setHorizontalHeaderLabels(["👁", "PV", "Value"])
+        self._hidden_now: "set[str]" = set()
+        self._eye_memory: "set[str] | None" = None   # hidden set before "hide all"
+        self._master_clicks = 0
+        self._master_timer = QTimer(self)
+        self._master_timer.setSingleShot(True)
+        self._master_timer.timeout.connect(self._master_eye_fire)
+        self.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+        self.horizontalHeader().sectionDoubleClicked.connect(
+            self._on_header_double_clicked)
+        self.horizontalHeader().setSectionsClickable(True)
+        self.horizontalHeader().setHighlightSections(False)
         # Name stretches (and elides), value sizes to its content — the other way
         # round, a user-added PV name like "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
         # ate the whole 275 px sidebar and pushed the VALUE out of sight.
@@ -18543,6 +19680,68 @@ class PvValueTable(QTableWidget):
         if col != 0 and 0 <= row < len(self._names):
             self.row_double_clicked.emit(self._names[row])
 
+    # ── master eye (header of column 0) ──────────────────────────────────────
+    def _on_header_clicked(self, section: int):
+        """Clicks are counted and judged once the double-click time has passed,
+        so the first click of a double-click never hides everything for a moment."""
+        if section != 0:
+            return
+        self._master_clicks += 1
+        if not self._master_timer.isActive():
+            self._master_timer.start(QApplication.doubleClickInterval())
+
+    def _on_header_double_clicked(self, section: int):
+        # Whether the header also reports the second press as a click depends on
+        # the Qt version — either way the pair counts as two clicks at least.
+        if section != 0:
+            return
+        self._master_clicks = max(self._master_clicks + 1, 2)
+        if not self._master_timer.isActive():
+            self._master_timer.start(QApplication.doubleClickInterval())
+
+    def _master_eye_fire(self):
+        clicks, self._master_clicks = self._master_clicks, 0
+        if clicks >= 2:
+            self.master_eye_show_all()
+        else:
+            self.master_eye_toggle()
+
+    def master_eye_toggle(self):
+        """Any PV shown → remember what was hidden and hide all of them. Nothing
+        shown → bring back what was shown before (every PV if nothing is known)."""
+        names = set(self._names)
+        if not names:
+            return
+        if names - self._hidden_now:
+            self._eye_memory = set(self._hidden_now)
+            self.hidden_set_requested.emit(set(names))
+        else:
+            mem = self._eye_memory
+            self._eye_memory = None
+            back = set(mem) & names if mem is not None else set()
+            if back == names:
+                back = set()
+            self.hidden_set_requested.emit(back)
+
+    def master_eye_show_all(self):
+        self._eye_memory = None
+        if self._names:
+            self.hidden_set_requested.emit(set())
+
+    def _sync_master_eye(self):
+        """The header glyph and tooltip follow the rows: 🚫 when nothing is shown."""
+        none_shown = bool(self._names) and not (set(self._names) - self._hidden_now)
+        it = self.horizontalHeaderItem(0)
+        if it is None:
+            it = QTableWidgetItem()
+            self.setHorizontalHeaderItem(0, it)
+        it.setText("🚫" if none_shown else "👁")
+        it.setToolTip("All PVs are hidden in the image overlay — click to bring back "
+                      "the ones that were shown, double-click to show all"
+                      if none_shown else
+                      "Click to hide every PV in the image overlay (a second click "
+                      "brings them back), double-click to show all")
+
     def eventFilter(self, obj, event):
         if (event.type() == QEvent.Type.ToolTip and obj is self.viewport()):
             idx = self.indexAt(event.pos())
@@ -18565,6 +19764,8 @@ class PvValueTable(QTableWidget):
         limits (the Image Finder) needs no change at all."""
         alarm = alarm or set()
         self._names = list(names)
+        self._hidden_now = set(hidden) & set(self._names)
+        self._sync_master_eye()
         self.setRowCount(len(self._names))
         self._apply_height(len(self._names))
         for i, name in enumerate(self._names):
@@ -18829,12 +20030,22 @@ class _TripBox(QWidget):
 
     def _paint_row(self, t: "_Trip", lbl: "_TripLabel", btn: QPushButton):
         """Everything about a row that can change without the list changing: the
-        repeat count, whether it is still happening, whether it has been seen."""
-        lbl.setStyleSheet("font-size: 10px; padding: 0;"
-                          + ("color: #888;" if t.acked else "color: #a00;"))
+        repeat count, whether it is still happening, whether it has been seen.
+
+        Only a row whose state CHANGED is written. Every repeat of an open trip refreshes
+        the box, and restyling all of up to TRIPS_MAX rows each time (a setStyleSheet and
+        two tooltips per row) was GUI-thread work that grew with the session."""
+        tip = t.tip()
+        state = (t.acked, t.head(), t.text, t.tail(), tip)
+        if getattr(lbl, "_painted_state", None) == state:
+            return
+        if getattr(lbl, "_painted_state", (None,))[0] != t.acked:
+            lbl.setStyleSheet("font-size: 10px; padding: 0;"
+                              + ("color: #888;" if t.acked else "color: #a00;"))
+        lbl._painted_state = state
         lbl.set_parts(t.head() + "  ", t.text, t.tail())
-        lbl.setToolTip(t.tip())
-        btn.setToolTip(t.tip())
+        lbl.setToolTip(tip)
+        btn.setToolTip(tip)
 
     def _make_row(self, t: "_Trip") -> QWidget:
         row = QWidget()
@@ -19154,13 +20365,17 @@ class _FocusWindow(QWidget):
     _RM     = 8      # how far from an edge a press still counts as that edge
 
     def __init__(self, content: QWidget, viewer, key: str, *,
-                 border: int = _BORDER, bg: str = "#1a1a1a", fixed: bool = False):
+                 border: int = _BORDER, bg: str = "#1a1a1a", fixed: bool = False,
+                 on_leave=None):
         super().__init__(None, Qt.WindowType.Tool
                                | Qt.WindowType.FramelessWindowHint
                                | Qt.WindowType.WindowStaysOnTopHint)
         self._viewer  = viewer
         self.key      = key
         self._content = content
+        # Who Esc / F11 / closing hands control back to: focus mode by default; one
+        # camera lifted out by a double-click (Viewer._pop_enter) passes its own.
+        self._on_leave = on_leave
         self._border  = 0 if fixed else border
         self._fixed   = fixed
         self._orig_parent = content.parentWidget()
@@ -19201,7 +20416,20 @@ class _FocusWindow(QWidget):
             child.installEventFilter(self)
 
     def _leave(self):
+        if self._on_leave is not None:
+            self._on_leave(self)
+            return
         self._viewer._toggle_focus_mode()
+
+    def swap_content(self, new: QWidget, old_parent: QWidget):
+        """Put `new` where the content was, handing the old content to `old_parent`.
+        For a rebuilt camera set: the window stays where it is and simply shows the new
+        tile of the same camera."""
+        self.release_content(old_parent)
+        self._content = new
+        self.layout().addWidget(new, 1)
+        new.setVisible(True)
+        self._watch(new)
 
     def release_content(self, parent: "QWidget | None" = None):
         """Hand the content back without deleting it. `parent` overrides where it goes:
@@ -19216,6 +20444,15 @@ class _FocusWindow(QWidget):
     # ── move: any left press on the content ──────────────────────────────────
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
+        if (self._on_leave is not None
+                and event.type() == QEvent.Type.MouseButtonDblClick
+                and event.button() == Qt.MouseButton.LeftButton
+                and isinstance(obj, QWidget) and self.isAncestorOf(obj)):
+            # A lifted-out camera goes back with the same gesture that lifted it out.
+            # Handled here, not by the tile: its own handler would also undo a
+            # selection click that never happened (the press below starts a move).
+            QTimer.singleShot(0, self._leave)
+            return True
         if (event.type() == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
                 # In single-camera mode the PV panel starts out INSIDE the wrapper and
@@ -19387,7 +20624,21 @@ class _FocusWindow(QWidget):
 
     def closeEvent(self, event):
         """Alt+F4 on one window ends focus mode for all of them — closing a single
-        window would otherwise take that camera away with no way to get it back."""
+        window would otherwise take that camera away with no way to get it back.
+
+        A camera lifted out on its own (on_leave set) goes back to the grid instead;
+        _pop_leave closes the window once it has handed the tile back."""
+        if self._on_leave is not None:
+            try:
+                holds = self._content.parentWidget() is self
+            except RuntimeError:
+                holds = False        # the tile was deleted (new camera set)
+            if holds:
+                event.ignore()
+                QTimer.singleShot(0, self._leave)
+                return
+            super().closeEvent(event)
+            return
         if self._viewer._focus_mode and not self._viewer._focus_toggling:
             event.ignore()
             QTimer.singleShot(0, self._leave)
@@ -19579,6 +20830,9 @@ class Viewer(QWidget):
         self._want_display_req: dict = {}
         self._display_epoch = 0
         self._scan_task: ScanTask | None = None
+        # Stop flag of the multi-camera scan in flight (one per scan, shared by its
+        # per-camera tasks); None when no multi-camera scan is running.
+        self._multi_scan_stop: threading.Event | None = None
         self._save_task: SaveRangeTask | None = None
         self._refresh_task: RefreshScanTask | None = None
         self.mark_a_ns: int | None = None
@@ -19637,6 +20891,13 @@ class Viewer(QWidget):
         self._online_timer.setInterval(200)
         self._online_timer.timeout.connect(self._online_poll)
         self._auto_follow    = False   # sleduj nejnovější snímek
+        # Bumped every time live mode starts or stops. A poll launched under one value
+        # and answering under another belongs to a live run that is over: its frames
+        # are still added, but it may not move the view (_live_result_may_move).
+        self._live_epoch     = 0
+        # A moment the user jumped to (saved timestamp, trip) that may not be in memory
+        # yet because live mode had trimmed it — the history reload lands there.
+        self._restore_want_ts = None
         # True once the live cap dropped frames from memory — turning live mode
         # off then re-scans from disk to put the full history back.
         self._live_trimmed   = False
@@ -19818,6 +21079,17 @@ class Viewer(QWidget):
         self._pv_stall_recoveries: int = 0
         self._pv_signals = _PvSignals()
         self._pv_signals.result.connect(self._pv_on_result)
+        # Live feed (see PV_LIVE_POLL_MS): its own poll, its own signal, so a live
+        # answer can never be taken for an exact per-frame one or the reverse.
+        self._pv_live_signals = _PvSignals()
+        self._pv_live_signals.result.connect(self._pv_live_on_result)
+        self._pv_live_timer = QTimer(self)
+        self._pv_live_timer.setInterval(PV_LIVE_POLL_MS)
+        self._pv_live_timer.timeout.connect(self._pv_live_poll)
+        self._pv_live_busy = False
+        self._pv_live_gen = 0
+        self._pv_live_ok_mono: "float | None" = None    # last good answer
+        self._pv_live_was_on = False
         self._pv_health_timer = QTimer(self)
         self._pv_health_timer.setInterval(PV_HEALTH_TICK_MS)
         self._pv_health_timer.timeout.connect(self._pv_health_tick)
@@ -19954,10 +21226,25 @@ class Viewer(QWidget):
             # event loop, i.e. a several-hundred-ms freeze every minute. The counts
             # never told us anything the RSS figure doesn't, so only the cheap total
             # is kept (one list build, no per-object work).
+            # Even that list build is gone now (26.10.2026): it walked the whole heap on the
+            # GUI thread every minute, and its cost grew with the session. The figure comes
+            # from the GUI-thread collector instead (main.install_gui_thread_gc), which
+            # counts the long-lived objects once per FULL pass anyway. The same place
+            # measures the longest GUI stall and the time spent collecting since the last
+            # line — the numbers that tell a stutter in waves apart from slow decodes.
             n_gc = -1
             n_pix = n_img = -1
+            gc_txt = ""
             try:
-                n_gc = len(gc.get_objects())
+                _gs = getattr(QApplication.instance(), "_gui_gc_stats", None)
+                if _gs is not None:
+                    n_gc = int(_gs.get("long_lived", -1))
+                    gc_txt = (f"stall={_gs['stall_max']:5.2f}s gcMs={_gs['gc_ms']:6.0f} "
+                              f"gcMax={_gs['gc_max_ms']:5.0f} gcFull={_gs['full']} ")
+                    _gs["stall_max"] = 0.0
+                    _gs["gc_ms"] = 0.0
+                    _gs["gc_max_ms"] = 0.0
+                    _gs["full"] = 0
             except Exception:
                 pass
             try:    axis_h = (self.axis_max_ns - self.axis_min_ns) / 3.6e12
@@ -20104,7 +21391,7 @@ class Viewer(QWidget):
                           f"pvOver={len(self._pv_alarm_names)} ")
             except Exception:
                 pass
-            line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} up={up:6.1f}m " + paints +
+            line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} up={up:6.1f}m " + gc_txt + paints +
                     prox_txt + lags_txt + dots_txt + cams_txt +
                     f"rss={rss_mb:8.1f}MB thr={n_threads:3d} pools={n_pools:3d} "
                     f"campools={n_campools:2d} children={n_children:6d} "
@@ -21238,6 +22525,7 @@ class Viewer(QWidget):
         self._pv_table = PvValueTable()
         self._pv_table.setVisible(False)
         self._pv_table.eye_clicked.connect(self._pv_toggle_eye)
+        self._pv_table.hidden_set_requested.connect(self._pv_set_hidden)
         self._pv_table.row_double_clicked.connect(self._shot_edit_reset)
         self._pv_table.shot_label = self._shot_label or SHOT_ROW_LABEL
         s_pv.body_layout.addWidget(self._pv_table)
@@ -21352,7 +22640,7 @@ class Viewer(QWidget):
         self.prog = QProgressBar(); self.prog.setVisible(False)
         self.prog.setRange(0, 0); self.prog.setTextVisible(False)
         self.btn_cancel_scan = QPushButton("Cancel scan"); self.btn_cancel_scan.setVisible(False)
-        self.btn_cancel_scan.clicked.connect(self.cancel_scan)
+        self.btn_cancel_scan.clicked.connect(self._on_cancel_scan_clicked)
 
         llay.addStretch(1)
 
@@ -21468,6 +22756,9 @@ class Viewer(QWidget):
         self._multi_grid.setVisible(False)
         self._multi_grid.camera_selected.connect(self._on_multicam_selected)
         self._multi_grid.overlay_edited.connect(self._on_overlay_edited)
+        self._multi_grid.camera_double_clicked.connect(self._solo_toggle)
+        self.img_view.double_clicked.connect(lambda: self._solo_toggle(-1))
+        self._pop_windows = {}    # camera name → its _FocusWindow (see _pop_enter)
         self._img_pointing_row.addWidget(self._multi_grid, 1)
 
         # PV overlay for multi-cam view — parented to _cam_row_widget so it floats
@@ -21776,185 +23067,363 @@ class Viewer(QWidget):
         self._refresh_draw_btns()
 
     def _open_overlay_settings(self):
-        from PySide6.QtWidgets import (QDialog, QFormLayout, QSpinBox,
-                                        QPushButton, QDialogButtonBox, QColorDialog)
-        from PySide6.QtGui import QColor
+        """Overlay Settings: one section per kind of mark (Crosses, Circles, Squares).
+
+        Each section starts with "Apply to" — every camera, the selected camera(s),
+        or one mark ("Cross 2") — and everything under it (colour, thickness, size,
+        outline, angle) is for that choice. Switching the choice keeps what was
+        changed for the previous one; Cancel undoes all of it. No field has a
+        made-up upper limit: a 4000 px frame wants numbers a 640 px one does not.
+
+        "All … – all cameras" sets the kind's style (also the one saved pictures
+        use) and drops any own look of those marks. The selected cameras or a single
+        mark get the look carried by the marks themselves (mark_look), so a saved
+        picture shows it too."""
+        from PySide6.QtWidgets import (QDialog, QFormLayout, QSpinBox, QGroupBox,
+                                       QPushButton, QDialogButtonBox, QColorDialog,
+                                       QCheckBox, QComboBox, QHBoxLayout, QWidget,
+                                       QVBoxLayout)
+
+        BIG = 100000
+        multi = self._is_multi_cam()
+
+        def all_views() -> list:
+            out = [self.img_view]
+            if multi:
+                out += [cv.img_view for cv in self._multi_grid._cam_views]
+            return out
+
+        has_sel = bool(multi and self._multi_grid.selected_cam_indices())
+
+        # Cancel puts back every mark and every camera's look; OK writes `work` (the
+        # panel style the saved pictures use) back to the panel.
+        _before = [(iv, copy_marks(iv.marks), mark_style_of_view(iv))
+                   for iv in all_views()]
+        work = dict(self._overlay_style())
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Overlay Settings")
-        dlg.setMinimumWidth(320)
-        lay = QFormLayout(dlg)
+        dlg.setMinimumWidth(380)
+        dlg.setStyleSheet(
+            "QDialog { background: #f3f3f3; color: #111111; }"
+            "QGroupBox { border: 1px solid #90a4ae; border-radius: 4px;"
+            " margin-top: 9px; padding: 14px 6px 6px 6px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;"
+            " left: 8px; padding: 0 4px; background: #f3f3f3; color: #0d47a1; }"
+            "QGroupBox QLabel, QGroupBox QCheckBox { font-weight: normal; }")
+        outer = QVBoxLayout(dlg)
 
-        def make_color_btn(color: QColor) -> QPushButton:
+        def color_btn(on_change) -> QPushButton:
             btn = QPushButton()
             btn.setFixedWidth(60)
-            btn._color = QColor(color)
-            btn.setStyleSheet(f"background: {color.name()}; border: 1px solid #888;")
+            btn._color = QColor(255, 255, 255)
+
+            def show(c):
+                btn._color = QColor(c)
+                btn.setStyleSheet(f"background: {QColor(c).name()}; "
+                                  "border: 1px solid #888;")
+            btn.set_color = show
+
             def pick():
                 c = QColorDialog.getColor(btn._color, dlg, "Pick color",
                                           QColorDialog.ColorDialogOption.ShowAlphaChannel)
                 if c.isValid():
-                    btn._color = c
-                    btn.setStyleSheet(f"background: {c.name()}; border: 1px solid #888;")
+                    show(c)
+                    on_change()
             btn.clicked.connect(pick)
             return btn
 
-        # Cross
-        cross_color_btn = make_color_btn(self._overlay_cross_color)
-        cross_thick_sb = QSpinBox(); cross_thick_sb.setRange(1, 20)
-        cross_thick_sb.setValue(self._overlay_cross_thick)
-        cross_size_sb = QSpinBox(); cross_size_sb.setRange(4, 200)
-        cross_size_sb.setValue(self._overlay_cross_size)
+        def img_px(iv):
+            pm = getattr(iv, "_pix", None)
+            if pm is None or pm.isNull():
+                return None
+            return pm.width(), pm.height()
 
-        # Zjisti rozměry aktuálního obrázku pro info label
-        _img_w = _img_h = None
-        if self.img_view._pix and not self.img_view._pix.isNull():
-            _img_w = self.img_view._pix.width()
-            _img_h = self.img_view._pix.height()
+        def size_px(kind, geom, iv):
+            """(width, height) of a circle / square in the camera's own pixels."""
+            wh = img_px(iv)
+            if wh is None:
+                return None
+            W, H = wh
+            g = mark_core(kind, geom)
+            if kind == "circle":
+                return 2.0 * g[2] * W, 2.0 * g[3] * H
+            return (g[2] - g[0]) * W, (g[3] - g[1]) * H
 
-        lay.addRow("Cross color:", cross_color_btn)
-        lay.addRow("Cross thickness:", cross_thick_sb)
-        lay.addRow("Cross size (px):", cross_size_sb)
-        if _img_w and _img_h:
-            _cross_info = QLabel(
-                f"Image: {_img_w}×{_img_h} px  |  "
-                f"thickness max ~{_img_w // 100} px  |  "
-                f"size max ~{min(_img_w, _img_h) // 2} px"
-            )
-            _cross_info.setStyleSheet("font-size: 10px; color: #666;")
-            lay.addRow("", _cross_info)
+        def resized(kind, geom, iv, w_px, h_px):
+            """The same mark, `w_px` × `h_px` about its own centre (turn and look kept)."""
+            wh = img_px(iv)
+            if wh is None:
+                return geom
+            W, H = wh
+            g = mark_core(kind, geom)
+            if kind == "circle":
+                core = (g[0], g[1], w_px / 2.0 / W, h_px / 2.0 / H)
+            else:
+                cx, cy = (g[0] + g[2]) / 2.0, (g[1] + g[3]) / 2.0
+                hw, hh = w_px / 2.0 / W, h_px / 2.0 / H
+                core = (cx - hw, cy - hh, cx + hw, cy + hh)
+            return with_angle(kind, core, mark_angle(kind, geom), mark_look(kind, geom))
 
-        from PySide6.QtWidgets import QCheckBox as _QCB, QComboBox as _QCombo
-        from PySide6.QtWidgets import QHBoxLayout as _QHB, QWidget as _QW
+        def values_of_style(st, kind) -> dict:
+            return {"color": QColor(st.get(f"{kind}_color") or QColor(255, 255, 255)),
+                    "thick": int(st.get(f"{kind}_thick", 2) or 2),
+                    "size": int(st.get("cross_size", 18) or 18),
+                    "outline": bool(st.get(f"{kind}_outline", False)),
+                    "outline_color": QColor(st.get(f"{kind}_outline_color")
+                                            or QColor(0, 0, 0)),
+                    "outline_w": int(st.get(f"{kind}_outline_w", 1) or 1)}
 
-        cb_all_cams = _QCB("Apply to all cameras")
-        cb_all_cams.setChecked(False)
+        def as_style(kind, v) -> dict:
+            st = {f"{kind}_color": QColor(v["color"]), f"{kind}_thick": int(v["thick"]),
+                  f"{kind}_outline": bool(v["outline"]),
+                  f"{kind}_outline_color": QColor(v["outline_color"]),
+                  f"{kind}_outline_w": int(v["outline_w"])}
+            if kind == "cross":
+                st["cross_size"] = int(v["size"])
+            return st
 
-        def views_for_turn() -> list:
-            """Cameras a turn acts on: every camera with "Apply to all cameras",
-            otherwise the ones the overlay controls are aimed at."""
-            if self._is_multi_cam() and cb_all_cams.isChecked():
-                return [cv.img_view for cv in self._multi_grid._cam_views]
-            return self._overlay_targets()
+        def as_look(kind, v) -> dict:
+            argb = QColor.NameFormat.HexArgb
+            lk = {"color": QColor(v["color"]).name(argb), "thick": int(v["thick"]),
+                  "outline": bool(v["outline"]),
+                  "outline_color": QColor(v["outline_color"]).name(argb),
+                  "outline_w": int(v["outline_w"])}
+            if kind == "cross":
+                lk["size"] = int(v["size"])
+            return lk
 
-        # Everything a turn may touch, for Cancel to put back.
-        _all_views = [self.img_view] + [cv.img_view for cv in self._multi_grid._cam_views]
-        _marks_before = [(iv, copy_marks(iv.marks)) for iv in _all_views]
+        def target_views(tgt) -> list:
+            return all_views() if tgt[0] == "all" else self._overlay_targets()
+
+        def indices(tgt, lst) -> range:
+            if tgt[0] == "mark":
+                return range(tgt[1], tgt[1] + 1) if tgt[1] < len(lst) else range(0)
+            return range(len(lst))
 
         _NAMES = {"cross": ("Cross", "crosses"), "circle": ("Circle", "circles"),
                   "square": ("Square", "squares")}
-        outline_w = {}
-        turn_w = {}
+        sections: dict = {}
 
-        def outline_row(kind):
-            o = self._overlay_outline[kind]
-            row = _QW(); h = _QHB(row); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
-            cb = _QCB("On"); cb.setChecked(bool(o["on"]))
-            cb.setToolTip("A contrasting rim along both sides of the line — keeps the "
-                          "mark visible on a bright beam and on a dark background.")
-            col = make_color_btn(o["color"])
-            sb = QSpinBox(); sb.setRange(1, 10); sb.setValue(int(o["w"])); sb.setSuffix(" px")
-            sb.setToolTip("Width of the rim on each side of the line")
-            h.addWidget(cb); h.addWidget(col); h.addWidget(sb); h.addStretch(1)
-            outline_w[kind] = (cb, col, sb)
-            return row
+        def first_mark(s, tgt):
+            """(view, geom) of the first mark the choice covers, or (None, None)."""
+            for iv in target_views(tgt):
+                lst = iv.marks.get(s["kind"]) or []
+                idx = indices(tgt, lst)
+                if len(idx):
+                    return iv, lst[idx[0]]
+            return None, None
 
-        def turn_row(kind):
-            """[which mark ▾] [angle °] — the mark list is read from the cameras."""
-            row = _QW(); h = _QHB(row); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
-            combo = _QCombo()
-            n = max([len(iv.marks.get(kind) or ()) for iv in views_for_turn()] or [0])
+        def load(s):
+            """Show the values of the current choice."""
+            kind, tgt = s["kind"], s["combo"].currentData()
+            iv, geom = first_mark(s, tgt)
+            if tgt[0] == "all":
+                v = values_of_style(work, kind)
+            elif tgt[0] == "sel":
+                v = values_of_style(mark_style_of_view(target_views(tgt)[0]), kind)
+            elif geom is not None:
+                v = values_of_style(mark_effective_style(kind, geom,
+                                                         mark_style_of_view(iv)), kind)
+            else:
+                v = values_of_style(work, kind)
+            s["loading"] = True
+            try:
+                s["col"].set_color(v["color"])
+                s["thick"].setValue(v["thick"])
+                if s["size"] is not None:
+                    s["size"].setValue(v["size"])
+                s["o_cb"].setChecked(v["outline"])
+                s["o_col"].set_color(v["outline_color"])
+                s["o_sb"].setValue(v["outline_w"])
+                # Angle and size belong to drawn marks: with none of this kind the
+                # rows are left out rather than shown greyed with a made-up value.
+                s["form"].setRowVisible(s["ang"], geom is not None)
+                s["ang"].setValue(mark_angle(kind, geom) if geom is not None else 0.0)
+                if s["w"] is not None:
+                    wh = size_px(kind, geom, iv) if geom is not None else None
+                    for sb in (s["w"], s["h"]):
+                        s["form"].setRowVisible(sb, wh is not None)
+                    if wh is not None:
+                        s["w"].setValue(max(1, int(round(wh[0]))))
+                        s["h"].setValue(max(1, int(round(wh[1]))))
+            finally:
+                s["loading"] = False
+            s["dirty"].clear()
+
+        def values(s) -> dict:
+            return {"color": s["col"]._color, "thick": s["thick"].value(),
+                    "size": s["size"].value() if s["size"] is not None else 18,
+                    "outline": s["o_cb"].isChecked(), "outline_color": s["o_col"]._color,
+                    "outline_w": s["o_sb"].value()}
+
+        def commit(s, tgt):
+            """Put what was changed in this section onto the choice `tgt`."""
+            if not s["dirty"]:
+                return
+            kind = s["kind"]
+            v = values(s)
+            for iv in target_views(tgt):
+                lst = iv.marks.get(kind) or []
+                if "style" in s["dirty"]:
+                    if tgt[0] == "all":
+                        apply_mark_style(iv, as_style(kind, v))
+                        for i in range(len(lst)):
+                            lst[i] = with_look(kind, lst[i], None)
+                    else:
+                        if tgt[0] == "sel":
+                            apply_mark_style(iv, as_style(kind, v))
+                        for i in indices(tgt, lst):
+                            lst[i] = with_look(kind, lst[i], as_look(kind, v))
+                if "geom" in s["dirty"] and s["w"] is not None:
+                    for i in indices(tgt, lst):
+                        lst[i] = resized(kind, lst[i], iv, s["w"].value(), s["h"].value())
+                iv.update()
+            if "style" in s["dirty"] and tgt[0] == "all":
+                work.update(as_style(kind, v))
+            s["dirty"].clear()
+
+        def build_section(kind):
             one, many = _NAMES[kind]
-            combo.addItem(f"All {many}", -1)
+            box = QGroupBox(many.capitalize())
+            form = QFormLayout(box)
+            combo = QComboBox()
+            combo.setMinimumWidth(220)
+            combo.addItem(f"All {many} – all cameras" if multi else f"All {many}",
+                          ("all", -1))
+            if has_sel:
+                combo.addItem(f"All {many} – selected camera(s)", ("sel", -1))
+            n = max([len(iv.marks.get(kind) or ()) for iv in all_views()] or [0])
             for i in range(n):
-                combo.addItem(f"{one} {i + 1}", i)
-            combo.setMinimumWidth(110)
-            sb = QDoubleSpinBox(); sb.setRange(-180.0, 180.0); sb.setDecimals(1)
-            sb.setSingleStep(5.0); sb.setSuffix(" °"); sb.setWrapping(True)
-            sb.setToolTip("Angle, counter-clockwise. The marks turn as you type; "
-                          "Cancel puts them back.")
-            h.addWidget(combo); h.addWidget(sb); h.addStretch(1)
-            if n == 0:
-                combo.setEnabled(False); sb.setEnabled(False)
-                combo.setToolTip(f"No {many} drawn on the camera(s)")
-            turn_w[kind] = (combo, sb)
+                combo.addItem(f"{one} {i + 1}", ("mark", i))
+            combo.setToolTip("What the settings below are for. The numbers are shown "
+                             "on the marks while this window is open.")
+            form.addRow("Apply to:", combo)
+            s = {"kind": kind, "combo": combo, "dirty": set(), "loading": False,
+                 "size": None, "w": None, "h": None, "form": form}
 
-            def show_angle():
-                idx = combo.currentData()
-                lst = []
-                for iv in views_for_turn():
-                    lst = iv.marks.get(kind) or []
-                    if lst:
-                        break
-                a = 0.0
-                if lst:
-                    k = 0 if idx is None or idx < 0 else min(idx, len(lst) - 1)
-                    a = mark_angle(kind, lst[k])
-                sb.blockSignals(True); sb.setValue(a); sb.blockSignals(False)
+            def dirty(field):
+                if not s["loading"]:
+                    s["dirty"].add(field)
+
+            s["col"] = color_btn(lambda: dirty("style"))
+            form.addRow("Color:", s["col"])
+            s["thick"] = QSpinBox()
+            s["thick"].setRange(1, BIG)
+            s["thick"].setSuffix(" px")
+            s["thick"].valueChanged.connect(lambda _v: dirty("style"))
+            form.addRow("Thickness:", s["thick"])
+            if kind == "cross":
+                s["size"] = QSpinBox()
+                s["size"].setRange(1, BIG)
+                s["size"].setSuffix(" px")
+                s["size"].setToolTip("Length of each arm, from the centre")
+                s["size"].valueChanged.connect(lambda _v: dirty("style"))
+                form.addRow("Size:", s["size"])
+            else:
+                for key, label in (("w", "Width:"), ("h", "Height:")):
+                    sb = QSpinBox()
+                    sb.setRange(1, BIG)
+                    sb.setSuffix(" px")
+                    sb.setToolTip(f"In pixels of the camera picture, about the "
+                                  f"{one.lower()}'s centre")
+                    sb.valueChanged.connect(lambda _v: dirty("geom"))
+                    s[key] = sb
+                    form.addRow(label, sb)
+
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            s["o_cb"] = QCheckBox("On")
+            s["o_cb"].setToolTip("A contrasting rim along both sides of the line — "
+                                 "keeps the mark visible on a bright beam and on a "
+                                 "dark background.")
+            s["o_cb"].toggled.connect(lambda _v: dirty("style"))
+            s["o_col"] = color_btn(lambda: dirty("style"))
+            s["o_sb"] = QSpinBox()
+            s["o_sb"].setRange(1, BIG)
+            s["o_sb"].setSuffix(" px")
+            s["o_sb"].setToolTip("Width of the rim on each side of the line")
+            s["o_sb"].valueChanged.connect(lambda _v: dirty("style"))
+            h.addWidget(s["o_cb"])
+            h.addWidget(s["o_col"])
+            h.addWidget(s["o_sb"])
+            h.addStretch(1)
+            form.addRow("Outline:", row)
+
+            ang = QDoubleSpinBox()
+            ang.setRange(-180.0, 180.0)
+            ang.setDecimals(1)
+            ang.setSingleStep(5.0)
+            ang.setSuffix(" °")
+            ang.setWrapping(True)
+            ang.setToolTip("Angle, counter-clockwise. The marks turn as you type; "
+                           "Cancel puts them back.")
+            s["ang"] = ang
+            form.addRow("Angle:", ang)
 
             def apply_angle(val):
-                idx = combo.currentData()
-                for iv in views_for_turn():
+                if s["loading"]:
+                    return
+                tgt = combo.currentData()
+                for iv in target_views(tgt):
                     lst = iv.marks.get(kind) or []
-                    for i in range(len(lst)):
-                        if idx is None or idx < 0 or idx == i:
-                            lst[i] = with_angle(kind, mark_core(kind, lst[i]), val)
+                    for i in indices(tgt, lst):
+                        lst[i] = with_angle(kind, mark_core(kind, lst[i]), val,
+                                            mark_look(kind, lst[i]))
                     iv.update()
+            ang.valueChanged.connect(apply_angle)
 
-            combo.currentIndexChanged.connect(lambda _i: show_angle())
-            sb.valueChanged.connect(apply_angle)
-            show_angle()
-            return row
+            s["prev"] = combo.currentData()
 
-        lay.addRow("Cross outline:", outline_row("cross"))
-        lay.addRow("Cross angle:", turn_row("cross"))
+            def on_target(_i):
+                commit(s, s["prev"])
+                s["prev"] = combo.currentData()
+                load(s)
+            combo.currentIndexChanged.connect(on_target)
+            sections[kind] = s
+            load(s)
+            return box
 
-        # Circle
-        circle_color_btn = make_color_btn(self._overlay_circle_color)
-        circle_thick_sb = QSpinBox(); circle_thick_sb.setRange(1, 20)
-        circle_thick_sb.setValue(self._overlay_circle_thick)
-        lay.addRow("Circle color:", circle_color_btn)
-        lay.addRow("Circle thickness:", circle_thick_sb)
-        lay.addRow("Circle outline:", outline_row("circle"))
-        lay.addRow("Circle angle:", turn_row("circle"))
-
-        # Square
-        square_color_btn = make_color_btn(self._overlay_square_color)
-        square_thick_sb = QSpinBox(); square_thick_sb.setRange(1, 20)
-        square_thick_sb.setValue(self._overlay_square_thick)
-        lay.addRow("Square color:", square_color_btn)
-        lay.addRow("Square thickness:", square_thick_sb)
-        lay.addRow("Square outline:", outline_row("square"))
-        lay.addRow("Square angle:", turn_row("square"))
+        for kind in MARK_KINDS:
+            outer.addWidget(build_section(kind))
 
         # Every mark of every kind at once.
-        all_sb = QDoubleSpinBox(); all_sb.setRange(-180.0, 180.0); all_sb.setDecimals(1)
-        all_sb.setSingleStep(5.0); all_sb.setSuffix(" °"); all_sb.setWrapping(True)
-        all_sb.setToolTip("Turn every cross, circle and square to this angle")
-        if not any(iv.marks.get(k) for iv in views_for_turn() for k in MARK_KINDS):
-            all_sb.setEnabled(False)
+        all_row = QWidget()
+        ah = QHBoxLayout(all_row)
+        ah.setContentsMargins(6, 4, 6, 0)
+        ah.addWidget(QLabel("All marks angle:"))
+        all_sb = QDoubleSpinBox()
+        all_sb.setRange(-180.0, 180.0)
+        all_sb.setDecimals(1)
+        all_sb.setSingleStep(5.0)
+        all_sb.setSuffix(" °")
+        all_sb.setWrapping(True)
+        all_sb.setToolTip("Turn every cross, circle and square on every camera to "
+                          "this angle")
+        all_sb.setEnabled(any(iv.marks.get(k) for iv in all_views() for k in MARK_KINDS))
 
         def apply_all(val):
-            for kind, (combo, sb) in turn_w.items():
-                if not sb.isEnabled():
-                    continue
-                combo.blockSignals(True); combo.setCurrentIndex(0); combo.blockSignals(False)
-                sb.setValue(val)      # turns the marks through apply_angle
+            for s in sections.values():
+                if s["combo"].currentIndex() != 0:
+                    s["combo"].setCurrentIndex(0)      # commits + loads "all cameras"
+                s["ang"].setValue(val)                 # turns them via apply_angle
         all_sb.valueChanged.connect(apply_all)
-        lay.addRow("All marks angle:", all_sb)
-
-        lay.addRow("", cb_all_cams)
+        ah.addWidget(all_sb)
+        ah.addStretch(1)
+        outer.addWidget(all_row)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
-        lay.addRow(btns)
+        outer.addWidget(btns)
 
         # While this window is open every mark carries its number, so "Cross 2" in
         # the lists above can be found on the picture.
         def _set_numbers(on: bool):
-            for iv in _all_views:
+            for iv in all_views():
                 try:
                     iv.show_mark_numbers = on
                     iv.update()
@@ -21967,27 +23436,33 @@ class Viewer(QWidget):
             _set_numbers(False)
 
         if accepted:
-            self._overlay_cross_color  = cross_color_btn._color
-            self._overlay_cross_thick  = cross_thick_sb.value()
-            self._overlay_cross_size   = cross_size_sb.value()
-            self._overlay_circle_color = circle_color_btn._color
-            self._overlay_circle_thick = circle_thick_sb.value()
-            self._overlay_square_color = square_color_btn._color
-            self._overlay_square_thick = square_thick_sb.value()
-            for kind, (cb, col, sb) in outline_w.items():
-                self._overlay_outline[kind] = {"on": cb.isChecked(),
-                                               "color": QColor(col._color),
-                                               "w": sb.value()}
-            self._apply_overlay_settings(all_cams=cb_all_cams.isChecked())
+            for s in sections.values():
+                commit(s, s["combo"].currentData())
+            self._overlay_cross_color  = QColor(work["cross_color"])
+            self._overlay_cross_thick  = int(work["cross_thick"])
+            self._overlay_cross_size   = int(work["cross_size"])
+            self._overlay_circle_color = QColor(work["circle_color"])
+            self._overlay_circle_thick = int(work["circle_thick"])
+            self._overlay_square_color = QColor(work["square_color"])
+            self._overlay_square_thick = int(work["square_thick"])
+            for kind in MARK_KINDS:
+                self._overlay_outline[kind] = {
+                    "on": bool(work[f"{kind}_outline"]),
+                    "color": QColor(work[f"{kind}_outline_color"]),
+                    "w": int(work[f"{kind}_outline_w"])}
             self._ui_state["mark_style"] = mark_style_to_json(self._overlay_style())
             self._save_ui_state()
-            # The turns were made on every camera they apply to as they were typed,
-            # so there is nothing to mirror here.
+            # Everything was put on the cameras it applies to while the window was
+            # open, so there is nothing to mirror here.
         else:
-            for iv, m in _marks_before:
-                iv.marks = m
-                iv._sel = None
-                iv.update()
+            for iv, m, st in _before:
+                try:
+                    iv.marks = m
+                    apply_mark_style(iv, st)
+                    iv._sel = None
+                    iv.update()
+                except RuntimeError:
+                    pass
 
     def _overlay_style(self) -> dict:
         """The look every SAVED picture uses. The panel's own settings, not a tile's:
@@ -22016,16 +23491,6 @@ class Viewer(QWidget):
     def _apply_style_to_iv(self, iv):
         apply_mark_style(iv, self._overlay_style())
 
-    def _apply_overlay_settings(self, all_cams: bool = False):
-        self._apply_style_to_iv(self.img_view)
-        if self._is_multi_cam():
-            if all_cams:
-                for cv in self._multi_grid._cam_views:
-                    self._apply_style_to_iv(cv.img_view)
-            else:
-                sel_iv = self._multi_grid.selected_img_view()
-                if sel_iv is not None:
-                    self._apply_style_to_iv(sel_iv)
 
     # ================================================================ PV VALUES
     def _open_pv_config(self):
@@ -22117,6 +23582,20 @@ class Viewer(QWidget):
         self._pv_rebuild_table()
         self._pv_update_overlay()
 
+    def _pv_set_hidden(self, hidden):
+        """Master eye in the table header: a whole new hidden set at once (the
+        shot counter row included)."""
+        hidden = set(hidden or ())
+        self._shot_hidden = SHOT_ROW_KEY in hidden
+        listed = set(self._pv_enabled)
+        # PVs not picked right now keep whatever eye they had.
+        self._pv_hidden = (set(self._pv_hidden) - listed) | (hidden & listed)
+        self._ui_state["shot_counter_hidden"] = self._shot_hidden
+        self._ui_state["pv_hidden"] = sorted(self._pv_hidden)
+        self._save_ui_state()
+        self._pv_rebuild_table()
+        self._pv_update_overlay()
+
     def _pv_rebuild_table(self):
         # The table is always there: its last row is the built-in shot counter, which
         # needs no PV. The hint below it still says how to pick some.
@@ -22161,6 +23640,8 @@ class Viewer(QWidget):
         if not getattr(self, "_online_mode", False):
             return
         self._shot.set_main(self._shot_source_name(self._shot_cam_index()))
+        n_cams = len(self._cam_names or []) if self._is_multi_cam() else 1
+        self._shot.set_cameras(self._shot_source_name(i) for i in range(max(1, n_cams)))
         if self._shot.add(self._shot_source_name(cam_idx), ts_list, time.monotonic()):
             self._shot_refresh_ui()
 
@@ -22180,11 +23661,13 @@ class Viewer(QWidget):
         self._pv_update_overlay()
         self._shot_timer.start()
         self._shot_poll()
+        self._pv_live_sync()
 
     def _shot_stop(self):
         """Live mode ended: nothing is counted any more; the last number stays shown."""
         self._shot_gen = getattr(self, "_shot_gen", 0) + 1
         self._shot_timer.stop()
+        self._pv_live_sync()
 
     def _shot_poll(self):
         """Energy readings, the source that decides what is a shot. Read off the GUI
@@ -22214,8 +23697,9 @@ class Viewer(QWidget):
                             continue
                         # An empty answer is an answer: no laser pulse in the window.
                         answered = True
-                        # A reading of 0 is the meter with no laser pulse, not a shot.
-                        out[ch] = [t for t, v in samples if v is not None and v > 0]
+                        # Meter noise (laser off) is not a shot — see SHOT_ENERGY_MIN_J.
+                        out[ch] = [t for t, v in samples
+                                   if v is not None and v > SHOT_ENERGY_MIN_J]
                         if samples:
                             break
             except Exception:
@@ -22270,8 +23754,10 @@ class Viewer(QWidget):
                 "laser energy readings (PTM1, SBW4) decide; an open camera adds a "
                 "shot only where the readings skipped one. A camera faster than the "
                 "shots, or one that keeps taking pictures after the laser stops, adds "
-                "nothing. If the energies cannot be read, a shot is what at least half "
-                "of the open cameras on the most common rate saw. Changing the "
+                "nothing. If the energies cannot be read, or show no laser pulse while "
+                "the cameras go on (low power), a shot is what at least half of the "
+                "open cameras on the most common rate saw; when one of them stops, "
+                "the laser has stopped. Changing the "
                 "camera keeps the number. After "
                 f"{int(self._shot.reset_s)} s without a shot the next one starts "
                 "again from 1; until then the last count stays shown. "
@@ -22279,6 +23765,20 @@ class Viewer(QWidget):
         full = self._pv_display_text(name)
         text = self._pv_value_text(name)
         state = self._pv_state(name)
+        if self._pv_live_feed_on():
+            samp = getattr(self, "_pv_live_samp", {}).get(name)
+            when = (f", written at {fmt_hhmmss_ms_from_ns(samp)}" if samp else "")
+            stale = self._pv_live_stale_s()
+            if stale is not None:
+                return text, state, (
+                    f"The archiver has not answered for {stale:.0f} s — this is the "
+                    f"last value it gave{when}.")
+            if state == PV_STATE_LOADING:
+                return text, state, "Live: reading the archiver."
+            return text, state, (
+                f"Live: the newest value in the archive{when}. In Live mode the values "
+                "are NOT matched to the picture on screen. Step back a frame (or turn "
+                "Live mode off) to see each frame's own value.")
         if name in self._pv_awaiting and state == PV_STATE_HELD:
             return text, state, (
                 "The archive has no reading of this PV for this shot — the other "
@@ -22392,6 +23892,170 @@ class Viewer(QWidget):
                 best = (gap, got[0])
         return best
 
+    # ── live feed (PV_LIVE_POLL_MS) ─────────────────────────────────────────
+    def _pv_live_feed_on(self) -> bool:
+        """True while the view follows the live edge: the PV values are then the
+        archiver's newest, not this frame's own (see PV_LIVE_POLL_MS)."""
+        return bool(self._pv_enabled and getattr(self, "_online_mode", False)
+                    and getattr(self, "_auto_follow", False))
+
+    def _pv_live_sync(self):
+        """Start or stop the feed to match the mode. Leaving it hands the panel back
+        to the exact per-frame lookup for the frame on screen."""
+        on = self._pv_live_feed_on()
+        if on:
+            if not self._pv_live_timer.isActive():
+                self._pv_live_gen += 1
+                self._pv_live_busy = False
+                self._pv_live_ok_mono = None
+                self._pv_awaiting = set()
+                t = getattr(self, "_pv_wait_timer", None)
+                if t is not None:
+                    t.stop()
+                if not self._suspended:
+                    self._pv_live_timer.start()
+                self._pv_live_poll()
+        else:
+            self._pv_live_timer.stop()
+            if self._pv_live_was_on:
+                self._pv_live_gen += 1            # a late answer is dropped
+                self._pv_live_busy = False
+                self._pv_live_was_on = False
+                self._pv_last_fetch_mono = 0.0
+                self._pv_trigger_fetch()
+        self._pv_live_was_on = on
+
+    def _pv_live_poll(self):
+        """One read of the newest value of every PV on display, off the GUI thread,
+        one at a time — a slow archiver must not pile requests up."""
+        if not self._pv_live_feed_on():
+            self._pv_live_sync()
+            return
+        if self._pv_live_busy:
+            return
+        names = list(self._pv_enabled)
+        sources = pv_source_names(names)
+        if not sources:
+            return
+        self._pv_live_busy = True
+        gen = self._pv_live_gen
+        sig = self._pv_live_signals
+
+        def _one(name):
+            """(name, value, status, sample ts) — the newest value there is."""
+            channel = pv_channel_for(name)
+            if not channel:
+                return name, None, "missing", None
+            now = cpva.archiver_now_ns() or time.time_ns()
+            lo = now - PV_LIVE_WINDOW_S * 1_000_000_000
+            hi = now + 5_000_000_000
+            try:
+                for nm in cpva.read_order(channel):
+                    got = [s for s in cpva.fetch_values(nm, lo, hi,
+                                                        timeout=CPVA_HTTP_TIMEOUT,
+                                                        try_value_suffix=False)
+                           if s[0] >= lo]
+                    if got:
+                        t, v = got[-1]
+                        val, _exact = cpva.quantize(channel, v)
+                        return name, val, "ok", int(t)
+                # Nothing written in the window: a setting, or a value written only
+                # on change — the last write is the current value.
+                back = cpva.value_at_or_before(channel, now,
+                                               timeout=CPVA_HTTP_TIMEOUT)
+                if back.value is not None:
+                    return name, back.value, "ok", back.ts_ns
+                return name, None, ("error" if back.status == "error"
+                                    else "not_found"), None
+            except Exception:
+                return name, None, "error", None
+
+        def _work():
+            from concurrent.futures import ThreadPoolExecutor
+            results: dict = {}
+            nums: dict = {}
+            samp: dict = {}
+            raw: dict = {}
+            sts: dict = {}
+            answered = False
+            try:
+                with ThreadPoolExecutor(
+                        max_workers=min(len(sources), PV_FETCH_MAX_WORKERS)) as ex:
+                    for name, val, status, t in ex.map(_one, sources):
+                        raw[name], sts[name] = val, status
+                        answered |= status != "error"
+                        if val is None:
+                            continue
+                        val *= PV_SCALE.get(name, 1.0)
+                        raw[name] = val
+                        if t is not None:
+                            samp[name] = int(t)
+                        if name in names:
+                            results[name] = pv_format_value(name, val)
+                            nums[name] = val
+                for nm, (val, status) in pv_eval_derived(names, raw, sts).items():
+                    if val is None:
+                        continue
+                    results[nm] = pv_format_value(nm, val)
+                    nums[nm] = val
+                    srcs = [samp[s] for s in
+                            ((pv_derived_def(nm) or {}).get("bindings") or {}
+                             ).values() if s in samp]
+                    if srcs:
+                        samp[nm] = max(srcs)
+            except Exception:
+                pass
+            finally:
+                try:
+                    sig.result.emit(gen, (results, nums, samp, answered))
+                except RuntimeError:
+                    pass        # the window was closed meanwhile
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _pv_live_on_result(self, gen: int, payload):
+        self._pv_live_busy = False
+        if gen != self._pv_live_gen or not self._pv_live_feed_on():
+            return
+        results, nums, samp, answered = payload
+        if answered:
+            self._pv_live_ok_mono = time.monotonic()
+        if results:
+            self._pv_values.update(results)
+            self._pv_live_samp = dict(getattr(self, "_pv_live_samp", {}), **samp)
+            self._pv_numbers = dict(nums)
+            self._pv_check_limits(self._pv_current_ts(), nums)
+        self._pv_rebuild_table()
+        self._pv_update_overlay()
+
+    def _pv_live_feed_hold(self) -> bool:
+        """For the frame-driven fetch paths: True (= do nothing) while the feed owns
+        the panel. A frame change then fetches nothing; a newly ticked PV gets its
+        "…" and is filled by the next poll."""
+        if not self._pv_live_feed_on():
+            if self._pv_live_was_on:
+                self._pv_live_sync()
+            return False
+        if not self._pv_live_timer.isActive() and not self._suspended:
+            self._pv_live_sync()
+        changed = False
+        for name in self._pv_enabled:
+            if name not in self._pv_values:
+                self._pv_values[name] = "…"
+                changed = True
+        if changed:
+            self._pv_rebuild_table()
+        return True
+
+    def _pv_live_stale_s(self) -> "float | None":
+        """Seconds since the feed last answered, when that is longer than
+        PV_LIVE_STALE_S; None while it is fresh (or has not started)."""
+        ok = self._pv_live_ok_mono
+        if ok is None:
+            return None
+        age = time.monotonic() - ok
+        return age if age > PV_LIVE_STALE_S else None
+
     def _pv_trigger_fetch(self):
         """Rate-limited entry with a LEADING edge: the first frame change fires the
         fetch immediately, further changes inside PV_REFRESH_MIN_INTERVAL_S are
@@ -22409,6 +24073,8 @@ class Viewer(QWidget):
         is what makes a deadline recede forever under a continuous trigger stream,
         which is the bug being fixed here — a fixed-rate trailing edge cannot."""
         if not self._pv_enabled:
+            return
+        if self._pv_live_feed_hold():
             return
         t = getattr(self, "_pv_debounce_timer", None)
         if t is None:
@@ -22516,6 +24182,15 @@ class Viewer(QWidget):
                 head = None
             if head is not None and (best is None or head > best):
                 best = head
+        # Channels are written only on CHANGE, so a head can sit seconds behind with
+        # nothing missing. Anything older than the archiver's own clock minus the
+        # publish margin is final (cpva.may_still_publish) — that moment counts as
+        # published whatever the heads say (13.10.2026).
+        now = cpva.archiver_now_ns()
+        if now is not None:
+            final = now - _PV_WINDOW_NS - int(cpva.PUBLISH_MARGIN_S * 1e9)
+            if best is None or final > best:
+                best = final
         return best
 
     def _pv_pick_fetch_ts(self, cur_ts: int) -> int:
@@ -22575,8 +24250,9 @@ class Viewer(QWidget):
         permanently greyed and permanently prefixed "⟳", i.e. the marker fired on
         healthy operation and said nothing about the unhealthy case it exists for.
         A grace of a few shots restores that distinction."""
-        if not self._pv_values:
-            return False
+        if not self._pv_values or self._pv_live_feed_on():
+            return False          # live feed: not tied to a frame, nothing to lag
+
         target = getattr(self, "_pv_target_ts", None)
         if target is None:
             target = self._pv_current_ts()
@@ -22594,6 +24270,8 @@ class Viewer(QWidget):
         timestamp. Unlike the old generation-token drop, a completed fetch is
         always applied — the overlay can lag briefly but never freezes stale."""
         if not self._pv_enabled:
+            return
+        if self._pv_live_feed_hold():
             return
         if getattr(self, "_pv_fetch_inflight", False):
             self._pv_fetch_dirty = True
@@ -22773,6 +24451,11 @@ class Viewer(QWidget):
         # re-trigger if frames changed while it ran.
         self._pv_fetch_inflight = False
         self._pv_last_result_mono = time.monotonic()
+        if self._pv_live_feed_on():
+            # An exact answer that was still on its way when the feed took over:
+            # the feed owns the panel now, and this would show an older frame's.
+            self._pv_fetch_dirty = False
+            return
         if results:
             # Remember WHICH frame these numbers describe, so the panel can admit
             # it when the displayed frame has moved on since.
@@ -22785,6 +24468,12 @@ class Viewer(QWidget):
             if not hasattr(self, "_pv_sample_ts"):
                 self._pv_sample_ts = {}
             self._pv_sample_ts.update({k: int(v) for k, v in (samp or {}).items()})
+            # A number that came back WITHOUT a sample time is the frame's own value
+            # (a setting, or the last write before the frame — written only on
+            # change): an older entry must not linger and flag it as another shot.
+            for k, txt in results.items():
+                if k not in (samp or {}) and pv_value_number_text(txt):
+                    self._pv_sample_ts.pop(k, None)
             self._pv_values.update(self._pv_apply_last_good(results))
             # Before the table and the overlay are rebuilt: the alarm decides which
             # rows are painted red, so it has to be settled first or every trip would
@@ -22863,6 +24552,12 @@ class Viewer(QWidget):
         time.time() reads 25 s on a frame that was taken a moment ago, and a bound built
         on it would abandon every wait before it began."""
         t = getattr(self, "_pv_wait_timer", None)
+        if self._pv_live_feed_on():
+            # The feed polls on its own; nothing is waited for frame by frame.
+            if t is not None:
+                t.stop()
+            self._pv_awaiting = set()
+            return
         # The frame we are trying to get data FOR — the one on screen, not the (possibly
         # older, already-published) frame the last fetch aimed at. Retargeting is exactly
         # the case that must keep retrying: the numbers on display are real, but they
@@ -23094,13 +24789,55 @@ class Viewer(QWidget):
         The frame-gap test is what keeps the retargeted case honest: those numbers are a
         real reading, so nothing else here would have flagged them, and an unflagged older
         shot sitting next to the current picture is the whole bug this panel had."""
-        if self._pv_sample_offset_s(name) is not None:
-            return True
-        if self._pv_held_age_s(name) is not None:
-            return True
+        if self._pv_live_feed_on():
+            return False          # live feed: never matched to the frame, by design
+        if (self._pv_sample_offset_s(name) is not None
+                or self._pv_held_age_s(name) is not None):
+            # Read for an earlier frame. The archiver writes only on CHANGE, so
+            # that number is still this frame's value unless a newer sample is
+            # known to exist (13.10.2026: with the archiver taking 1–7 s a request
+            # and the camera at 3.3 Hz, every value was "of an earlier frame" and
+            # every dot was orange, while nothing had changed).
+            return self._pv_newer_sample_known(name)
         if name in getattr(self, "_pv_no_sample", ()):
             return True
         return self._pv_values.get(name, "").endswith(cpva.PV_TEXT_STALE_SUFFIX)
+
+    def _pv_newer_sample_known(self, name: str) -> bool:
+        """True when the archive (as cached — no network) holds a sample of `name`
+        newer than the one on display and no later than this frame's window: the
+        number shown is then really outdated. A formula asks its sources."""
+        cur = self._pv_current_ts()
+        if cur is None:
+            return False
+        win = self._pv_claim_window_ns()
+        shown = getattr(self, "_pv_sample_ts", {}).get(name)
+        if shown is None:
+            shown = self._pv_last_good_ts.get(name)
+        if shown is None:
+            return True                       # unknown origin: keep the flag
+        lo, hi = int(shown) + win, int(cur) + win
+        if hi <= lo:
+            return False
+        ch = pv_channel_for(name)
+        chans = [ch] if ch else [
+            pv_channel_for(s) for s in
+            ((pv_derived_def(name) or {}).get("bindings") or {}).values()]
+        key = cpva.date_key_for_ns(int(cur))
+        for c in chans:
+            if not c:
+                continue
+            try:
+                day = cpva.peek_day(c, key)
+            except Exception:
+                day = None
+            if day is None or not day.samples:
+                continue
+            ts = [t for t, _v in day.samples]
+            i = bisect.bisect_right(ts, lo)
+            if i < len(ts) and ts[i] <= hi:
+                return True
+        return False
 
     def _pv_shot_skipped(self, name: str) -> bool:
         """True when the archive has this frame's shot for ANOTHER channel but not for
@@ -23133,15 +24870,27 @@ class Viewer(QWidget):
         Red (loading) wins: while a number for this frame is still on its way, what
         is shown is not its final answer. Then grey (no number at all), then orange
         (a real number, of another shot)."""
+        raw = self._pv_values.get(name, "…")
+        if self._pv_live_feed_on():
+            # Live feed: a number is the newest there is — no dot. Red until the
+            # first answer, grey when the archiver stopped answering.
+            if self._pv_live_stale_s() is not None:
+                return PV_STATE_NONE
+            if self._pv_live_ok_mono is None or not pv_value_number_text(raw):
+                return PV_STATE_LOADING
+            return ""
         if pending is None:
             pending = self._pv_is_pending()
-        raw = self._pv_values.get(name, "…")
         if (not pending and name in self._pv_awaiting
                 and raw not in ("…", cpva.PV_TEXT_PENDING)
                 and self._pv_shot_skipped(name)):
             return PV_STATE_HELD
-        if (pending or name in self._pv_awaiting
-                or raw in ("…", cpva.PV_TEXT_PENDING)):
+        # Our own refresh running behind (`pending`) only reddens a value that has
+        # no number yet; a number already shown stays valid until a newer sample is
+        # known (_pv_is_held), because the archiver writes only on change.
+        has_number = bool(pv_value_number_text(raw))
+        if (name in self._pv_awaiting or raw in ("…", cpva.PV_TEXT_PENDING)
+                or (pending and not has_number)):
             return PV_STATE_LOADING
         if raw == cpva.PV_TEXT_ERROR or raw.startswith(cpva.PV_TEXT_NOT_FOUND) \
                 or raw == "—":
@@ -23295,8 +25044,7 @@ class Viewer(QWidget):
             return
         # Live mode drags the slider to the newest frame on every arrival, so it has to
         # go first or the shot would be on screen for a fraction of a second.
-        if getattr(self, "_auto_follow", False):
-            self._btn_auto_follow.setChecked(False)
+        self._leave_live_for_navigation()
         if trip.kind == "image" and self._is_multi_cam():
             # The tile that failed may still be cached as the frame that could not be
             # read. Drop it and the coalescing gate so the jump really goes back to
@@ -24195,7 +25943,20 @@ class Viewer(QWidget):
             self._nav_frame[cam_i] = len(cam_ts) - 1
             self._per_cam_display_one(cam_i, latest_ts)
 
+    def _note_user_moved_cam(self, cam_idx: int):
+        """Remember which slave tiles the user put somewhere by hand since live mode went
+        off, so the history reload (_restore_redisplay_multicam) leaves them there. Moving
+        the MASTER re-syncs every slave, so it forgets them all."""
+        moved = getattr(self, "_user_moved_cams", None)
+        if moved is None:
+            moved = self._user_moved_cams = set()
+        if cam_idx == self._per_cam_master_idx:
+            moved.clear()
+        else:
+            moved.add(cam_idx)
+
     def _on_per_cam_pressed(self, cam_idx: int):
+        self._note_user_moved_cam(cam_idx)
         self._per_cam_scrubbing_cam = cam_idx
         # A per-camera drag IS a scrub, and nothing said so. _is_scrubbing was written only
         # by the SHARED slider's handlers — the slider multi-cam hides — so on the path the
@@ -24216,11 +25977,7 @@ class Viewer(QWidget):
         # the manual scrub. For the master slider the existing value_changed /
         # released handlers then bind all cameras to the master's time. The user
         # re-enables Auto-follow when ready to watch live again.
-        if self._online_mode:
-            self._stop_online_mode()
-            self._restore_full_history()
-            if not self._live_trimmed:
-                self._proxy_kick()
+        self._leave_live_for_navigation()
         # Render the frame the drag starts on through the same tick as the rest — the
         # frame the row IS on (see _per_cam_row_frame), not the one its handle position
         # maps back to, which is one earlier.
@@ -24228,6 +25985,11 @@ class Viewer(QWidget):
             cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
             if cam_ts:
                 fi = self._per_cam_row_frame(cam_idx)
+                # The shared position follows the grabbed row NOW, not one nav tick later:
+                # an arrival still in flight judges "was the view at the end?" from
+                # current_idx, and a stale one sent the grid back to the newest frame.
+                if self._per_cam_is_info_cam(cam_idx):
+                    self._per_cam_sync_shared_widgets(cam_idx, cam_ts[fi])
                 self._nav_request(cam_idx, cam_ts[fi], fi)
             else:
                 self._nav_request(cam_idx, self._per_cam_slider_to_ts(
@@ -24279,6 +26041,13 @@ class Viewer(QWidget):
         slider handle, not to the render pipeline (same split as _on_slider_changed)."""
         if not self._cam_items or cam_idx >= len(self._cam_items):
             return
+        if not self._is_playing:
+            self._note_user_moved_cam(cam_idx)
+        if self._per_cam_scrubbing_cam < 0 and not self._is_playing:
+            # Wheel / arrow key / groove click on a row: no sliderPressed, so this is the
+            # only place that can leave live mode for it. Every programmatic move goes
+            # through set_value, which blocks the signal, so live advance never gets here.
+            self._leave_live_for_navigation()
         t_ns = self._per_cam_slider_to_ts(cam_idx, v)
         cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
         frame_idx = None
@@ -24368,6 +26137,11 @@ class Viewer(QWidget):
         if not self._nav_pending and not self._is_playing \
                 and self._per_cam_scrubbing_cam < 0:
             self._nav_timer.stop()
+            # The move is over: arm the native tier. Only the preview branch of
+            # _per_cam_display_one armed it, so a tile served from the cache or by a real
+            # read (zoomed, Binary, preview not covering the moment) after an arrow, wheel
+            # or groove step stayed at tile size for good.
+            self._schedule_hq()
 
     def _per_cam_row_frame(self, cam_idx: int) -> int:
         """Which FRAME index camera cam_idx's slider row is parked on: the frame NEAREST
@@ -25013,6 +26787,30 @@ class Viewer(QWidget):
         shown = _at(getattr(self, "_cam_shown_ts_ns", []), cam_idx, 0)
         return newest if newest > shown else None
 
+    def _note_slaves_left_alone(self, master_cam: int, master_ts_ns: int, targets: list):
+        """Diag line for every slave a settle left where it was: no frame of its own
+        within SLAVE_SYNC_MAX_NS of the master. Says how far its nearest frame is and
+        how much of the camera is in memory, so "the tile did not move although the
+        frames exist" can be told apart from a real gap. Settle paths only — once per
+        release, never per drag tick."""
+        moved = {i for i, _ in targets}
+        for i in range(len(self._per_cam_rows)):
+            if i == master_cam or i in moved:
+                continue
+            cam_ts = self._cam_ts[i] if i < len(self._cam_ts) else []
+            if not cam_ts:
+                continue
+            pos = bisect.bisect_right(cam_ts, master_ts_ns)
+            gaps = [abs(master_ts_ns - cam_ts[j]) for j in (pos - 1, pos)
+                    if 0 <= j < len(cam_ts)]
+            name = _strip_cam_name(_at(getattr(self, "_cam_names", []), i, "")) or f"cam{i}"
+            diag_note(f"SLAVE left alone cam{i} ({name}) "
+                      f"master={fmt_hhmmss_ms_from_ns(master_ts_ns)} "
+                      f"nearest={min(gaps) / 1e9:.1f}s "
+                      f"in memory {fmt_hhmmss_ms_from_ns(cam_ts[0])}-"
+                      f"{fmt_hhmmss_ms_from_ns(cam_ts[-1])} "
+                      f"history_reload={'pending' if self._live_trimmed else 'done'}")
+
     def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int,
                              live_edge: bool = False):
         """Display every slave at the master's moment. Used by the SETTLE paths (release,
@@ -25034,6 +26832,7 @@ class Viewer(QWidget):
                     targets.append((i, ts))
         else:
             targets = self._per_cam_slave_targets(master_cam, master_ts_ns)
+            self._note_slaves_left_alone(master_cam, master_ts_ns, targets)
         for i, slave_ts in targets:
             # set_value blocks signals, so this cannot re-enter _on_per_cam_value_changed.
             self._per_cam_rows[i].set_value(self._per_cam_ts_to_slider(i, slave_ts))
@@ -25247,6 +27046,8 @@ class Viewer(QWidget):
         self._cam_ref_paths    = [None] * n
         self._cam_ref_scaled   = [dict() for _ in range(n)]
         self._cam_diff_stats   = {}
+        self._cam_diff_stale   = set()
+        self._cam_diff_shown   = {}
         self._cam_diff_final   = {}
         self._diff_last_final  = None
         self._clear_sub_auto_hold()
@@ -25289,7 +27090,14 @@ class Viewer(QWidget):
                     self._on_cam_loaded(cam_i, gen, req, idx, ms, br, gid, bo, img, key))
             self._cam_signals.append(sig)
 
+        # The one-camera view is going away: its lifted-out window comes home first.
+        self._pop_leave_all(only_single=True)
         self._multi_grid.setup_cameras(cam_names, layout_config=layout_config)
+        # A camera lifted out into its own window stays out, now showing its new tile.
+        self._pop_rehome()
+        # References set earlier in the session come back on their cameras (the arrays
+        # were emptied above, the green badges went with the old tiles).
+        self._reapply_kept_references_multi()
         self._multi_grid.set_label_font_size(self._cam_label_size_sb.value())
         # Every new tile starts on the settings the panel is showing; from here on only
         # an actual control change may alter them, and only for the targeted tiles.
@@ -25335,6 +27143,26 @@ class Viewer(QWidget):
             return ts
         idx = min(_at(getattr(self, "_cam_current_idx", []), cam_idx, 0), len(cam_ts) - 1)
         return cam_ts[max(0, idx)]
+
+    def _leave_live_for_navigation(self):
+        """The user moved through time by hand — drag, wheel, arrow key, groove click,
+        frame arrows, a saved timestamp. Any of them means "show me THIS moment", so live
+        mode goes off here, before the move is rendered.
+
+        Only a mouse PRESS on the handle used to do this (and in single-camera mode only
+        the RELEASE), so the wheel, the keys and a jump left live running and the next
+        arrival dragged the view straight back to the newest frame.
+
+        Also forgets a pending jump target (see _jump_to_saved_ts): the user has moved
+        on from it, and the history reload must keep what is on screen instead."""
+        self._restore_want_ts = None
+        # The existing path: _on_auto_follow_toggled stops the live run, starts the
+        # full-history reload and the preview sweep.
+        if self._btn_auto_follow.isChecked():
+            self._btn_auto_follow.setChecked(False)
+        elif self._online_mode or self._auto_follow:
+            # Button already unticked with signals blocked — same effect, called directly.
+            self._on_auto_follow_toggled(False)
 
     def _on_auto_follow_toggled(self, checked: bool):
         self._auto_follow = checked
@@ -25511,7 +27339,9 @@ class Viewer(QWidget):
                 if not buf or ts_ns > buf[-1].ts_ns:
                     buf.append(Item(p, ts_ns))
                 return
-            self._merge_single_new_items([Item(p, ts_ns)])
+            # Watchers run only in live mode; a push delivered after it stopped was
+            # queued before — keep the frame, do not move the view to it.
+            self._merge_single_new_items([Item(p, ts_ns)], may_move=self._online_mode)
             return
         if cam_i >= len(self._cam_items):
             return
@@ -25545,7 +27375,7 @@ class Viewer(QWidget):
         if hasattr(self, "_cam_poll_max_ts") and cam_i < len(self._cam_poll_max_ts):
             self._cam_poll_max_ts[cam_i] = ts_ns
         # Trim only while live mode is ON — see ONLINE_MAX_ITEMS
-        if self._online_mode and len(self._cam_items[cam_i]) > ONLINE_MAX_ITEMS:
+        if self._online_mode and len(self._cam_items[cam_i]) > ONLINE_MAX_ITEMS + ONLINE_TRIM_SLACK:
             trim = len(self._cam_items[cam_i]) - ONLINE_MAX_ITEMS
             self._cam_items[cam_i] = self._cam_items[cam_i][trim:]
             self._cam_ts[cam_i]    = self._cam_ts[cam_i][trim:]
@@ -25569,7 +27399,9 @@ class Viewer(QWidget):
         if not self._online_mode:
             self.lbl_scan_progress.setText(f"Frames: {total}")
         cam_ts_now = self._cam_ts[cam_i]
-        if cam_ts_now:
+        # Watchers run only in live mode: a push delivered after it stopped was queued
+        # before, and may not move the view (see _live_result_may_move).
+        if cam_ts_now and self._online_mode:
             latest_ts = cam_ts_now[-1]
             was_at_end = (
                 _prev_current_idx is not None and
@@ -25626,7 +27458,13 @@ class Viewer(QWidget):
             newest = self.ts_list[-1]
         if not newest:
             return False            # nothing loaded — no day to leave
-        if _dt_from_ns(new_ts_ns).date() <= _dt_from_ns(newest).date():
+        new_day = _dt_from_ns(new_ts_ns).date()
+        if new_day <= _dt_from_ns(newest).date():
+            return False
+        # Only ever onto TODAY. A camera folder whose newest file is weeks old still
+        # counts as "a later day" against an even older window, and the diag log shows
+        # the window re-picked onto 26.08 that way, again and again, into October.
+        if new_day != _prague_today():
             return False
         # A new day AND a real silence in between — see LIVE_DAY_ROLL_MIN_GAP_S.
         return (new_ts_ns - newest) >= LIVE_DAY_ROLL_MIN_GAP_S * 1e9
@@ -25655,12 +27493,12 @@ class Viewer(QWidget):
         self._pending_online_mode = True
         self._stop_online_mode()
         self.cancel_scan()
-        seg = PickSeg(day, dt.hour, 0, 23, 59)
+        seg = live_hour_seg(day, dt.hour)
         self.last_pick_date         = day
-        self.last_pick_hour_from    = dt.hour
-        self.last_pick_min_from     = 0
-        self.last_pick_hour_to      = 23
-        self.last_pick_min_to       = 59
+        self.last_pick_hour_from    = seg.h_from
+        self.last_pick_min_from     = seg.m_from
+        self.last_pick_hour_to      = seg.h_to
+        self.last_pick_min_to       = seg.m_to
         # Legacy single-day path on purpose — the folder enumeration it drives is the
         # one that is certain to cover a plain "this hour to end of day" pick.
         self._last_pick_segments    = None
@@ -25682,6 +27520,11 @@ class Viewer(QWidget):
 
     def _start_online_mode(self):
         self._online_mode = True
+        self._live_epoch += 1     # a poll from before (Refresh, an older run) is not ours
+        # Live puts every tile back on the newest frame — nothing is "placed by hand" now,
+        # and a reload still waiting for a drag to end belongs to the old browse.
+        self._user_moved_cams = set()
+        self._backfill_pending = None
         # Before any watcher or poll can deliver — they all filter on this.
         self._open_ts_window_end()
         # Live mode shows the newest frame at full quality — the preloaded preview
@@ -25785,6 +27628,7 @@ class Viewer(QWidget):
 
     def _stop_online_mode(self):
         self._online_mode = False
+        self._live_epoch += 1     # polls still in flight may no longer move the view
         self._shot_stop()
         self._stop_dir_watchers()
         self._dir_watch_sigs = None
@@ -25922,9 +27766,27 @@ class Viewer(QWidget):
         back on the frame they were watching."""
         if self._online_mode:
             return   # live mode came back on meanwhile — the cap rules again
+        if self._navigating():
+            # Never under a running drag. The merge widens the axis (_extend_axis_to_items),
+            # which changes what every slider position MEANS while the handle stays put —
+            # the release then landed on a different moment than the one let go of, and
+            # in master mode the slaves were synced back to the master's live moment.
+            # Wait for the release and merge against where the handles ended up.
+            self._backfill_pending = (per_cam, keep_ts, self._gen)
+            QTimer.singleShot(250, self._retry_restored_history)
+            return
+        self._backfill_pending = None
         # The re-scan reads whole hour folders — re-apply the picked window so a
         # minute-precise selection is not widened by turning live mode off.
         per_cam = [self._filter_to_ts_windows(items) for items in per_cam]
+        # Where the user is NOW — read before the lists are replaced, because every index
+        # shifts once the older frames move in ahead. `keep_ts` is only the fallback: it
+        # was taken when live mode went off, and the reload takes seconds on the share,
+        # so by now the user has usually gone somewhere else. Landing on keep_ts snapped
+        # the slider back to "now" a few seconds after every trip into the past.
+        keep_ts = self._restore_anchor_ts(keep_ts)
+        cam_keep = ([self._restore_cam_ts(ci) for ci in range(len(self._cam_items))]
+                    if self._is_multi_cam() else [])
         if self._is_multi_cam():
             for cam_i, disk_items in enumerate(per_cam):
                 if cam_i >= len(self._cam_items):
@@ -25958,20 +27820,124 @@ class Viewer(QWidget):
         self._scrub_side = 500 if n >= 15000 else (600 if n >= 6000 else 900)
         idx = len(self.items) - 1
         if keep_ts is not None:
-            idx = min(bisect.bisect_left(self.ts_list, keep_ts), len(self.ts_list) - 1)
+            idx = self._time_to_nearest_index(keep_ts)
+            idx = max(0, min(idx, len(self.items) - 1))
         self.current_idx = idx
         self.target_idx  = idx
+        self._restore_want_ts = None
         if self._is_multi_cam():
-            self._display_multicam_index(idx, update_slider=True)
-        else:
+            self._restore_redisplay_multicam(idx, keep_ts, cam_keep)
+        elif not self._navigating():
             self._display_exact_index(idx, self.ts_list[idx], update_slider=True)
-        total = (sum(len(c) for c in self._cam_items) if self._is_multi_cam()
+        total =(sum(len(c) for c in self._cam_items) if self._is_multi_cam()
                  else len(self.items))
         self.lbl_scan_progress.setText(f"Frames: {total}")
         self.lbl_index.setText(self._index_text(idx))
         self._live_trimmed = False
         # The full window is back — preload it at preview quality for smooth scrubbing.
         self._proxy_kick()
+
+    def _retry_restored_history(self):
+        """The deferred half of _merge_restored_history: runs once the drag is over."""
+        pending = getattr(self, "_backfill_pending", None)
+        if not pending:
+            return
+        per_cam, keep_ts, gen = pending
+        if gen != self._gen:
+            self._backfill_pending = None   # a new scan replaced the dataset meanwhile
+            return
+        self._merge_restored_history(per_cam, keep_ts)
+
+    def _restore_cam_ts(self, cam_i: int) -> int:
+        """The moment camera cam_i's tile was last asked for (0 = nothing yet).
+
+        The camera's slider HANDLE when there is one: that is where the user let go, and
+        _cam_current_idx is written only when a render actually runs, so right after a
+        release it could still name the live frame — the reload then put the tile back
+        on "now". _cam_current_idx is the fallback (no per-camera rows)."""
+        cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+        if not cam_ts:
+            return 0
+        if cam_i < len(getattr(self, "_per_cam_rows", []) or []):
+            return cam_ts[self._per_cam_row_frame(cam_i)]
+        fi = _at(getattr(self, "_cam_current_idx", []), cam_i, len(cam_ts) - 1)
+        return cam_ts[max(0, min(len(cam_ts) - 1, fi))]
+
+    def _restore_anchor_ts(self, fallback):
+        """The moment the history reload must land on: a jump target still waiting for
+        its frames, else the master camera's moment, else the shared position."""
+        if self._restore_want_ts:
+            return self._restore_want_ts
+        master = self._per_cam_master_idx
+        if self._is_multi_cam() and 0 <= master < len(self._cam_ts) and self._cam_ts[master]:
+            return self._restore_cam_ts(master)
+        if self.current_idx is not None and 0 <= self.current_idx < len(self.ts_list):
+            return self.ts_list[self.current_idx]
+        return fallback
+
+    def _restore_redisplay_multicam(self, idx: int, keep_ts, cam_keep: list):
+        """Multi-cam half of _merge_restored_history: every tile back on the moment it
+        was on, and — in master mode — every slave synced to the master again.
+
+        The re-sync is what makes the slaves follow after leaving live mode. Until the
+        reload is in, each camera holds only its newest ONLINE_MAX_ITEMS frames (6 min at
+        10 Hz), so a slave asked for an older moment had nothing within SLAVE_SYNC_MAX_NS
+        and stayed put; the frames it needed arrive only here."""
+        # Indices shifted under every tile: map each back to the frame it was on.
+        for cam_i, ts in enumerate(cam_keep):
+            if not ts:
+                continue
+            fi = self._per_cam_ts_to_frame(cam_i, ts)
+            if cam_i < len(self._cam_current_idx):
+                self._cam_current_idx[cam_i] = fi
+            if cam_i in self._nav_frame:
+                self._nav_frame[cam_i] = fi
+            # The axis may have grown under the handle (_extend_axis_to_items): put it
+            # back on its own moment, or the next read of the handle names another one.
+            if cam_i < len(self._per_cam_rows):
+                self._per_cam_rows[cam_i].set_value(self._per_cam_ts_to_slider(cam_i, ts))
+        if self._navigating():
+            return          # a drag / playback is running; its release renders
+        if not self._per_cam_rows:
+            self._display_multicam_index(idx, update_slider=True)
+            return
+        master = self._per_cam_master_idx
+        sv = self._time_to_slider_value(self.items[idx].ts_ns)
+        self.slider.blockSignals(True)
+        self.slider.setValue(sv)
+        self.slider.blockSignals(False)
+        cam_ts_m = self._cam_ts[master] if 0 <= master < len(self._cam_ts) else []
+        if cam_ts_m and keep_ts:
+            fi = self._per_cam_ts_to_frame(master, keep_ts)
+            t_ns = cam_ts_m[fi]
+            self._per_cam_rows[master].set_value(self._per_cam_ts_to_slider(master, t_ns))
+            self._nav_frame[master] = fi
+            self._per_cam_display_one(master, t_ns)
+            # A slave the user moved by hand since leaving live stays where they put it.
+            # Syncing it too snapped it back to the master's moment — which, when only
+            # that slave was dragged, was still the live frame ("let go in the past,
+            # jumped back to now").
+            moved = getattr(self, "_user_moved_cams", set())
+            for i, ts in enumerate(cam_keep):
+                if i == master or i not in moved or not ts \
+                        or i >= len(self._per_cam_rows):
+                    continue
+                self._per_cam_rows[i].set_value(self._per_cam_ts_to_slider(i, ts))
+                self._nav_frame[i] = self._per_cam_ts_to_frame(i, ts)
+                self._per_cam_display_one(i, ts)
+            targets = [(i, ts) for i, ts in self._per_cam_slave_targets(master, t_ns)
+                       if i not in moved]
+            for i, slave_ts in targets:
+                self._per_cam_rows[i].set_value(self._per_cam_ts_to_slider(i, slave_ts))
+                self._nav_frame[i] = self._per_cam_ts_to_frame(i, slave_ts)
+                self._per_cam_display_one(i, slave_ts)
+            self._per_cam_sync_shared_widgets(master, t_ns)
+            self._per_cam_write_clocks(t_ns)
+            self._cam_refresh_stale_marks()
+        else:
+            # Independent mode: each tile stays where the user put it.
+            self._per_cam_redraw_in_place()
+            self._set_info_for(idx, self.items[idx].ts_ns)
 
     # ---- the ONE verdict about live health ----------------------------------------
     def _cam_behind_arrival(self, cam_i: int, want_ts: int = 0) -> bool:
@@ -26246,11 +28212,20 @@ class Viewer(QWidget):
                 self._single_last_full_poll_mono = now
             self._online_poll_single_bg()
 
-    def _merge_single_new_items(self, new_items: list):
+    def _live_result_may_move(self, launch_epoch: int) -> bool:
+        """Whether a poll launched under `launch_epoch` may still move the view. A poll
+        started while live mode ran and answering after the user left it is over: its
+        frames are kept, but jumping to them threw the user back to "now" mid-browse."""
+        return launch_epoch == self._live_epoch
+
+    def _merge_single_new_items(self, new_items: list, may_move: bool = True):
         """Merge freshly arrived single-camera frames into the timeline and
         advance the display. Shared by the listdir poll AND the dir-watcher
         push — both deliver through the identical code path (the ts cutoff in
-        each caller de-duplicates double delivery)."""
+        each caller de-duplicates double delivery).
+
+        `may_move` False adds the frames without moving the view (a stale live poll,
+        see _live_result_may_move)."""
         # A manual refresh with live mode OFF re-lists whole hour folders, so the
         # picked window still applies (online mode keeps its end open).
         new_items = self._filter_to_ts_windows(new_items)
@@ -26285,7 +28260,7 @@ class Viewer(QWidget):
         # Cap to ONLINE_MAX_ITEMS — drop oldest frames to prevent unbounded growth.
         # Only while live mode is ON; with it OFF the full history must stay
         # browsable (turning it off restores what was trimmed).
-        if self._online_mode and len(self.items) > ONLINE_MAX_ITEMS:
+        if self._online_mode and len(self.items) > ONLINE_MAX_ITEMS + ONLINE_TRIM_SLACK:
             trim = len(self.items) - ONLINE_MAX_ITEMS
             self.items = self.items[trim:]
             self.ts_list = self.ts_list[trim:]
@@ -26317,7 +28292,7 @@ class Viewer(QWidget):
             _prev_len > 0 and
             _prev_current_idx >= _prev_len - 1
         )
-        if self._auto_follow or was_at_end:
+        if may_move and (self._auto_follow or was_at_end):
             # Live mode always wants the NEWEST frame, so anything still queued for an
             # older one is dead weight on the same share — and since _open_reader buffers
             # each file in RAM while it decodes, a backlog costs memory as well as
@@ -26355,6 +28330,7 @@ class Viewer(QWidget):
             if _k not in active_keys:
                 self._poll_seen.pop(_k, None)
         seen_map = {str(f): self._poll_seen.setdefault(str(f), set()) for f in folders}
+        live_epoch = self._live_epoch
 
         def on_found(new_items):
             self._online_poll_running = False
@@ -26373,7 +28349,8 @@ class Viewer(QWidget):
                     if not buf or it.ts_ns > buf[-1].ts_ns:
                         buf.append(it)
                 return
-            self._merge_single_new_items(new_items)
+            self._merge_single_new_items(
+                new_items, may_move=self._live_result_may_move(live_epoch))
 
         class _PollSignals2(QObject):
             # (new_items, new_folders, folder_error) — see _CamPollSignals.found
@@ -26581,7 +28558,7 @@ class Viewer(QWidget):
             self._cam_poll_sigs[cam_i] = sig  # keep reference so it isn't GC'd
 
             def make_callback(ci, g, _folders=folders, _had_watcher=has_watcher,
-                              _poll_start=now):
+                              _poll_start=now, _epoch=self._live_epoch):
                 def on_cam_found(cam_idx: int, new_items: list, new_folders: list,
                                  folder_err=None):
                     self._cam_poll_running[cam_idx] = False
@@ -26642,7 +28619,7 @@ class Viewer(QWidget):
                     self._cam_ts[cam_idx].extend(it.ts_ns for it in new_items)
                     # Cap per-camera list to ONLINE_MAX_ITEMS to prevent unbounded
                     # growth — live mode only (see ONLINE_MAX_ITEMS)
-                    if self._online_mode and len(self._cam_items[cam_idx]) > ONLINE_MAX_ITEMS:
+                    if self._online_mode and len(self._cam_items[cam_idx]) > ONLINE_MAX_ITEMS + ONLINE_TRIM_SLACK:
                         trim = len(self._cam_items[cam_idx]) - ONLINE_MAX_ITEMS
                         self._cam_items[cam_idx] = self._cam_items[cam_idx][trim:]
                         self._cam_ts[cam_idx]    = self._cam_ts[cam_idx][trim:]
@@ -26665,7 +28642,7 @@ class Viewer(QWidget):
                         self.lbl_scan_progress.setText(f"Frames: {total_frames}")
                     self.lbl_index.setText(self._index_text(self.current_idx))
                     cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
-                    if cam_ts_now:
+                    if cam_ts_now and self._live_result_may_move(_epoch):
                         latest_ts = cam_ts_now[-1]
                         was_at_end = (
                             _prev_current_idx is not None and
@@ -26783,7 +28760,7 @@ class Viewer(QWidget):
         # history the user still wants to scrub back into.
         n_cams = len(self._cam_items)
         shared_cap = ONLINE_MAX_ITEMS * max(1, n_cams)
-        if self._online_mode and len(self.items) > shared_cap:
+        if self._online_mode and len(self.items) > shared_cap + ONLINE_TRIM_SLACK * max(1, n_cams):
             trim = len(self.items) - shared_cap
             self.items = self.items[trim:]
             self.ts_list = self.ts_list[trim:]
@@ -26928,6 +28905,9 @@ class Viewer(QWidget):
             folders = cam_folder_lists[0]
             existing = [f for f in folders if _is_dir_quiet(f)]
             if not existing:
+                # The view just switched to this camera — a scan of the previous
+                # pick must not land in it after all.
+                self.cancel_scan()
                 QMessageBox.warning(self, "Folder not found",
                     _camera_folder_problem(cam_names[0], folders))
                 # No scan starts — drop the landing hints so they cannot be picked
@@ -26944,7 +28924,7 @@ class Viewer(QWidget):
             self.img_view.pdxm1_cam_name = cam_names[0]
             self.img_view.show_pdxm1_grid = (_is_diode_cam(cam_names[0])
                                              and get_pdxm1_grid_config(cam_names[0]).show)
-            self.img_view.ref_rect_cfg = get_ref_rect_config(cam_names[0])
+            self.img_view.ref_rect_cfg = get_ref_frames(cam_names[0])
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -26979,6 +28959,10 @@ class Viewer(QWidget):
         if self._scan_task is not None:
             self._scan_task.cancel()
             self._scan_task = None
+        if self._multi_scan_stop is not None:
+            self._multi_scan_stop.set()
+        stop = threading.Event()
+        self._multi_scan_stop = stop
 
         self._reset_ui_for_new_scan([], "Multi-camera")
         self._switch_to_multi_view()
@@ -27000,6 +28984,11 @@ class Viewer(QWidget):
 
         def on_cam_scan_done(cam_i: int, items: list, folders: list):
             if gen != self._gen:
+                # Superseded: stop the cameras still walking and let go of the flag,
+                # or a later cancel_scan would take this dead scan for a live one.
+                stop.set()
+                if self._multi_scan_stop is stop:
+                    self._multi_scan_stop = None
                 return
             items = self._filter_to_ts_windows(items)
             _prev_len = len(self._cam_items[cam_i])
@@ -27014,6 +29003,8 @@ class Viewer(QWidget):
             self.lbl_scan_progress.setText(
                 f"Scanned {finished_count[0]}/{n_cams} cameras…")
             if finished_count[0] == n_cams:
+                if self._multi_scan_stop is stop:
+                    self._multi_scan_stop = None
                 first_folders = [f for f in cam_first_folder if f is not None]
                 self._on_multi_scan_all_done(
                     gen, cam_names,
@@ -27032,19 +29023,30 @@ class Viewer(QWidget):
 
             # Každá kamera jako samostatný QRunnable — správně přes Qt thread pool
             class _CamScanTask(QRunnable):
-                def __init__(self, ci, cname, folders, pick_args, sig):
+                def __init__(self, ci, cname, folders, pick_args, sig, stop):
                     super().__init__()
                     self._ci = ci
                     self._cname = cname
                     self._folders = folders
                     self._pick = pick_args
                     self._sig = sig
+                    self._stop = stop
 
                 def run(self):
+                    # A cancelled scan reports nothing: the cancel already bumped the
+                    # generation, and quitting early frees the pool thread for the next
+                    # scan instead of walking the rest of the share for nobody.
+                    if self._stop.is_set():
+                        return
                     # Existence filtering runs HERE, off the UI thread — one
                     # stat per folder per camera over SMB froze the open with
                     # many cameras on a slow link.
-                    existing = [f for f in self._folders if _is_dir_quiet(f)]
+                    existing = []
+                    for f in self._folders:
+                        if self._stop.is_set():
+                            return
+                        if _is_dir_quiet(f):
+                            existing.append(f)
                     if not existing:
                         try:
                             pd, hf, ht, segs, mf, mt = self._pick
@@ -27056,9 +29058,13 @@ class Viewer(QWidget):
                             existing = []
                     items: list[Item] = []
                     for folder in existing:
+                        if self._stop.is_set():
+                            return
                         try:
                             with os.scandir(folder) as it:
                                 for e in it:
+                                    if self._stop.is_set():
+                                        return
                                     if not e.is_file():
                                         continue
                                     name = e.name
@@ -27075,7 +29081,7 @@ class Viewer(QWidget):
                     items.sort(key=lambda x: x.ts_ns)
                     self._sig.done.emit(self._ci, items, existing)
 
-            task = _CamScanTask(cam_i, cam_name, list(folder_list), _pick_args, _signals)
+            task = _CamScanTask(cam_i, cam_name, list(folder_list), _pick_args, _signals, stop)
             self.scan_pool.start(task)
 
     def _on_multi_scan_all_done(
@@ -27501,6 +29507,7 @@ class Viewer(QWidget):
             self._cam_names = [cam_names[0]]
             existing = [f for f in cam_folder_lists[0] if _is_dir_quiet(f)]
             if not existing:
+                self.cancel_scan()   # same reasoning as in open_folder
                 QMessageBox.warning(self, "Folder not found",
                     _camera_folder_problem(cam_names[0], cam_folder_lists[0]))
                 # No scan starts — same reasoning as in open_folder.
@@ -27514,7 +29521,7 @@ class Viewer(QWidget):
             self.img_view.pdxm1_cam_name = cam_names[0]
             self.img_view.show_pdxm1_grid = (_is_diode_cam(cam_names[0])
                                              and get_pdxm1_grid_config(cam_names[0]).show)
-            self.img_view.ref_rect_cfg = get_ref_rect_config(cam_names[0])
+            self.img_view.ref_rect_cfg = get_ref_frames(cam_names[0])
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -27548,7 +29555,7 @@ class Viewer(QWidget):
     _SUSPEND_RESTART_TIMERS = (
         "play_timer", "_online_blink_timer", "_cam_dot_timer",
         "_cam_stuck_timer", "_pv_health_timer", "_pv_alarm_timer",
-        "_diag_timer", "_pv_debounce_timer", "_pointing_replay_timer",
+        "_diag_timer", "_pv_debounce_timer", "_pv_live_timer", "_pointing_replay_timer",
         "_prefetch_debounce", "_refine_timer", "_hq_timer")
     # Timers that follow a held mouse button or key — stopped, never restarted:
     # nothing is held any more once the user has clicked another tab.
@@ -27705,13 +29712,14 @@ class Viewer(QWidget):
         self._cameras_loaded = True
         self._last_pick_extra_dates = None
         if st.get("live"):
-            # Live comes back live: this hour to the end of today, as a fresh live pick.
+            # Live comes back live: today's current hour, as a fresh live pick. Later
+            # hours come in through live mode itself (_open_ts_window_end).
             dt = datetime.now(TZ_PRAGUE)
             hour_start = ns_from_dt(floor_to_hour(dt))
-            seg = PickSeg(dt.date(), dt.hour, 0, 23, 59)
+            seg = live_hour_seg(dt.date(), dt.hour)
             self.last_pick_date = dt.date()
-            self.last_pick_hour_from, self.last_pick_min_from = dt.hour, 0
-            self.last_pick_hour_to, self.last_pick_min_to = 23, 59
+            self.last_pick_hour_from, self.last_pick_min_from = seg.h_from, seg.m_from
+            self.last_pick_hour_to, self.last_pick_min_to = seg.h_to, seg.m_to
             self._last_pick_segments = None
             windows = [seg_bounds_ns(seg)]
             self._last_pick_windows = list(windows)
@@ -27942,6 +29950,8 @@ class Viewer(QWidget):
         if not items:
             QMessageBox.information(self, "Range search", "Could not parse timestamps from files."); return
 
+        # A folder scan still in flight would otherwise land over this list.
+        self.cancel_scan()
         self._stop_online_mode()
         self._hard_reset_runtime()
         self.opened_folders = []
@@ -28619,6 +30629,13 @@ class Viewer(QWidget):
         # with nothing to say they belonged to another one.
         if self._stats_are_final(st):
             self._cam_diff_final[cam_i] = (self._frame_of_key(key), st)
+        stale = getattr(self, "_cam_diff_stale", None)
+        if st is None and stale and cam_i in stale:
+            # Not measured at the new threshold yet — keep the old block standing
+            # (marked) rather than dropping it, see _on_subtract_changed.
+            return
+        if stale:
+            stale.discard(cam_i)
         self._cam_diff_stats[cam_i] = (self._frame_of_key(key), st)
 
     def _flush_cam_diff_stats(self):
@@ -28642,8 +30659,21 @@ class Viewer(QWidget):
             frame, latest = self._cam_diff_stats[c]
             st, prov = self._pick_diff_stats(latest, frame,
                                              self._cam_diff_final.get(c))
+            shown = getattr(self, "_cam_diff_shown", None)
+            if shown is None:
+                shown = self._cam_diff_shown = {}
             if st is None:
-                continue
+                # Nothing measured for this frame (yet, or evicted). The camera's last
+                # block stays standing, marked not final: dropping it changed the
+                # column's height and moved the whole settings column under the cursor.
+                st = shown.get(c)
+                if st is None:
+                    continue
+                prov = True
+            else:
+                shown[c] = st
+            if c in (getattr(self, "_cam_diff_stale", None) or ()):
+                prov = True   # numbers of the previous threshold, standing in
             items.append((f"{name}: {self._fmt_diff_stats(st, compact=True, provisional=prov)}",
                           st, prov))
         self.lbl_diff_stats.setText("")
@@ -29146,10 +31176,12 @@ class Viewer(QWidget):
                     self._cam_sub_hold.pop(cam_i, None)
                     self._cam_diff_stats.pop(cam_i, None)
                     self._cam_diff_final.pop(cam_i, None)
+                    getattr(self, "_cam_diff_shown", {}).pop(cam_i, None)
                     ts_str = fmt_prague_full_from_ns(it.ts_ns)
                     self._multi_grid.set_cam_ref_status(cam_i, f"Ref: {ts_str}")
                     self._cam_caches[cam_i] = PixCache(self._cam_cache_size(len(self._cam_caches)))
                     cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else f"cam {cam_i}"
+                    self._ref_keep_put(cam_name, it.path, it.ts_ns)
                     set_names.append(cam_name)
                 except Exception:
                     pass
@@ -29179,6 +31211,7 @@ class Viewer(QWidget):
         it = self.items[self.current_idx]
         self._ref_path = it.path
         self._ref_scaled = {}   # re-decode at display size, drop stale sizes
+        self._ref_keep_put(Path(it.path).parent.name, it.path, it.ts_ns)
         # A new reference is a new subtraction run: Auto measures its first frame again,
         # and the numbers on the panel belong to the difference that has just gone.
         self._sub_auto_hold = None
@@ -29224,12 +31257,15 @@ class Viewer(QWidget):
                         return
                 selected = have
             for cam_i in selected:
+                if cam_i < len(self._cam_names):
+                    self._ref_keep_drop(self._cam_names[cam_i])
                 self._cam_ref_images[cam_i] = None
                 self._cam_ref_paths[cam_i] = None
                 self._cam_ref_scaled[cam_i] = {}
                 self._cam_sub_hold.pop(cam_i, None)
                 self._cam_diff_stats.pop(cam_i, None)
                 self._cam_diff_final.pop(cam_i, None)
+                getattr(self, "_cam_diff_shown", {}).pop(cam_i, None)
                 # An empty text takes the green badge off the tile (set_cam_ref_status).
                 self._multi_grid.set_cam_ref_status(cam_i, "")
                 if cam_i < len(self._cam_caches):
@@ -29249,6 +31285,7 @@ class Viewer(QWidget):
 
         if self._ref_path is None:
             return
+        self._ref_keep_drop(Path(self._ref_path).parent.name)
         self._ref_path = None
         self._ref_scaled = {}
         self._ref_image = None
@@ -29269,6 +31306,64 @@ class Viewer(QWidget):
             self._display_exact_index(
                 self.current_idx, self.items[self.current_idx].ts_ns,
                 update_slider=True)
+
+    # ---- references kept for the whole session ------------------------------------
+    # A reference used to vanish with every new time window: both scan paths empty the
+    # per-camera arrays, because a slot index means another camera in the next set. The
+    # user rule (26.10.2026): a reference stays until the program is closed or it is
+    # removed with "Remove ref". So the reference is remembered here by CAMERA NAME (the
+    # camera folder, .../YYYY/MM/DD/HH/<CAM>/file) — never by slot — and put back after
+    # each scan. Memory only, never saved: closing the program forgets them. The picture
+    # is decoded lazily from the path (_ref_arr_for / _cam_ref_arr_for), so a reference
+    # outside the new window works exactly like one inside it.
+    @staticmethod
+    def _ref_keep_key(cam_name) -> str:
+        return _strip_cam_name(str(cam_name or "")).casefold()
+
+    def _ref_keep_put(self, cam_name, path, ts_ns: int):
+        key = self._ref_keep_key(cam_name)
+        if not key:
+            return
+        if getattr(self, "_ref_keep", None) is None:
+            self._ref_keep = {}
+        self._ref_keep[key] = (path, int(ts_ns))
+
+    def _ref_keep_drop(self, cam_name):
+        getattr(self, "_ref_keep", {}).pop(self._ref_keep_key(cam_name), None)
+
+    def _reapply_kept_references_multi(self):
+        """Put the session's references back on the tiles of a freshly built camera set."""
+        keep = getattr(self, "_ref_keep", None)
+        if not keep:
+            return
+        names = []
+        for cam_i, name in enumerate(self._cam_names):
+            hit = keep.get(self._ref_keep_key(name))
+            if hit is None or cam_i >= len(self._cam_ref_paths):
+                continue
+            path, ts_ns = hit
+            self._cam_ref_images[cam_i] = True
+            self._cam_ref_paths[cam_i] = path
+            self._cam_ref_scaled[cam_i] = {}
+            self._multi_grid.set_cam_ref_status(
+                cam_i, f"Ref: {fmt_prague_full_from_ns(ts_ns)}")
+            names.append(_strip_cam_name(name))
+        if names:
+            self._set_ref_status(f"Ref: {', '.join(names)}")
+        self._update_ref_buttons()
+
+    def _reapply_kept_reference_single(self, cam_name):
+        """Single-camera half of the above: the reference of this camera, if it has one."""
+        hit = getattr(self, "_ref_keep", {}).get(self._ref_keep_key(cam_name))
+        if hit is None:
+            return
+        path, ts_ns = hit
+        self._ref_path = path
+        self._ref_scaled = {}
+        ts_str = fmt_prague_full_from_ns(ts_ns)
+        self.img_view.set_cam_ref_text(f"Ref: {ts_str}")
+        self._set_ref_status(f"Ref: {ts_str}")
+        self._update_ref_buttons()
 
     def _has_reference(self) -> bool:
         """True when at least one subtraction reference is set for the current mode."""
@@ -29329,7 +31424,13 @@ class Viewer(QWidget):
             self._clear_sub_auto_hold()
             self._diff_last_final = None
             self._cam_diff_final = {}
-            self._cam_diff_stats = {}
+            # The per-camera numbers are NOT thrown away: emptying them made the
+            # histogram column rebuild one camera at a time as the tiles came back (1, 2,
+            # 3, … blocks, compact on/off), each step a new height for the INFO panel — and
+            # the whole settings column below it, the spinbox under the cursor included,
+            # jiggled on every click. They stay in place marked "not final" (amber, "…")
+            # until each camera's measurement at the new threshold replaces them.
+            self._cam_diff_stale = set(self._cam_diff_stats)
         self._refresh_ref_warning()
         # The preview layer is unusable while Subtraction is on, so _proxy_enabled now
         # depends on this checkbox: pause the sweep when it goes on, resume when off.
@@ -29519,6 +31620,16 @@ class Viewer(QWidget):
         base = self._cam_tile_side(n_cams)
         if not (self._online_mode and self._auto_follow) or self._navigating():
             return base
+        # A camera lifted out into its own window is shown large: read it native.
+        if self._multi_grid.is_popped(cam_idx):
+            return HQ_SIDE
+        # A cyclic palette (Binary) is never painted small first. Shrinking averages
+        # neighbouring values, and on a palette that repeats every 16 counts the average
+        # lands on an unrelated colour — the "blurry, then sharp" picture at 3.3 Hz was in
+        # fact a WRONG picture, then the right one. The small read saves nothing either:
+        # the PNG is decoded whole before it is scaled (see load_image_scaled).
+        if palette_is_cyclic(self._cam_disp_get(cam_idx)["gid"]):
+            return HQ_SIDE
         # The MASTER's cadence, not this camera's, whenever the master is the clock
         # (_live_advance_cam): a slave is repainted once per master arrival, so how often
         # its own folder receives files says nothing about how long its render may take.
@@ -30512,10 +32623,16 @@ class Viewer(QWidget):
             key = (ck, HQ_SIDE, brighten, gradient_id, bc) + rr.key_parts
             shown = (self._cam_shown_key[cam_i]
                      if cam_i < len(getattr(self, "_cam_shown_key", [])) else None)
-            if shown == key:
-                continue          # already native on this exact frame and these params
             cache  = self._cam_caches[cam_i] if cam_i < len(self._cam_caches) else None
             cached = cache.get(key) if cache is not None else None
+            if shown == key and (
+                    (cached is not None and not cached.isNull())
+                    or _at(self._cam_want, cam_i, None) is not None
+                    or self._cam_inflight_count(cam_i) > 0):
+                # Already native on this exact frame and these params, or its native
+                # read is still on the way. A claim with neither (the read was lost, see
+                # _on_cam_loaded) falls through and is read again.
+                continue
             if cached is not None and not cached.isNull():
                 self._cam_set_shown_key(cam_i, key)
                 iv.set_pixmap(cached)
@@ -30876,12 +32993,20 @@ class Viewer(QWidget):
         self.lbl_index.setText("0 / 0"); self.tickbar.set_axis(0, 0)
         self.prog.setVisible(True); self.prog.setRange(0, 0)
         self.lbl_scan_progress.setText("Scanning..."); self.btn_cancel_scan.setVisible(True)
+        # The reference cleared above comes back if it was set on this same camera
+        # earlier in the session (see _ref_keep). Multi-camera passes no folders and
+        # restores per tile in _setup_multi_cam instead.
+        if folders:
+            self._reapply_kept_reference_single(folders[0].name)
 
     def _start_scan(self, folders, axis_override, folder_label):
         # _start_scan is the SINGLE-camera scan path — clear stale multi-cam
         # state here, or a previous multi session's _cam_folder_lists makes
         # _start_online_mode arm watchers on dead folders and _is_multi_cam()
         # can stay wrongly True (leftover _cam_names).
+        # Several cameras → one: the lifted-out tiles belong to the view going away.
+        # Checked BEFORE _cam_names is cut, while _pop_leave can still rebuild the grid.
+        self._pop_leave_all(keep_single=True)
         if len(self._cam_names) > 1:
             self._cam_names = self._cam_names[:1]
         self._cam_folder_lists = []
@@ -30895,6 +33020,8 @@ class Viewer(QWidget):
         self._gen += 1; gen = self._gen
         if self._scan_task is not None:
             self._scan_task.cancel(); self._scan_task = None
+        if self._multi_scan_stop is not None:
+            self._multi_scan_stop.set(); self._multi_scan_stop = None
         self.axis_override = axis_override
         # Multi-day pick → the axis skips everything between the picked windows
         # (None for an explicit folder / file list = plain linear axis).
@@ -30913,7 +33040,32 @@ class Viewer(QWidget):
         self.scan_pool.start(task)
 
     def cancel_scan(self):
-        if self._scan_task is not None: self._scan_task.cancel()
+        """Stop the scan in flight, single- or multi-camera, and make sure nothing it
+        still delivers lands. The worker only checks its flag between files, so it can
+        be past its last check, or stuck in a slow share listing; the new generation
+        drops that late result instead of letting it fill the timeline after all."""
+        single, multi = self._scan_task, self._multi_scan_stop
+        if single is None and multi is None:
+            return
+        if single is not None:
+            single.cancel(); self._scan_task = None
+        if multi is not None:
+            multi.set(); self._multi_scan_stop = None
+        self._gen += 1
+        # The quick first frame may already be on screen — it is not a loaded window.
+        self.items = []; self.ts_list = []; self.current_idx = None
+        self.img_view.clear()
+        self.prog.setVisible(False)
+        self.lbl_scan_progress.setText(""); self.btn_cancel_scan.setVisible(False)
+        self.lbl_filename.setText("File: scan cancelled.")
+        # Nothing landed — the hints must not leak into the next scan.
+        self._clear_pending_landing()
+
+    def _on_cancel_scan_clicked(self):
+        # The user called the load off: a live pick must not switch itself back on
+        # with the next Refresh.
+        self._pending_online_mode = False
+        self.cancel_scan()
 
     def _on_scan_quick_item(self, gen, item):
         """Show newest image found so far before the full scan finishes."""
@@ -31186,6 +33338,9 @@ class Viewer(QWidget):
         # previous drag's latched size.
         self._drag_side = self._scrub_side
         if self._is_playing: self.stop()
+        # Live off at the START of the drag. It used to wait for the release, so every
+        # arrival during the drag pulled the handle back to the newest frame.
+        self._leave_live_for_navigation()
         # Decode the subtraction reference(s) for every size the drag can ask for now:
         # _ref_arr_for caches per max_side and decodes off the share synchronously, so a
         # size that first appeared mid-drag stalled the 33 ms scrub tick on a network read.
@@ -31217,9 +33372,11 @@ class Viewer(QWidget):
         # reads the same moment as the label burned into the frame.
         self.tickbar.set_cursor(ts)
         if not self._is_scrubbing and not self._is_playing:
-            # Wheel / keyboard / groove-click: no press, no release, so nothing else
-            # would ever render this position. Debounced so holding a key does not
-            # queue a decode per repeat.
+            # Wheel / keyboard / groove-click: no press, no release — this is the only
+            # place that sees the move, so it is also the one that leaves live mode.
+            self._leave_live_for_navigation()
+            # Nothing else would ever render this position. Debounced so holding a key
+            # does not queue a decode per repeat.
             self._keynav_debounce.start(60)
             # These moves emit no sliderPressed, so this is the only place that can take
             # the native tier back down while the wheel is still spinning.
@@ -31314,9 +33471,9 @@ class Viewer(QWidget):
     def _on_slider_released(self):
         if self.scrub_timer.isActive(): self.scrub_timer.stop()
         self._is_scrubbing = False
-        # Pokud user posune slider, vypni auto-follow
-        if self._auto_follow:
-            self._btn_auto_follow.setChecked(False)
+        # Live mode already went off at the press; this covers a release without one.
+        if self._online_mode or self._auto_follow:
+            self._leave_live_for_navigation()
         if not self.items: return
         t = self._slider_to_time_ns(self.slider.value())
         idx = self._time_to_nearest_index(t)
@@ -31696,11 +33853,23 @@ class Viewer(QWidget):
                     cam_i, self._cam_ref_render_for(cam_i, want_key[0], max_side).mkey)
                 self._start_cam_load(cam_i)
                 return
+            self._start_cam_load(cam_i)
+            # The tile is waiting for its NATIVE render (_hq_upgrade_tiles claimed it) and
+            # a tile-size load of the same moment landed late. Re-deriving from UI state
+            # here used to go through _per_cam_display_one at tile size, which put the
+            # shown key back to the small render — so when the native one landed it was
+            # rejected as stale and the tile stayed blurry with the sharp picture sitting
+            # unused in the cache. Keep the claim while the native read is still queued or
+            # running; if it is gone, ask for it again instead of downgrading.
+            if want_key[1] == HQ_SIDE and not (self._online_mode and self._auto_follow):
+                if (_at(self._cam_want, cam_i, None) is None
+                        and self._cam_inflight_count(cam_i) == 0):
+                    self._schedule_hq()
+                return
             # The wanted render is neither cached nor pending (_cam_want was
             # consumed by the launch of the render that just finished) — re-derive
             # it from live UI state so the tile always converges on the settings
             # actually shown in the panel.
-            self._start_cam_load(cam_i)
             if self._cam_inflight_count(cam_i) < self._cam_inflight_depth():
                 self._redraw_cam_in_place(cam_i)
             return
@@ -32150,7 +34319,15 @@ class Viewer(QWidget):
         poll timer is stopped, so _live_health's own stall test would call every camera
         faulted the moment the operator started browsing. Both blink timers are stopped
         with live mode too, so nothing normally reaches here — this is the one place
-        the rule is stated rather than four call sites that must each remember it."""
+        the rule is stated rather than four call sites that must each remember it.
+
+        SWITCHED OFF (user rule, 26.10.2026): the trip list is for the laser leaving its
+        energy limits, nothing else. A camera that cannot be read, lags or loses its
+        folder still shows on its own red dot and tooltip (_live_health), but it no
+        longer opens a trip. The body below is kept so the rule can be turned back on
+        by deleting this one guard."""
+        if not CAM_FAULT_TRIPS:
+            return
         if not getattr(self, "_online_mode", False):
             return
         key = f"cam{cam_i}"
@@ -32575,6 +34752,7 @@ class Viewer(QWidget):
 
     def step_frame(self, delta_idx):
         if self._is_playing: self.stop()
+        self._leave_live_for_navigation()
         # Per-cam slider mode: step the master camera, sync slaves
         if self._is_multi_cam() and self._per_cam_rows:
             self._per_cam_step(delta_idx)
@@ -32751,6 +34929,170 @@ class Viewer(QWidget):
         win.raise_()
         win.activateWindow()
 
+    # ── One camera lifted out into its own window (double-click) ─────────────
+    # Focus mode for ONE camera: the double-clicked tile — the very same widget, so it
+    # keeps playing live — moves into a borderless window of its own (_FocusWindow: drag
+    # anywhere to move it, drag its edge to resize it, right-drag on the picture to zoom
+    # into a part, middle-click to zoom back out). The other cameras stay in the Slider
+    # and re-tile over the space it left. A double-click inside the window, Esc, F11 or
+    # Alt+F4 puts it back. Several cameras can be out at once. Each window remembers its
+    # place and size per camera (slider_ui_state.json, _POP_STATE_KEY).
+    #
+    # Until 26.10.2026 the double-click put the camera full-screen over the whole
+    # monitor instead, hiding every other camera; the user asked for this behaviour.
+    _POP_STATE_KEY = "popped_windows"    # camera name → [x, y, w, h]
+
+    def _solo_toggle(self, idx: int = -1):
+        # Deferred: it comes from inside the tile's own mouse handler, and the tile
+        # must not be moved to another window while that handler is still running.
+        QTimer.singleShot(0, lambda: self._solo_toggle_now(idx))
+
+    def _pop_key(self, idx: int) -> "str | None":
+        if self._is_multi_cam():
+            views = self._multi_grid._cam_views
+            return views[idx].cam_name if 0 <= idx < len(views) else None
+        if getattr(self, "_single_wrapper", None) is None or not self.items:
+            return None
+        return "__single__"
+
+    def _solo_toggle_now(self, idx: int):
+        if self._focus_mode or self._watcher_mode:
+            return
+        key = self._pop_key(idx)
+        if key is None:
+            return
+        fw = self._pop_windows.get(key)
+        if fw is not None:
+            self._pop_leave(fw)
+            return
+        if not self.isVisible():
+            return
+        self._pop_enter(idx, key)
+
+    def _pop_enter(self, idx: int, key: str):
+        multi = self._is_multi_cam()
+        if multi:
+            content = self._multi_grid._cam_views[idx]
+            # The tile leaves its container — stop the container placing it.
+            cont = getattr(self._multi_grid, "_reg_container", None)
+            if cont is not None and hasattr(cont, "detach"):
+                cont.detach()
+            self._multi_grid._popped.add(idx)
+        else:
+            content = self._single_wrapper
+        # Where it opens: where it was last time, else a large window in the middle of
+        # this monitor — "lifted out to be looked at closely", so bigger than its tile.
+        screen = self.window().screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        w, h = int(avail.width() * 0.6), int(avail.height() * 0.7)
+        rect = QRect(avail.x() + (avail.width() - w) // 2,
+                     avail.y() + (avail.height() - h) // 2, w, h)
+        r = (self._ui_state.get(self._POP_STATE_KEY) or {}).get(key)
+        if isinstance(r, (list, tuple)) and len(r) == 4:
+            saved = QRect(int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+            if self._rect_on_a_screen(saved):
+                rect = saved
+        fw = _FocusWindow(content, self, key, on_leave=self._pop_leave)
+        self._pop_windows[key] = fw
+        # A new camera set deletes the tile under the window: then the window just goes.
+        fw._gone_conn = content.destroyed.connect(
+            lambda *_, k=key: QTimer.singleShot(0, lambda: self._pop_tile_gone(k)))
+        fw.setGeometry(rect)
+        fw.show()
+        if multi:
+            self._multi_grid._rebuild_grid()
+        # No grey band around the picture (same as focus mode), once the layout settled.
+        QTimer.singleShot(0, fw.fit_to_picture)
+        # The tile is much bigger now: let the settle pass re-read it at full size.
+        if multi:
+            self._schedule_hq()
+
+    def _pop_remember(self, fw):
+        state = dict(self._ui_state.get(self._POP_STATE_KEY) or {})
+        g = fw.geometry()
+        state[fw.key] = [g.x(), g.y(), g.width(), g.height()]
+        self._ui_state[self._POP_STATE_KEY] = state
+        self._save_ui_state()
+
+    def _pop_leave(self, fw):
+        """Put a lifted-out camera back into the Slider."""
+        if self._pop_windows.get(fw.key) is not fw:
+            return
+        del self._pop_windows[fw.key]
+        self._pop_remember(fw)
+        try:
+            QObject.disconnect(fw._gone_conn)
+        except Exception:
+            pass
+        content = fw._content
+        try:
+            if isinstance(content, CameraView):
+                self._multi_grid._popped.discard(content.cam_index)
+                fw.release_content(self._multi_grid)
+            else:
+                fw.release_content(self._img_pointing_row.parentWidget())
+                self._img_pointing_row.insertWidget(0, content, 1)
+                content.setVisible(True)
+        except RuntimeError:
+            pass      # the tile was deleted meanwhile (the camera set changed)
+        fw.close()
+        fw.deleteLater()
+        if self._is_multi_cam():
+            self._multi_grid._rebuild_grid()
+            self._schedule_hq()
+
+    def _pop_tile_gone(self, key: str):
+        """The tile inside a lifted-out window was deleted (new camera set): close it."""
+        fw = self._pop_windows.pop(key, None)
+        if fw is None:
+            return
+        self._pop_remember(fw)
+        fw.close()
+        fw.deleteLater()
+
+    def _pop_leave_all(self, keep_single: bool = False, only_single: bool = False):
+        """Lifted-out cameras back — before focus or watcher mode take the tiles, and
+        when the view switches between one camera and several."""
+        for key, fw in list(self._pop_windows.items()):
+            single = key == "__single__"
+            if (keep_single and single) or (only_single and not single):
+                continue
+            self._pop_leave(fw)
+
+    def _pop_rehome(self):
+        """The camera set was rebuilt (every scan does it, a new time window included):
+        each lifted-out window keeps its place and now shows the NEW tile of its camera,
+        so a camera that was out stays out. A window whose camera is not in the new set
+        closes."""
+        grid = self._multi_grid
+        by_name = {cv.cam_name: cv for cv in grid._cam_views}
+        moved = False
+        for key, fw in list(self._pop_windows.items()):
+            if key == "__single__":
+                continue
+            try:
+                QObject.disconnect(fw._gone_conn)
+            except Exception:
+                pass
+            new = by_name.get(key)
+            if new is None:
+                del self._pop_windows[key]
+                self._pop_remember(fw)
+                try:
+                    fw.release_content(grid)   # the old tile, already on its way out
+                except RuntimeError:
+                    pass
+                fw.close()
+                fw.deleteLater()
+                continue
+            fw.swap_content(new, grid)
+            grid._popped.add(new.cam_index)
+            fw._gone_conn = new.destroyed.connect(
+                lambda *_, k=key: QTimer.singleShot(0, lambda: self._pop_tile_gone(k)))
+            moved = True
+        if moved:
+            grid._rebuild_grid()
+
     def _restore_overlay_positions(self):
         """Put the PV panel back on the fraction of its parent it was dragged to."""
         self._pv_update_overlay()
@@ -32780,6 +35122,8 @@ class Viewer(QWidget):
         try:
             self._focus_mode = not self._focus_mode
             if self._focus_mode:
+                # Lifted-out cameras come home first: focus mode takes every tile.
+                self._pop_leave_all()
                 self._focus_enter()
             else:
                 self._focus_leave()
@@ -32788,6 +35132,7 @@ class Viewer(QWidget):
         QTimer.singleShot(0, self._restore_overlay_positions)
 
     def _toggle_watcher_mode(self):
+        self._pop_leave_all()
         self._watcher_mode = not self._watcher_mode
         show = not self._watcher_mode
         # Show/hide left panel, slider, tickbar
@@ -32940,6 +35285,12 @@ class Viewer(QWidget):
     def _jump_to_saved_ts(self, target_ts: int, label: str,
                           pos: "int | None" = None, total: "int | None" = None):
         """Land on the frame nearest `target_ts` and report the residual Δt."""
+        # Live mode would drag the view back to the newest frame on the next arrival.
+        self._leave_live_for_navigation()
+        # Live mode may have trimmed this moment out of memory; the history reload just
+        # started puts it back and lands here (_merge_restored_history).
+        if getattr(self, "_backfill_running", False) or self._live_trimmed:
+            self._restore_want_ts = target_ts
         best_idx = self._time_to_nearest_index(target_ts)
         best_ts = self.items[best_idx].ts_ns
         diff_ms = abs(best_ts - target_ts) / 1_000_000
@@ -35213,53 +37564,90 @@ class Viewer(QWidget):
 def install_wheel_guard(app):
     """A value must never change just because the pointer crossed its control.
 
-    Number fields, drop-downs and setting sliders answer the mouse wheel only
-    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
-    the notch goes to the panel behind them instead, so the settings panel still
-    scrolls when the pointer happens to pass over the Subtraction threshold on
-    the way down. A control meant to take the wheel at any time carries the
-    "wheelAlways" property — the frame sliders set it, because stepping through
-    shots with the wheel is the whole point of them.
+    Number boxes, drop-downs and sliders answer the wheel only after they were
+    CLICKED (or reached with Tab), and only while the pointer is over them --
+    Qt delivers a wheel notch to the control under the pointer, so a selected
+    field elsewhere on the page is never touched. Moving the pointer away keeps
+    the field selected (the keyboard still edits it); the wheel works on it
+    again when the pointer comes back. Selecting another control ends it. An
+    unselected field passes the notch to the panel behind it, so a settings
+    panel still scrolls when the pointer happens to pass over a field. The
+    focus a freshly opened window HANDS its first field does not count.
 
-    Scroll bars are left out: they are sliders too, and the wheel is how a pane
-    gets scrolled.
+    A control meant to take the wheel at any time carries the "wheelAlways"
+    property -- the frame sliders set it, because stepping through shots with
+    the wheel is the whole point of them. Scroll bars are left out: they are
+    sliders too, and the wheel is how a pane gets scrolled.
 
-    One app-wide filter, so a dialog built much later is covered as well. It is
-    spelled out in every entry point rather than imported once: each tab also
-    runs on its own, and a sibling module would have to survive the frozen build
-    (the same reason `_import_img_scale` is copied into each tab).
+    One app-wide filter, installed once, so a dialog built much later is
+    covered as well. It is spelled out in every entry point rather than
+    imported once: each tab also runs on its own, and a sibling module would
+    have to survive the frozen build (the same reason `_import_img_scale` is
+    copied into each tab). The copies in main.py, is_t.py, if_t.py and sf_t.py
+    are identical (testing/test_wheel_guard.py checks it).
     """
+    from PySide6.QtCore import QEvent, QObject, Qt
     from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
-                                   QAbstractSpinBox, QScrollBar)
+                                   QAbstractSpinBox, QApplication, QComboBox,
+                                   QScrollBar)
+
+    app = app or QApplication.instance()
+    if app is None or getattr(app, "_wheel_guard", None) is not None:
+        return
 
     class _WheelGuard(QObject):
         _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
-        # Focus the user asked for. The focus a freshly opened window HANDS to its
-        # first field (ActiveWindow / Other) does not count, or the top field of a
-        # panel would answer the wheel before it had ever been touched.
         _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
                    Qt.FocusReason.BacktabFocusReason,
                    Qt.FocusReason.ShortcutFocusReason)
-        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
-                  Qt.FocusReason.OtherFocusReason)
+        # Focus that leaves only for a moment and comes back to the same field:
+        # another window was activated, or the drop-down's own list opened.
+        _KEEP = (Qt.FocusReason.ActiveWindowFocusReason,
+                 Qt.FocusReason.PopupFocusReason)
 
         def eventFilter(self, obj, ev):
+            """EVERY event in the program passes through here, so it may not
+            raise -- ever. An exception escaping a Python override on the whole
+            application leaves PySide6 in an error state and the process dies
+            later with an access violation (measured 2026-09-17), and `obj` can
+            be a widget Qt is tearing down. A stray scroll is the cheaper loss.
+            """
+            try:
+                return self._filter(obj, ev)
+            except Exception:
+                return False
+
+        def _filter(self, obj, ev):
             t = ev.type()
             if t == QEvent.Type.Polish and isinstance(obj, self._GUARDED):
-                # Spin boxes and drop-downs come with Qt's WheelFocus: the wheel
-                # notch ITSELF hands them the focus, with the same "mouse" reason
-                # a click gives, before this filter sees the notch -- so every
-                # field the pointer crossed counted as clicked and took the
-                # value change. Without WheelFocus only a click or Tab focuses.
+                # Spin boxes and drop-downs come with WheelFocus: Qt hands them
+                # the focus, as a MOUSE focus, the moment a wheel notch lands on
+                # them -- before the notch itself is delivered. That made every
+                # untouched field "clicked" just in time to take the notch.
+                # StrongFocus still takes a click or Tab, never the wheel.
                 if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
                     obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 return False
+            if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+                # A click is what selects the field -- also the field that
+                # already HAD the focus (the first one of a window is handed
+                # it), where no FocusIn follows the click. The press lands on
+                # the spin box's own text line, so look one or two levels up.
+                w = obj
+                for _ in range(3):
+                    if isinstance(w, self._GUARDED):
+                        w.setProperty("wheelReady", True)
+                        break
+                    w = w.parentWidget() if hasattr(w, "parentWidget") else None
+                    if w is None:
+                        break
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
-                # Popup and menu reasons are left as they are: closing a drop-down
-                # hands the focus back, which must not undo the click that opened it.
                 if ev.reason() in self._EARNED:
                     obj.setProperty("wheelReady", True)
-                elif ev.reason() in self._GIVEN:
+                return False
+            if t == QEvent.Type.FocusOut and isinstance(obj, self._GUARDED):
+                if ev.reason() not in self._KEEP:
                     obj.setProperty("wheelReady", False)
                 return False
             if t != QEvent.Type.Wheel:
@@ -35276,7 +37664,9 @@ def install_wheel_guard(app):
                 QApplication.sendEvent(pane.viewport(), ev)
             return True
 
-    app.installEventFilter(_WheelGuard(app))
+    guard = _WheelGuard(app)
+    app.installEventFilter(guard)
+    app._wheel_guard = guard
 
 
 # ================================================================== MAIN

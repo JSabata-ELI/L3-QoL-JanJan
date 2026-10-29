@@ -22,6 +22,8 @@
     "refresh_alert_minutes": 30.0,
     "data_watchdog_enabled": true,
     "data_watchdog_fail_polls": 2,
+    "data_watchdog_remind_hours": 12.0,
+    "data_watchdog_ok_after_minutes": 15.0,
     "frozen_check_enabled": true,
     "frozen_alert_enabled": true,
     "learn_days_default": 7,

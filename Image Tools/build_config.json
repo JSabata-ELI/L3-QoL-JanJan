@@ -1,8 +1,7 @@
 {
-  "collect_all": ["PIL", "PySide6", "scipy", "matplotlib"],
-  "collect_binaries": ["numpy", "numpy.libs"],
   "hidden_imports": [
     "daypicker",
+    "is_window_read",
     "numpy.linalg",
     "numpy.linalg.lapack_lite",
     "numpy.core._multiarray_umath",

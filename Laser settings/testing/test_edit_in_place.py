@@ -86,8 +86,14 @@ def main():
     ft._size.setValue(ft._size.value() + 3)
     check("the same row widgets", row_ids(), before_rows)
     check("the Limits table was not refilled", table_items(), before_items)
+    # The new size, or as much of it as the (never shown) tab has room for —
+    # a typed size never runs past the window's edge (12.10.2026).
+    look = win.look()
     check("and the rows wear the new size",
-          ov._row_widgets[0]._look_key[1], int(win.look()["size_px"]))
+          ov._row_widgets[0]._look_key[1],
+          ov._shrunk_to_window(look, int(look["size_px"]),
+                               int(look["mark_px"]),
+                               int(win.halls()["band_px"]))[0])
     ft._bold.setChecked(not ft._bold.isChecked())
     check("Bold: the same row widgets", row_ids(), before_rows)
     ft._single.setChecked(True)

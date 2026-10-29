@@ -117,8 +117,9 @@ import numpy as np
 from PIL import Image as PilImage
 
 from PySide6.QtCore import (Qt, QTimer, QDate, QRunnable, QThreadPool, QObject,
-                            Signal, QPointF, QRect, QSize, QLocale, QEvent)
-from PySide6.QtGui import (QColor, QTextCharFormat, QPixmap, QImage, QFont, QCursor,
+                            Signal, QPoint, QPointF, QRect, QSize, QLocale, QEvent)
+from PySide6.QtGui import (QColor, QTextCharFormat, QPixmap, QImage, QFont,
+                           QFontMetrics, QCursor,
                            QPainter, QPen, QPalette, QImageWriter,
                            QShortcut, QKeySequence)
 from PySide6.QtWidgets import (
@@ -256,7 +257,7 @@ def _import_daypicker():
     Three locations are searched because a built app has no single answer. Next to
     this file means _internal, and _internal never survives the trip to the
     share: copying a program there does not bring its _internal at all, and
-    "Deploy Libraries" (Dev Tools/cm_t.py) fills the destination's one from a
+    "Deploy Libraries" (Dev Tools/dt_core.py) fills the destination's one from a
     single shared runtime library, deleting whatever that library does not have.
     daypicker.py is not in it and cannot be. The copy compiled into the exe
     (build_config.json -> hidden_imports) and the loose file the deploy drops
@@ -307,6 +308,13 @@ def _import_daypicker():
 
 
 daypicker = _import_daypicker()
+
+
+def _finder_default_window() -> "tuple[int, int, int, int]":
+    """The window a day gets in this tab: the whole lab day, 07:00–21:00 — TODAY
+    included. The picker stops today at the next hour (it feeds live views); a
+    search simply finds nothing in the hours not written yet."""
+    return (daypicker.DEFAULT_FROM_HOUR, 0, daypicker.DEFAULT_TO_HOUR, 0)
 
 # Maps energy CSV column name → CPVA archiver channel name for API lookup
 CPVA_CHANNEL_MAP: dict[str, str] = cpva.CHANNEL_MAP
@@ -1094,6 +1102,198 @@ def build_derived_series(plan: "list[dict]", series: dict,
     return out
 
 
+def _formula_signature(spec: dict) -> tuple:
+    """What a computed formula curve depends on: change any of it and the curve
+    already held is not this formula any more."""
+    return (spec.get("expr") or "",
+            tuple(sorted((spec.get("bindings") or {}).items())),
+            tuple(spec.get("sources") or ()))
+
+
+def _fetch_window_samples(channel: str, start_ns: int,
+                          end_ns: int) -> "tuple[list, str, str]":
+    """Samples between two timestamps, through the archiver's DAY cache.
+
+    `cpva.get_day` keeps an LRU of whole days, recovers from the archiver's HTTP 500
+    on an oversize query by splitting it, and reports whether the fetch actually
+    succeeded — none of which the plain windowed query it replaced could do. A UTC
+    ("lab time") day straddles two Prague days, so both are asked for and the result
+    is clipped back to the window.
+
+    The third value is the name the samples actually came from when it is NOT the
+    one asked for — SBW4's two names take turns, and a curve drawn from the other
+    one has to say so rather than look like the name on the list.
+
+    Only the asked hours are read (`span_ns`), and in pieces (`piece_ns`): a whole
+    day of a per-shot PV parsed in one go held Python's global lock for seconds,
+    and the window could not be clicked until it was done (27.10.2026)."""
+    keys = {cpva.date_key_for_ns(start_ns), cpva.date_key_for_ns(end_ns)}
+    merged: list = []
+    worst = "ok"
+    alias = ""
+    for k in sorted(keys):
+        asked = cpva.channel_for_day(channel, k)
+        d0, d1 = cpva.day_bounds_ns(k)
+        span = (max(int(start_ns), d0), min(int(end_ns), d1))
+        res = cpva.get_day(asked, k, timeout=cpva.FULL_DAY_TIMEOUT,
+                           span_ns=span, piece_ns=_FETCH_PIECE_NS)
+        merged.extend(res.samples)
+        if _PV_STATUS_RANK.get(res.status, 3) > _PV_STATUS_RANK.get(worst, 0):
+            worst = res.status
+        src = (getattr(res, "src_channel", "") or "").split(".value")[0]
+        if res.samples and src and src != channel:
+            alias = src
+    out = sorted((t, v) for (t, v) in merged if start_ns <= t <= end_ns)
+    if worst == "ok" and not out:
+        worst = "empty"
+    return out, worst, alias
+
+
+def _formula_samples(plan: "list[dict]", src_channels: dict, start_ns: int,
+                     end_ns: int, have: "dict | None" = None,
+                     fetch=None) -> "tuple[dict, dict, dict]":
+    """Every formula of `plan` over one window, as plain [(t_ns, value)] lists.
+
+    The ONE place a formula is computed over time for this window and for the
+    condition search, so the curve drawn and the moment found cannot disagree.
+    `src_channels` is registry name → channel (snapshotted on the GUI thread);
+    `have` is channel → samples already in hand, read again only when missing.
+
+    Returns ({formula name → samples}, {formula name → why it has no curve},
+    {registry name → source status})."""
+    fetch = fetch or _fetch_window_samples
+    have = have or {}
+    src: dict = {}
+    statuses: dict = {}
+    for nm, ch in src_channels.items():
+        if ch in have:
+            vals = have[ch]
+            st = "ok" if vals else "empty"
+        else:
+            try:
+                vals, st, _alt = fetch(ch, start_ns, end_ns)
+            except Exception:
+                vals, st = [], "error"
+        statuses[nm] = st
+        src[nm] = {
+            "channel": ch, "status": st,
+            "ts": np.asarray([t for (t, _v) in vals], dtype=np.int64),
+            "val": np.asarray([float(v) if _is_finite(v) else float("nan")
+                               for (_t, v) in vals], dtype=np.float64),
+        }
+    try:
+        got = build_derived_series(plan, src, [(start_ns, end_ns + 1)])
+    except Exception as e:
+        got = {spec["name"]: {"ts": _EMPTY_TS, "val": _EMPTY_VAL, "reason": str(e)}
+               for spec in plan}
+    series: dict = {}
+    reasons: dict = {}
+    for nm, entry in got.items():
+        # Back to the shape the graph and the statistics read: a plain list of
+        # (t, value), NaN where the formula has a gap.
+        series[nm] = [(int(t), float(v)) for t, v in
+                      zip(entry.get("ts", ()), entry.get("val", ()))]
+        r = entry.get("reason")
+        if r:
+            reasons[nm] = r
+    return series, reasons, statuses
+
+
+def _cond_mask(row: dict, vals) -> "np.ndarray":
+    """One condition row as a test on a whole array; NaN (no value) never passes."""
+    v = np.asarray(vals, dtype=np.float64)
+    op = row.get("op") or ">"
+    a = float(row.get("value") or 0.0)
+    b = float(row.get("value2") or 0.0)
+    with np.errstate(invalid="ignore"):
+        if op == "between":
+            lo, hi = (a, b) if a <= b else (b, a)
+            return (v >= lo) & (v <= hi)
+        if op == ">=":
+            return v >= a
+        if op == "<":
+            return v < a
+        if op == "<=":
+            return v <= a
+        return v > a
+
+
+def _first_all_rows_hit(rows: "list[dict]", windows, after_ns: int = 0,
+                        is_cancelled=lambda: False, fetch=None, seed_fn=None
+                        ) -> "tuple[int, dict] | None":
+    """(t_ns, {channel → value}) of the first moment inside `windows` at which EVERY
+    row holds together, later than `after_ns`; None when there is none. Raises on an
+    archiver failure, so "never" is only said after a real answer.
+
+    Each row is {channel, op, value, value2} — a plain channel, or a formula key
+    carrying its own `plan` and `src_channels`. The rows are put on ONE time base
+    the way a formula's sources are (`_merge_base_ts`: two per-shot channels
+    publishing the same shot tens of ms apart count as one moment) and every row is
+    held forward from its last sample (`_hold_index`, `_hold_limit_ns`) — a setting
+    that last changed an hour ago still has a value now.
+
+    `seed_fn(channel, before_ns)` → (t_ns, value) | None gives a channel's value
+    from before the window, so a step channel with no sample inside it still
+    counts."""
+    fetch = fetch or _fetch_window_samples
+    spans = sorted((int(a), int(b)) for a, b in windows)
+    for a, b in spans:
+        if is_cancelled():
+            return None
+        lo = max(a, int(after_ns) + 1) if after_ns else a
+        if lo > b:
+            continue
+        cols: list = []           # (channel, ts array, val array)
+        for row in rows:
+            key = row.get("channel") or ""
+            if _is_derived_key(key):
+                nm = _derived_name(key)
+                got, _why, st = _formula_samples(row.get("plan") or [],
+                                                 row.get("src_channels") or {},
+                                                 a, b, fetch=fetch)
+                if any(s == "error" for s in st.values()):
+                    raise RuntimeError(f"a source of {nm} could not be read")
+                samples = got.get(nm) or []
+                ch_for_hold = ""
+            else:
+                samples, status, _alt = fetch(key, a, b)
+                if status == "error":
+                    raise RuntimeError(f"{key} could not be read")
+                ch_for_hold = key
+                if seed_fn is not None and (not samples or samples[0][0] > a):
+                    try:
+                        seed = seed_fn(key, a - 1)
+                    except Exception:
+                        seed = None
+                    if seed is not None:
+                        samples = [(int(seed[0]), seed[1])] + list(samples)
+            ts = np.asarray([int(t) for t, _v in samples], dtype=np.int64)
+            val = np.asarray([float(v) if _is_finite(v) else float("nan")
+                              for _t, v in samples], dtype=np.float64)
+            cols.append((ch_for_hold, ts, val, row))
+        base = _merge_base_ts([ts[(ts >= lo) & (ts <= b)] for _c, ts, _v, _r in cols])
+        if base.size == 0:
+            continue
+        ok = np.ones(base.size, dtype=bool)
+        values: dict = {}
+        for ch, ts, val, row in cols:
+            idx = _hold_index(ts, base)
+            have = idx >= 0
+            safe = np.clip(idx, 0, max(ts.size - 1, 0))
+            held = np.full(base.size, np.nan, dtype=np.float64)
+            if ts.size:
+                age = base - ts[safe]
+                live = have & (age <= _hold_limit_ns(ts, ch))
+                held[live] = val[safe][live]
+            ok &= _cond_mask(row, held)
+            values[row.get("channel") or ""] = held
+        hit = np.flatnonzero(ok)
+        if hit.size:
+            i = int(hit[0])
+            return int(base[i]), {k: float(v[i]) for k, v in values.items()}
+    return None
+
+
 def _is_finite(v) -> bool:
     """A real number, and not a NaN or an infinity.
 
@@ -1472,6 +1672,52 @@ QCheckBox::indicator:checked { border: 2px solid #2d7dff; background: #2d7dff; }
 # #111 label is invisible on near-black.
 _CHECKBOX_STYLE_DARK = _CHECKBOX_STYLE.replace("color: #111;", "color: #eeeeee;")
 
+
+class _FitCheckBox(QCheckBox):
+    """A checkbox whose label shrinks its text to fit the width it is given.
+
+    A PV name is never cut (house rule): when "compressed SBW4  (formula)" does not
+    fit beside the test and the value, its text gets smaller instead. The size goes
+    into the widget's own style sheet — a style-sheet font beats setFont()."""
+
+    _BASE_PX = 13
+    _MIN_PX = 8
+
+    def __init__(self, text: str, style: str, parent=None):
+        super().__init__(text, parent)
+        self._style = style
+        self._px = None
+        # The width comes from the layout, never from the text: otherwise a long
+        # name would push the value box off the row before it could shrink.
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(40)
+        self._apply(self._BASE_PX)
+
+    def _apply(self, px: int):
+        if px == self._px:
+            return
+        self._px = px
+        self.setStyleSheet(self._style + f"QCheckBox {{ font-size: {px}px; }}")
+
+    def _fit(self):
+        room = self.width() - 18 - 6 - 10      # indicator, spacing, padding
+        px = self._BASE_PX
+        while px > self._MIN_PX:
+            f = QFont(self.font())
+            f.setPixelSize(px)
+            f.setWeight(QFont.Weight.DemiBold)
+            if QFontMetrics(f).horizontalAdvance(self.text()) <= room:
+                break
+            px -= 1
+        self._apply(px)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        try:
+            self._fit()
+        except Exception:
+            pass
+
 # The "send this on to another tab" buttons. They sit two or three to a row in a
 # 268 px panel, so they are smaller than a normal button — and every colour is
 # spelled out, both states: a button left to the style comes out pale on pale and
@@ -1569,49 +1815,6 @@ def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None,
     if full_scale is None:
         full_scale = img_scale.FULL_SCALE_16
     return img_scale.render_u8(arr, auto, full_scale, gamma, contrast, offset, out)
-
-
-def _scale_note(info: dict, arr, auto: "int | bool", full_scale: float = None, gamma=None,
-                path=None, pil_mode: str = None,
-                contrast: int = 0, offset: int = 0,
-                gamma_applied: "float | None" = None) -> str:
-    """One line saying what the displayed intensities mean, for the label under the
-    preview. `info` is an already-open image's `.info` — never re-open the file for it,
-    a share read costs 130–160 ms.
-
-    A gamma other than 1 is named here because it moves which count a colour sits on;
-    Auto gamma is resolved from the frame so the number shown is the one applied. A
-    manual contrast or brightness is named for exactly the same reason. Pass
-    `gamma_applied` when the render already resolved Auto gamma, so this does not repeat
-    the median pass over the frame.
-
-    "8-bit source" is decided by the PIL MODE when it is given: a 16-bit frame drawn on
-    its camera's reference range also has a full_scale of its own (see img_scale), so
-    testing the number alone would label it an 8-bit file."""
-    applied = gamma_applied
-    if applied is None:
-        applied = (img_scale.auto_gamma(arr, full_scale or img_scale.FULL_SCALE_16)
-                   if img_scale.is_auto_gamma(gamma)
-                   else img_scale.gamma_from_slider(gamma))
-    is_8bit = (pil_mode not in ("I", "I;16")) if pil_mode is not None else (
-        full_scale is not None and full_scale != img_scale.FULL_SCALE_16)
-    if is_8bit:
-        a = int(auto or 0)
-        mode = "absolute scale"
-        if applied is not None and abs(applied - img_scale.GAMMA_NEUTRAL) > 0.005:
-            mode += f"  ·  gamma {applied:.2f}"
-        if contrast:
-            mode += (f"  ·  contrast {int(contrast):+d}"
-                     + (" (auto)" if a & img_scale.AUTO_CONTRAST else ""))
-        if offset:
-            mode += (f"  ·  brightness {int(offset):+d}"
-                     + (" (auto)" if a & img_scale.AUTO_BRIGHT else ""))
-        return f"8-bit source  ·  {mode}"
-    return img_scale.meta_from_info(info, arr).scale_note(
-        auto, gamma, applied,
-        img_scale.current_reference_bits(img_scale.camera_from_path(path))
-        if path is not None else None,
-        contrast, offset)
 
 
 # Frames whose physical max pixel value is below this are considered "empty"
@@ -1790,6 +1993,44 @@ class _NoScrollComboBox(QComboBox):
     """QComboBox that ignores mousewheel — prevents accidental value changes."""
     def wheelEvent(self, event):
         event.ignore()
+
+
+class _CamMenuButton(QPushButton):
+    """The camera name over a frame, which is also the way to jump to another
+    camera: it opens a list of the cameras. It looks like the name plate it replaced,
+    plus a drawn ▼ at its right end so it reads as something to click."""
+
+    _ARROW_W = 26                     # px kept free at the right for the ▼
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # An exception escaping a Qt override takes the program down — draw or skip.
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            h = self.height()
+            cx = self.width() - self._ARROW_W // 2 - 2
+            cy = h // 2 + 1
+            s = max(4, min(7, h // 5))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#ffffff") if self.isEnabled() else QColor("#8a8a8a"))
+            p.drawPolygon([QPoint(cx - s, cy - s // 2 - 1),
+                           QPoint(cx + s, cy - s // 2 - 1),
+                           QPoint(cx, cy + s // 2 + 2)])
+            p.end()
+        except Exception:
+            pass
+
+
+# The light drop-down list the camera button opens — the Workshop's menu look. Set on
+# the menu itself: the app stylesheet would otherwise paint it grey-on-grey.
+_CAM_MENU_QSS = (
+    "QMenu { background: #ffffff; color: #16202c; border: 1px solid #c3c9d2;"
+    " padding: 3px; font-size: 14px; }"
+    "QMenu::item { padding: 5px 22px 5px 22px; }"
+    "QMenu::item:selected { background: #cfe0f7; color: #10243c; }"
+    "QMenu::item:checked { font-weight: bold; }"
+    "QMenu::item:disabled { color: #9aa3ad; }")
 
 # ── UI HELPERS ────────────────────────────────────────────────────────────────
 def _hsep() -> QFrame:
@@ -3215,10 +3456,11 @@ class ImageFinderWidget(QWidget):
         s_act  = _add_section("actions",  "Actions",          True)
         s_pv   = _add_section("pv",       "PV Values",        True)
         # Image / Display used to be folded away — it was three sliders and a palette.
-        # It now also holds the marks, the rotation and the reference day that used to
-        # sit in a strip above the pictures, so it opens by default.
+        # It now also holds the marks and the rotation that used to sit in a strip
+        # above the pictures, so it opens by default.
         s_disp = _add_section("display",  "Image / Display",  True)
-        s_cmp  = _add_section("compare",  "Comparison",       False)
+        # Comparison holds the reference day as well as A/B, so it opens by default too.
+        s_cmp  = _add_section("compare",  "Comparison",       True)
 
         # ══════════════════ Group: SOURCE ════════════════════════════════════
         # The Image Slider's Source pattern: one button opens the calendar, the
@@ -3364,8 +3606,7 @@ class ImageFinderWidget(QWidget):
         # in Prague (real) time — this tab has no lab-time mode any more.
         self._segments: "list" = [
             daypicker.PickSeg(daypicker.qdate_to_date(self._selected_days[0]),
-                              *daypicker.default_window_for(
-                                  daypicker.qdate_to_date(self._selected_days[0])))]
+                              *_finder_default_window())]
         # The Mon–Sun gate for a Ctrl+Shift stretch lives in the dialog now; the
         # last state is carried across openings so it does not reset every time.
         self._wd_gate: "set[int]" = {0, 1, 2, 3, 4}
@@ -3381,6 +3622,7 @@ class ImageFinderWidget(QWidget):
         self._pv_table = _get_slider_module().PvValueTable()
         self._pv_table.setVisible(False)
         self._pv_table.eye_clicked.connect(self._pv_toggle_eye)
+        self._pv_table.hidden_set_requested.connect(self._pv_set_hidden)
         ll.addWidget(self._pv_table)
         self._pv_no_pv_lbl = QLabel("No PVs selected. Click PVs to choose.")
         self._pv_no_pv_lbl.setStyleSheet("font-size: 10px; color: #888; padding: 2px 0;")
@@ -3657,16 +3899,9 @@ class ImageFinderWidget(QWidget):
         # this tab that was not in the panel. They ask the same question as the
         # sliders above ("how does the wall look"), so they live in the same group,
         # under a divider.
+        # The reference day is not here: it is a comparison, so it sits in the
+        # Comparison group next to A/B.
         ll.addWidget(_hsep())
-
-        ref_row = QHBoxLayout(); ref_row.setSpacing(4)
-        ref_row.addWidget(QLabel("Reference day:"))
-        self._baseline_cb = _NoScrollComboBox()
-        # No minimum width: in a 268 px panel a minimum on a combo is what pushes a
-        # horizontal scrollbar onto the whole column. It takes the space that is left.
-        self._baseline_cb.currentIndexChanged.connect(self._on_baseline_changed)
-        ref_row.addWidget(self._baseline_cb, 1)
-        ll.addLayout(ref_row)
 
         size_row = QHBoxLayout(); size_row.setSpacing(4)
         self._btn_fit = QPushButton("Fit")
@@ -3685,10 +3920,95 @@ class ImageFinderWidget(QWidget):
         size_row.addWidget(self._btn_save_wall, 1)
         ll.addLayout(size_row)
 
+        # The picture size as a slider — the same zoom Ctrl + wheel sets, for
+        # whoever does not know the wheel does it.
+        zoom_row = QHBoxLayout(); zoom_row.setSpacing(4)
+        zoom_row.addWidget(QLabel("Picture size:"))
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(int(_DayWall._ZOOM_MIN * 100),
+                                   int(_DayWall._ZOOM_MAX * 100))
+        self._zoom_slider.setValue(100)
+        self._zoom_slider.setToolTip(
+            "How big the frames are drawn. The middle of the pane is 100 %; bigger "
+            "makes the pane scroll. Fit puts it back.")
+        self._zoom_slider.valueChanged.connect(self._on_zoom_slider)
+        zoom_row.addWidget(self._zoom_slider, 1)
+        ll.addLayout(zoom_row)
+
+        # The text size of the caption under each frame, in half points —
+        # remembered for the next start.
+        cap_row = QHBoxLayout(); cap_row.setSpacing(4)
+        cap_row.addWidget(QLabel("Label size:"))
+        self._cap_slider = QSlider(Qt.Orientation.Horizontal)
+        self._cap_slider.setRange(int(_DayWall.CAPTION_PT_MIN * 2),
+                                  int(_DayWall.CAPTION_PT_MAX * 2))
+        try:
+            cap_pt = float(self._ui_state.get("caption_pt",
+                                              _DayWall.CAPTION_PT_DEFAULT))
+        except (TypeError, ValueError):
+            cap_pt = _DayWall.CAPTION_PT_DEFAULT
+        cap_pt = max(_DayWall.CAPTION_PT_MIN, min(_DayWall.CAPTION_PT_MAX, cap_pt))
+        self._cap_slider.setValue(int(round(cap_pt * 2)))
+        self._cap_slider.setToolTip(
+            "How big the text under each frame is (time, day, camera).")
+        self._cap_val_lbl = QLabel(f"{cap_pt:g} pt")
+        self._cap_val_lbl.setMinimumWidth(QFontMetrics(
+            self._cap_val_lbl.font()).horizontalAdvance("20.5 pt") + 2)
+        self._cap_slider.valueChanged.connect(self._on_caption_slider)
+        cap_row.addWidget(self._cap_slider, 1)
+        cap_row.addWidget(self._cap_val_lbl)
+        ll.addLayout(cap_row)
+
+        # Day by day: cameras as rows (days across) or as columns (days downward).
+        # The buttons live in a strip ABOVE the pictures (built with the tabs below):
+        # in this panel nobody found them.
+        self._day_strip = QWidget()
+        lay_row = QHBoxLayout(self._day_strip)
+        lay_row.setContentsMargins(4, 2, 4, 2); lay_row.setSpacing(6)
+        _strip_lbl = QLabel("Day by day layout:")
+        _strip_lbl.setStyleSheet("color:#111111; font-weight:600;")
+        lay_row.addWidget(_strip_lbl)
+        self._btn_day_horiz = QPushButton("Horizontal")
+        self._btn_day_vert = QPushButton("Vertical")
+        for b in (self._btn_day_horiz, self._btn_day_vert):
+            b.setCheckable(True)
+            b.setFixedHeight(24)
+            b.setMinimumWidth(96)
+            b.setStyleSheet(
+                "QPushButton { background:#e8e8e8; color:#111; border:1px solid #9a9a9a;"
+                " border-radius:3px; padding:2px 10px; font-weight:600; }"
+                "QPushButton:hover:!checked { background:#ffffff; }"
+                "QPushButton:checked { background:#1565C0; color:#ffffff;"
+                " border:1px solid #0D47A1; }")
+            lay_row.addWidget(b, 0)
+        lay_row.addStretch(1)
+        self._btn_day_horiz.setToolTip(
+            "One row per camera, the days next to each other.")
+        self._btn_day_vert.setToolTip(
+            "One column per camera, the days under each other — newest on top.")
+        self._day_layout = ("rows" if self._ui_state.get("day_layout") == "rows"
+                            else "cols")
+        self._btn_day_horiz.setChecked(self._day_layout == "rows")
+        self._btn_day_vert.setChecked(self._day_layout == "cols")
+        self._btn_day_horiz.clicked.connect(lambda: self._set_day_layout("rows"))
+        self._btn_day_vert.clicked.connect(lambda: self._set_day_layout("cols"))
+
         self._build_overlay_controls(ll)
 
         # ══════════════════ Group: COMPARISON ════════════════════════════════
         ll = s_cmp.body_layout
+
+        # Reference day: every other day on the wall is drawn as its difference from
+        # this one, on one common intensity scale.
+        ref_row = QHBoxLayout(); ref_row.setSpacing(4)
+        ref_row.addWidget(QLabel("Reference day:"))
+        self._baseline_cb = _NoScrollComboBox()
+        # No minimum width: in a 268 px panel a minimum on a combo is what pushes a
+        # horizontal scrollbar onto the whole column. It takes the space that is left.
+        self._baseline_cb.currentIndexChanged.connect(self._on_baseline_changed)
+        ref_row.addWidget(self._baseline_cb, 1)
+        ll.addLayout(ref_row)
+        ll.addWidget(_hsep())
 
         # memory A/B
         ab_row = QHBoxLayout()
@@ -3756,6 +4076,7 @@ class ImageFinderWidget(QWidget):
         pcl.setContentsMargins(0, 0, 0, 0); pcl.setSpacing(2)
 
         self._wall_shared = _WallShared()
+        self._wall_shared.cap_pt = self._cap_slider.value() / 2.0
         self._cam_walls: "dict[str, _DayWall]" = {}
         self._wall_pages: "dict[int, _DayWall]" = {}   # tab index → wall
         self._last_wall_tab = 0
@@ -3787,7 +4108,6 @@ class ImageFinderWidget(QWidget):
         self._preview_lbl       = self._frame_view["img"]
         self._preview_cam_lbl   = self._frame_view["cam"]
         self._preview_ts_lbl    = self._frame_view["ts"]
-        self._preview_scale_lbl = self._frame_view["scale"]
         self._preview_counter   = self._frame_view["counter"]
         self._prev_btn          = self._frame_view["prev"]
         self._next_btn          = self._frame_view["next"]
@@ -3799,6 +4119,10 @@ class ImageFinderWidget(QWidget):
         self._detail_tab_idx = self._view_tabs.addTab(self._detail_page,
                                                       self._DETAIL_TAB_TITLE)
         self._view_tabs.currentChanged.connect(self._on_view_tab_changed)
+        # The Day by day layout switch, over the pictures it changes — shown only
+        # while the Day by day tab is on screen (_on_view_tab_changed).
+        pcl.addWidget(self._day_strip, 0)
+        self._day_strip.setVisible(False)
         pcl.addWidget(self._view_tabs, 1)
 
         outer.addWidget(preview_col, 1)
@@ -4038,7 +4362,13 @@ class ImageFinderWidget(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._wd_gate = {i for i, cb in enumerate(dlg._wd_checks) if cb.isChecked()}
-        self._segments = dlg.all_segments()
+        # The picker cuts TODAY's default off at the next hour. This tab searches the
+        # whole lab day, so a today the user never retimed gets the full 07–21 too.
+        self._segments = [
+            daypicker.PickSeg(s.date, *_finder_default_window())
+            if (s.h_from, s.m_from, s.h_to, s.m_to)
+            == tuple(daypicker.default_window_for(s.date)) else s
+            for s in dlg.all_segments()]
         self._selected_days = [daypicker.date_to_qdate(s.date) for s in self._segments]
         self._user_has_selected_day = True
         self._quiet_load_gen = None
@@ -4098,7 +4428,11 @@ class ImageFinderWidget(QWidget):
         # only repaints what a scroll newly exposed — so the whole wall is asked to
         # repaint, or the day label smears across the band.
         sc.horizontalScrollBar().valueChanged.connect(
-            lambda _v, w=wall: w.update() if w.layout_mode() == "rows" else None)
+            lambda _v, w=wall: w.update()
+            if w.layout_mode() in ("rows", "cols") else None)
+        # Same for the camera band of the vertical wall, which rides down with it.
+        sc.verticalScrollBar().valueChanged.connect(
+            lambda v, w=wall: w.on_vscroll(v))
         return sc
 
     def _zoom_wall(self, wall: "_DayWall", notches: int):
@@ -4120,6 +4454,42 @@ class ImageFinderWidget(QWidget):
         self._btn_fit.setEnabled(abs(z - 1.0) > 1e-6)
         self._btn_fit.setText("Fit" if abs(z - 1.0) <= 1e-6
                               else f"Fit  ({z * 100:.0f} %)")
+        sl = getattr(self, "_zoom_slider", None)
+        if sl is not None and sl.value() != int(round(z * 100)):
+            sl.blockSignals(True)
+            sl.setValue(int(round(z * 100)))
+            sl.blockSignals(False)
+
+    def _on_zoom_slider(self, value: int):
+        w = getattr(self, "_wall", None)
+        if w is not None and w.set_zoom(value / 100.0):
+            self._sync_zoom_label()
+
+    def _on_caption_slider(self, value: int):
+        pt = value / 2.0
+        self._cap_val_lbl.setText(f"{pt:g} pt")
+        walls = self._all_walls()
+        self._wall_shared.cap_pt = pt
+        for w in walls:
+            w.refresh_captions()
+        self._ui_state["caption_pt"] = pt
+        self._write_ui_state_file({"caption_pt": pt})
+
+    def _set_day_layout(self, mode: str):
+        """Horizontal (a row per camera) or vertical (a column per camera) for the
+        Day by day wall — remembered for the next start."""
+        self._day_layout = mode
+        self._btn_day_horiz.setChecked(mode == "rows")
+        self._btn_day_vert.setChecked(mode == "cols")
+        self._ui_state["day_layout"] = mode
+        self._write_ui_state_file({"day_layout": mode})
+        dw = getattr(self, "_day_wall", None)
+        if dw is not None and dw.layout_mode() in ("rows", "cols"):
+            dw.set_layout_mode(mode)
+            host = dw._scroll_host
+            if host is not None:
+                host.verticalScrollBar().setValue(0)
+                host.horizontalScrollBar().setValue(0)
 
     def _wire_wall(self, wall: "_DayWall"):
         wall.tile_clicked.connect(self._on_wall_tile_clicked)
@@ -4143,7 +4513,7 @@ class ImageFinderWidget(QWidget):
         " border:1px solid #5f5f5f; }")
 
     def _make_frame_page(self) -> "tuple[QWidget, dict]":
-        """The frame page — picture, captions, the scale note and the ◀ ▶ row.
+        """The frame page — captions on top, the picture, and the ◀ ▶ row.
 
         Built TWICE: the close-up window and the Detailed view tab are the same
         thing in two places, and a second copy of the code would be a second look
@@ -4151,8 +4521,8 @@ class ImageFinderWidget(QWidget):
         one frame list, one index and one background read — step forward in the tab
         and the window is on the same frame.
 
-        Returns the page and its widgets: `img`, `cam`, `ts`, `scale`, `prev`,
-        `next`, `counter`.
+        Returns the page and its widgets: `img`, `cam` (the camera button),
+        `cam_menu`, `ts`, `prev`, `next`, `counter`.
         """
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -4179,23 +4549,27 @@ class ImageFinderWidget(QWidget):
         pal.setColor(QPalette.ColorRole.WindowText, QColor("#eeeeee"))
         page.setPalette(pal)
 
-        img = QLabel()
-        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        img.setStyleSheet("background:#1a1a1a; border-radius:3px;")
-        img.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        img.setMinimumSize(100, 100)
-        img.setScaledContents(False)      # scaled by hand, keeping the aspect
-        lay.addWidget(img, 1)
-
+        # The camera and the time sit ABOVE the picture, where the operators look for
+        # them. The camera plate is a button: it lists the cameras and jumps to one.
         lbl_row = QHBoxLayout()
         lbl_row.setContentsMargins(0, 0, 0, 0)
         lbl_row.setSpacing(2)
-        cam = QLabel("")
-        cam.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        cam = _CamMenuButton("")
         cam.setStyleSheet(
-            "font-size: 20px; font-weight: bold; color: #eee; background: #444; "
-            "padding: 2px 6px; border-radius: 2px;")
+            "QPushButton { font-size: 20px; font-weight: bold; color: #eeeeee;"
+            " background: #444444; border: 1px solid #5a5a5a; border-radius: 2px;"
+            f" padding: 2px {_CamMenuButton._ARROW_W + 4}px 2px 6px; text-align: left; }}"
+            "QPushButton:hover { background: #555555; border: 1px solid #8a8a8a; }"
+            "QPushButton:pressed { background: #3a3a3a; }"
+            "QPushButton::menu-indicator { image: none; width: 0px; }")
         cam.setFixedHeight(34)
+        cam.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        cam.setToolTip("Jump to another camera")
+        cam_menu = QMenu(cam)
+        cam_menu.setStyleSheet(_CAM_MENU_QSS)
+        cam_menu.aboutToShow.connect(
+            lambda m=cam_menu: self._fill_cam_menu(m))
+        cam.setMenu(cam_menu)
         ts = QLabel("")
         ts.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         ts.setStyleSheet(
@@ -4206,14 +4580,13 @@ class ImageFinderWidget(QWidget):
         lbl_row.addWidget(ts, 2)
         lay.addLayout(lbl_row, 0)
 
-        # What the displayed intensities MEAN. Without it a frame at 3 % of full scale
-        # is indistinguishable from a broken render, and a palette is decoration rather
-        # than a reading.
-        scale = QLabel("")
-        scale.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        scale.setStyleSheet(
-            "font-size: 11px; color: #bbb; background: transparent; padding: 0 6px;")
-        lay.addWidget(scale, 0)
+        img = QLabel()
+        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img.setStyleSheet("background:#1a1a1a; border-radius:3px;")
+        img.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        img.setMinimumSize(100, 100)
+        img.setScaledContents(False)      # scaled by hand, keeping the aspect
+        lay.addWidget(img, 1)
 
         # Step through the frames. These arrows lived in the panel on the left, far
         # from the picture they move — nobody found them. They belong under the frame.
@@ -4245,8 +4618,71 @@ class ImageFinderWidget(QWidget):
         nav.addStretch(1)
         lay.addLayout(nav, 0)
 
-        return page, {"img": img, "cam": cam, "ts": ts, "scale": scale,
+        return page, {"img": img, "cam": cam, "cam_menu": cam_menu, "ts": ts,
                       "prev": prev, "next": nxt, "counter": counter}
+
+    def _fill_cam_menu(self, menu: QMenu):
+        """The cameras of the frames being stepped through, in their order on the
+        wall, the one on screen ticked. Filled as it opens, so it is always the
+        current list."""
+        menu.clear()
+        # As wide as the plate it drops from, like any drop-down list.
+        btn = menu.parentWidget()
+        if btn is not None:
+            menu.setMinimumWidth(btn.width())
+        names = list(self._preview_cam_names or [])
+        if not names and self._preview_paths:
+            names = [Path(p).parent.name for p in self._preview_paths]
+        idx = self._preview_idx
+        cur = names[idx] if 0 <= idx < len(names) else None
+        seen: list = []
+        for n in names:
+            if n not in seen:
+                seen.append(n)
+        if not seen:
+            a = menu.addAction("No frames")
+            a.setEnabled(False)
+            return
+        for n in seen:
+            a = menu.addAction(extract_display_label(n))
+            a.setCheckable(True)
+            a.setChecked(n == cur)
+            a.triggered.connect(lambda _c=False, name=n: self._jump_to_camera(name))
+
+    def _jump_to_camera(self, cam_name: str):
+        """Show `cam_name`'s frame of the SAME day and pick as the one on screen —
+        that is the comparison — or its first frame when it has none there."""
+        names = list(self._preview_cam_names or [])
+        if not names or not self._preview_paths:
+            return
+        mine = [i for i, n in enumerate(names) if n == cam_name]
+        if not mine:
+            return
+        cells: dict = {}
+        for w in self._all_walls():
+            for c in w.cells():
+                if c.get("path") is not None:
+                    cells.setdefault(c["path"], c)
+
+        def where(p) -> tuple:
+            c = cells.get(p) or {}
+            return (str(c.get("day")), c.get("col_slot") or c.get("pick") or 0)
+
+        cur_p = (self._preview_paths[self._preview_idx]
+                 if 0 <= self._preview_idx < len(self._preview_paths) else None)
+        target = mine[0]
+        if cur_p is not None and cur_p in cells:
+            want = where(cur_p)
+            same = [i for i in mine if where(self._preview_paths[i]) == want]
+            if same:
+                target = same[0]
+            else:
+                same_day = [i for i in mine
+                            if where(self._preview_paths[i])[0] == want[0]]
+                if same_day:
+                    target = same_day[0]
+        self._preview_idx = target
+        self._preview_show()
 
     def _detail_tab_is_current(self) -> bool:
         """Is the Detailed view the tab on screen? A frame is only rendered for a
@@ -4296,10 +4732,11 @@ class ImageFinderWidget(QWidget):
         idx = getattr(self, "_detail_tab_idx", None)
         if idx is None:
             return
-        n = len(self._preview_paths)
+        same = self._cam_indices()
         txt = self._DETAIL_TAB_TITLE
-        if n:
-            txt += f"  ({self._preview_idx + 1}/{n})"
+        if same:
+            k = (same.index(self._preview_idx) + 1) if self._preview_idx in same else 1
+            txt += f"  ({k}/{len(same)})"
         self._view_tabs.setTabText(idx, txt)
 
     def keyPressEvent(self, event):
@@ -4389,8 +4826,12 @@ class ImageFinderWidget(QWidget):
             # reference that wall already has.
             self._rebuild_baseline_combo(wall.cells(),
                                          current=getattr(wall, "_baseline_idx", None))
-        for w in (self._baseline_cb, self._btn_save_wall):
+        for w in (self._baseline_cb, self._btn_save_wall, self._zoom_slider):
             w.setEnabled(on_wall)
+        dw = getattr(self, "_day_wall", None)
+        self._day_strip.setVisible(
+            on_wall and wall is dw and dw is not None
+            and dw.layout_mode() in ("rows", "cols"))
         for w in self._overlay_widgets:
             w.setEnabled(on_wall)
         # Fit belongs to the wall now on screen, and each wall carries its own zoom.
@@ -4568,7 +5009,7 @@ class ImageFinderWidget(QWidget):
         day_wall = _DayWall(shared=self._wall_shared)
         self._wire_wall(day_wall)
         if cells:
-            day_wall.set_layout_mode("rows")
+            day_wall.set_layout_mode(getattr(self, "_day_layout", "cols"))
             day_wall.set_cells(cells)
             title = "Day by day"
         else:
@@ -5397,17 +5838,33 @@ class ImageFinderWidget(QWidget):
         self._preview_from_view = True
         self._preview_show()
 
-    def _preview_prev(self):
-        if not self._preview_paths:
+    def _cam_indices(self, idx: "int | None" = None) -> "list[int]":
+        """The frames of the camera shown at `idx` (default: the current frame), in
+        list order. The ◀ ▶ arrows and the "k / N" counter work inside this list:
+        four cameras over ten days step 1 / 10, and the camera plate picks which ten."""
+        n = len(self._preview_paths)
+        if n == 0:
+            return []
+        idx = self._preview_idx if idx is None else idx
+        names = self._preview_cam_names or []
+        if len(names) != n or not (0 <= idx < n):
+            return list(range(n))
+        cam = names[idx]
+        return [i for i, c in enumerate(names) if c == cam]
+
+    def _preview_step(self, delta: int):
+        same = self._cam_indices()
+        if not same:
             return
-        self._preview_idx = (self._preview_idx - 1) % len(self._preview_paths)
+        k = same.index(self._preview_idx) if self._preview_idx in same else 0
+        self._preview_idx = same[(k + delta) % len(same)]
         self._preview_show()
 
+    def _preview_prev(self):
+        self._preview_step(-1)
+
     def _preview_next(self):
-        if not self._preview_paths:
-            return
-        self._preview_idx = (self._preview_idx + 1) % len(self._preview_paths)
-        self._preview_show()
+        self._preview_step(+1)
 
     def _on_preview_ready(self, qimg: QImage, gen: int):
         """Slot called on main thread when background thread finishes loading."""
@@ -5417,7 +5874,6 @@ class ImageFinderWidget(QWidget):
         energy_text = getattr(self, "_preview_energy_text", "")
         if energy_text:
             pm = self._paint_pv_bar(pm, energy_text)
-        note = getattr(self, "_preview_scale_note", "")
         # Park the greyed-out sliders on what the Auto passes actually applied to this
         # frame, so the number on screen is the number in the picture (same contract as
         # the Slider tab's Auto controls).
@@ -5426,7 +5882,6 @@ class ImageFinderWidget(QWidget):
         # usually hidden, and scaling for a hidden label costs nothing worth avoiding
         # while it keeps the two in step: switch to the other and the frame is there.
         for view in getattr(self, "_frame_views", []):
-            view["scale"].setText(note)
             lbl = view["img"]
             avail_w = max(lbl.width(),  200)
             avail_h = max(lbl.height(), 200)
@@ -5481,8 +5936,11 @@ class ImageFinderWidget(QWidget):
         if not self._preview_paths:
             return
         idx   = self._preview_idx
-        total = len(self._preview_paths)
         path  = self._preview_paths[idx]
+        # Counted within the camera on screen — see _cam_indices.
+        same = self._cam_indices(idx)
+        n_cam = len(same)
+        k_cam = (same.index(idx) + 1) if idx in same else 1
         # Use per-file cam name if available, fallback to folder name
         per_file_cam = (self._preview_cam_names[idx]
                         if self._preview_cam_names and idx < len(self._preview_cam_names)
@@ -5490,9 +5948,9 @@ class ImageFinderWidget(QWidget):
         raw_cam = per_file_cam or self._preview_cam or path.parent.name
         cam_txt = extract_display_label(raw_cam)
         for view in getattr(self, "_frame_views", []):
-            view["counter"].setText(f"{idx + 1} / {total}")
-            view["prev"].setEnabled(total > 1)
-            view["next"].setEnabled(total > 1)
+            view["counter"].setText(f"{k_cam} / {n_cam}")
+            view["prev"].setEnabled(n_cam > 1)
+            view["next"].setEnabled(n_cam > 1)
             view["cam"].setText(cam_txt)
         self._sync_detail_title()
         ns = extract_ns_from_stem(path.stem)
@@ -5515,8 +5973,6 @@ class ImageFinderWidget(QWidget):
 
         # PV overlay text for the bar painted in _on_preview_ready (main thread).
         self._preview_energy_text = ""
-        # Cleared here so a failed load shows no note rather than the previous frame's.
-        self._preview_scale_note = ""
         if (self._cb_pv_preview.isChecked() and self._pv_visible_cols()):
             entry = self._energy_entry_for_path(path)
             if entry is not None:
@@ -5566,13 +6022,6 @@ class ImageFinderWidget(QWidget):
                 bc_out: dict = {}
                 arr8 = _render_u8(arr, auto, full_scale, gamma, contrast, offset, bc_out)
                 self._bc_applied = bc_out
-                # The note names what was APPLIED, so it reads Auto's numbers out of
-                # bc_out rather than the zeros the widgets hold while Auto is on.
-                self._preview_scale_note = _scale_note(
-                    info, arr, auto, full_scale, gamma, path, mode,
-                    int(bc_out.get("contrast", contrast)),
-                    int(bc_out.get("offset", offset)),
-                    bc_out.get("gamma"))
                 lut = GRADIENTS.get(grad_name)
                 if lut is not None:
                     pil_img = PilImage.fromarray(
@@ -5663,7 +6112,7 @@ class ImageFinderWidget(QWidget):
         for s in self._segments:
             if s.date == day:
                 return (s.h_from, s.m_from, s.h_to, s.m_to)
-        return daypicker.default_window_for(day)
+        return _finder_default_window()
 
     def _auto_select_today(self):
         """Called once after startup — act on the day the tab opened on."""
@@ -5931,6 +6380,16 @@ class ImageFinderWidget(QWidget):
         self._save_pv_state()
         self._pv_refresh_table()
         # The bar under the preview follows the eye, so the frame has to be repainted.
+        if self._preview_paths:
+            self._preview_show()
+
+    def _pv_set_hidden(self, hidden):
+        """Master eye in the PV table's header: a whole new hidden set at once."""
+        listed = set(self._energy_selected_cols)
+        self._energy_hidden_pvs = ((set(self._energy_hidden_pvs) - listed)
+                                   | (set(hidden or ()) & listed))
+        self._save_pv_state()
+        self._pv_refresh_table()
         if self._preview_paths:
             self._preview_show()
 
@@ -7501,8 +7960,14 @@ class ImageFinderWidget(QWidget):
             "<=": lambda v: v <= a,
         }.get(op, lambda v: v > a)
 
-    @staticmethod
-    def _cond_text(condition: dict) -> str:
+    @classmethod
+    def _cond_text(cls, condition: dict) -> str:
+        """The condition in words — every row, joined by "and"."""
+        rows = condition.get("rows") or []
+        if len(rows) > 1:
+            return " and ".join(cls._cond_text(dict(r)) for r in rows)
+        if rows:
+            condition = rows[0]
         op = condition.get("op") or ">"
         lbl = condition.get("label") or condition.get("channel") or "PV"
         if op == "between":
@@ -7514,18 +7979,22 @@ class ImageFinderWidget(QWidget):
 
     def _find_condition_moment(self, days, cams, condition,
                                regions_by_day, cancelled=None, log_fn=None,
-                               after_ns: int = 0) -> dict:
-        """The FIRST moment the condition held and the cameras had something on them.
+                               after_ns: int = 0,
+                               windows_by_day: "dict | None" = None) -> dict:
+        """The FIRST moment the condition held.
 
         One moment for every camera, on purpose: the question "what did the cameras
         look like when SBW4 was over 13 J" is about one shot, and giving each camera
         its own nearest-match timestamp would answer a different question per tile.
 
+        Only inside the time the user set: the marked regions when the scope is
+        "regions", otherwise each day's picked window (`windows_by_day`, day →
+        [(start_ns, end_ns)]); a day missing from it is searched whole.
+
         Returns {status, target_ns, value, day, …}. `status` is one of
           found              — target_ns is the answer
           never_met          — the condition was never true on the marked days
-          no_camera_signal   — it was true, but no camera was live at any such moment
-          archiver_error     — the days could not be read, so "never" cannot be said
+          archiver_error    — the days could not be read, so "never" cannot be said
           cancelled
         """
         def log(msg: str):
@@ -7538,118 +8007,139 @@ class ImageFinderWidget(QWidget):
         channel = condition.get("channel")
         test = self._cond_predicate(condition)
         scope_regions = (condition.get("scope") == "regions")
+        # One plain PV keeps the fast walk (hour slices, stop at the first hit).
+        # Several rows, or a formula, are judged together on one time base.
+        rows = list(condition.get("rows") or [])
+        joint = len(rows) > 1 or any(_is_derived_key(r.get("channel") or "")
+                                     for r in rows)
 
-        # ── 1. Every moment the condition held, in time order ────────────────
+        # ── 1. The FIRST moment the condition held — and nothing more ─────────
+        # 13.10.2026, the user: "find the first image that meets the condition and
+        # move on". So the day is not read whole: the time is walked forward in
+        # growing slices (1 h, 2 h, 4 h, …) and the walk stops at the first sample
+        # that passes. A day already in the cache (PV Search just drew it) is
+        # answered from there with no request at all.
         candidates: list = []          # (t_ns, value, day)
         error_days: list = []
         for day in days:
             if is_cancelled():
                 return {"status": "cancelled"}
             key = day.strftime("%Y-%m-%d")
-            ch_day = cpva.channel_for_day(channel, key)
-            try:
-                res = cpva.get_day(ch_day, key, timeout=cpva.FULL_DAY_TIMEOUT)
-            except Exception as e:
-                log(f"{key}: archiver error — {e}")
-                error_days.append(day)
-                continue
-            if res.status in ("error", "stale"):
-                log(f"{key}: archiver did not answer ({res.status})")
-                error_days.append(day)
-                if res.status == "error":
-                    continue
-            windows = None
             if scope_regions:
                 marked = regions_by_day.get(day) or regions_by_day.get(key) or []
                 if not marked:
                     log(f"{key}: no region marked — skipped")
                     continue
                 windows = [_region_span(r) for r in marked]
-            hits = 0
-            for t_ns, val in res.samples:
-                try:
-                    fv = float(val)
-                except (TypeError, ValueError):
-                    continue
-                if not test(fv):
-                    continue
-                if windows is not None and not any(a <= t_ns <= b for a, b in windows):
-                    continue
-                if after_ns and int(t_ns) <= after_ns:
-                    continue        # already tried and rejected
-                candidates.append((int(t_ns), fv, day))
-                hits += 1
-                if hits >= _COND_MAX_HITS_PER_DAY:
-                    log(f"{key}: {hits} matching samples — only the earliest are tried")
-                    break
-            if hits:
-                log(f"{key}: {hits} sample(s) match")
+            else:
+                windows = (windows_by_day or {}).get(day) or [_day_bounds_ns_for(day)]
+            values: dict = {}
+            try:
+                if joint:
+                    got = _first_all_rows_hit(rows, windows, after_ns, is_cancelled,
+                                              seed_fn=self._cond_seed)
+                    hit = None
+                    if got is not None:
+                        values = got[1]
+                        hit = (got[0], values.get(channel, float("nan")))
+                else:
+                    hit = self._first_condition_hit(channel, key, windows, test,
+                                                    after_ns, is_cancelled)
+            except Exception as e:
+                log(f"{key}: archiver error — {e}")
+                error_days.append(day)
+                continue
+            if hit is not None:
+                candidates.append((hit[0], hit[1], day, values))
         candidates.sort(key=lambda c: c[0])
 
         if not candidates:
+            if is_cancelled():
+                return {"status": "cancelled"}
             if error_days:
                 return {"status": "archiver_error", "error_days": error_days}
             return {"status": "never_met"}
 
-        # ── 2. The first of them where the cameras were actually live ────────
-        # Judged by each camera's own :TotalPower — the reading the automatic search
-        # already trusts for "was this camera seeing anything".
-        tp_cache: dict = {}
+        # No per-camera "was it live" check any more: it read every camera's
+        # TotalPower for the whole day before a single frame was looked at, and
+        # was most of the search's time. A blank frame is still caught afterwards
+        # (_condition_results tries the next moment when EVERY camera is blank).
+        t_ns, val, day, values = candidates[0]
+        return {"status": "found", "target_ns": t_ns, "value": val, "day": day,
+                "values": values,
+                "cams_live": 0, "cams": len(cams),
+                "error_days": error_days, "candidates": len(candidates)}
 
-        def cam_live(cam_name: str, day, t_ns: int) -> "bool | None":
-            """True/False, or None when this camera cannot be judged (no TotalPower
-            channel, or the archiver would not say)."""
-            tp = _cam_totalpower_channel(cam_name)
-            if not tp:
+    @staticmethod
+    def _cond_seed(channel: str, before_ns: int) -> "tuple[int, float] | None":
+        """The value a STEP channel (a setting, the waveplate) was sitting at before
+        a window opened — it may not move inside the window at all, and that is
+        still a value. A per-shot channel is never carried in from outside."""
+        try:
+            if not cpva.is_step_channel(channel):
                 return None
-            key = (cam_name, day)
-            if key not in tp_cache:
+            res = cpva.value_at_or_before(channel, int(before_ns))
+        except Exception:
+            return None
+        if res.ts_ns is None or res.value is None:
+            return None
+        return int(res.ts_ns), float(res.value)
+
+    @staticmethod
+    def _first_condition_hit(channel: str, key: str, windows, test,
+                             after_ns: int = 0, is_cancelled=lambda: False
+                             ) -> "tuple[int, float] | None":
+        """(t_ns, value) of the first sample inside `windows` (sorted or not) that
+        passes `test` and is later than `after_ns`; None when there is none.
+        Raises on an archiver failure, so "never" is only said after a real answer.
+
+        From the day cache when it already holds the day; otherwise the windows
+        are read forward in slices of 1, 2, 4, 8… hours and the walk stops at the
+        first hit — a match at 09:00 costs one small request instead of a day."""
+        def first_in(samples, a, b):
+            for t, v in samples:
+                if t < a or t > b or (after_ns and t <= after_ns):
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if test(fv):
+                    return int(t), fv
+            return None
+
+        spans = sorted((int(a), int(b)) for a, b in windows)
+        for name in cpva.read_order(channel):
+            cached = cpva.peek_day(name, key)
+            # A carry-over sample from before the day is not the day's data.
+            if (cached is not None and cached.samples
+                    and cached.samples[-1][0] >= cpva.day_bounds_ns(key)[0]):
+                for a, b in spans:
+                    hit = first_in(cached.samples, a, b)
+                    if hit is not None:
+                        return hit
+                return None
+        hour = 3_600_000_000_000
+        for a, b in spans:
+            lo = max(a, int(after_ns) + 1) if after_ns else a
+            step = hour
+            while lo <= b:
                 if is_cancelled():
                     return None
-                d0, d1 = _day_bounds_ns_for(day)
-                try:
-                    tp_cache[key] = _cpva_active_windows_ns(tp, d0, d1,
-                                                            debug_log=None) or []
-                except Exception as e:
-                    log(f"TotalPower {tp}: {e}")
-                    tp_cache[key] = None
-            wins = tp_cache[key]
-            if wins is None:
-                return None
-            if not wins:
-                return False
-            return any(a <= t_ns <= b for a, b in wins)
-
-        tried = 0
-        fallback = None            # first candidate where SOME camera was live
-        for t_ns, val, day in candidates:
-            if is_cancelled():
-                return {"status": "cancelled"}
-            tried += 1
-            if tried > _COND_MAX_CANDIDATES:
-                log(f"stopped after {_COND_MAX_CANDIDATES} candidate moments")
-                break
-            verdicts = [cam_live(c[0], day, t_ns) for c in cams]
-            live = [v for v in verdicts if v is True]
-            dead = [v for v in verdicts if v is False]
-            if not dead:
-                # Nothing says a camera was dark: either all live, or nothing to go on.
-                return {"status": "found", "target_ns": t_ns, "value": val,
-                        "day": day, "cams_live": len(live), "cams": len(cams),
-                        "error_days": error_days, "candidates": len(candidates)}
-            if live and fallback is None:
-                fallback = (t_ns, val, day, len(live))
-
-        if fallback is not None:
-            t_ns, val, day, n_live = fallback
-            log(f"no moment had every camera live — taking the first where "
-                f"{n_live}/{len(cams)} were")
-            return {"status": "found", "target_ns": t_ns, "value": val, "day": day,
-                    "cams_live": n_live, "cams": len(cams), "partial": True,
-                    "error_days": error_days, "candidates": len(candidates)}
-        return {"status": "no_camera_signal", "candidates": len(candidates),
-                "first_ns": candidates[0][0], "first_day": candidates[0][2],
-                "error_days": error_days}
+                hi = min(b, lo + step)
+                got: list = []
+                for name in cpva.read_order(channel):
+                    ans = cpva.fetch_values(name, lo, hi, timeout=cpva.FULL_DAY_TIMEOUT,
+                                            try_value_suffix=False)
+                    if any(lo <= t <= hi for t, _v in ans):
+                        got = ans
+                        break
+                hit = first_in(got, lo, hi)
+                if hit is not None:
+                    return hit
+                lo = hi + 1
+                step = min(step * 2, 8 * hour)
+        return None
 
     def _find_image_for_day_cam(
         self,
@@ -8061,8 +8551,14 @@ class ImageFinderWidget(QWidget):
         qds = [prefill_qdate] if prefill_qdate else (
             self._effective_days()
             or [daypicker.date_to_qdate(self._primary_day())])
+        # …and the TIMES picked for each of them, so the graph reads 07–21 when
+        # 07–21 was picked, the same part of the day the search will look at.
+        windows = {}
+        for q in qds:
+            d = date(q.year(), q.month(), q.day())
+            windows[d] = self._day_window(d)
         try:
-            dlg = PVRegionSearchDialog(cams, qds, self)
+            dlg = PVRegionSearchDialog(cams, qds, self, windows=windows)
         except Exception as e:
             import traceback
             self._log(f"PV Search error: {e}\n{traceback.format_exc()}")
@@ -8097,8 +8593,8 @@ class ImageFinderWidget(QWidget):
         cond = cfg.get("condition")
         if cond:
             self._log(f"VIEW (PV condition): {len(cfg['cameras'])} cams × "
-                      f"{len(cfg['days'])} day(s), {cond['label']} {cond['op']} "
-                      f"{cond['value']:g} over {cond['scope']}")
+                      f"{len(cfg['days'])} day(s), {self._cond_text(cond)} "
+                      f"over {cond['scope']}")
             self._run_multiday_search(cfg)
             return
         moments = [int(t) for t in (cfg.get("moments_ns") or [])]
@@ -8256,16 +8752,32 @@ class ImageFinderWidget(QWidget):
         _exec_progress(dlg)
 
     def _run_condition_search(self, cfg: dict, condition: dict):
-        """PV-condition search: find ONE moment, then take it from every camera.
+        """PV-condition search: on EACH marked day, the first moment the condition held
+        (inside that day's regions or Time window), taken from every camera.
 
-        Deliberately not a per-camera search. "Show me the cameras when SBW4 was over
-        13 J" is a question about a single shot; letting each camera pick its own
-        nearest match would put a different shot in every tile and call it a
-        comparison."""
+        One moment per day for ALL the cameras, never a per-camera match: "show me the
+        cameras when SBW4 was over 13 J" is a question about a shot, and letting each
+        camera pick its own nearest match would put a different shot in every tile.
+        Per DAY, because a 12-day search answered with one day was the complaint
+        (13.10.2026)."""
         cams    = cfg["cameras"]
         days    = cfg["days"]
         regions_by_day = cfg.get("regions") or {}
         cond_text = self._cond_text(condition)
+        if condition.get("scope") == "regions":
+            # Regions marked: only the days carrying one are asked — a day without
+            # a region is not "no match", it was never part of the question.
+            days = [d for d in days
+                    if regions_by_day.get(d) or regions_by_day.get(str(d))]
+        # Each day's picked Time window — the "more precise time" the search keeps
+        # to when no region narrows it further.
+        # The PV Search window hands back the windows it drew, so the graph and
+        # the search agree even for a day added in that window's own calendar.
+        cfg_wins = cfg.get("windows") or {}
+        windows_by_day = {
+            d: [daypicker.seg_bounds_ns(daypicker.PickSeg(
+                d, *(cfg_wins.get(d) or self._day_window(d))))]
+            for d in days}
 
         cancel_evt = threading.Event()
         prog_dlg = QDialog(self)
@@ -8274,7 +8786,7 @@ class ImageFinderWidget(QWidget):
         prog_dlg.setWindowFlags(prog_dlg.windowFlags() &
                                 ~Qt.WindowType.WindowCloseButtonHint)
         prog_layout = QVBoxLayout(prog_dlg)
-        prog_lbl = QLabel(f"Looking for the first moment {cond_text}…")
+        prog_lbl = QLabel(f"Looking for the first moment {cond_text} on each day…")
         prog_lbl.setWordWrap(True)
         prog_bar = QProgressBar()
         prog_bar.setRange(0, len(cams) + 1)
@@ -8308,93 +8820,16 @@ class ImageFinderWidget(QWidget):
             except RuntimeError:
                 pass
 
+        prog_bar.setRange(0, max(1, len(days)))
+
         def worker():
             emit_log(f"[condition] {cond_text}  over {len(days)} day(s), "
                      f"{len(cams)} camera(s)")
-            after_ns = 0
-            last_fail: dict = {"status": "never_met"}
-            for attempt in range(_COND_MAX_FRAME_TRIES):
-                if cancel_evt.is_set():
-                    break
-                res = self._find_condition_moment(
-                    days, cams, condition, regions_by_day,
-                    cancelled=cancel_evt, log_fn=emit_log, after_ns=after_ns)
-                if res.get("status") != "found":
-                    last_fail = res
-                    break
-                target_ns = res["target_ns"]
-                day = res["day"]
-                dt = datetime.fromtimestamp(target_ns / 1e9, tz=timezone.utc)
-                if PRAGUE:
-                    dt = dt.astimezone(PRAGUE)
-                emit_log(f"  moment: {day.strftime('%d.%m.%Y')} {dt.strftime('%H:%M:%S')}"
-                         f"  value={res['value']:.4g}"
-                         f"  ({res.get('cams_live', 0)}/{res.get('cams', 0)} cameras live)")
-                emit_progress(1, "Reading the cameras…")
-
-                # Every camera at ONE moment — the same question the moment search
-                # asks, so it is asked the same way: all the cameras at once through
-                # the shared folder cache, which reads an hour's folder once for the
-                # lot of them instead of once each.
-                def one_cam(item):
-                    _i, (cam_name, cam_label, _folder) = item
-                    lines: list = []
-                    if cancel_evt.is_set():
-                        return cam_name, cam_label, None, None, {}, "cancelled", lines
-                    p, real_h = self._resolve_frame_at(
-                        cam_name, target_ns, cancel_evt, None)
-                    meta = {"ptm1": None, "sbw4": None, "source": "pv_cond",
-                            "pv_peak": res["value"], "pv_cond": cond_text}
-                    if condition.get("channel") == CPVA_SBW4_CHANNEL:
-                        meta["sbw4"] = res["value"]
-                    elif condition.get("channel") == CPVA_SHOT_CHANNEL:
-                        meta["ptm1"] = res["value"]
-                    status = "not_found"
-                    blank = False
-                    if p is not None:
-                        status = "found"
-                        # ~1 frame per 35 s is stored, so the nearest one can be a
-                        # good few seconds off. That is a reading, and it is said.
-                        f_ns = extract_ns_from_stem(p.stem)
-                        if f_ns:
-                            off = abs(f_ns - target_ns) / 1e9
-                            meta["offset_s"] = off
-                            lines.append(f"  {cam_label}: {p.name}  ({off:+.1f}s from the moment)")
-                        if not _image_is_nonempty(p):
-                            meta["blank"] = True
-                            blank = True
-                            lines.append(f"  {cam_label}: nothing on the frame")
-                    else:
-                        lines.append(f"  {cam_label}: no frame within reach")
-                    meta["_blank"] = blank
-                    return cam_name, cam_label, p, real_h, meta, status, lines
-
-                results: dict[str, list] = {}
-                usable = 0
-                self._ensure_scan_cache()
-                workers = min(_MOMENT_RESOLVE_WORKERS, max(1, len(cams)))
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    for i, (cam_name, cam_label, p, real_h, meta, status, lines) in \
-                            enumerate(ex.map(one_cam, list(enumerate(cams)))):
-                        for ln in lines:
-                            emit_log(ln)
-                        if status == "found" and not meta.pop("_blank", False):
-                            usable += 1
-                        meta.pop("_blank", None)
-                        results[cam_name] = [(day, real_h, p, meta, status)]
-                        emit_progress(2 + i, cam_label)
-
-                if usable or cancel_evt.is_set():
-                    try:
-                        _sig.done.emit({"_final": results, "_moment": res})
-                    except RuntimeError:
-                        pass
-                    return
-                emit_log("  every camera came back blank — trying the next moment")
-                after_ns = target_ns
-                last_fail = {"status": "all_blank", "target_ns": target_ns, "day": day}
+            results, per_day = self._condition_results(
+                days, cams, condition, regions_by_day, windows_by_day,
+                cancel_evt, emit_log, emit_progress)
             try:
-                _sig.done.emit({"_final": {}, "_fail": last_fail})
+                _sig.done.emit({"_final": results, "_per_day": per_day})
             except RuntimeError:
                 pass
 
@@ -8410,14 +8845,20 @@ class ImageFinderWidget(QWidget):
                 prog_bar.setValue(data["_progress"])
                 prog_lbl.setText(data["_label"]); return
             results = data.get("_final") or {}
-            fail = data.get("_fail")
-            if fail is not None or not results:
-                self._report_condition_failure(fail or {}, cond_text)
+            per_day: dict = data.get("_per_day") or {}
+            matched = [d for d, r in per_day.items() if r.get("status") == "found"]
+            if not results or not matched:
+                # Nothing on any day: say WHY, using the most telling day's answer.
+                rank = {"archiver_error": 3, "no_camera_signal": 2, "all_blank": 1}
+                fails = sorted((r for r in per_day.values()),
+                               key=lambda r: rank.get(r.get("status"), 0), reverse=True)
+                if any(r.get("status") == "cancelled" for r in per_day.values()):
+                    fails = [{"status": "cancelled"}]
+                self._report_condition_failure(fails[0] if fails else {}, cond_text)
                 return
             found_paths = sorted(
                 [p for v in results.values() for _, _, p, _, _ in v if p is not None],
                 key=lambda x: x.name)
-            moment = data.get("_moment") or {}
             if found_paths:
                 self._preview_set_files(found_paths, "PV condition")
                 self._energy_info.setPlainText("Loading energy data…")
@@ -8427,22 +8868,136 @@ class ImageFinderWidget(QWidget):
                     self._refresh_energy_info()
                 self._run_energy_lookup_async(found_paths, on_done=_after_energy)
             self.fill_wall(results, cfg["cameras"])
-            n = len(found_paths)
-            if moment.get("partial"):
+            missed = [d for d in days if d not in matched]
+            summary = (f"PV condition: {cond_text} — matched on {len(matched)} of "
+                       f"{len(days)} day(s)")
+            if missed:
+                summary += " (no match: " + ", ".join(
+                    d.strftime("%d.%m.") for d in missed) + ")"
+            self._log(summary)
+            if missed:
                 QMessageBox.information(
                     self, "PV Search",
-                    f"{cond_text}.\n\nNo moment had every camera live. Took the first "
-                    f"where {moment.get('cams_live', 0)} of {moment.get('cams', 0)} "
-                    f"were — {n} frame(s) on the wall.")
-            elif n < len(cams):
-                QMessageBox.information(
-                    self, "PV Search",
-                    f"{cond_text}.\n\n{n} of {len(cams)} cameras had a frame at that "
-                    "moment; the rest are listed in the log.")
+                    f"{cond_text}.\n\nFound on {len(matched)} of {len(days)} day(s). "
+                    "No match on: " + ", ".join(d.strftime("%d.%m.") for d in missed)
+                    + ".\nThe log says why for each day.")
 
         _sig.done.connect(on_signal)
         threading.Thread(target=worker, daemon=True).start()
         _exec_progress(prog_dlg)
+
+    def _condition_results(self, days, cams, condition, regions_by_day,
+                           windows_by_day, cancel_evt, log, progress=None
+                           ) -> "tuple[dict, dict]":
+        """The condition search's work, day by day — no Qt, so it can be tested.
+
+        Returns (results, per_day): `results` is camera → [(day, real_h, path, meta,
+        status)], one entry per matched day, the shape `fill_wall` takes; `per_day` is
+        day → the answer for that day ({"status": "found" | "never_met" | …})."""
+        cond_text = self._cond_text(condition)
+        results: "dict[str, list]" = {}
+        per_day: dict = {}
+        self._ensure_scan_cache()
+        for n_day, day in enumerate(sorted(days), start=1):
+            if cancel_evt.is_set():
+                per_day[day] = {"status": "cancelled"}
+                break
+            if progress:
+                progress(n_day - 1, f"Day {n_day}/{len(days)} — {day.strftime('%d.%m.%Y')}")
+            after_ns = 0
+            answer: dict = {"status": "never_met"}
+            for _attempt in range(_COND_MAX_FRAME_TRIES):
+                if cancel_evt.is_set():
+                    answer = {"status": "cancelled"}
+                    break
+                res = self._find_condition_moment(
+                    [day], cams, condition, regions_by_day,
+                    cancelled=cancel_evt, log_fn=log, after_ns=after_ns,
+                    windows_by_day=windows_by_day)
+                if res.get("status") != "found":
+                    answer = res
+                    break
+                target_ns = res["target_ns"]
+                dt = datetime.fromtimestamp(target_ns / 1e9, tz=timezone.utc)
+                if PRAGUE:
+                    dt = dt.astimezone(PRAGUE)
+                vals = res.get("values") or {}
+                if len(vals) > 1:
+                    lbl = {r.get("channel"): r.get("label") or r.get("channel")
+                           for r in (condition.get("rows") or [])}
+                    said = "  ".join(f"{lbl.get(k, k)}={v:.4g}"
+                                     for k, v in vals.items())
+                else:
+                    said = f"value={res['value']:.4g}"
+                log(f"  {day.strftime('%d.%m.%Y')}: first match {dt.strftime('%H:%M:%S')}"
+                    f"  {said}")
+
+                # Every camera at ONE moment, all at once through the shared folder
+                # cache, which reads an hour's folder once for the lot of them.
+                def one_cam(item, res=res, target_ns=target_ns):
+                    cam_name, cam_label, _folder = item
+                    lines: list = []
+                    if cancel_evt.is_set():
+                        return cam_name, None, None, {}, "cancelled", lines, False
+                    p, real_h = self._resolve_frame_at(
+                        cam_name, target_ns, cancel_evt, None)
+                    meta = {"ptm1": None, "sbw4": None, "source": "pv_cond",
+                            "pv_peak": res["value"], "pv_cond": cond_text,
+                            "asked_ns": int(target_ns)}
+                    vals = res.get("values") or {}
+                    if vals:
+                        meta["sbw4"] = vals.get(CPVA_SBW4_CHANNEL)
+                        meta["ptm1"] = vals.get(CPVA_SHOT_CHANNEL)
+                    elif condition.get("channel") == CPVA_SBW4_CHANNEL:
+                        meta["sbw4"] = res["value"]
+                    elif condition.get("channel") == CPVA_SHOT_CHANNEL:
+                        meta["ptm1"] = res["value"]
+                    status, blank = "not_found", False
+                    if p is not None:
+                        status = "found"
+                        # ~1 frame per 35 s is stored, so the nearest one can be a
+                        # good few seconds off. That is a reading, and it is said.
+                        f_ns = extract_ns_from_stem(p.stem)
+                        if f_ns:
+                            off = abs(f_ns - target_ns) / 1e9
+                            meta["offset_s"] = off
+                            lines.append(f"    {cam_label}: {p.name}  "
+                                         f"({off:+.1f}s from the moment)")
+                        if not _image_is_nonempty(p):
+                            meta["blank"] = True
+                            blank = True
+                            lines.append(f"    {cam_label}: nothing on the frame")
+                    else:
+                        lines.append(f"    {cam_label}: no frame within reach")
+                    return cam_name, p, real_h, meta, status, lines, blank
+
+                day_rows: list = []
+                usable = 0
+                workers = min(_MOMENT_RESOLVE_WORKERS, max(1, len(cams)))
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    for cam_name, p, real_h, meta, status, lines, blank in \
+                            ex.map(one_cam, list(cams)):
+                        for ln in lines:
+                            log(ln)
+                        if status == "found" and not blank:
+                            usable += 1
+                        day_rows.append((cam_name, (day, real_h, p, meta, status)))
+                if usable or cancel_evt.is_set():
+                    for cam_name, row in day_rows:
+                        results.setdefault(cam_name, []).append(row)
+                    answer = dict(res, status="found")
+                    break
+                log(f"  {day.strftime('%d.%m.')}: every camera came back blank — "
+                    "trying the next moment")
+                after_ns = target_ns
+                answer = {"status": "all_blank", "target_ns": target_ns, "day": day}
+            if answer.get("status") == "never_met":
+                log(f"  {day.strftime('%d.%m.%Y')}: the condition never held "
+                    "in the set time")
+            per_day[day] = answer
+        if progress:
+            progress(len(days), "Done")
+        return results, per_day
 
     def _report_condition_failure(self, fail: dict, cond_text: str):
         """Say WHICH of the three ways it failed. "Not found" would read as "the
@@ -10170,12 +10725,15 @@ _PV_LINE_DASHES = ["-", "--", ":", "-."]
 # How bad an archiver answer is, worst wins when several days are merged. "empty"
 # is a real answer ("nothing was recorded"); "error" is the absence of one.
 _PV_STATUS_RANK = {"ok": 0, "empty": 1, "stale": 2, "error": 3}
-# A condition like "SBW4 above 5 J" can be true for thousands of samples in a day.
-# Only the earliest ones can ever be the answer, so the scan stops counting there;
-# and only so many are tested against the cameras, because each new day tested costs
-# one TotalPower query per camera.
-_COND_MAX_HITS_PER_DAY = 400
-_COND_MAX_CANDIDATES = 60
+# A PV's hours are read from the archiver in pieces this long (_fetch_window_samples):
+# short enough that parsing one answer never holds the window up for long.
+_FETCH_PIECE_NS = 2 * 3600 * 1_000_000_000
+# How long after the last tick on the PV list the graph is loaded and redrawn.
+_PV_TICK_SETTLE_MS = 600
+# While a load is running, the graph is redrawn at most this often (or three times
+# the last redraw's cost, if that is longer). Each arriving PV used to rebuild the
+# whole figure at once, and back to back those rebuilds were the window's time.
+_PARTIAL_REDRAW_MIN_MS = 400
 # How many moments to try when every camera's frame comes back blank at the one
 # picked. Each try is a fresh set of share reads, so it is not unbounded.
 _COND_MAX_FRAME_TRIES = 4
@@ -10303,10 +10861,12 @@ class _PVBrowseDialog(QDialog):
         self._sig.done.connect(self._on_channels)
 
         self._all: list[str] = []
+        # The list from the last opening shows at once, and a fresh one is asked
+        # for every time: channels added to the archiver while the program is open
+        # must show up without a restart, and the download is ~0.03 s.
         if _PV_CHANNEL_CACHE is not None:
             self._on_channels(_PV_CHANNEL_CACHE)
-        else:
-            threading.Thread(target=self._load_worker, daemon=True).start()
+        threading.Thread(target=self._load_worker, daemon=True).start()
 
     def _load_worker(self):
         global _PV_CHANNEL_CACHE
@@ -10328,10 +10888,17 @@ class _PVBrowseDialog(QDialog):
 
     def _on_channels(self, payload):
         if isinstance(payload, Exception):
-            self._status.setText(f"Failed to load channels: {payload}")
+            if not self._all:          # an older list on screen stays usable
+                self._status.setText(f"Failed to load channels: {payload}")
             return
+        if list(payload) == self._all:
+            return                     # nothing new — keep the list and the pick
+        picked = {i.text() for i in self._list.selectedItems()}
         self._all = list(payload)
         self._apply_filter(self._filter.text())
+        for i in range(self._list.count()):
+            if self._list.item(i).text() in picked:
+                self._list.item(i).setSelected(True)
 
     def _apply_filter(self, text: str):
         """Rank the channels with the SHARED PV ranker.
@@ -10341,7 +10908,7 @@ class _PVBrowseDialog(QDialog):
         typing two words found nothing, and the best match was wherever the alphabet
         happened to put it. `cpva.rank_pv_match` is what the Image Slider's picker
         and the Shot Finder use — words are tokens, AND-matched anywhere in the name,
-        with the order they were typed in worth a bonus."""
+        in any order."""
         q = cpva.split_query(text or "")
         self._list.clear()
         if not q:
@@ -10379,17 +10946,37 @@ class PVRegionSearchDialog(QDialog):
     apart sit side by side with no empty week between them.
     """
 
-    def __init__(self, cams: list, initial_qdates, parent=None):
+    def __init__(self, cams: list, initial_qdates, parent=None,
+                 windows: "dict | None" = None):
         super().__init__(parent)
         self.setWindowTitle("PV Search")
+        # day → (h_from, m_from, h_to, m_to): the times picked for each day in the
+        # tab's Time window. The graph reads and shows ONLY that part of the day —
+        # it used to read 00:00–23:59 whatever was picked, which cost the archiver
+        # the whole night for nothing and drew a graph the search never looks at.
+        # A day added in this window's own calendar gets the tab's default.
+        self._windows: dict = dict(windows or {})
+        self._bounds_cache: dict = {}
+        # (channel, day, mode) → the curve as drawn — see _hold_xy.
+        self._xy_cache: dict = {}
         # As large as the screen allows: six curves, up to five value axes and the
         # table of marked ranges all live on the right-hand side, and at 1180×800
         # the plot itself was left about 560 px wide.
         # …but never larger than the screen it opens on, or the Search button at
         # the foot of the sidebar lands under the taskbar.
-        _w, _h = 1520, 960
+        # 1100 tall (was 960): the sidebar — calendar, days, PVs, condition — fits
+        # without its own scroll bar. Measured against the screen the TAB is on: the
+        # primary screen can be a laptop panel while the program runs on a monitor.
+        # 13.10.2026: 1520 × 970, the size the user picked (calendar compact, the
+        # whole sidebar visible).
+        _w, _h = 1520, 970
         try:
-            _av = QApplication.primaryScreen().availableGeometry()
+            _scr = None
+            if parent is not None:
+                _scr = parent.window().screen()
+            _scr = (_scr or QApplication.screenAt(QCursor.pos())
+                    or QApplication.primaryScreen())
+            _av = _scr.availableGeometry()
             _w = min(_w, _av.width() - 40)
             _h = min(_h, _av.height() - 60)
         except Exception:
@@ -10401,7 +10988,11 @@ class PVRegionSearchDialog(QDialog):
         # day → {channel → [(t_ns, value), …]}. One entry per marked day; the graph
         # reads whichever days it is showing.
         self._series: "dict[object, dict[str, list]]" = {}
-        self._day_status: "dict[object, str]" = {}   # day → ok | empty | stale | error
+        # day → ok | empty | stale | error, the worst over the PVs ticked NOW — worked
+        # out from `_ch_status` ((day, channel) → status), because a PV read earlier
+        # and unticked since must not keep a day marked as failed.
+        self._day_status: "dict[object, str]" = {}
+        self._ch_status: dict = {}
         # channel → {"name", "unit", "step"} — what the PV registry and the archiver
         # know about a channel. `step` says the channel is written only when it
         # CHANGES, which is what decides whether its curve is held across a gap.
@@ -10500,6 +11091,12 @@ class PVRegionSearchDialog(QDialog):
             done = Signal(object)
         self._sig = _Sig()
         self._sig.done.connect(self._on_series_loaded)
+        # Ticking PVs on the list waits for the LAST tick: five quick clicks are one
+        # load and one redraw, not five of each fighting over the window.
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setSingleShot(True)
+        self._tick_timer.setInterval(_PV_TICK_SETTLE_MS)
+        self._tick_timer.timeout.connect(self._reload_series)
 
         self._build_ui()
         self._seed_default_pvs()
@@ -10558,7 +11155,9 @@ class PVRegionSearchDialog(QDialog):
         self._btn_ticks = _btn(
             "Ticks", "How far apart the time labels are.", self._edit_ticks)
         self._btn_reset_view = _btn(
-            "Whole day", "Undo every zoom and hand-set range.", self._reset_view)
+            "Whole window",
+            "Back to the whole picked time of the day: undo every zoom and "
+            "hand-set range.", self._reset_view)
         row.addStretch(1)
         self._btn_copy_graph = _btn(
             "Copy", "The graph to the clipboard, as a picture.", self._copy_graph)
@@ -10614,12 +11213,15 @@ class PVRegionSearchDialog(QDialog):
                 pass
         if self._tick_min:
             try:
-                from matplotlib.ticker import MultipleLocator
-                # Both x mappings are in DAYS (one-day mode is an mdates number,
-                # all-days is base + day index + fraction), so one conversion works
-                # for both.
-                ax.xaxis.set_major_locator(
-                    MultipleLocator(self._tick_min / 1440.0))
+                if self._mode == "all":
+                    # A day there is its picked window wide, not 24 h, so the
+                    # spacing is laid out per day — see _all_days_ticks.
+                    self._all_days_ticks(self._tick_min)
+                else:
+                    from matplotlib.ticker import MultipleLocator
+                    # One-day mode is an mdates number, in DAYS.
+                    ax.xaxis.set_major_locator(
+                        MultipleLocator(self._tick_min / 1440.0))
             except Exception:
                 pass
         if self._x_lim_user is not None:
@@ -10705,8 +11307,8 @@ class PVRegionSearchDialog(QDialog):
             return nums[0], nums[1], nums[2]
 
         try:
-            h0, m0, s0 = _parse(e_a.text(), 8)
-            h1, m1, s1 = _parse(e_b.text(), 19)
+            h0, m0, s0 = _parse(e_a.text(), daypicker.DEFAULT_FROM_HOUR)
+            h1, m1, s1 = _parse(e_b.text(), daypicker.DEFAULT_TO_HOUR)
         except ValueError:
             QMessageBox.information(self, "Time range",
                                     "Type the times as HH:MM.")
@@ -10748,7 +11350,7 @@ class PVRegionSearchDialog(QDialog):
         self._redraw()
 
     def _reset_view(self):
-        """Back to the whole day, automatic axes, no zoom."""
+        """Back to the day's whole picked window, automatic axes, no zoom."""
         self._y_lim = None
         self._x_lim_user = None
         self._tick_min = 0
@@ -11196,11 +11798,26 @@ class PVRegionSearchDialog(QDialog):
     def _tz(self):
         return PRAGUE if PRAGUE is not None else timezone.utc
 
+    def _day_window_for(self, day) -> "tuple[int, int, int, int]":
+        """(h_from, m_from, h_to, m_to) of one day — what the Time window picked."""
+        win = self._windows.get(day)
+        return tuple(win) if win else _finder_default_window()
+
     def _day_bounds_for(self, day) -> "tuple[int, int]":
-        tz = self._tz()
-        t0 = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=tz)
-        t1 = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=tz)
-        return int(t0.timestamp() * 1e9), int(t1.timestamp() * 1e9)
+        """[start_ns, end_ns) of the part of the day this window reads and draws:
+        the day's picked Time window (07:00–21:00 unless set otherwise), the same
+        bounds the search itself keeps to."""
+        win = self._day_window_for(day)
+        key = (day, win)
+        got = self._bounds_cache.get(key)
+        if got is None:
+            got = daypicker.seg_bounds_ns(daypicker.PickSeg(day, *win))
+            self._bounds_cache[key] = got
+        return got
+
+    def _day_span_ns(self, day) -> int:
+        s_ns, e_ns = self._day_bounds_for(day)
+        return max(1, int(e_ns - s_ns))
 
     # ── UI ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -11220,7 +11837,12 @@ class PVRegionSearchDialog(QDialog):
         self._cal_frame, self._cal = _make_multiselect_calendar(
             QDate(self._days[0].year, self._days[0].month, self._days[0].day))
         self._cal.setMinimumWidth(260)
-        self._cal.setMaximumHeight(172)
+        # Fixed, not a maximum: six rows of 24 px, just enough for the day numbers.
+        # With only a maximum the frame took the window's spare height and stretched
+        # the nav bar and the day-name band (13.10.2026).
+        self._cal.setFixedHeight(152)
+        self._cal_frame.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                      QSizePolicy.Policy.Fixed)
         self._last_cal_click = QDate(self._days[0].year, self._days[0].month,
                                      self._days[0].day)
         self._cal.clicked.connect(self._on_cal_clicked)
@@ -11370,51 +11992,34 @@ class PVRegionSearchDialog(QDialog):
         # The other way of naming a moment: instead of dragging a span by eye, say
         # what the value had to be and let the search find the first time it was.
         side.addWidget(_section_label("Condition"))
-        self._cond_on = QCheckBox("Find the first moment a PV was…")
+        self._cond_on = QCheckBox("Each day, the first moment a PV was…")
         self._cond_on.setStyleSheet(_CHECKBOX_STYLE)
         self._cond_on.setToolTip(
-            "Instead of the marked regions, search for the first moment the PV met "
-            "this condition — the SAME moment for every camera.")
+            "On every marked day, find the first moment ALL the ticked rows below "
+            "held at once — the SAME moment for every camera.\nWith regions marked "
+            "on the graph, only inside them; otherwise inside each day's Time "
+            "window.")
         self._cond_on.toggled.connect(self._on_cond_toggled)
         side.addWidget(self._cond_on)
 
-        cond_row = QHBoxLayout(); cond_row.setSpacing(4)
-        self._cond_pv_cb = QComboBox()
-        self._cond_pv_cb.setToolTip("Which PV the condition is about")
-        self._cond_pv_cb.setMinimumWidth(90)
-        self._cond_op_cb = QComboBox()
-        for _op, _lbl in ((">", ">"), (">=", "≥"), ("<", "<"), ("<=", "≤"),
-                          ("between", "between")):
-            self._cond_op_cb.addItem(_lbl, _op)
-        self._cond_op_cb.setFixedWidth(74)
-        self._cond_op_cb.currentIndexChanged.connect(self._sync_cond_row)
-        self._cond_val = QDoubleSpinBox()
-        self._cond_val.setRange(-1e9, 1e9); self._cond_val.setDecimals(2)
-        self._cond_val.setValue(13.0)
-        self._cond_val2 = QDoubleSpinBox()
-        self._cond_val2.setRange(-1e9, 1e9); self._cond_val2.setDecimals(2)
-        self._cond_val2.setValue(20.0)
-        self._cond_val2.setVisible(False)
-        for _w in (self._cond_val, self._cond_val2):
-            _w.setMinimumWidth(70)
-        cond_row.addWidget(self._cond_pv_cb, 1)
-        cond_row.addWidget(self._cond_op_cb, 0)
-        cond_row.addWidget(self._cond_val, 0)
-        cond_row.addWidget(self._cond_val2, 0)
-        side.addLayout(cond_row)
+        # ONE ROW PER TICKED PV, formulas included (27.10.2026, the user: "whatever
+        # I tick has to show up in the conditions"). Each row has its own box, test
+        # and value; the search wants every ticked row true at the same moment.
+        # Name on its own line, the test under it: a sidebar 292 px wide cannot hold
+        # a name, an operator and two numbers on one line without cutting the name.
+        self._cond_box = QWidget()
+        self._cond_rows_lay = QVBoxLayout(self._cond_box)
+        self._cond_rows_lay.setContentsMargins(0, 0, 0, 0)
+        self._cond_rows_lay.setSpacing(2)
+        side.addWidget(self._cond_box)
+        # channel → {"on", "op", "v1", "v2"}: what each PV's row was set to, kept
+        # while the PV is unticked so ticking it again brings the row back as it was.
+        self._cond_settings: "dict[str, dict]" = {}
+        # channel → the row's widgets, for the PVs ticked now.
+        self._cond_rows: "dict[str, dict]" = {}
 
-        scope_row = QHBoxLayout(); scope_row.setSpacing(6)
-        self._cond_scope_days = QRadioButton("whole days")
-        self._cond_scope_regs = QRadioButton("marked regions only")
-        self._cond_scope_days.setChecked(True)
-        for _rb in (self._cond_scope_days, self._cond_scope_regs):
-            _rb.setStyleSheet(_RADIO_STYLE + "QRadioButton { font-size:11px; }")
-            scope_row.addWidget(_rb)
-        scope_row.addStretch(1)
-        side.addLayout(scope_row)
-        self._cond_widgets = [self._cond_pv_cb, self._cond_op_cb, self._cond_val,
-                              self._cond_val2, self._cond_scope_days,
-                              self._cond_scope_regs]
+        # No "whole days / regions" switch: marked regions narrow the search on
+        # their own (get_config), the Time window does it otherwise.
         self._on_cond_toggled(False)
 
         # NO list of regions here. It used to sit at the bottom of the sidebar and
@@ -11731,9 +12336,29 @@ class PVRegionSearchDialog(QDialog):
                         unit = _get_slider_module().pv_units_for(name) or ""
                 except Exception:
                     unit = ""
+            if not unit and _is_derived_key(channel):
+                unit = self._formula_source_unit(_derived_name(channel))
             got = {"name": name, "unit": unit, "step": None}
             self._ch_meta[channel] = got
         return got
+
+    @staticmethod
+    def _formula_source_unit(name: str) -> str:
+        """The unit a formula with no unit of its own is drawn in: its source's, when
+        it is built on exactly ONE PV ("compressed SBW4" = SBW4 × 0.749 is joules).
+
+        Left unitless it got an axis of its own, both axes scaled to their own data,
+        and a curve proportional to its source lay exactly under it — drawn, and
+        invisible. A formula over two or more PVs keeps no unit: a ratio of two
+        joules channels is not joules."""
+        try:
+            sl = _get_slider_module()
+            sources = list(sl.pv_source_names([name]))
+            if len(sources) != 1:
+                return ""
+            return sl.pv_units_for(sources[0]) or ""
+        except Exception:
+            return ""
 
     def _unit_key_for(self, channel: str) -> str:
         """Which y axis a channel belongs on. Its unit, or the channel itself when it
@@ -11794,40 +12419,160 @@ class PVRegionSearchDialog(QDialog):
 
     def _refresh_primary_combo(self):
         prev = self._primary_cb.currentData()
-        prev_cond = self._cond_pv_cb.currentData()
-        for cb, keep in ((self._primary_cb, prev), (self._cond_pv_cb, prev_cond)):
-            cb.blockSignals(True)
-            cb.clear()
-            for label, ch in self._checked_channels():
-                # Formulas are drawn, not searched: both of these are asked of the
-                # ARCHIVER (the peak inside a region, the first moment a condition
-                # held), and a formula has no channel to ask for.
-                if _is_derived_key(ch):
-                    continue
-                cb.addItem(label, ch)
-            # keep the previous pick if it is still checked, else default to first
-            idx = cb.findData(keep)
-            if idx >= 0:
-                cb.setCurrentIndex(idx)
-            cb.blockSignals(False)
+        cb = self._primary_cb
+        cb.blockSignals(True)
+        cb.clear()
+        for label, ch in self._checked_channels():
+            # A formula is not offered here: the peak inside a region is asked of
+            # the ARCHIVER, and a formula has no channel to ask for.
+            if _is_derived_key(ch):
+                continue
+            cb.addItem(label, ch)
+        # keep the previous pick if it is still checked, else default to first
+        idx = cb.findData(prev)
+        if idx >= 0:
+            cb.setCurrentIndex(idx)
+        cb.blockSignals(False)
+        self._rebuild_cond_rows()
+
+    # ── Condition rows ────────────────────────────────────────────────────
+    _COND_OPS = ((">", ">"), (">=", "≥"), ("<", "<"), ("<=", "≤"),
+                 ("between", "between"))
+
+    def _rebuild_cond_rows(self):
+        """One condition row per TICKED PV, formulas included, in list order.
+
+        Rows are rebuilt from scratch — cheap, a handful of widgets — and every
+        row reads its settings from `_cond_settings`, so a PV unticked and ticked
+        again comes back exactly as it was left."""
+        if not hasattr(self, "_cond_rows_lay"):
+            return
+        for row in self._cond_rows.values():
+            w = row["w"]
+            w.setParent(None)
+            w.deleteLater()
+        self._cond_rows = {}
+        for label, ch in self._checked_channels():
+            st = self._cond_settings.get(ch)
+            if st is None:
+                # Nothing is ticked until the operator ticks it (27.10.2026: SBW4
+                # came pre-ticked while the other rows could not be ticked at all
+                # before the master box was on — the two did not make sense together).
+                st = {"on": False, "op": ">=", "v1": 13.0, "v2": 20.0}
+                self._cond_settings[ch] = st
+            self._cond_rows[ch] = self._make_cond_row(ch, label, st)
+            self._cond_rows_lay.addWidget(self._cond_rows[ch]["w"])
+        self._cond_box.setEnabled(self._cond_on.isChecked())
+        self._sync_search_button()
+
+    def _make_cond_row(self, ch: str, label: str, st: dict) -> dict:
+        """ONE line per PV: [☐ name] [≥] [13.00].
+
+        It used to be two — the name alone on the first, the test and a value box
+        stretched across the whole sidebar on the second — so every PV cost two
+        rows for one short number. The value box is now as wide as a number needs,
+        the name takes the rest and shrinks its text when it is long (it is never
+        cut). Only "between" needs a second value; that one goes on a line of its
+        own under the first, so the name keeps its room."""
+        w = QWidget(self._cond_box)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 1, 0, 1)
+        lay.setSpacing(2)
+        line = QHBoxLayout()
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(4)
+        full = label.replace("\n", " ")
+        # The "(formula)" tag is the PV list's business — it is on the row right
+        # above. Here it only cost the name its size: "compressed SBW4  (formula)"
+        # came out at 9 px beside the test and the value.
+        name = full.replace("  (formula)", "").strip() or full
+        box = _FitCheckBox(name, _CHECKBOX_STYLE)
+        box.setChecked(bool(st.get("on")))
+        box.setToolTip(f"{full}\n\nSearch by this PV too. Every ticked row must "
+                       "hold at the same moment.")
+        op = QComboBox()
+        for _op, _lbl in self._COND_OPS:
+            op.addItem(_lbl, _op)
+        i = op.findData(st.get("op") or ">=")
+        op.setCurrentIndex(i if i >= 0 else 1)
+        # As narrow as a "≥" needs, and wide enough for "between" when that is
+        # the choice — a cut operator name is no better than a cut PV name.
+        def fit_op():
+            op.setFixedWidth(op.fontMetrics().horizontalAdvance(
+                op.currentText() or "≥") + 32)
+        fit_op()
+        v1 = QDoubleSpinBox()
+        v2 = QDoubleSpinBox()
+        num_w = v1.fontMetrics().horizontalAdvance("-00000.00") + 26
+        for sp, val in ((v1, st.get("v1", 13.0)), (v2, st.get("v2", 20.0))):
+            sp.setRange(-1e9, 1e9)
+            sp.setDecimals(2)
+            sp.setValue(float(val))
+            sp.setFixedWidth(num_w)
+        line.addWidget(box, 1)
+        line.addWidget(op, 0)
+        line.addWidget(v1, 0)
+        lay.addLayout(line)
+        line2 = QWidget(w)
+        l2 = QHBoxLayout(line2)
+        l2.setContentsMargins(0, 0, 0, 0)
+        l2.setSpacing(4)
+        l2.addStretch(1)
+        and_lbl = QLabel("and")
+        and_lbl.setStyleSheet("color:#111111;")
+        l2.addWidget(and_lbl)
+        l2.addWidget(v2)
+        lay.addWidget(line2)
+        line2.setVisible(op.currentData() == "between")
+
+        def save(*_):
+            st["on"] = box.isChecked()
+            st["op"] = op.currentData()
+            st["v1"] = float(v1.value())
+            st["v2"] = float(v2.value())
+            line2.setVisible(st["op"] == "between")
+            fit_op()
+            for x in (op, v1, v2):
+                x.setEnabled(st["on"])
+            self._sync_search_button()
+        box.toggled.connect(save)
+        op.currentIndexChanged.connect(save)
+        v1.valueChanged.connect(save)
+        v2.valueChanged.connect(save)
+        for x in (op, v1, v2):
+            x.setEnabled(bool(st.get("on")))
+        return {"w": w, "box": box, "op": op, "v1": v1, "v2": v2}
+
+    def _cond_rows_on(self) -> "list[dict]":
+        """The ticked condition rows, in PV-list order — {channel, label, op, value,
+        value2}."""
+        out = []
+        for label, ch in self._checked_channels():
+            st = self._cond_settings.get(ch)
+            if not st or not st.get("on"):
+                continue
+            out.append({"channel": ch,
+                        "label": label.replace("  (formula)", ""),
+                        "op": st.get("op") or ">=",
+                        "value": float(st.get("v1", 0.0)),
+                        "value2": float(st.get("v2", 0.0))})
+        return out
 
     def _on_pv_checks_changed(self, *_):
+        # The lists under the PV list follow at once (they cost nothing); the graph
+        # waits for the last tick of a burst — see _tick_timer.
         self._refresh_primary_combo()
-        self._reload_series()
+        self._status.setText("Updating the graph…")
+        self._tick_timer.start()
 
     # ── Condition ─────────────────────────────────────────────────────────
     def _on_cond_toggled(self, on: bool):
-        for w in getattr(self, "_cond_widgets", []):
-            w.setEnabled(on)
-        self._sync_cond_row()
+        if hasattr(self, "_cond_box"):
+            self._cond_box.setEnabled(on)
         self._sync_search_button()
 
-    def _sync_cond_row(self, *_):
-        between = (self._cond_op_cb.currentData() == "between")
-        self._cond_val2.setVisible(between)
-
     def _cond_is_on(self) -> bool:
-        return bool(self._cond_on.isChecked() and self._cond_pv_cb.currentData())
+        return bool(self._cond_on.isChecked() and self._cond_rows_on())
 
     def _sync_search_button(self):
         if not hasattr(self, "_btn_search"):
@@ -12277,6 +13022,10 @@ class PVRegionSearchDialog(QDialog):
         for t in self._moments:
             k = self._local_dt(t).date()
             moments[k] = moments.get(k, 0) + 1
+        # The list is rebuilt after every load, including the one a click on a day
+        # starts. clear() puts the scroll back to the top, so three weeks of days
+        # jumped to the first one on every click — keep where the user was.
+        scroll = self._day_list.verticalScrollBar().value()
         self._day_list.blockSignals(True)
         self._day_list.clear()
         child_ink = QColor("#333333")
@@ -12321,6 +13070,10 @@ class PVRegionSearchDialog(QDialog):
         cur = (self._day_list.topLevelItem(self._focus_i)
                if 0 <= self._focus_i < len(self._days) else None)
         self._day_list.setCurrentItem(cur)
+        self._day_list.verticalScrollBar().setValue(scroll)
+        if cur is not None:
+            self._day_list.scrollToItem(
+                cur, QAbstractItemView.ScrollHint.EnsureVisible)
         self._day_list.blockSignals(False)
         self._apply_day_paint()
         self._sync_day_header()
@@ -12352,7 +13105,9 @@ class PVRegionSearchDialog(QDialog):
         self._apply_day_paint()
         self._sync_day_header()
         if self._mode == "one":
-            self._reload_series()
+            # Not inside the click: a day already loaded is redrawn at once, and that
+            # rebuilds the list — deleting the very item this signal is about.
+            QTimer.singleShot(0, self._reload_series)
 
     def _sync_day_header(self):
         one = (self._mode == "one")
@@ -12417,8 +13172,10 @@ class PVRegionSearchDialog(QDialog):
             idx = self._days.index(d)
         except ValueError:
             return float("nan")
+        # A day is one unit wide in "all" mode, and that unit is its picked
+        # window (07–21), not 24 hours — the night is not on the axis at all.
         d0_ns, _ = self._day_bounds_for(d)
-        frac = (t_ns - d0_ns) / 86_400e9
+        frac = (t_ns - d0_ns) / self._day_span_ns(d)
         return self._base_num() + idx + frac
 
     def _x_to_ns(self, x: float) -> "int | None":
@@ -12432,8 +13189,9 @@ class PVRegionSearchDialog(QDialog):
         if idx < 0 or idx >= len(self._days):
             return None
         frac = min(max(off - idx, 0.0), 1.0)
-        d0_ns, _ = self._day_bounds_for(self._days[idx])
-        return int(d0_ns + frac * 86_400e9)
+        day = self._days[idx]
+        d0_ns, _ = self._day_bounds_for(day)
+        return int(d0_ns + frac * self._day_span_ns(day))
 
     def _day_for_x(self, x: float):
         if self._mode == "one":
@@ -12454,86 +13212,150 @@ class PVRegionSearchDialog(QDialog):
     @staticmethod
     def _fetch_window(channel: str, start_ns: int,
                       end_ns: int) -> "tuple[list, str, str]":
-        """Samples between two timestamps, through the archiver's DAY cache.
+        """See `_fetch_window_samples` — kept as the one seam the tests replace."""
+        return _fetch_window_samples(channel, start_ns, end_ns)
 
-        `cpva.get_day` keeps an LRU of whole days, recovers from the archiver's
-        HTTP 500 on an oversize query by splitting it, and reports whether the fetch
-        actually succeeded — none of which the plain windowed query it replaced could
-        do. A UTC ("lab time") day straddles two Prague days, so both are asked for
-        and the result is clipped back to the window.
+    def _rebuild_day_status(self):
+        """day → the worst archiver answer among the PLAIN PVs ticked now."""
+        ticked = [ch for _lbl, ch in self._checked_channels()
+                  if not _is_derived_key(ch)]
+        out: dict = {}
+        for (d, ch), st in self._ch_status.items():
+            if ch not in ticked:
+                continue
+            if _PV_STATUS_RANK.get(st, 3) > _PV_STATUS_RANK.get(out.get(d, "ok"), 0):
+                out[d] = st
+            else:
+                out.setdefault(d, "ok")
+        self._day_status = out
 
-        The third value is the name the samples actually came from when it is NOT
-        the one asked for — SBW4's two names take turns, and a curve drawn from the
-        other one has to say so rather than look like the name on the list."""
-        keys = {cpva.date_key_for_ns(start_ns), cpva.date_key_for_ns(end_ns)}
-        merged: list = []
-        worst = "ok"
-        alias = ""
-        for k in sorted(keys):
-            asked = cpva.channel_for_day(channel, k)
-            res = cpva.get_day(asked, k, timeout=cpva.FULL_DAY_TIMEOUT)
-            merged.extend(res.samples)
-            if _PV_STATUS_RANK.get(res.status, 3) > _PV_STATUS_RANK.get(worst, 0):
-                worst = res.status
-            src = (getattr(res, "src_channel", "") or "").split(".value")[0]
-            if res.samples and src and src != channel:
-                alias = src
-        out = sorted((t, v) for (t, v) in merged if start_ns <= t <= end_ns)
-        if worst == "ok" and not out:
-            worst = "empty"
-        return out, worst, alias
+    @staticmethod
+    def _formula_snapshot(derived_keys: "list[str]") -> "tuple[list, dict]":
+        """(plan, {registry name → channel}) for the formula keys — taken on the GUI
+        thread, see `derived_plan`."""
+        sl = _get_slider_module()
+        plan = derived_plan([_derived_name(k) for k in derived_keys])
+        src_channels: dict = {}
+        for spec in plan:
+            for nm in spec["sources"]:
+                ch = sl.pv_channel_for(nm)
+                if ch:
+                    src_channels[nm] = ch
+        return plan, src_channels
 
     def _reload_series(self):
         """Fetch what the graph is about to show and is not holding yet.
 
-        Days already read stay in `self._series`, so stepping back to a day, or
-        switching to All days after looking at one, costs nothing. Changing the PV
-        list throws the lot away — the stored series are per channel."""
+        Everything read stays in `self._series` (day → channel → samples): stepping
+        back to a day, switching to All days, unticking a PV and ticking it again all
+        cost nothing. Only a (day, PV) pair not held yet is fetched — ticking one more
+        PV reads that one PV, not the whole list again, and unticking one is a
+        redraw. A formula is computed again when its expression or letters change.
+
+        A newer call supersedes a running one: the worker checks `_load_gen` between
+        reads and stops, instead of running to the end next to its successor."""
+        if getattr(self, "_tick_timer", None) is not None:
+            self._tick_timer.stop()
         channels = [ch for _, ch in self._checked_channels()]
-        key = tuple(sorted(channels))
-        if key != getattr(self, "_series_key", None):
-            self._series = {}
-            self._day_status = {}
-            self._series_key = key
-            self._stat_cache.clear()
         days = self._shown_days()
         self._load_gen += 1
         gen = self._load_gen
+        self._rebuild_day_status()
+        # (day, channel) pairs this load still owes — the legend says "loading…"
+        # for them instead of leaving the PV off the graph.
+        self._pending = set()
+        self._redraw_done_at = 0.0       # the first piece of a load draws at once
+        if getattr(self, "_partial_timer", None) is not None:
+            self._partial_timer.stop()
         if not channels:
-            self._series = {}
             self._redraw()
             self._status.setText("No PV selected — check at least one PV to plot.")
             return
-        missing = [d for d in days if d not in self._series]
-        if not missing:
-            self._redraw()
-            self._on_series_loaded({"gen": gen, "series": {}, "status": {}})
-            return
-        days = missing
-        self._status.setText(
-            f"Loading {len(days)} day(s) — {len(channels)} PV(s)…")
 
-        bounds = {d: self._day_bounds_for(d) for d in days}
         # A formula is COMPUTED, not read: the plan and the channels of its leaf
         # sources are worked out here, on the GUI thread, and handed to the worker.
         # The plan is a snapshot on purpose — the registry must not change under a
         # computation that is already running.
         derived_keys = [ch for ch in channels if _is_derived_key(ch)]
-        channels = [ch for ch in channels if not _is_derived_key(ch)]
         plan = []
         src_channels: dict = {}          # registry name → channel to fetch
         if derived_keys:
             try:
-                sl = _get_slider_module()
-                plan = derived_plan([_derived_name(k) for k in derived_keys])
-                for spec in plan:
-                    for nm in spec["sources"]:
-                        ch = sl.pv_channel_for(nm)
-                        if ch:
-                            src_channels[nm] = ch
+                plan, src_channels = self._formula_snapshot(derived_keys)
             except Exception as e:
                 self._log_derived_error = str(e)
                 plan = []
+        # A formula whose definition changed since it was computed is not held.
+        sigs = {_DERIVED_PREFIX + spec["name"]: _formula_signature(spec)
+                for spec in plan}
+        formula_sig = getattr(self, "_formula_sig", None)
+        if formula_sig is None:
+            formula_sig = self._formula_sig = {}
+        for k, sig in sigs.items():
+            if formula_sig.get(k) != sig:
+                for per in self._series.values():
+                    per.pop(k, None)
+
+        need: dict = {}                  # day → [plain channels to read]
+        need_f: dict = {}                # day → [formula keys to compute]
+        for d in days:
+            held = self._series.get(d) or {}
+            plain = [ch for ch in channels
+                     if not _is_derived_key(ch) and ch not in held]
+            forms = [ch for ch in derived_keys if ch not in held]
+            if plain or forms:
+                need[d] = plain
+                need_f[d] = forms
+        if not need:
+            self._redraw()
+            self._on_series_loaded({"gen": gen, "series": {}, "status": {}})
+            return
+        days = sorted(need)
+        self._pending = {(d, ch) for d in days for ch in need[d] + need_f[d]}
+        # Drawn now, so a newly ticked PV is in the legend as "loading…" at once.
+        self._redraw()
+        n_pv = len({ch for lst in need.values() for ch in lst}
+                   | {ch for lst in need_f.values() for ch in lst})
+        first = next((ch for d in sorted(need) for ch in need[d] + need_f[d]), "")
+        n_total = sum(len(need[d]) + len(need_f[d]) for d in need)
+        self._status.setText(
+            f"Loading {self._pv_label_for(first)}  (1/{n_total})…" if first
+            else f"Loading {len(days)} day(s) — {n_pv} PV(s)…")
+
+        bounds = {d: self._day_bounds_for(d) for d in days}
+        # What each day already holds, for a formula whose source is on the list.
+        held_now = {d: dict(self._series.get(d) or {}) for d in days}
+        fetch = self._fetch_window
+        channels = sorted({ch for lst in need.values() for ch in lst})
+
+        def stale() -> bool:
+            return gen != self._load_gen
+
+        # What the status line counts down: every (day, PV) read and every formula
+        # computed, in the order the worker takes them.
+        n_steps = sum(len(need[d]) + len(need_f[d]) for d in days)
+        done_steps = [0]
+
+        def emit_partial(d, per: dict, stat_part: dict, alias_part: dict,
+                         next_label: str):
+            """One PV (or the formulas of a day) straight onto the graph.
+
+            The graph used to wait for EVERY ticked PV of every day before it drew
+            anything: four PVs over a long day was a blank graph for many seconds
+            and then all of them at once. Now each one is drawn as it arrives."""
+            done_steps[0] += len(per) or 1
+            try:
+                self._sig.done.emit({
+                    "gen": gen, "partial": True,
+                    "series": {d: per}, "status": stat_part,
+                    # No "steps" here: whether a PV holds its value is decided
+                    # by the second pass below, which skips a channel that
+                    # already has an answer.
+                    "alias": alias_part,
+                    "formula_sig": {k: sigs[k] for k in per if k in sigs},
+                    "progress": (done_steps[0], n_steps, next_label)})
+            except RuntimeError:
+                pass
 
         def worker():
             out: dict = {}
@@ -12544,17 +13366,32 @@ class PVRegionSearchDialog(QDialog):
             for d in days:
                 s_ns, e_ns = bounds[d]
                 per_ch: dict = {}
-                worst = "ok"
-                for ch in channels:
+                todo = list(need[d])
+                if stale():
+                    return
+                # The PVs of a day are read SIDE BY SIDE (up to three at once) and
+                # each is drawn the moment it answers. One after another, a slow
+                # PTM1 kept SBW4 off the graph until PTM1 was done (27.10.2026).
+                ex = ThreadPoolExecutor(max_workers=max(1, min(3, len(todo))))
+
+                def _read(ch, s_ns=s_ns, e_ns=e_ns):
                     try:
-                        vals, st, alt = self._fetch_window(ch, s_ns, e_ns)
+                        return fetch(ch, s_ns, e_ns)
                     except Exception:
-                        vals, st, alt = [], "error", ""
+                        return [], "error", ""
+                futs = {ex.submit(_read, ch): ch for ch in todo}
+                left = list(todo)
+                for fut in as_completed(futs):
+                    ch = futs[fut]
+                    left.remove(ch)
+                    if stale():
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        return
+                    vals, st, alt = fut.result()
                     if alt:
                         alias[ch] = alt
                     per_ch[ch] = vals
-                    if _PV_STATUS_RANK.get(st, 3) > _PV_STATUS_RANK.get(worst, 0):
-                        worst = st
+                    stat[(d, ch)] = st
                     if ch not in known:
                         # Without a timestamp this answers from what is already
                         # known and never asks the archiver — see below.
@@ -12562,50 +13399,45 @@ class PVRegionSearchDialog(QDialog):
                             known[ch] = bool(cpva.is_step_channel(ch))
                         except Exception:
                             known[ch] = False
+                    if stale():
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        return
+                    nxt = (left[0] if left
+                           else (need_f[d][0] if need_f[d] else ""))
+                    emit_partial(d, {ch: vals}, {(d, ch): st},
+                                 ({ch: alt} if alt else {}), nxt)
+                ex.shutdown(wait=False)
                 # ── The formulas, over the same day ───────────────────────────
                 # Computed from the LEAF sources, fetched here whether or not they
                 # are on the PV list: a formula's letters are its own business.
-                if plan:
-                    src: dict = {}
-                    for nm, ch in src_channels.items():
-                        if ch in per_ch:
-                            vals = per_ch[ch]
-                            st = "ok" if vals else "empty"
-                        else:
-                            try:
-                                vals, st, _alt = self._fetch_window(ch, s_ns, e_ns)
-                            except Exception:
-                                vals, st = [], "error"
-                        src[nm] = {
-                            "channel": ch, "status": st,
-                            "ts": np.asarray([t for (t, _v) in vals],
-                                             dtype=np.int64),
-                            "val": np.asarray([float(v) if _is_finite(v)
-                                               else float("nan")
-                                               for (_t, v) in vals],
-                                              dtype=np.float64),
-                        }
-                    try:
-                        got = build_derived_series(plan, src, [(s_ns, e_ns + 1)])
-                    except Exception as e:
-                        got = {spec["name"]: {"ts": _EMPTY_TS, "val": _EMPTY_VAL,
-                                              "reason": str(e)}
-                               for spec in plan}
-                    for nm, entry in got.items():
-                        # Back to the shape the graph and the statistics read: a
-                        # plain list of (t, value), NaN where the formula has a gap.
-                        per_ch[_DERIVED_PREFIX + nm] = [
-                            (int(t), float(v)) for t, v in
-                            zip(entry.get("ts", ()), entry.get("val", ()))]
-                        r = entry.get("reason")
-                        if r:
-                            reasons[nm] = r
+                want = {_derived_name(k) for k in need_f[d]}
+                day_plan = [spec for spec in plan if spec["name"] in want]
+                if day_plan:
+                    if stale():
+                        return
+                    have = dict(held_now[d])
+                    have.update(per_ch)
+                    got, why, _st = _formula_samples(day_plan, src_channels,
+                                                     s_ns, e_ns, have=have,
+                                                     fetch=fetch)
+                    f_part: dict = {}
+                    for nm, samples in got.items():
+                        per_ch[_DERIVED_PREFIX + nm] = samples
+                        f_part[_DERIVED_PREFIX + nm] = samples
+                    reasons.update(why)
+                    if stale():
+                        return
+                    emit_partial(d, f_part, {}, {}, "")
                 out[d] = per_ch
-                stat[d] = worst
+            if stale():
+                return
+            # Everything is on the graph already, piece by piece; this last one
+            # only closes the load — the status line, the formulas that could not
+            # be computed, and the numbers in the picks table.
             try:
-                self._sig.done.emit({"gen": gen, "series": out, "status": stat,
+                self._sig.done.emit({"gen": gen, "series": {}, "status": stat,
                                      "steps": known, "alias": alias,
-                                     "reasons": reasons})
+                                     "reasons": reasons, "formula_sig": sigs})
             except RuntimeError:
                 pass
 
@@ -12617,6 +13449,8 @@ class PVRegionSearchDialog(QDialog):
             steps: dict = {}
             seeds: dict = {}
             for ch in channels:
+                if stale():
+                    return
                 if self._ch_meta.get(ch, {}).get("step") is not None:
                     continue
                 s_ns0 = bounds[days[0]][0]
@@ -12628,7 +13462,9 @@ class PVRegionSearchDialog(QDialog):
                     steps[ch] = False
             for d in days:
                 s_ns, _e = bounds[d]
-                for ch in channels:
+                for ch in need[d]:
+                    if stale():
+                        return
                     holds = steps.get(ch, self._ch_meta.get(ch, {}).get("step"))
                     if not holds or (ch, d) in self._seeds:
                         continue
@@ -12655,8 +13491,18 @@ class PVRegionSearchDialog(QDialog):
     def _on_series_loaded(self, data: dict):
         if data.get("gen") != self._load_gen:
             return   # a newer request superseded this one
-        self._series.update(data.get("series") or {})
-        self._day_status.update(data.get("status") or {})
+        # Merged PER CHANNEL: a load that read one more PV must not throw away the
+        # PVs the day already held.
+        for d, per in (data.get("series") or {}).items():
+            self._series.setdefault(d, {}).update(per)
+            for k in per:
+                if _is_derived_key(k):
+                    self._derived_reason.pop(_derived_name(k), None)
+        self._ch_status.update(data.get("status") or {})
+        if not hasattr(self, "_formula_sig"):
+            self._formula_sig = {}
+        self._formula_sig.update(data.get("formula_sig") or {})
+        self._rebuild_day_status()
         self._alias_used.update(data.get("alias") or {})
         # A formula with no curve says WHY, where the curve would be. A silent gap
         # reads as a broken tab.
@@ -12664,9 +13510,38 @@ class PVRegionSearchDialog(QDialog):
         for ch, holds in (data.get("steps") or {}).items():
             self._pv_meta_for(ch)["step"] = bool(holds)
         self._seeds.update(data.get("seeds") or {})
-        self._redraw()
-        self._refresh_day_list()
-        n = sum(len(v) for per in self._series.values() for v in per.values())
+        if data.get("series") or data.get("seeds") or data.get("steps"):
+            self._xy_cache.clear()
+        pending = getattr(self, "_pending", None)
+        if pending is not None:
+            if data.get("partial"):
+                for d, per in (data.get("series") or {}).items():
+                    for k in per:
+                        pending.discard((d, k))
+            else:
+                pending.clear()
+        if data.get("partial"):
+            # Throttled: back-to-back full rebuilds were what kept the window busy.
+            self._redraw_partial()
+        else:
+            if getattr(self, "_partial_timer", None) is not None:
+                self._partial_timer.stop()
+            self._redraw_measured()
+            self._refresh_day_list()
+        if data.get("partial"):
+            # One PV of a load that is still running: drawn, and the status line
+            # says what comes next. The picks table waits for the end of the load.
+            done, total, nxt = data.get("progress") or (0, 0, "")
+            if nxt:
+                self._status.setText(
+                    f"Loading {self._pv_label_for(nxt)}  ({min(done + 1, total)}"
+                    f"/{total})…")
+            else:
+                self._status.setText(f"Loading…  ({done}/{total})")
+            return
+        ticked = [ch for _lbl, ch in self._checked_channels()]
+        n = sum(len((self._series.get(d) or {}).get(ch) or [])
+                for d in self._shown_days() for ch in ticked)
         bad = [d for d in self._shown_days()
                if self._day_status.get(d) in ("error", "stale")]
         if bad:
@@ -12736,28 +13611,142 @@ class PVRegionSearchDialog(QDialog):
 
         The edge points are SYNTHETIC — nothing was recorded at those times — so they
         get no marker. Only real samples do.
+
+        Worked out with numpy, all samples at once, and kept in `_xy_cache`. It
+        used to be one datetime + timezone + date2num call PER SAMPLE on the GUI
+        thread: 360 000 samples froze the window for seconds on every redraw.
+        Samples outside the day's window (the archiver hands back a little extra)
+        are left out — in "All days" they would spill into the neighbouring day.
         """
         s_ns, e_ns = self._day_bounds_for(day)
         samples = (self._series.get(day) or {}).get(channel) or []
         holds = bool(self._pv_meta_for(channel).get("step"))
-        xs: list = []
-        ys: list = []
+        seed = self._seeds.get((channel, day)) if holds else None
+        end_ns = min(int(e_ns), time.time_ns()) if holds else int(e_ns)
+        # The held line runs to "now" on today, so the minute is part of the key.
+        # In "All days" a day sits at its index after the first marked day.
+        place = ((self._days[0] if self._days else None,
+                  self._days.index(day) if day in self._days else -1)
+                 if self._mode == "all" else None)
+        key = (id(samples), len(samples), holds, seed, s_ns, e_ns,
+               end_ns // 60_000_000_000, place)
+        ck = (channel, day, self._mode)
+        hit = self._xy_cache.get(ck)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        n = len(samples)
+        ts = np.fromiter((p[0] for p in samples), dtype=np.int64, count=n)
+        vs = np.fromiter((p[1] for p in samples), dtype=float, count=n)
+        keep = (ts >= s_ns) & (ts <= e_ns)
+        if not keep.all():
+            ts, vs = ts[keep], vs[keep]
+        mx = self._ns_array_to_x(ts, day)
+        my = vs
+        xs_parts = []
+        ys_parts = []
         if holds:
-            seed = self._seeds.get((channel, day))
-            first_ns = samples[0][0] if samples else None
+            first_ns = int(ts[0]) if len(ts) else None
             if seed and (first_ns is None or seed[0] < first_ns):
-                xs.append(self._ns_to_x(s_ns, day))
-                ys.append(float(seed[1]))
-        mx = [self._ns_to_x(t, day) for t, _v in samples]
-        my = [float(v) for _t, v in samples]
-        xs.extend(mx)
-        ys.extend(my)
-        if holds and ys:
-            end_ns = min(int(e_ns), time.time_ns())
-            if end_ns > (samples[-1][0] if samples else s_ns):
-                xs.append(self._ns_to_x(end_ns, day))
-                ys.append(ys[-1])
-        return xs, ys, mx, my
+                xs_parts.append(self._ns_array_to_x(np.array([s_ns]), day))
+                ys_parts.append(np.array([float(seed[1])]))
+        xs_parts.append(mx)
+        ys_parts.append(my)
+        last_y = (ys_parts[-1][-1] if len(ys_parts[-1])
+                  else (ys_parts[0][-1] if len(ys_parts) > 1 else None))
+        if holds and last_y is not None:
+            if end_ns > (int(ts[-1]) if len(ts) else s_ns):
+                xs_parts.append(self._ns_array_to_x(np.array([end_ns]), day))
+                ys_parts.append(np.array([float(last_y)]))
+        xs = np.concatenate(xs_parts) if xs_parts else np.empty(0)
+        ys = np.concatenate(ys_parts) if ys_parts else np.empty(0)
+        out = (xs, ys, mx, my)
+        self._xy_cache[ck] = (key, out)
+        return out
+
+    def _ns_array_to_x(self, ts, day) -> "np.ndarray":
+        """`_ns_to_x` for a whole array of timestamps of one day at once."""
+        ts = np.asarray(ts, dtype=np.int64)
+        if self._mode == "one":
+            # A matplotlib date number is days since its epoch, in UTC; the axis
+            # formatter carries tz=PRAGUE, so no timezone is applied here.
+            ep = getattr(self, "_mpl_epoch_x", None)
+            if ep is None:
+                ep = self._mpl_epoch_x = float(self._mdates.date2num(
+                    datetime(1970, 1, 1, tzinfo=timezone.utc)))
+            return ep + ts.astype(float) / 86_400e9
+        try:
+            idx = self._days.index(day)
+        except ValueError:
+            return np.full(len(ts), np.nan)
+        d0_ns, _ = self._day_bounds_for(day)
+        return (self._base_num() + idx
+                + (ts - d0_ns).astype(float) / self._day_span_ns(day))
+
+    @staticmethod
+    def _thin_for_drawing(xs, ys, n_bins: int):
+        """At most ~2 points per pixel column — the lowest and the highest in it.
+
+        Every spike stays on the graph (a min/max envelope never smooths one
+        away), but matplotlib draws a few thousand points instead of hundreds of
+        thousands. Only the DRAWING is thinned; picks and their numbers read the
+        samples themselves."""
+        n = len(xs)
+        if n <= 3 * max(1, n_bins) or n < 2:
+            return xs, ys
+        x0, x1 = float(xs[0]), float(xs[-1])
+        if not (x1 > x0):
+            return xs, ys
+        bins = ((xs - x0) / (x1 - x0) * (n_bins - 1)).astype(np.int64)
+        starts = np.r_[0, np.flatnonzero(np.diff(bins)) + 1]
+        ends = np.r_[starts[1:], n] - 1
+        lo = np.fmin.reduceat(ys, starts)
+        hi = np.fmax.reduceat(ys, starts)
+        # The first sample of each column carries its time; the envelope goes
+        # first-low-high-last, so a step that crosses a column is still a step.
+        out_x = np.empty(len(starts) * 4)
+        out_y = np.empty(len(starts) * 4)
+        out_x[0::4] = xs[starts]; out_y[0::4] = ys[starts]
+        out_x[1::4] = xs[starts]; out_y[1::4] = lo
+        out_x[2::4] = xs[ends];   out_y[2::4] = hi
+        out_x[3::4] = xs[ends];   out_y[3::4] = ys[ends]
+        return out_x, out_y
+
+    def _no_curve_note(self, ch: str, days: list) -> str:
+        """Why a ticked PV has no curve on the shown day(s), in a few words."""
+        pending = getattr(self, "_pending", set())
+        if any((d, ch) in pending for d in days):
+            return "loading…"
+        if _is_derived_key(ch) and self._derived_reason.get(_derived_name(ch)):
+            return "could not be computed"
+        sts = [self._ch_status.get((d, ch)) for d in days]
+        if any(s in ("error", "stale") for s in sts):
+            return "archiver did not answer"
+        return "no data in these hours"
+
+    def _redraw_partial(self):
+        """A redraw while a load is still running — at most one per
+        max(_PARTIAL_REDRAW_MIN_MS, 3 × the last redraw's cost). The first piece
+        of a load draws at once; the rest wait for the gap."""
+        t = getattr(self, "_partial_timer", None)
+        if t is None:
+            t = self._partial_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._redraw_measured)
+        if t.isActive():
+            return
+        gap_s = max(_PARTIAL_REDRAW_MIN_MS / 1000.0,
+                    3.0 * getattr(self, "_redraw_cost_s", 0.0))
+        since = time.monotonic() - getattr(self, "_redraw_done_at", 0.0)
+        if since >= gap_s:
+            self._redraw_measured()
+        else:
+            t.start(int((gap_s - since) * 1000) + 1)
+
+    def _redraw_measured(self):
+        t0 = time.monotonic()
+        self._redraw()
+        self._redraw_done_at = time.monotonic()
+        self._redraw_cost_s = self._redraw_done_at - t0
 
     def _redraw(self):
         ax = self._ax
@@ -12799,6 +13788,13 @@ class PVRegionSearchDialog(QDialog):
 
         ordered_groups = sorted(groups.items(), key=_group_rank)
         handles: list = []
+        self._drawn_lines = []
+        # How many pixel columns one day gets — the curves are thinned to that.
+        try:
+            plot_px = max(400, int(self._canvas.width()))
+        except Exception:
+            plot_px = 1500
+        bins_per_day = max(200, plot_px // max(1, len(days)))
         for k, (unit_key, members) in enumerate(ordered_groups):
             if k == 0:
                 axis = ax
@@ -12811,25 +13807,47 @@ class PVRegionSearchDialog(QDialog):
                 self._axes_extra.append(axis)
             for label, ch in members:
                 colour, dash = self._style_for(ch)
-                xs: list = []
-                ys: list = []
-                mxs: list = []
-                mys: list = []
+                xs_p: list = []
+                ys_p: list = []
+                full: list = []
+                n_marks = 0
+                mxs_p: list = []
+                mys_p: list = []
                 for d in days:
                     dx, dy, mx, my = self._hold_xy(ch, d)
-                    if not dx:
+                    if not len(dx):
                         continue
                     any_data = True
-                    if xs:
-                        xs.append(np.nan); ys.append(np.nan)   # break between days
-                    xs.extend(dx); ys.extend(dy)
-                    mxs.extend(mx); mys.extend(my)
-                if not xs:
+                    if xs_p:
+                        # A break between days.
+                        xs_p.append(np.array([np.nan]))
+                        ys_p.append(np.array([np.nan]))
+                    full.append((dx, dy))
+                    dx, dy = self._thin_for_drawing(dx, dy, bins_per_day)
+                    xs_p.append(dx); ys_p.append(dy)
+                    n_marks += len(mx)
+                    mxs_p.append(mx); mys_p.append(my)
+                if not xs_p:
+                    # A ticked PV with no curve still has its line in the legend,
+                    # saying why. Skipped silently, a PV still loading, empty or
+                    # unanswered was simply not on the graph (27.10.2026: "two PVs
+                    # ticked, I see one").
+                    ln, = axis.plot([], [], dash, lw=1.2, color=colour,
+                                    label=(f"{label_by_ch.get(ch, label)} — "
+                                           f"{self._no_curve_note(ch, days)}"))
+                    handles.append(ln)
                     continue
+                xs = np.concatenate(xs_p)
+                ys = np.concatenate(ys_p)
+                mxs = np.concatenate(mxs_p) if n_marks < 600 else []
+                mys = np.concatenate(mys_p) if n_marks < 600 else []
                 ln, = axis.plot(xs, ys, dash, lw=1.2, alpha=0.9, color=colour,
                                 drawstyle="steps-post",
                                 label=label_by_ch.get(ch, label))
                 handles.append(ln)
+                # The whole curve, kept for a zoom: thinned to the full window it
+                # would lose its detail the moment the time axis is narrowed.
+                self._drawn_lines.append((ln, full))
                 # The real samples, where there are few enough for a dot to mean
                 # something. A held value is a line, never a dot: nothing was
                 # recorded there.
@@ -12855,18 +13873,14 @@ class PVRegionSearchDialog(QDialog):
                         transform=ax.get_xaxis_transform(), ha="center", va="bottom",
                         fontsize=8, color="#37474F")
             ax.set_xlabel("Time within each day")
-            # Ticks by the hour of the (virtual) day, so every day is read the same
-            # way. Left to matplotlib's own locator the labels land wherever a run
-            # of several days happens to put them.
-            step = 6 if len(days) <= 4 else 12
-            ax.xaxis.set_major_locator(
-                self._mdates.HourLocator(byhour=range(0, 24, step)))
+            # Ticks: _update_time_ticks, at the end of the redraw.
         elif days:
             s_ns, e_ns = self._day_bounds_for(days[0])
             ax.set_xlim(self._ns_to_x(s_ns, days[0]), self._ns_to_x(e_ns, days[0]))
             ax.set_xlabel("Time")
-        ax.xaxis.set_major_formatter(self._mdates.DateFormatter(
-            "%H:%M", tz=PRAGUE))
+            # The tick positions: _update_time_ticks, at the end of the redraw.
+            ax.xaxis.set_major_formatter(self._mdates.DateFormatter(
+                "%H:%M", tz=PRAGUE))
         # The strip of controls under the graph — grid, legend, log, the two hand-set
         # ranges and the tick spacing. One legend for every axis: matplotlib gives
         # each axes its own, and three of them would sit on top of each other in the
@@ -12885,8 +13899,170 @@ class PVRegionSearchDialog(QDialog):
         # The axis was just rebuilt, so the zoom history points at limits that no
         # longer exist. `ax.clear()` threw the view away; the stack has to go with it.
         self._xlim_stack = []
+        # Any change of the time axis — right-drag zoom, zoom back out, the
+        # toolbar's pan and zoom, a hand-set range — re-thins the curves to what
+        # is on screen, so a zoom shows every sample again.
+        try:
+            self._ax.callbacks.disconnect(getattr(self, "_xlim_cid", None))
+        except Exception:
+            pass
+        self._xlim_cid = self._ax.callbacks.connect(
+            "xlim_changed", lambda _a: self._rethin_soon())
+        if self._x_lim_user is not None:
+            self._rethin_lines()
+        self._update_time_ticks()
         self._canvas.draw_idle()
         self._install_span()
+
+    _TICK_STEPS_MIN = (1, 2, 5, 10, 15, 30, 60, 120, 180, 240, 360, 720)
+
+    def _update_time_ticks(self):
+        """Time labels on round clock times, for whatever part of the time axis
+        is on screen — about eight of them.
+
+        Whole hours counted from the window's own start over the whole window
+        (07:00, 09:00 … 21:00; matplotlib's own choice landed on 09:12, 11:36 and
+        skipped the start), finer steps as the axis is zoomed in. Placed by hand:
+        HourLocator's `byhour` did not keep to Prague time and came out an hour
+        off. A spacing set under "Ticks" is left alone."""
+        if self._tick_min:
+            return
+        days = self._shown_days()
+        if not days:
+            return
+        try:
+            from matplotlib.ticker import FixedLocator
+            lo, hi = self._ax.get_xlim()
+            if self._mode == "all":
+                unit_ns = sum(self._day_span_ns(d) for d in days) / len(days)
+            else:
+                unit_ns = 86_400e9
+            vis_min = max(1.0, (hi - lo) * unit_ns / 60e9)
+            step = next((s for s in self._TICK_STEPS_MIN if vis_min / s <= 8),
+                        self._TICK_STEPS_MIN[-1])
+            if self._mode == "all":
+                self._all_days_ticks(step)
+                return
+            d0 = days[0]
+            s_ns, e_ns = self._day_bounds_for(d0)
+            hour_ns = 3_600_000_000_000
+            step_ns = step * 60_000_000_000
+            midnight = int(datetime(d0.year, d0.month, d0.day,
+                                    tzinfo=self._tz()).timestamp() * 1e9)
+            # The window's first whole hour is the anchor every step counts from.
+            anchor = midnight + -(-(s_ns - midnight) // hour_ns) * hour_ns
+            lo_ns = self._x_to_ns(lo) or s_ns
+            hi_ns = self._x_to_ns(hi) or e_ns
+            t = anchor + -(-(lo_ns - anchor) // step_ns) * step_ns
+            pos = []
+            while t <= hi_ns and len(pos) < 50:
+                pos.append(self._ns_to_x(t, d0))
+                t += step_ns
+            self._ax.xaxis.set_major_locator(FixedLocator(pos))
+        except Exception:
+            pass
+
+    def _rethin_soon(self):
+        """Coalesced: a pan fires xlim_changed on every mouse move."""
+        t = getattr(self, "_rethin_timer", None)
+        if t is None:
+            t = self._rethin_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(30)
+            t.timeout.connect(self._rethin_and_draw)
+        t.start()
+
+    def _rethin_and_draw(self):
+        self._rethin_lines()
+        self._update_time_ticks()
+        self._canvas.draw_idle()
+
+    def _rethin_lines(self) -> bool:
+        """Thin every drawn curve again for the time range now on screen."""
+        lines = getattr(self, "_drawn_lines", None) or []
+        if not lines:
+            return False
+        lo, hi = self._ax.get_xlim()
+        if not hi > lo:
+            return False
+        try:
+            px = max(400, int(self._canvas.width()))
+        except Exception:
+            px = 1500
+        changed = False
+        for ln, parts in lines:
+            xs_p: list = []
+            ys_p: list = []
+            for dx, dy in parts:
+                if not len(dx):
+                    continue
+                # One sample beyond each edge, so the line runs to the frame.
+                i0 = max(0, int(np.searchsorted(dx, lo)) - 1)
+                i1 = min(len(dx), int(np.searchsorted(dx, hi, side="right")) + 1)
+                if i1 <= i0:
+                    continue
+                sx, sy = dx[i0:i1], dy[i0:i1]
+                frac = (min(hi, float(sx[-1])) - max(lo, float(sx[0]))) / (hi - lo)
+                bins = max(50, int(px * max(0.0, min(1.0, frac))))
+                sx, sy = self._thin_for_drawing(sx, sy, bins)
+                if xs_p:
+                    xs_p.append(np.array([np.nan]))
+                    ys_p.append(np.array([np.nan]))
+                xs_p.append(sx); ys_p.append(sy)
+            try:
+                if xs_p:
+                    ln.set_data(np.concatenate(xs_p), np.concatenate(ys_p))
+                else:
+                    ln.set_data([], [])
+                changed = True
+            except Exception:
+                pass
+        return changed
+
+    def _all_days_ticks(self, step_min: int = 0):
+        """Time labels for "All days": whole steps of each day's own window.
+
+        `step_min` 0 picks a step that leaves about a dozen labels in all."""
+        from matplotlib.ticker import FixedLocator, FuncFormatter
+        days = list(self._days)
+        if not days:
+            return
+        if not step_min:
+            hours = sum(self._day_span_ns(d) for d in days) / 3600e9
+            step_min = 720
+            for cand in (60, 120, 180, 240, 360, 720):
+                if hours * 60 / cand <= 12:
+                    step_min = cand
+                    break
+        step_ns = int(step_min) * 60_000_000_000
+        tz = self._tz()
+        pos: list = []
+        v_lo, v_hi = self._ax.get_xlim()
+        v_lo, v_hi = v_lo - 1e-6, v_hi + 1e-6
+        hour_ns = 3_600_000_000_000
+        for d in days:
+            s_ns, e_ns = self._day_bounds_for(d)
+            midnight = int(datetime(d.year, d.month, d.day,
+                                    tzinfo=tz).timestamp() * 1e9)
+            # From the first whole hour of the window, so 07–21 reads 07:00,
+            # 10:00, 13:00 … rather than starting at whatever 3 h divides.
+            t = midnight + -(-(s_ns - midnight) // hour_ns) * hour_ns
+            # Not ON the right edge: that x is also the next day's left edge.
+            # Only what is on screen — a fine step over six days is thousands.
+            while t < e_ns:
+                x = self._ns_to_x(t, d)
+                if v_lo <= x <= v_hi:
+                    pos.append(x)
+                t += step_ns
+
+        def _fmt(x, _pos=None):
+            t = self._x_to_ns(x)
+            if t is None:
+                return ""
+            return self._local_dt(t).strftime("%H:%M")
+
+        self._ax.xaxis.set_major_locator(FixedLocator(pos))
+        self._ax.xaxis.set_major_formatter(FuncFormatter(_fmt))
 
     def _paint_pick_number(self, x: float, n: int, edge: str = "#111111",
                            dy: float = -3.0):
@@ -13249,8 +14425,9 @@ class PVRegionSearchDialog(QDialog):
                 base = self._base_num()
                 fa = min(max(a - (base + idx), 0.0), 1.0)
                 fb = min(max(b - (base + idx), 0.0), 1.0)
-                t_start = int(d0_ns + fa * 86_400e9)
-                t_end = int(d0_ns + fb * 86_400e9)
+                span = self._day_span_ns(day)
+                t_start = int(d0_ns + fa * span)
+                t_end = int(d0_ns + fb * span)
             if t_start is None or t_end is None or t_end <= t_start:
                 continue
             rid = self._region_seq
@@ -13348,12 +14525,6 @@ class PVRegionSearchDialog(QDialog):
         # window owns only the second: the tab asks for the cameras when it has to,
         # whichever half was answered first.
         if self._cond_is_on():
-            if self._cond_scope_regs.isChecked() and not self._regions:
-                QMessageBox.information(
-                    self, title,
-                    "The condition is set to search the marked regions, but no "
-                    "region is marked. Drag one on the graph, or switch the "
-                    "condition to whole days."); return
             if not self._days:
                 QMessageBox.information(self, title, "Mark at least one day."); return
             self.accept()
@@ -13411,14 +14582,30 @@ class PVRegionSearchDialog(QDialog):
                 for i, r in enumerate(lst)]
         cond = None
         if self._cond_is_on():
+            rows = self._cond_rows_on()
+            # A formula row carries its own plan, snapshotted HERE on the GUI
+            # thread, for the same reason _reload_series snapshots it.
+            for row in rows:
+                if _is_derived_key(row["channel"]):
+                    try:
+                        plan, src = self._formula_snapshot([row["channel"]])
+                    except Exception:
+                        plan, src = [], {}
+                    row["plan"], row["src_channels"] = plan, src
+            first = rows[0]
             cond = {
-                "channel": self._cond_pv_cb.currentData(),
-                "label":   self._cond_pv_cb.currentText(),
-                "op":      self._cond_op_cb.currentData(),
-                "value":   float(self._cond_val.value()),
-                "value2":  float(self._cond_val2.value()),
-                "scope":   ("regions" if self._cond_scope_regs.isChecked()
-                            else "days"),
+                # The first row again at the top level, for every reader that
+                # knows one condition only.
+                "channel": first["channel"],
+                "label":   first["label"],
+                "op":      first["op"],
+                "value":   first["value"],
+                "value2":  first["value2"],
+                # Every ticked row; the search wants ALL of them at one moment.
+                "rows":    rows,
+                # Marked regions narrow the search to themselves; without any,
+                # each day's Time window is the limit.
+                "scope":   ("regions" if self._regions else "days"),
             }
         # In condition mode the search covers every MARKED day, not only the days
         # that happen to carry a region. Otherwise it is every day something was
@@ -13451,6 +14638,8 @@ class PVRegionSearchDialog(QDialog):
             # keeps these after this window closes, so its prev/next shot arrows
             # can walk the day without reopening it.
             "snap_stamps":     self._snap_stamps(),
+            # The part of each day the graph showed — the search keeps to it.
+            "windows":         {d: self._day_window_for(d) for d in self._days},
             "start_hour":      0,
             "max_hour":        23,
         }
@@ -13511,6 +14700,9 @@ class _WallShared:
         # relative point. On by default: the reason to draw a circle on a beam at
         # all is almost always to ask whether the OTHER frames sit inside it.
         self.link_marks = True
+        # The tile caption's text size, in points — one setting for every wall
+        # ("Label size" in the panel).
+        self.cap_pt = _DayWall.CAPTION_PT_DEFAULT
 
     # ── undo ──────────────────────────────────────────────────────────────────
     def push_undo(self):
@@ -13573,14 +14765,45 @@ class _WallScroll(QScrollArea):
                 self.zoomed.emit(int(round(notches))
                                  or (1 if notches > 0 else -1))
                 return
-        # A plain wheel on the Day-by-day wall steps whole cameras, one row a notch.
+        # A plain wheel on the Day-by-day wall steps whole rows, one a notch: a day
+        # in the vertical layout. In the horizontal layout the days run sideways, so
+        # there the wheel steps a DAY sideways — down = right, up = left — and only
+        # falls back to stepping the cameras when every day already fits the pane.
         w = self.widget()
-        if isinstance(w, _DayWall) and w.layout_mode() == "rows":
+        if isinstance(w, _DayWall) and w.layout_mode() in ("rows", "cols"):
             notches = event.angleDelta().y() / 120.0
             if notches:
                 step = int(round(notches)) or (1 if notches > 0 else -1)
+                hbar = self.horizontalScrollBar()
+                lefts = sorted(x for x in w.col_lefts() if x >= 0)
+                if lefts and hbar.maximum() > 0:
+                    cur = hbar.value()
+                    if step < 0:              # wheel towards the user: right
+                        after = [x for x in lefts if x > cur]
+                        target = (after[min(-step, len(after)) - 1] if after
+                                  else hbar.maximum())
+                    else:
+                        before = [x for x in lefts if x < cur]
+                        target = before[-min(step, len(before))] if before else 0
+                    hbar.setValue(target)
+                    event.accept()
+                    return
                 bar = self.verticalScrollBar()
-                bar.setValue(bar.value() - step * w.row_pitch())
+                tops = sorted(t for t in w.row_tops() if t >= 0)
+                if tops:
+                    # Snap to the row edges themselves, so every notch lands a row
+                    # in exactly the same place — never a pitch added to wherever
+                    # the bar happened to be.
+                    cur = bar.value()
+                    if step < 0:              # wheel towards the user: down
+                        after = [t for t in tops if t > cur]
+                        target = after[min(-step, len(after)) - 1] if after else cur
+                    else:
+                        before = [t for t in tops if t < cur]
+                        target = before[-min(step, len(before))] if before else 0
+                    bar.setValue(target)
+                else:
+                    bar.setValue(bar.value() - step * w.row_pitch())
                 event.accept()
                 return
         super().wheelEvent(event)
@@ -13632,12 +14855,24 @@ class _DayWall(QWidget):
     selection_changed = Signal()
 
     _GAP       = 3                    # px between tiles, so captions cannot touch
-    _CAPTION_H = 20                   # px reserved under each frame for its day label
-    _DAY_HDR_H = 22                   # px for the day banner in rows-by-day mode
+    # The caption under each frame. Its text size is the operator's ("Label size");
+    # the strip is as tall as that text needs, never less than the old 20 px.
+    CAPTION_PT_DEFAULT = 8.5
+    CAPTION_PT_MIN, CAPTION_PT_MAX = 7.0, 20.0
+    _CAPTION_H_MIN = 20
+    # The vertical wall's camera plates and day bands follow "Label size" too; these
+    # are the heights they never go below (the old fixed sizes). The plates' text is
+    # this much larger than the captions', as it always was (10 pt over 8.5 pt).
+    _DAY_HDR_MIN = 22
+    _DAY_BAND_MIN = 20
+    _HEAD_PT_RATIO = 10.0 / 8.5
     _HANDLE_R  = 7                    # overlay grab handle radius
     # Never more than four frames across. Beyond that a row of thumbnails is not a
     # comparison any more — and it is the operators' own number.
     _MAX_COLS  = 4
+    # The vertical Day-by-day wall: one column per camera, and this many fill the
+    # pane before it scrolls sideways — the operator's number.
+    _MAX_CAM_COLS = 6
     _ZOOM_MIN, _ZOOM_MAX = 0.5, 8.0
     _ZOOM_STEP = 1.15
 
@@ -13645,7 +14880,13 @@ class _DayWall(QWidget):
         super().__init__(parent)
         self.setMinimumSize(200, 150)
         self.setAutoFillBackground(True)
-        self.setStyleSheet("background:#1a1a1a;")
+        # The dark ground is NAMED, never a bare "background:" — a bare rule also
+        # reaches the hover tooltip, which then came out grey on near-black.
+        self.setObjectName("dayWall")
+        self.setStyleSheet(
+            "QWidget#dayWall { background:#1a1a1a; }"
+            "QToolTip { background:#ffffe0; color:#111111;"
+            " border:1px solid #808080; padding:3px; }")
         self.setMouseTracking(True)
 
         self._shared = shared if shared is not None else _WallShared()
@@ -13662,10 +14903,14 @@ class _DayWall(QWidget):
         # "grid" — every tile the same size, at most four across, as large as the
         #          pane allows. What a comparison wall wants, and the default.
         # "rows" — one row per CAMERA, the days always in the same order.
+        # "cols" — one COLUMN per camera, the days downward, newest on top.
         # "pack" — the Slider's free-form partition, biggest frame wins. Kept only
         #          for a caller that explicitly asks for it.
         self._layout_mode = "grid"
-        self._row_heads: "list[tuple[QRect, str]]" = []   # camera banners in rows mode
+        # Camera banners: across each row in rows mode, over each column in cols mode.
+        self._row_heads: "list[tuple[QRect, str]]" = []
+        self._row_keys: list = []           # rows mode: the camera of each _row_heads entry
+        self._day_bands: "list[tuple[QRect, str]]" = []   # cols mode: one per day
         self._multi_cam = False             # set by set_cells — see _caption
         self._zoom = 1.0                    # 1.0 = fits the pane exactly
         self._fit_w = self._fit_h = 0       # last known pane size — see _avail
@@ -13691,6 +14936,14 @@ class _DayWall(QWidget):
 
         self._sig = _WallSignals()
         self._sig.tile_ready.connect(self._on_tile_ready)
+
+        # The tile under the mouse, at full quality once the mouse rests on it.
+        self._hq = None                     # (index, _hq_key, pixmap)
+        self._hq_timer = QTimer(self)
+        self._hq_timer.setSingleShot(True)
+        self._hq_timer.setInterval(self._HQ_DELAY_MS)
+        self._hq_timer.timeout.connect(self._make_hq)
+        self._last_vscroll = 0
 
     # ── contents ──────────────────────────────────────────────────────────────
     def cells(self) -> "list[dict]":
@@ -13861,6 +15114,8 @@ class _DayWall(QWidget):
         """"grid" — every tile the same size, at most four across, as large as they go.
         "rows" — one row per CAMERA, the days always in the same order, for reading
         along a line and seeing one camera change from day to day.
+        "cols" — the same turned upright: one column per camera, one row per day
+        with the newest on top, read downward.
         "pack" — the Slider's free-form partition, where the biggest frame wins."""
         if mode == self._layout_mode:
             return
@@ -13870,9 +15125,8 @@ class _DayWall(QWidget):
         self.update()
 
     def layout_mode(self) -> str:
-        """Which of the three layouts this wall is on. The pane asks, so a plain
-        wheel can step whole cameras on the Day-by-day wall and scroll on the
-        others."""
+        """Which layout this wall is on. The pane asks, so a plain wheel can step
+        whole rows on the Day-by-day wall and scroll on the others."""
         return self._layout_mode
 
     # ── zoom ──────────────────────────────────────────────────────────────────
@@ -13899,6 +15153,69 @@ class _DayWall(QWidget):
 
     def reset_zoom(self) -> bool:
         return self.set_zoom(1.0)
+
+    # ── caption size ──────────────────────────────────────────────────────────
+    # `_cap_scale` is 1 on screen; "Save view" raises it for the duration of the
+    # export, so the strip grows with the text instead of the text spilling over.
+    _cap_scale = 1.0
+
+    def _caption_font(self, scale: float = 1.0) -> QFont:
+        f = QFont(self.font())
+        f.setPointSizeF(max(5.0, float(self._shared.cap_pt) * scale))
+        return f
+
+    @property
+    def _CAPTION_H(self) -> int:
+        """Px reserved under each frame for its caption — as tall as the chosen
+        text size needs."""
+        h = QFontMetrics(self._caption_font()).height() + 6
+        return int(round(max(self._CAPTION_H_MIN, h) * self._cap_scale))
+
+    def _head_font(self, scale: float = 1.0) -> QFont:
+        """The camera plates over the vertical wall — bold, a step above the
+        captions, and growing with them."""
+        f = self._caption_font(scale * self._HEAD_PT_RATIO)
+        f.setBold(True)
+        return f
+
+    def _band_font(self, scale: float = 1.0) -> QFont:
+        """The day bands across the vertical wall, and the camera name pinned into
+        the horizontal wall's caption strip: the captions' size, bold."""
+        f = self._caption_font(scale)
+        f.setBold(True)
+        return f
+
+    def _row_name_fit(self, txt: str, col_w: float,
+                      scale: float = 1.0) -> "tuple[QFont, int]":
+        """The font and box width of a camera name pinned into the horizontal
+        wall's caption strip. The box never grows past one column: a long name is
+        never cut, its TEXT gets smaller until it fits."""
+        f = self._band_font(scale)
+        pad = int(6 * scale)
+        room = max(1, int(col_w) - 2 * self._GAP - 2 * pad)
+        pt = f.pointSizeF()
+        while pt > 5.0 and QFontMetrics(f).horizontalAdvance(txt) > room:
+            pt -= 0.5
+            f.setPointSizeF(pt)
+        return f, QFontMetrics(f).horizontalAdvance(txt) + 2 * pad
+
+    @property
+    def _DAY_HDR_H(self) -> int:
+        """Px of the camera plate over the vertical wall — as tall as its text."""
+        return max(self._DAY_HDR_MIN, QFontMetrics(self._head_font()).height() + 5)
+
+    @property
+    def _DAY_BAND_H(self) -> int:
+        """Px of the band naming a day across the vertical wall."""
+        return max(self._DAY_BAND_MIN, QFontMetrics(self._band_font()).height() + 4)
+
+    def refresh_captions(self):
+        """Re-lay the tiles after the caption size (`_WallShared.cap_pt`, shared by
+        every wall) changed: the picture gets what the caption leaves of the tile."""
+        self._pix.clear()
+        self._hq = None
+        self._relayout()
+        self.update()
 
     def selected_paths(self) -> set:
         return set(self._shared.sel)
@@ -14139,8 +15456,9 @@ class _DayWall(QWidget):
         return rows, cols
 
     def _row_head_text(self, cam) -> str:
-        """The banner over one row: the CAMERA, how many days it spans, and what is on
-        it when those days carry several picks."""
+        """The name of one row: the CAMERA, and what is on it when its days carry
+        several picks. How many days it spans is not said — every caption on the
+        row names its own day, and the name shares the caption strip now."""
         head = str(cam or "")
         # BOTH kinds are counted. It used to choose one word for the whole wall from
         # `any(pick)`, so a day carrying four moments AND four regions was announced
@@ -14157,12 +15475,6 @@ class _DayWall(QWidget):
         moments = {c.get("pick") for c in on_day
                    if c.get("pick") and not (c.get("region")
                                              or c.get("pick_kind") == "region")}
-        # HOW MANY DAYS this camera's line reaches across — its own phrase, not part
-        # of the "moments + regions" pair. Only worth saying when it is more than one:
-        # the tiles' own captions name the day either way.
-        days = {c.get("day") for c in on_day}
-        if len(days) > 1:
-            head += f"   ·   {len(days)} days"
         bits = []
         if len(moments) > 1 or (moments and regions):
             bits.append(f"{len(moments)} moment" + ("s" if len(moments) != 1 else ""))
@@ -14172,14 +15484,33 @@ class _DayWall(QWidget):
             head += "   ·   " + " + ".join(bits)
         return head
 
+    def row_tops(self) -> "list[int]":
+        """Scroll positions that put a row exactly at the top of the pane, from the
+        last layout. The wheel snaps to these instead of adding a pitch: in the
+        vertical layout a day band sits between rows, so pitch steps drifted and the
+        cameras crept up the pane notch by notch (13.10.2026)."""
+        return list(getattr(self, "_row_tops", []) or [])
+
+    def col_lefts(self) -> "list[int]":
+        """Scroll positions that put a day column exactly at the left edge of the
+        pane, in the horizontal layout — where the wheel steps sideways, a day a
+        notch. Empty in every other layout."""
+        if self._layout_mode != "rows":
+            return []
+        _rows, cols = self._row_order()
+        cw = self.row_col_width()
+        return [int(round(i * cw)) for i in range(len(cols))]
+
     def row_pitch(self) -> int:
-        """The height of one row including its banner — what a wheel notch steps."""
+        """The height of one row — what a wheel notch steps. A row has no banner of
+        its own any more: the camera name sits in its caption strip."""
+        if self._layout_mode == "cols":
+            return max(1, self.cols_tile_height())
         rows, cols = self._row_order()
         if not rows or not cols:
-            return max(1, self._DAY_HDR_H + 90)
+            return 90
         _W, H = self._avail()
-        row_h = max(90, int(H * self._zoom / self._ROWS_IN_VIEW) - self._DAY_HDR_H)
-        return self._DAY_HDR_H + row_h
+        return max(90, int(H * self._zoom / self._ROWS_IN_VIEW))
 
     def row_col_width(self) -> float:
         """How wide one column of the Day-by-day wall is.
@@ -14216,29 +15547,39 @@ class _DayWall(QWidget):
         rows, cols = self._row_order()
         self._rects = [QRect() for _ in self._cells]
         self._row_heads = []
+        self._row_keys = []
         if not rows or not cols:
             return
         # The PANE's width, never this widget's own: with more than four columns the
         # widget is deliberately wider than the pane, so measuring itself would make
         # every pass wider than the last. Same reason as _avail's for the height.
-        W = max(1, self._avail()[0])
-        pitch = self.row_pitch()
-        row_h = pitch - self._DAY_HDR_H
+        W, H = max(1, self._avail()[0]), max(1, self._avail()[1])
+        pitch = row_h = self.row_pitch()
         total_h = len(rows) * pitch
+        # One or two cameras keep the three-rows-a-pane size, but sit in the MIDDLE
+        # of the pane instead of under its top edge with a black third below.
+        y_off = (H - total_h) // 2 if total_h < H else 0
         pos = {}
         n = len(cols)
         cw = self.row_col_width()
         total_w = cw * n
+        self._row_tops = [y_off + r * pitch for r in range(len(rows))]
+        self._row_keys = list(rows)
+        cap_h = self._CAPTION_H
         for r, row_key in enumerate(rows):
-            y = r * pitch
+            y = y_off + r * pitch
+            # The camera NAME is no band over the row any more: it sits at the left
+            # end of the row's caption strip (where `_paint_into` pins it to the
+            # pane's left edge). This rect is its unscrolled place; the paint
+            # records where it really landed.
+            txt = self._row_head_text(row_key)
+            _f, nw = self._row_name_fit(txt, cw)
             self._row_heads.append(
-                (QRect(0, y, int(round(max(W, total_w))), self._DAY_HDR_H),
-                 self._row_head_text(row_key)))
+                (QRect(0, y + row_h - cap_h, nw, cap_h), txt))
             for cidx, col in enumerate(cols):
                 x0 = int(round(cidx * cw))
                 x1 = int(round((cidx + 1) * cw))
-                pos[(row_key, col)] = QRect(x0, y + self._DAY_HDR_H,
-                                            max(20, x1 - x0), row_h)
+                pos[(row_key, col)] = QRect(x0, y, max(20, x1 - x0), row_h)
         for i, c in enumerate(self._cells):
             self._rects[i] = pos.get((self._cell_row_key(c), self._cell_col_key(c)),
                                      QRect(0, 0, 0, 0))
@@ -14246,6 +15587,111 @@ class _DayWall(QWidget):
         # A single pixel of rounding must not raise the sideways bar: it takes height
         # from the viewport, the rows re-lay out shorter, and that must not feed back.
         self.setMinimumWidth(int(round(total_w)) if total_w > W + 2 else 0)
+
+    # ── the vertical Day-by-day wall ("cols") ────────────────────────────────
+    def _col_order(self) -> "tuple[list, list]":
+        """(cameras left to right, (day, pick) rows top to bottom).
+
+        The NEWEST day is the top row, the oldest the bottom one — the operator's
+        rule for reading down a column. The picks of one day stay in time order."""
+        cams, rows = [], []
+        for c in self._cells:
+            k, r = self._cell_row_key(c), self._cell_col_key(c)
+            if k not in cams:
+                cams.append(k)
+            if r not in rows:
+                rows.append(r)
+        cams.sort(key=lambda d: str(d))
+        rows.sort(key=lambda t: t[1] or 0)
+        rows.sort(key=lambda t: str(t[0]), reverse=True)     # stable: picks keep order
+        return cams, rows
+
+    def cols_col_width(self) -> float:
+        """One camera column: as many cameras as there are fill the pane, up to six;
+        more than that and the pane scrolls sideways."""
+        cams, _rows = self._col_order()
+        n = len(cams)
+        if n <= 0:
+            return 1.0
+        W, _H = self._avail()
+        return max(40.0, W / min(self._MAX_CAM_COLS, n) * self._zoom)
+
+    def cols_tile_height(self) -> int:
+        """One (day, pick) row: as tall as the tallest frame needs to fill its column,
+        but never more than a THIRD of the pane — at least three days are always on
+        screen (the operator's rule). A tall camera (the diode array) used to make a
+        row the whole pane high. Zoom scales the cap, so bigger still works."""
+        cw = self.cols_col_width()
+        pic_w = max(8.0, cw - 2 * self._GAP)
+        aspects = self._aspects()
+        a = min(aspects) if aspects else 4.0 / 3.0
+        tile_h = pic_w / a + self._CAPTION_H + 2 * self._GAP
+        _W, H = self._avail()
+        cap = ((H - self._DAY_HDR_H) / 3.0 - self._DAY_BAND_H) * self._zoom
+        if cap > 40:
+            tile_h = min(tile_h, cap)
+        return int(round(tile_h))
+
+    @staticmethod
+    def _day_band_text(day) -> str:
+        if hasattr(day, "strftime"):
+            return f"{_WEEKDAYS_EN[day.weekday()]}  {day.strftime('%d.%m.%Y')}"
+        return str(day or "")
+
+    def _relayout_cols(self):
+        """ONE COLUMN PER CAMERA; one row per (day, pick), newest day on top.
+
+        The camera names are a band across the top (kept on screen while scrolling
+        down, see `_paint_into`); each day starts with a thin band naming it."""
+        cams, rows = self._col_order()
+        self._rects = [QRect() for _ in self._cells]
+        self._row_heads = []
+        self._day_bands = []
+        if not cams or not rows:
+            return
+        W = max(1, self._avail()[0])
+        cw = self.cols_col_width()
+        n = len(cams)
+        total_w = cw * n
+        full_w = int(round(max(W, total_w)))
+        th = self.cols_tile_height()
+
+        def xs(ci: int) -> "tuple[int, int]":
+            return int(round(ci * cw)), int(round((ci + 1) * cw))
+
+        for ci, cam in enumerate(cams):
+            x0, x1 = xs(ci)
+            self._row_heads.append((QRect(x0, 0, x1 - x0, self._DAY_HDR_H), str(cam)))
+        pos = {}
+        y = self._DAY_HDR_H
+        prev_day = object()
+        # Where the wheel parks the pane: each row's top (its day band, if it opens
+        # a day), less the camera band that stays pinned over the top of the pane.
+        self._row_tops = []
+        for r in rows:
+            self._row_tops.append(y - self._DAY_HDR_H)
+            if r[0] != prev_day:
+                prev_day = r[0]
+                self._day_bands.append((QRect(0, y, full_w, self._DAY_BAND_H),
+                                        self._day_band_text(r[0])))
+                y += self._DAY_BAND_H
+            for ci, cam in enumerate(cams):
+                x0, x1 = xs(ci)
+                pos[(cam, r)] = QRect(x0, y, max(20, x1 - x0), th)
+            y += th
+        for i, c in enumerate(self._cells):
+            self._rects[i] = pos.get((self._cell_row_key(c), self._cell_col_key(c)),
+                                     QRect(0, 0, 0, 0))
+        self.setMinimumHeight(y)
+        self.setMinimumWidth(int(round(total_w)) if total_w > W + 2 else 0)
+
+    def _vscroll(self) -> int:
+        """How far the pane is scrolled down — the camera band rides with it."""
+        sc = self._scroll_host
+        try:
+            return sc.verticalScrollBar().value() if sc is not None else 0
+        except RuntimeError:
+            return 0
 
     def _avail(self) -> "tuple[int, int]":
         """The room the tiles have to fit into.
@@ -14373,11 +15819,19 @@ class _DayWall(QWidget):
         n = len(self._cells)
         self._rects = []
         self._row_heads = []
+        self._day_bands = []
+        # Where each picture landed is learnt again by the next paint; the sharp
+        # hover copy belongs to the old size.
+        self._img_rects = [QRect() for _ in self._cells]
+        self._hq = None
         if n == 0:
             self.setMinimumHeight(150)
             return
         if self._layout_mode == "rows":
             self._relayout_rows()
+            return
+        if self._layout_mode == "cols":
+            self._relayout_cols()
             return
         if self._layout_mode == "grid":
             self._relayout_grid()
@@ -14418,7 +15872,24 @@ class _DayWall(QWidget):
         self._pix.clear()          # tiles are rendered to their drawn size
 
     # ── rendering ─────────────────────────────────────────────────────────────
-    def _tile_pixmap(self, idx: int, target: QRect) -> "QPixmap | None":
+    def _thin_step(self, shape, target: QRect, rot: int) -> int:
+        """Every how-many-th pixel a tile needs: the frame is read at full resolution
+        but drawn a few hundred pixels wide, and rendering all of it (palette, gamma)
+        for every tile is what made the wall stutter. Striding by the whole number of
+        frame pixels per drawn pixel keeps at least the drawn size, so the smooth
+        scale that follows still has every pixel it shows."""
+        h, w = shape[:2]
+        if rot in (90, 270):
+            w, h = h, w
+        avail_h = max(8, target.height() - self._CAPTION_H - 2 * self._GAP)
+        avail_w = max(8, target.width() - 2 * self._GAP)
+        return max(1, int(min(h / avail_h, w / avail_w)))
+
+    def _tile_pixmap(self, idx: int, target: QRect,
+                     hq: bool = False) -> "QPixmap | None":
+        """The tile's picture at its drawn size, from a thinned frame (see
+        `_thin_step`). `hq` renders from EVERY pixel instead — the tile under the
+        mouse — and leaves the cache alone."""
         # Resolve the shared Auto pair BEFORE the cache key is built — it is part of
         # the key, and computing it afterwards would invalidate the cache on the very
         # next tile and re-render the whole wall on every repaint.
@@ -14441,26 +15912,35 @@ class _DayWall(QWidget):
         # one tile must not throw away the other forty-nine pixmaps.
         akey = (adj.get("contrast"), adj.get("offset"), adj.get("gamma"),
                 adj.get("rot", 0), adj.get("grad"))
-        hit = self._pix.get(idx)
-        if hit is not None and hit[0] == akey:
-            return hit[1]
+        if not hq:
+            hit = self._pix.get(idx)
+            if hit is not None and hit[0] == akey:
+                return hit[1]
         entry = self._raw.get(cell.get("path"))
         if not entry:
             return None
         arr, full_scale = entry
+        step = 1 if hq else self._thin_step(arr.shape, target,
+                                            int(adj.get("rot", 0)) % 360)
+        base_arr = None
         if self._baseline_idx is not None and self._baseline_idx != idx:
             base = self._raw.get(self._cells[self._baseline_idx].get("path"))
             if base and base[0].shape == arr.shape and full_scale and base[1]:
-                # Subtract on ONE common range, never on the stored values. The archiver
-                # stretched each frame by its own bracket, so a dim day and a bright one
-                # can both sit near 51 000 in the file: subtracting those gives almost
-                # zero and the deviation comes out black, while the real difference is
-                # the whole point. Converting both to the same range first makes the
-                # difference a difference in true intensity.
-                k = img_scale.FULL_SCALE_16
-                arr = np.abs(arr.astype(np.float32) * (k / float(full_scale))
-                             - base[0].astype(np.float32) * (k / float(base[1])))
-                full_scale = k
+                base_arr = base
+        if step > 1:
+            arr = arr[::step, ::step]
+        if base_arr is not None:
+            # Subtract on ONE common range, never on the stored values. The archiver
+            # stretched each frame by its own bracket, so a dim day and a bright one
+            # can both sit near 51 000 in the file: subtracting those gives almost
+            # zero and the deviation comes out black, while the real difference is
+            # the whole point. Converting both to the same range first makes the
+            # difference a difference in true intensity.
+            b0 = base_arr[0][::step, ::step] if step > 1 else base_arr[0]
+            k = img_scale.FULL_SCALE_16
+            arr = np.abs(arr.astype(np.float32) * (k / float(full_scale))
+                         - b0.astype(np.float32) * (k / float(base_arr[1])))
+            full_scale = k
         if has_intensity:
             # This frame was picked out and adjusted by hand. Its own numbers replace
             # the wall's — including Auto, which is a shared reading it has opted out
@@ -14501,8 +15981,34 @@ class _DayWall(QWidget):
             avail_w, avail_h,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation)
-        self._pix[idx] = (akey, pm)
+        if not hq:
+            self._pix[idx] = (akey, pm)
         return pm
+
+    # ── the sharp copy of the tile under the mouse ───────────────────────────
+    _HQ_DELAY_MS = 150
+
+    def _hq_key(self, idx: int, r: QRect) -> tuple:
+        adj = self._shared.adj.get(self._cells[idx].get("path")) or {}
+        return (self._render_key, tuple(sorted(adj.items(), key=lambda t: t[0])),
+                r.width(), r.height())
+
+    def _make_hq(self):
+        """The mouse has rested on a tile: render it from every pixel of its frame."""
+        i = self._hover
+        if not (0 <= i < len(self._cells)) or i >= len(self._rects):
+            return
+        r = self._rects[i]
+        if r.width() <= 0 or r.height() <= 0:
+            return
+        try:
+            pm = self._tile_pixmap(i, r, hq=True)
+        except Exception:
+            pm = None
+        if pm is None or pm.isNull():
+            return
+        self._hq = (i, self._hq_key(i, r), pm)
+        self.update(r)
 
     # How the frame was chosen, in words the caption has room for. A frame nobody
     # vouched for has to look different from one a shot picked, or a black tile reads
@@ -14516,7 +16022,7 @@ class _DayWall(QWidget):
         # camera, so repeating it under every tile of that line says nothing and the
         # one thing the tile is not otherwise told apart by — which day it is — had
         # no room left. Everywhere else the old rule stands.
-        if self._multi_cam and self._layout_mode != "rows":
+        if self._multi_cam and self._layout_mode not in ("rows", "cols"):
             # Many cameras at one moment: the camera is what tells the tiles apart.
             txt = str(cell.get("cam") or "")
         else:
@@ -14565,20 +16071,52 @@ class _DayWall(QWidget):
                 txt += "  (own palette)"
         return txt
 
-    def _paint_into(self, painter: QPainter, rects: list, scale: float = 1.0):
+    def _paint_into(self, painter: QPainter, rects: list, scale: float = 1.0,
+                    clip: "QRect | None" = None):
+        """Draw the wall. `clip` (on screen only) skips every tile outside it — a
+        scroll or a hover repaints a strip, not all forty tiles."""
         f = painter.font()
         f.setPointSizeF(max(6.0, 8.5 * scale))
         painter.setFont(f)
+        # Every label on the wall follows "Label size": the tile captions, the camera
+        # names and the day bands alike.
+        cf = self._caption_font(scale)
+        cap_h = self._CAPTION_H
         live = (scale == 1.0 and rects is self._rects)
-        if live:
+        if live and len(self._img_rects) != len(self._cells):
             self._img_rects = [QRect() for _ in self._cells]
-        if self._layout_mode == "rows":
-            hf = painter.font()
-            hf.setBold(True)
-            # WHICH CAMERA a row is must stay readable however far the wall is
-            # scrolled sideways, so the words ride with the viewport while the band
-            # spans the whole width. Scrolled off the left edge, the banner named
-            # nothing.
+        # Horizontal Day by day: WHICH CAMERA a row is sits at the left end of the
+        # row's caption strip, pinned to the pane's left edge however far the wall is
+        # scrolled sideways. Worked out before the tiles, so a caption the name box
+        # covers can make room for it. row key → [font, x0, x1, text, anchor tile].
+        names: dict = {}
+        if (self._layout_mode == "rows" and self._row_heads
+                and len(self._row_keys) == len(self._row_heads)):
+            hs = 0
+            if live:
+                sc = self._scroll_host
+                try:
+                    if sc is not None:
+                        hs = sc.horizontalScrollBar().value()
+                except RuntimeError:
+                    pass
+            nx0 = hs + int(self._GAP * scale)
+            cw = self.row_col_width() * scale
+            for k, (_hr, txt) in zip(self._row_keys, self._row_heads):
+                nf, nw = self._row_name_fit(txt, cw, scale)
+                names[k] = [nf, nx0, nx0 + nw, txt, -1]
+            for i, cell in enumerate(self._cells):
+                if i >= len(rects):
+                    break
+                nm = names.get(self._cell_row_key(cell))
+                r = rects[i]
+                if (nm is not None and r.width() > 0
+                        and r.left() <= nm[1] <= r.right()):
+                    nm[4] = i
+        cap_tops: dict = {}                 # tile → where its caption strip landed
+        if self._layout_mode == "cols":
+            # The day bands across the vertical wall. Their words ride with the
+            # sideways scroll, like the row banners above.
             x_pad = int(10 * scale)
             if live:
                 sc = self._scroll_host
@@ -14587,35 +16125,45 @@ class _DayWall(QWidget):
                         x_pad += sc.horizontalScrollBar().value()
                 except RuntimeError:
                     pass
-            for hr, txt in self._row_heads:
-                r = (hr if scale == 1.0 else
-                     QRect(int(hr.x() * scale), int(hr.y() * scale),
-                           int(hr.width() * scale), int(hr.height() * scale)))
-                painter.fillRect(r, QColor("#333"))
-                painter.setFont(hf)
-                painter.setPen(QPen(QColor("#eee")))
+            bf = self._band_font(scale)
+            for br, txt in self._day_bands:
+                r = self._scaled_rect(br, scale)
+                painter.fillRect(r, QColor("#3a3a3a"))
+                painter.setFont(bf)
+                painter.setPen(QPen(QColor("#ffffff")))
                 painter.drawText(r.adjusted(x_pad, 0, 0, 0),
                                  Qt.AlignmentFlag.AlignVCenter |
                                  Qt.AlignmentFlag.AlignLeft, txt)
-                painter.setFont(f)
+            painter.setFont(f)
         for i, cell in enumerate(self._cells):
             if i >= len(rects):
                 break
             r = rects[i]
             if r.width() <= 0 or r.height() <= 0:
                 continue
+            if clip is not None and not r.intersects(clip):
+                continue
             is_base = (self._baseline_idx == i)
             path = cell.get("path")
             pm = self._tile_pixmap(i, r)
+            hq = self._hq if live else None
+            if (hq is not None and hq[0] == i and i == self._hover
+                    and hq[1] == self._hq_key(i, r)):
+                pm = hq[2]
+            # The caption hangs directly under the picture, and the two are centred
+            # in the tile together: pinned to the tile's bottom edge it sat far
+            # below a wide frame in a tall tile, belonging to nothing.
+            cap_rect = QRect(r.x(), r.y() + r.height() - cap_h, r.width(), cap_h)
             if pm is not None and not pm.isNull():
                 x = r.x() + (r.width() - pm.width()) // 2
                 y = r.y() + self._GAP + (
-                    r.height() - self._CAPTION_H - 2 * self._GAP - pm.height()) // 2
+                    r.height() - cap_h - 2 * self._GAP - pm.height()) // 2
                 painter.drawPixmap(x, y, pm)
                 ir = QRect(x, y, pm.width(), pm.height())
                 if live:
                     self._img_rects[i] = ir
                 self._paint_overlay(painter, path, ir, scale)
+                cap_rect.moveTop(min(y + pm.height(), r.y() + r.height() - cap_h))
             else:
                 # Three different states, three different looks. "Nothing near the
                 # moment" is an ANSWER and wears the warning colour; a frame still
@@ -14629,11 +16177,9 @@ class _DayWall(QWidget):
                 else:
                     note = "no image" if path is None else "…"
                 painter.drawText(r.adjusted(int(4 * scale), 0, int(-4 * scale),
-                                            -self._CAPTION_H),
+                                            -cap_h),
                                  Qt.AlignmentFlag.AlignCenter |
                                  Qt.TextFlag.TextWordWrap, note)
-            cap_rect = QRect(r.x(), r.y() + r.height() - self._CAPTION_H,
-                             r.width(), self._CAPTION_H)
             if cell.get("status") == "no_frame":
                 # Dark red band with white ink — never a dark tint left to inherit
                 # black text, which is the rogue-row look this program avoids.
@@ -14643,16 +16189,111 @@ class _DayWall(QWidget):
                 painter.fillRect(cap_rect,
                                  QColor("#2b2b2b" if not is_base else "#4a3b00"))
                 painter.setPen(QPen(QColor("#ffd54f" if is_base else "#ddd")))
-            painter.drawText(cap_rect, Qt.AlignmentFlag.AlignCenter,
-                             self._caption(cell) + ("  (reference)" if is_base else ""))
+            cap_txt = self._caption(cell) + ("  (reference)" if is_base else "")
+            cap_tops[i] = cap_rect.y()
+            # Where the pinned camera name covers part of this strip, the caption is
+            # centred in what is left to the right of it — never under it.
+            text_rect = cap_rect
+            nm = names.get(self._cell_row_key(cell)) if names else None
+            if (nm is not None and cap_rect.left() < nm[2]
+                    and cap_rect.right() > nm[1]):
+                left = min(cap_rect.right(), max(cap_rect.left(),
+                                                 nm[2] + int(4 * scale)))
+                text_rect = QRect(left, cap_rect.y(),
+                                  max(1, cap_rect.right() + 1 - left), cap_h)
+            # A caption is never cut: in a narrow tile its text gets smaller.
+            tf = QFont(cf)
+            room = max(1, text_rect.width() - int(6 * scale))
+            pt = tf.pointSizeF()
+            while pt > 5.0 and QFontMetrics(tf).horizontalAdvance(cap_txt) > room:
+                pt -= 0.5
+                tf.setPointSizeF(pt)
+            painter.setFont(tf)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, cap_txt)
+            painter.setFont(f)
             if path is not None and path in self._shared.sel:
                 painter.setPen(QPen(QColor("#4a9eff"), 3))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(r.adjusted(1, 1, -2, -2))
-            elif i == self._hover:
+            if i == self._hover and live:
+                # Hovering a MARKED tile shows too — inside the blue mark, so the two
+                # never hide each other. Marking is for the edit controls; it must not
+                # make a tile look dead under the mouse.
+                inset = 4 if (path is not None and path in self._shared.sel) else 1
                 painter.setPen(QPen(QColor("#6cf"), 2))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(r.adjusted(1, 1, -2, -2))
+                painter.drawRect(r.adjusted(inset, inset, -inset - 1, -inset - 1))
+        if names:
+            self._paint_row_names(painter, rects, names, cap_tops, cap_h, scale, live)
+        if self._layout_mode == "cols":
+            self._paint_cam_heads(painter, scale, live)
+
+    def _paint_row_names(self, painter: QPainter, rects: list, names: dict,
+                         cap_tops: dict, cap_h: int, scale: float, live: bool):
+        """The camera names of the horizontal wall, each on a plate at the left end
+        of its row's caption strip — drawn last, so they sit over the tiles.
+
+        The plate takes the strip of the tile under the pane's left edge. That tile
+        may not have been repainted in this pass (a hover repaints one tile), so its
+        strip's place comes from what was last drawn for it."""
+        inset = int(3 * scale)
+        for idx, k in enumerate(self._row_keys):
+            nm = names.get(k)
+            if nm is None:
+                continue
+            nf, x0, x1, txt, anchor = nm
+            y = None
+            if anchor >= 0:
+                y = cap_tops.get(anchor)
+                if y is None:
+                    r = rects[anchor]
+                    y = r.y() + r.height() - cap_h
+                    ir = self._img_rect_at(anchor) if live else None
+                    if ir is not None and ir.intersects(r):
+                        y = min(ir.y() + ir.height(), y)
+            if y is None:
+                hr = self._scaled_rect(self._row_heads[idx][0], scale)
+                y = hr.y()
+            box = QRect(x0, y + inset, x1 - x0, max(1, cap_h - 2 * inset))
+            painter.fillRect(box, QColor("#3c3c3c"))
+            painter.setPen(QPen(QColor("#6a6a6a")))
+            painter.drawRect(box.adjusted(0, 0, -1, -1))
+            painter.setFont(nf)
+            painter.setPen(QPen(QColor("#ffffff")))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, txt)
+            if live:
+                self._row_heads[idx] = (QRect(box), txt)
+
+    @staticmethod
+    def _scaled_rect(r: QRect, scale: float) -> QRect:
+        if scale == 1.0:
+            return r
+        return QRect(int(r.x() * scale), int(r.y() * scale),
+                     int(r.width() * scale), int(r.height() * scale))
+
+    def _paint_cam_heads(self, painter: QPainter, scale: float, live: bool):
+        """The camera names over the vertical wall's columns. On screen they stay at
+        the top of the pane while the days scroll under them; in a saved picture
+        they sit at the top of the image.
+
+        A long name is never cut: the TEXT gets smaller until it fits its column."""
+        dy = self._vscroll() if live else 0
+        base = QFont(painter.font())
+        for hr, txt in self._row_heads:
+            r = self._scaled_rect(hr, scale).translated(0, dy)
+            painter.fillRect(r, QColor("#333333"))
+            painter.setPen(QPen(QColor("#555555")))
+            painter.drawLine(r.right(), r.top(), r.right(), r.bottom())
+            hf = self._head_font(scale)
+            pt = hf.pointSizeF()
+            room = max(1, r.width() - int(8 * scale))
+            while pt > 5.0 and QFontMetrics(hf).horizontalAdvance(txt) > room:
+                pt -= 0.5
+                hf.setPointSizeF(pt)
+            painter.setFont(hf)
+            painter.setPen(QPen(QColor("#ffffff")))
+            painter.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
+        painter.setFont(base)
 
     # ── overlay painting ──────────────────────────────────────────────────────
     def _paint_overlay(self, painter: QPainter, path, ir: QRect, scale: float = 1.0):
@@ -14738,7 +16379,7 @@ class _DayWall(QWidget):
             return
         if len(self._rects) != len(self._cells):
             self._relayout()
-        self._paint_into(painter, self._rects)
+        self._paint_into(painter, self._rects, clip=event.rect())
 
     # What one saved view may cost, in pixels. 80 Mpx is about 9600 × 8300 — a large
     # PNG, but one that can be opened; RGB888 makes it ~240 MB while it is being
@@ -14808,15 +16449,21 @@ class _DayWall(QWidget):
         painter = QPainter(img)
         saved_pix, saved_key = self._pix, self._render_key
         self._pix, self._render_key = {}, None      # render at the larger tile size
+        self._cap_scale = scale                     # the caption strip grows too
         try:
             self._paint_into(painter, big, scale=scale)
         finally:
             painter.end()
+            self._cap_scale = 1.0
             self._pix, self._render_key = saved_pix, saved_key
         return img
 
     # ── interaction ───────────────────────────────────────────────────────────
     def _hit(self, pos) -> int:
+        # The camera band of the vertical wall lies OVER the tiles scrolled under it;
+        # the camera name plate of the horizontal wall lies over a caption strip.
+        if self._layout_mode in ("rows", "cols") and self._on_row_head(pos):
+            return -1
         for i, r in enumerate(self._rects):
             if r.contains(pos):
                 return i
@@ -14890,17 +16537,43 @@ class _DayWall(QWidget):
             return
         i = self._hit(pos.toPoint())
         if i != self._hover:
+            old = self._hover
             self._hover = i
+            self._hq = None
             self.setToolTip(self._tile_tip(i) if i >= 0 else "")
-            self.update()
+            # Only the two tiles that changed are repainted, not the whole wall.
+            self._update_tile(old)
+            self._update_tile(i)
+            if i >= 0:
+                self._hq_timer.start()
+            else:
+                self._hq_timer.stop()
         super().mouseMoveEvent(event)
 
+    def _update_tile(self, i: int):
+        if 0 <= i < len(self._rects):
+            self.update(self._rects[i])
+
     def leaveEvent(self, event):
+        self._hq_timer.stop()
         if self._hover != -1:
+            old = self._hover
             self._hover = -1
+            self._hq = None
             self.setToolTip("")
-            self.update()
+            self._update_tile(old)
         super().leaveEvent(event)
+
+    def on_vscroll(self, value: int):
+        """The pane scrolled down or up. Only the vertical wall cares: its camera band
+        rides at the top of the pane, so the band's old and new places are repainted
+        — not the whole wall."""
+        if self._layout_mode != "cols":
+            return
+        old, self._last_vscroll = self._last_vscroll, int(value)
+        h = self._DAY_HDR_H + 2
+        self.update(QRect(0, old, self.width(), h))
+        self.update(QRect(0, int(value), self.width(), h))
 
     def mousePressEvent(self, event):
         pos = event.position()
@@ -14995,7 +16668,8 @@ class _DayWall(QWidget):
     def _on_row_head(self, pos) -> bool:
         """True when this point is inside one of the row banners — the grey bands that
         name the camera. They are not pictures and not empty canvas either."""
-        return any(hr.contains(pos) for hr, _txt in self._row_heads)
+        dy = self._vscroll() if self._layout_mode == "cols" else 0
+        return any(hr.translated(0, dy).contains(pos) for hr, _txt in self._row_heads)
 
     def mouseDoubleClickEvent(self, event):
         """Double click is the quick way into the close-up.
@@ -15273,53 +16947,90 @@ class _SaveFramesDialog(QDialog):
 def install_wheel_guard(app):
     """A value must never change just because the pointer crossed its control.
 
-    Number fields, drop-downs and setting sliders answer the mouse wheel only
-    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
-    the notch goes to the panel behind them instead, so a settings panel still
-    scrolls when the pointer happens to pass over a field on the way down. A
-    control that is meant to take the wheel at any time carries the "wheelAlways"
-    property.
+    Number boxes, drop-downs and sliders answer the wheel only after they were
+    CLICKED (or reached with Tab), and only while the pointer is over them --
+    Qt delivers a wheel notch to the control under the pointer, so a selected
+    field elsewhere on the page is never touched. Moving the pointer away keeps
+    the field selected (the keyboard still edits it); the wheel works on it
+    again when the pointer comes back. Selecting another control ends it. An
+    unselected field passes the notch to the panel behind it, so a settings
+    panel still scrolls when the pointer happens to pass over a field. The
+    focus a freshly opened window HANDS its first field does not count.
 
-    Scroll bars are left out: they are sliders too, and the wheel is how a pane
-    gets scrolled.
+    A control meant to take the wheel at any time carries the "wheelAlways"
+    property -- the frame sliders set it, because stepping through shots with
+    the wheel is the whole point of them. Scroll bars are left out: they are
+    sliders too, and the wheel is how a pane gets scrolled.
 
-    One app-wide filter, so a dialog built much later is covered as well. It is
-    spelled out in every entry point rather than imported once: each tab also
-    runs on its own, and a sibling module would have to survive the frozen build
-    (the same reason `_import_img_scale` is copied into each tab).
+    One app-wide filter, installed once, so a dialog built much later is
+    covered as well. It is spelled out in every entry point rather than
+    imported once: each tab also runs on its own, and a sibling module would
+    have to survive the frozen build (the same reason `_import_img_scale` is
+    copied into each tab). The copies in main.py, is_t.py, if_t.py and sf_t.py
+    are identical (testing/test_wheel_guard.py checks it).
     """
-    from PySide6.QtCore import QEvent
+    from PySide6.QtCore import QEvent, QObject, Qt
     from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
-                                   QAbstractSpinBox, QScrollBar)
+                                   QAbstractSpinBox, QApplication, QComboBox,
+                                   QScrollBar)
+
+    app = app or QApplication.instance()
+    if app is None or getattr(app, "_wheel_guard", None) is not None:
+        return
 
     class _WheelGuard(QObject):
         _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
-        # Focus the user asked for. The focus a freshly opened window HANDS to its
-        # first field (ActiveWindow / Other) does not count, or the top field of a
-        # panel would answer the wheel before it had ever been touched.
         _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
                    Qt.FocusReason.BacktabFocusReason,
                    Qt.FocusReason.ShortcutFocusReason)
-        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
-                  Qt.FocusReason.OtherFocusReason)
+        # Focus that leaves only for a moment and comes back to the same field:
+        # another window was activated, or the drop-down's own list opened.
+        _KEEP = (Qt.FocusReason.ActiveWindowFocusReason,
+                 Qt.FocusReason.PopupFocusReason)
 
         def eventFilter(self, obj, ev):
+            """EVERY event in the program passes through here, so it may not
+            raise -- ever. An exception escaping a Python override on the whole
+            application leaves PySide6 in an error state and the process dies
+            later with an access violation (measured 2026-09-17), and `obj` can
+            be a widget Qt is tearing down. A stray scroll is the cheaper loss.
+            """
+            try:
+                return self._filter(obj, ev)
+            except Exception:
+                return False
+
+        def _filter(self, obj, ev):
             t = ev.type()
             if t == QEvent.Type.Polish and isinstance(obj, self._GUARDED):
-                # Spin boxes and drop-downs come with Qt's WheelFocus: the wheel
-                # notch ITSELF hands them the focus, with the same "mouse" reason
-                # a click gives, before this filter sees the notch -- so every
-                # field the pointer crossed counted as clicked and took the
-                # value change. Without WheelFocus only a click or Tab focuses.
+                # Spin boxes and drop-downs come with WheelFocus: Qt hands them
+                # the focus, as a MOUSE focus, the moment a wheel notch lands on
+                # them -- before the notch itself is delivered. That made every
+                # untouched field "clicked" just in time to take the notch.
+                # StrongFocus still takes a click or Tab, never the wheel.
                 if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
                     obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 return False
+            if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+                # A click is what selects the field -- also the field that
+                # already HAD the focus (the first one of a window is handed
+                # it), where no FocusIn follows the click. The press lands on
+                # the spin box's own text line, so look one or two levels up.
+                w = obj
+                for _ in range(3):
+                    if isinstance(w, self._GUARDED):
+                        w.setProperty("wheelReady", True)
+                        break
+                    w = w.parentWidget() if hasattr(w, "parentWidget") else None
+                    if w is None:
+                        break
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
-                # Popup and menu reasons are left as they are: closing a drop-down
-                # hands the focus back, which must not undo the click that opened it.
                 if ev.reason() in self._EARNED:
                     obj.setProperty("wheelReady", True)
-                elif ev.reason() in self._GIVEN:
+                return False
+            if t == QEvent.Type.FocusOut and isinstance(obj, self._GUARDED):
+                if ev.reason() not in self._KEEP:
                     obj.setProperty("wheelReady", False)
                 return False
             if t != QEvent.Type.Wheel:
@@ -15336,7 +17047,9 @@ def install_wheel_guard(app):
                 QApplication.sendEvent(pane.viewport(), ev)
             return True
 
-    app.installEventFilter(_WheelGuard(app))
+    guard = _WheelGuard(app)
+    app.installEventFilter(guard)
+    app._wheel_guard = guard
 
 
 def main():

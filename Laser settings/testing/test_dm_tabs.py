@@ -176,8 +176,9 @@ def main():
     tab.refresh()
     check("the right grid is Low power", tab._saved.caption(),
           "Saved: Low power")
-    # 21 differ by more than 10 levels, 18 by more than MATCH_TOL (15).
-    check("18 electrodes marked", len(tab._now._marked), 18)
+    # 17 differ by more than MATCH_TOL (15) — the Applied voltages grid, read
+    # since 12.10.2026 (the Set-up grid's colours gave 18).
+    check("17 electrodes marked", len(tab._now._marked), 17)
     grab(tab, "dm_tab_compare.png")
     tab._table.clearSelection()
 
@@ -197,13 +198,16 @@ def main():
     check("and it says why", "minimised" in tab._detail.text(), True)
     grab(tab, "dm_tab_minimised.png")
 
-    print("a built-in set-up cannot be deleted, but can be renamed")
+    print("a built-in set-up can be deleted and renamed (21.10.2026)")
     engine.look(high)
     tab.refresh()
     tab._table.selectRow(0)
     tab.refresh()
-    check("Delete off", tab._delete_btn.isEnabled(), False)
+    check("Delete on", tab._delete_btn.isEnabled(), True)
     check("Rename on", tab._rename_btn.isEnabled(), True)
+    check("Undo replace off: never replaced", tab._undo_btn.isEnabled(), False)
+    check("Restore built-in off: both there", tab._restore_btn.isEnabled(),
+          False)
     tab._table.clearSelection()
 
     print("Delete wants two clicks")
@@ -214,6 +218,86 @@ def main():
     tab._delete()
     tab.refresh()
     check("second click deletes", tab._names, ["Low power", "High power"])
+    tab._table.clearSelection()
+
+    print("a new Low power saved under the same name replaces the old one")
+    new_low = [list(c) for c in low.colours]
+    new_low[7] = [255, 0, 0]
+    engine.look(low._replace(colours=new_low))
+    tab.refresh()
+    tab._name.setText("low power")
+    tab._save()
+    check("first click arms it", tab._save_btn.text(),
+          "Click again to replace \"Low power\"")
+    check("the file is untouched yet",
+          D.read_json(Path(tmp.name) / D.SHARE_SUBDIR / D.SETUPS_NAME)
+          .get("setups", {}).get("Low power"), None)
+    tab._save()
+    tab.refresh()
+    check("second click replaces", tab._note.text(),
+          "The grid of \"Low power\" is replaced. Undo replace brings the old "
+          "one back.")
+    check("the button has its own text back", tab._save_btn.text(),
+          "Save the grid on the mirror now")
+    check("recognised as Low power", tab._banner.text(), "Low power")
+    check("no third set-up", tab._names, ["Low power", "High power"])
+    row = tab._names.index("Low power")
+    check("the Saved column says replaced",
+          "replaced" in tab._table.item(row, dm_t._C_SAVED).text(), True)
+    grab(tab, "dm_tab_replaced.png")
+
+    print("undo replace")
+    tab._table.selectRow(row)
+    tab.refresh()
+    check("Undo replace on", tab._undo_btn.isEnabled(), True)
+    tab._undo()
+    tab._undo()
+    tab.refresh()
+    check("the old grid is back", tab._banner.text(), "Not a saved set-up")
+    tab._table.clearSelection()
+
+    print("Replace with the grid on the mirror now, from the picked row")
+    tab._table.selectRow(row)
+    tab.refresh()
+    check("Replace on", tab._replace_btn.isEnabled(), True)
+    tab._replace()
+    check("first click arms it", tab._replace_btn.text(),
+          "Click again to replace \"Low power\"")
+    tab._replace()
+    tab.refresh()
+    check("replaced again", tab._banner.text(), "Low power")
+    tab._table.clearSelection()
+
+    print("two ticked for Low power: a warning")
+    engine.look(low)
+    tab.refresh()
+    tab._name.setText("Old low")
+    tab._save()
+    tab.refresh()
+    old_row = tab._names.index("Old low")
+    tab._table.item(old_row, dm_t._C_LOW).setCheckState(Qt.CheckState.Checked)
+    tab.refresh()
+    check("the warning shows", (tab._twice.isHidden(),
+                                "\"Low power\", \"Old low\"" in
+                                tab._twice.text()), (False, True))
+    grab(tab, "dm_tab_ticked_twice.png")
+    tab._table.item(old_row, dm_t._C_LOW).setCheckState(
+        Qt.CheckState.Unchecked)
+    tab.refresh()
+    check("gone once unticked", tab._twice.isHidden(), True)
+
+    print("delete the built-in High power, then restore it")
+    tab._table.clearSelection()
+    tab._table.selectRow(tab._names.index("High power"))
+    tab._delete()
+    tab._delete()
+    tab.refresh()
+    check("deleted", "High power" in tab._names, False)
+    check("Restore built-in on", tab._restore_btn.isEnabled(), True)
+    tab._restore()
+    tab.refresh()
+    check("restored", (tab._names[:2], tab._note.text()),
+          (["Low power", "High power"], "Built-in High power restored."))
 
     print("the share cannot be reached")
     dead = FakeEngine(D.Share(roots=[str(Path(tmp.name) / "nowhere")]))

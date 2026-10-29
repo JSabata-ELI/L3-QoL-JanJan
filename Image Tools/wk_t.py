@@ -2,7 +2,7 @@
 #
 # Receives images from Image Finder / Image Slider / Shot Finder and lets the operator
 # look at them the way ImageJ is used in the lab: magnify a chosen spot, measure a
-# region, read a profile, annotate, compare two frames, save a copy.
+# region, read a profile, annotate, put several frames side by side, save a copy.
 #
 # THE ONE RULE OF THIS TAB: display settings never change pixels.
 #   Brightness, contrast, gamma, the display window and the palette live in
@@ -26,6 +26,7 @@ import sys
 import csv
 import json
 import math
+import threading
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from PIL import Image as _PilImg
 
 from PySide6.QtCore import (
     Qt, QPointF, QRectF, QSize, Signal, QRunnable, QThreadPool, QObject, QTimer,
+    QEvent,
 )
 from PySide6.QtGui import (
     QImage, QColor, QPainter, QPen, QBrush, QFont, QPolygonF, QCursor, QGuiApplication,
@@ -45,7 +47,9 @@ from PySide6.QtWidgets import (
     QSlider, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFileDialog,
     QMessageBox, QSizePolicy, QScrollArea, QFrame, QToolButton, QButtonGroup,
     QColorDialog, QSplitter, QDialog, QInputDialog, QAbstractButton, QMenu,
-    QTableWidget, QTableWidgetItem, QHeaderView, QStyle,
+    QTableWidget, QTableWidgetItem, QHeaderView, QStyle, QListWidget, QListWidgetItem,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyleOptionButton, QApplication,
+    QAbstractItemView,
 )
 
 try:
@@ -1784,6 +1788,14 @@ class _WorkshopSlot:
     offset: "tuple[float, float]" = (0.0, 0.0)
     fitted: bool = False
 
+    # The moment the frame was taken (Unix ns), when the archive told us: frames from
+    # the Finder / Slider / Shot Finder carry it in the file name. A file opened from
+    # the computer, a pasted picture and anything the Workshop made have None — and
+    # then the collage shows no PV line for it at all, rather than a guessed moment.
+    ts_ns: "int | None" = None
+    # Ticked under Show in the Images table: on screen (two or more: side by side).
+    in_collage: bool = False
+
     def _state(self):
         # base / raw are never modified in place — every edit builds a new array — so
         # the history can share references instead of copying megabytes per step.
@@ -1864,6 +1876,65 @@ class _WorkshopSlot:
 #  Background reader for the native-precision data
 # ─────────────────────────────────────────────────────────────────
 
+def _read_native(im, path) -> "tuple":
+    """(counts, full_scale, camera, note, bracketed) of an open single-channel file
+    deeper than 8 bits; counts is None for an 8-bit or colour file.
+
+    One reader for both routes in — a file opened in the Workshop and the background
+    re-read behind a picture another tab sent — so the two cannot read the same file
+    into different numbers. `bracketed` says the file carried the archiver's MaxValue
+    and the counts were un-stretched against it."""
+    info = dict(getattr(im, "info", {}) or {})
+    arr = np.array(im)
+    if arr.ndim != 2 or arr.dtype in (np.uint8, np.bool_):
+        return None, None, "", "source is 8-bit — values are display codes", False
+    full_scale = None
+    camera = ""
+    note = ""
+    bracketed = False
+    if img_scale is not None:
+        try:
+            camera = img_scale.camera_from_path(str(path)) or ""
+            fb = img_scale.bits_from_max_value(img_scale.max_value_from_info(info or {}))
+            rb = img_scale.reference_bits(camera or None, fb)
+            # Undo the archiver's stretch: what is in the file is the frame's bracket
+            # blown up to 16 bits, not what the sensor counted.
+            arr, full_scale = img_scale.measure_counts(arr, fb, rb)
+            full_scale = float(full_scale)
+            bracketed = bool(fb)
+            if not fb:
+                note = "no bracket in the file — values are the stored 16-bit numbers"
+        except Exception:
+            full_scale = None
+    return arr, full_scale, camera, note, bracketed
+
+
+def _picture_from_counts(counts: np.ndarray, full_scale: float) -> np.ndarray:
+    """8-bit grey picture of native counts: 0 → black, `full_scale` → white, rounded
+    rather than truncated, so each display code is the nearest one to the real value.
+    The counts themselves stay in the slot for every measurement."""
+    a = np.nan_to_num(np.asarray(counts, dtype=np.float32), nan=0.0,
+                      posinf=float(full_scale), neginf=0.0)
+    a = np.clip(a, 0.0, float(full_scale)) * (255.0 / float(full_scale))
+    return np.rint(a).astype(np.uint8)
+
+
+def _file_full_scale(counts: np.ndarray) -> float:
+    """The display range for a deep file that carries no archiver bracket.
+
+    The plain 16-bit range would squeeze a 12-bit camera's frame (peak ≤ 4095) into the
+    bottom 16 display codes — a black picture, and the display window could not bring
+    the detail back because it is not in the 8-bit picture any more. The power-of-two
+    bracket of the frame's own peak uses at least half of the 256 codes, and two frames
+    from the same camera usually land on the same bracket, so they stay comparable."""
+    finite = np.asarray(counts)[np.isfinite(counts)] if np.issubdtype(
+        np.asarray(counts).dtype, np.floating) else np.asarray(counts)
+    peak = float(finite.max()) if finite.size else 0.0
+    bits = img_scale.bits_from_max_value(peak) if img_scale is not None else None
+    fs = float(2 ** bits - 1) if bits else 1.0
+    return max(fs, peak, 1.0)
+
+
 class _RawSignals(QObject):
     done = Signal(object, object, object, str, str)   # slot, raw, full_scale, camera, note
 
@@ -1889,34 +1960,43 @@ class _RawLoadTask(QRunnable):
                 self._sig.done.emit(slot, None, None, "", "no source file — values are display codes")
                 return
             with _PilImg.open(str(p)) as im:
-                mode = im.mode
-                info = dict(getattr(im, "info", {}) or {})
-                arr = np.array(im)
-            if arr.ndim != 2 or arr.dtype == np.uint8:
-                self._sig.done.emit(slot, None, None, "",
-                                    "source is 8-bit — values are display codes")
-                return
-            full_scale = None
-            camera = ""
-            note = ""
-            if img_scale is not None:
-                try:
-                    camera = img_scale.camera_from_path(str(p)) or ""
-                    fb = img_scale.bits_from_max_value(
-                        img_scale.max_value_from_info(info or {}))
-                    rb = img_scale.reference_bits(camera or None, fb)
-                    # Undo the archiver's stretch: what is in the file is the frame's
-                    # bracket blown up to 16 bits, not what the sensor counted.
-                    arr, full_scale = img_scale.measure_counts(arr, fb, rb)
-                    full_scale = float(full_scale)
-                    if not fb:
-                        note = ("no bracket in the file — values are the stored "
-                                "16-bit numbers")
-                except Exception:
-                    full_scale = None
-            self._sig.done.emit(slot, arr, full_scale, camera, note)
+                arr, full_scale, camera, note, _ = _read_native(im, p)
+            self._sig.done.emit(slot, arr, None if arr is None else full_scale,
+                                camera, note)
         except Exception as e:
             self._sig.done.emit(slot, None, None, "", f"could not read source file ({e})")
+
+
+class _SCWorkSignals(QObject):
+    # token, result dict (None = failed), 8-bit copy, beam mask. One object for the
+    # tab's whole life — a fresh signals object per task is what died after ~2000.
+    done = Signal(object, object, object, object)
+
+
+class _SCWorkTask(QRunnable):
+    """Spatial Contrast of the frame in memory, off the GUI thread. The maths is the
+    Image Slider's own (is_t.spatial_contrast); only the plain arrays come back — the
+    preview picture is made on the GUI thread."""
+
+    def __init__(self, token, arr, threshold, excl, bit_depth, fn,
+                 signals: _SCWorkSignals):
+        super().__init__()
+        self._token = token
+        self._arr = arr
+        self._thr = threshold
+        self._excl = excl
+        self._bd = bit_depth
+        self._fn = fn
+        self._sig = signals
+
+    def run(self):
+        try:
+            result, arr_8bit, mask = self._fn(self._arr, self._thr, self._excl,
+                                              self._bd)
+            self._sig.done.emit(self._token, result, arr_8bit, mask)
+        except Exception as e:
+            self._sig.done.emit(self._token, {"error": f"Could not measure: {e}"},
+                                None, None)
 
 
 class _WriteSignals(QObject):
@@ -2062,6 +2142,10 @@ class WorkshopCanvas(QWidget):
         self._text_active = False
         self._hover_img: "QPointF | None" = None
         self._menu_request = None                # set by the tab: right-click menu
+        #  Spatial Contrast's top-intensity circles, set by the tab:
+        #  (measured array, [(x, y), …], radius px, thickness px) or None. Drawn only
+        #  while the slot still holds that very array.
+        self.sc_marks = None
 
     # ── Slot binding ──────────────────────────────────────────────
 
@@ -2098,13 +2182,20 @@ class WorkshopCanvas(QWidget):
             self.fit_to_view()
         self.update()
 
-    def set_compare(self, img: "QImage | None"):
-        """Show a composed comparison instead of the slot. Editing is refused while
-        one is shown — the picture on screen is no longer this slot's pixels."""
+    def set_compare(self, img: "QImage | None",
+                    caption: str = "COMPARISON VIEW — editing is off",
+                    refit: bool = True):
+        """Show a composed comparison (or the collage) instead of the slot. Editing is
+        refused while one is shown — the picture on screen is no longer this slot's
+        pixels. `refit` False keeps the zoom when the same view is only re-rendered
+        (a collage whose PV values just arrived)."""
         was_comparing = self._compare is not None
+        same_size = (was_comparing and img is not None
+                     and img.size() == self._compare.size())
         self._compare = img
+        self._compare_caption = caption
         self._sel = -1
-        if img is not None:
+        if img is not None and (refit or not same_size):
             self.fit_to_view()
         elif was_comparing and self._slot is not None and self._slot.fitted:
             # Give the operator back the zoom they had on this image before comparing.
@@ -2857,6 +2948,7 @@ class WorkshopCanvas(QWidget):
             paint_annots(p, [self._poly], self._img_to_widget, self._zoom)
         if self._angle is not None:
             paint_annots(p, [self._angle], self._img_to_widget, self._zoom)
+        self._paint_sc_marks(p)
 
         a = self.selected()
         if a is not None and self.tool == TOOL_SELECT:
@@ -2870,9 +2962,33 @@ class WorkshopCanvas(QWidget):
             p.drawRect(r)
 
         if self._compare is not None:
+            caption = getattr(self, "_compare_caption", "COMPARISON VIEW — editing is off")
+            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            p.setFont(font)
+            # On a dark plate of its own: a collage on a white ground would otherwise
+            # put the yellow words on white.
+            fm = QFontMetrics(font)
+            p.fillRect(QRectF(4, 4, fm.horizontalAdvance(caption) + 8, fm.height() + 4),
+                       QColor(20, 20, 20, 200))
             p.setPen(QColor("#ffd24a"))
-            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            p.drawText(8, 18, "COMPARISON VIEW — editing is off")
+            p.drawText(8, 6 + fm.ascent(), caption)
+
+    def _paint_sc_marks(self, p: QPainter):
+        """Orange circles on the top-intensity pixels, as in the Image Slider: fixed
+        screen size, centred on each pixel."""
+        marks = self.sc_marks
+        slot = self._slot
+        if (not marks or slot is None or self._compare is not None
+                or slot.measure_arr() is not marks[0]):
+            return
+        _arr, pts, r, thick = marks
+        p.save()
+        p.setPen(QPen(QColor(255, 80, 0, 230), thick))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for x, y in pts:
+            c = self._img_to_widget(x + 0.5, y + 0.5)
+            p.drawEllipse(c, r, r)
+        p.restore()
 
     def _paint_pixel_values(self, p: QPainter):
         """At high magnification write the value inside each pixel, the way ImageJ does.
@@ -3307,6 +3423,84 @@ def _small_label(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setStyleSheet("color: #333; font-size: 11px;")
     return lbl
+
+
+def _part_heading(text: str) -> QLabel:
+    """The heading of one part inside a panel group: small capitals under a thin
+    rule, so the parts of a group read as separate blocks without each needing a
+    coloured bar of its own."""
+    lbl = QLabel(text.upper())
+    lbl.setStyleSheet("QLabel { font-size: 10px; color: #2c3440; font-weight: 700;"
+                      " letter-spacing: 1px; border-top: 1px solid #c3cad3;"
+                      " margin-top: 6px; padding-top: 5px; }")
+    return lbl
+
+
+def _group_note(text: str) -> QLabel:
+    """The line under a group's header that says what the whole group does."""
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("QLabel { color: #3e4856; font-size: 10px; font-style: italic; }")
+    return lbl
+
+
+class _SliderValueBox(QDoubleSpinBox):
+    """The typed twin of a display slider: type a number or step it with the arrows.
+
+    It shows the value in the user's units (gamma 1.00, not the slider's 100) and
+    steps 1 % of the slider's range per arrow click. A typed number takes effect on
+    Enter or when the box is left — not on every keystroke, so typing -120 does not
+    flash -1 and -12 on the picture. The wheel follows the app-wide guard: only once
+    the box was clicked and while the pointer is over it."""
+
+    def __init__(self, slider: QSlider, scale: int = 1, decimals: int = 0):
+        super().__init__()
+        self._slider = slider
+        self._scale = scale
+        self.setDecimals(decimals)
+        self.setRange(slider.minimum() / scale, slider.maximum() / scale)
+        span = (slider.maximum() - slider.minimum()) / scale
+        self.setSingleStep(max(round(span / 100.0, decimals), 1 / 10 ** decimals))
+        self.setKeyboardTracking(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setFixedWidth(64)
+        self.setStyleSheet(
+            "QDoubleSpinBox { background: #ffffff; color: #111111; font-size: 11px;"
+            " font-weight: 600; }"
+            "QDoubleSpinBox:disabled { background: #f0f0f0; color: #6a6a6a; }")
+        self.show_value(slider.value() / scale)
+        self.valueChanged.connect(self._to_slider)
+        slider.valueChanged.connect(lambda v: self.show_value(v / self._scale))
+
+    def show_value(self, value: float):
+        """Put a number in the box without it travelling back to the slider."""
+        was = self.blockSignals(True)
+        try:
+            self.setValue(value)
+        finally:
+            self.blockSignals(was)
+        if not self.hasFocus():
+            # An arrow click selects the digits; left selected they stay painted
+            # in the highlight colour after the box is done with.
+            self.lineEdit().deselect()
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        try:
+            self.lineEdit().deselect()
+        except Exception:
+            pass
+
+    def changeEvent(self, ev):
+        super().changeEvent(ev)
+        try:
+            if ev.type() == QEvent.Type.EnabledChange and not self.isEnabled():
+                self.lineEdit().deselect()
+        except Exception:
+            pass
+
+    def _to_slider(self, value: float):
+        self._slider.setValue(int(round(value * self._scale)))
 
 
 def _value_label(text: str, width: int = 26) -> QLabel:
@@ -4148,6 +4342,71 @@ _TABLE_QSS = (
 )
 
 
+class _CenteredCheckDelegate(QStyledItemDelegate):
+    """A tick box in the MIDDLE of its column (the Announcer's delegate).
+
+    `setTextAlignment(AlignHCenter)` moves only the text of a cell — a tick-only cell
+    draws its box glued to the left edge whatever alignment is asked for. So the box
+    is drawn here by hand, centred under its heading, and the click is taken in that
+    same rectangle."""
+
+    def _box(self, option, index, widget):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        style = widget.style() if widget is not None else QApplication.style()
+        box = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemCheckIndicator, opt, widget)
+        box.moveCenter(option.rect.center())
+        return box
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        state = index.data(Qt.ItemDataRole.CheckStateRole)
+        # The cell itself first — ground, zebra stripe, selection — without the
+        # indicator the style puts on the left.
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        if state is None:
+            return
+        box = QStyleOptionButton()
+        box.rect = self._box(option, index, widget)
+        box.state = QStyle.StateFlag.State_Enabled | (
+            QStyle.StateFlag.State_On
+            if Qt.CheckState(state) == Qt.CheckState.Checked
+            else QStyle.StateFlag.State_Off)
+        style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck, box,
+                            painter, widget)
+
+    def editorEvent(self, event, model, option, index):
+        flags = index.flags()
+        if not (flags & Qt.ItemFlag.ItemIsUserCheckable
+                and flags & Qt.ItemFlag.ItemIsEnabled):
+            return False
+        state = index.data(Qt.ItemDataRole.CheckStateRole)
+        if state is None:
+            return False
+        kind = event.type()
+        if kind == QEvent.Type.MouseButtonRelease:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+            if not self._box(option, index, option.widget).contains(
+                    event.position().toPoint()):
+                return False
+        elif kind == QEvent.Type.KeyPress:
+            if event.key() not in (Qt.Key.Key_Space, Qt.Key.Key_Select):
+                return False
+        else:
+            # Presses and double clicks are left alone, so the row still selects.
+            return False
+        turned = (Qt.CheckState.Unchecked
+                  if Qt.CheckState(state) == Qt.CheckState.Checked
+                  else Qt.CheckState.Checked)
+        return model.setData(index, turned, Qt.ItemDataRole.CheckStateRole)
+
+
 class _TableDialog(QDialog):
     """A table of numbers with Copy and Save CSV — the results table, the histogram
     counts and the beam report all use this one window.
@@ -4209,11 +4468,10 @@ class _TableDialog(QDialog):
         for ri, r in enumerate(self._rows):
             for ci, cell in enumerate(r):
                 item = QTableWidgetItem(cell)
-                # Numbers right, words left — a column of right-aligned numbers can be
-                # compared down the column, a ragged one cannot.
-                if _looks_numeric(cell):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight
-                                          | Qt.AlignmentFlag.AlignVCenter)
+                # Every cell centred, words and numbers alike — a column where some
+                # cells sit left and others right reads as broken.
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter
+                                      | Qt.AlignmentFlag.AlignVCenter)
                 self._table.setItem(ri, ci, item)
         self._table.resizeColumnsToContents()
         hdr = self._table.horizontalHeader()
@@ -4234,14 +4492,6 @@ class _TableDialog(QDialog):
             return
         if not _write_csv(path, self._headers, self._rows):
             QMessageBox.warning(self, "Save error", f"Could not save:\n{path}")
-
-
-def _looks_numeric(text: str) -> bool:
-    try:
-        float(str(text).replace("°", "").replace("%", "").strip())
-        return True
-    except ValueError:
-        return False
 
 
 class _CurveDialog(QDialog):
@@ -5082,12 +5332,210 @@ _TOOL_STRIP = [
 ]
 
 _SECTION_ACCENTS = {
-    "images": "#2f6fd0", "display": "#7a4fc0", "measure": "#b0396b",
-    "beam": "#0f7f8f", "filters": "#4d7a2a", "edit": "#2e9e5b",
-    "combine": "#5a5f8f", "compare": "#d08a1e", "save": "#c0392b",
+    "images": "#2f6fd0", "view": "#7a4fc0", "measure": "#d08a1e",
+    "change": "#4d7a2a", "save": "#c0392b",
 }
 
-COMPARE_MODES = ["Off", "Side by side", "Blend", "Difference"]
+#  The side panel's five groups, sorted by what their controls DO — ten groups by topic
+#  were too many to find anything in, and did not say whether a control only changes
+#  the look, the data, or makes a new image. (key, title, open by default, header tip,
+#  the one line under the header that says what the whole group does.)
+_PANEL_GROUPS = (
+    ("images", "Images", True,
+     "The pictures the Workshop is holding: which are shown, which one is the "
+     "reference, and new images combined from the open ones.",
+     "The table says which pictures are on screen (several ticked: side by side) and "
+     "which one is the reference for subtraction. Combine makes a NEW image — "
+     "nothing open is changed."),
+    # Named as in the Image Slider, where the same controls live under the same title.
+    ("view", "Image / Display", True,
+     "How the picture looks: false colour, which values are shown, contrast, "
+     "brightness, gamma, and how several pictures are laid out side by side.",
+     "Only how the picture looks on screen. The picture data and the measured "
+     "numbers stay as they are."),
+    ("measure", "Measure", False,
+     "Numbers from a region or the whole picture, the pixel size, the beam's size "
+     "and shape, and the Spatial Contrast.",
+     "Numbers from the picture. Nothing in the picture changes — except “Add scale "
+     "bar” and “Mark the centre”, which draw onto it."),
+    ("change", "Change picture", False,
+     "Filters, turning, mirroring, resizing, binning and subtracting the reference. "
+     "These change the picture data itself; every step can be undone.",
+     "Changes the picture data itself, and the measured values with it. Every step "
+     "can be undone (Ctrl+Z)."),
+    ("save", "Save", True,
+     "Writing out the picture, the measured values, an animation of every open "
+     "picture, and the drawing as a session.",
+     "What goes into a file: the picture as shown on screen, or the plain measured "
+     "values."),
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Collage — several images in one grid
+# ─────────────────────────────────────────────────────────────────
+#  Ticking two or more images under Show in the Images table puts them side by side,
+#  in rows and columns, each with its own name, drawing and (when the frame's moment
+#  is known) the PV values of that moment. It is a VIEW only: the slots are not
+#  touched, and "Make a new image" is the one way to turn it into pixels.
+
+COLLAGE_TILE_MODES = ("Same size", "1:1 pixels")
+COLLAGE_LABEL_MODES = ("Off", "Name", "Name + time")
+COLLAGE_LABEL_PLACES = ("Above", "Below")
+COLLAGE_BACKGROUNDS = ("Black", "White")
+
+_COLLAGE_DEFAULTS = {
+    "columns": 0,                  # 0 = Auto
+    "tiles": "Same size",
+    "gap": 8,
+    "background": "Black",
+    "label": "Name",
+    "label_place": "Below",
+    "drawings": True,
+    "show_pvs": False,
+    "pvs": [],
+    "pv_hidden": [],
+}
+
+
+def collage_grid(n: int, columns: int = 0) -> "tuple[int, int]":
+    """(columns, rows) for n tiles. Auto keeps the grid as square as it can, wider
+    than tall when it cannot be square: 2 → 2×1, 4 → 2×2, 5 → 3×2, 9 → 3×3."""
+    if n <= 0:
+        return 0, 0
+    cols = int(columns) if columns and columns > 0 else math.ceil(math.sqrt(n))
+    cols = max(1, min(cols, n))
+    return cols, math.ceil(n / cols)
+
+
+def _collage_font(px: int) -> QFont:
+    f = QFont("Segoe UI")
+    f.setStyleHint(QFont.StyleHint.SansSerif)
+    f.setPixelSize(max(6, int(px)))
+    f.setBold(True)
+    return f
+
+
+def _collage_label_strip(text: str, width: int, ink: QColor, ground: QColor,
+                         start_px: int) -> QImage:
+    """One line of name under or over a tile. The text shrinks until the whole name
+    fits — a name is never cut while there is a size left that shows it — and only
+    below the smallest readable size is the middle of it elided."""
+    floor_px = 9
+    px = max(floor_px, start_px)
+    avail = max(1, width - 8)
+    while px > floor_px and QFontMetrics(_collage_font(px)).horizontalAdvance(text) > avail:
+        px -= 1
+    font = _collage_font(px)
+    fm = QFontMetrics(font)
+    shown = text if fm.horizontalAdvance(text) <= avail else \
+        fm.elidedText(text, Qt.TextElideMode.ElideMiddle, avail)
+    h = fm.height() + max(4, fm.height() // 3)
+    img = QImage(max(1, width), h, QImage.Format.Format_RGB888)
+    img.fill(ground)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    p.setFont(font)
+    p.setPen(ink)
+    p.drawText(QRectF(0, 0, width, h), int(Qt.AlignmentFlag.AlignCenter), shown)
+    p.end()
+    return img
+
+
+def render_collage(tiles: list, opts: dict, pv_bar=None) -> "QImage | None":
+    """Lay several pictures out in one grid.
+
+    `tiles` — one dict per picture, in order: {"image": QImage (already rendered, with
+    the drawing on it when it should have one), "label": str, "pv": str | None}.
+    "pv" None means no PV line at all on that tile (a picture with no known moment);
+    a string is drawn under the picture by `pv_bar(QPixmap, text) -> QPixmap`, the
+    Image Slider's own white bar, so the collage and a saved Slider frame read alike.
+
+    `opts` — the collage settings (see _COLLAGE_DEFAULTS)."""
+    tiles = [t for t in tiles if t.get("image") is not None and not t["image"].isNull()]
+    if not tiles:
+        return None
+    o = dict(_COLLAGE_DEFAULTS)
+    o.update(opts or {})
+    cols, rows = collage_grid(len(tiles), int(o.get("columns") or 0))
+    gap = max(0, int(o.get("gap") or 0))
+    white = str(o.get("background")) == "White"
+    ground = QColor(255, 255, 255) if white else QColor(0, 0, 0)
+    ink = QColor(17, 17, 17) if white else QColor(240, 240, 240)
+    same = str(o.get("tiles")) == "Same size"
+    label_mode = str(o.get("label") or "Off")
+    label_above = str(o.get("label_place")) == "Above"
+
+    # 1. Every picture at its tile size. "Same size": all fitted into one common box
+    #    (the largest width × the largest height), aspect kept — a small crop next to a
+    #    full frame is shown as big as the frame. "1:1": every pixel stays one pixel.
+    box_w = max(t["image"].width() for t in tiles)
+    box_h = max(t["image"].height() for t in tiles)
+    pictures = []
+    for t in tiles:
+        img = t["image"].convertToFormat(QImage.Format.Format_RGB888)
+        if same and (img.width() != box_w or img.height() != box_h):
+            img = img.scaled(box_w, box_h, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        pictures.append(img)
+
+    # 2. One cell per tile: the picture, its PV bar, its name.
+    cell_w_ref = box_w if same else int(np.median([p.width() for p in pictures]))
+    label_px = max(12, min(48, cell_w_ref // 26))
+    cells = []
+    for t, pic in zip(tiles, pictures):
+        body = pic
+        pv = t.get("pv")
+        if pv is not None and pv_bar is not None:
+            try:
+                body = pv_bar(QPixmap.fromImage(pic), pv).toImage().convertToFormat(
+                    QImage.Format.Format_RGB888)
+            except Exception:
+                body = pic
+        text = str(t.get("label") or "") if label_mode != "Off" else ""
+        strip = (_collage_label_strip(text, body.width(), ink, ground, label_px)
+                 if text else None)
+        h = body.height() + (strip.height() if strip is not None else 0)
+        cell = QImage(body.width(), h, QImage.Format.Format_RGB888)
+        cell.fill(ground)
+        p = QPainter(cell)
+        y = 0
+        if strip is not None and label_above:
+            p.drawImage(0, 0, strip)
+            y = strip.height()
+        p.drawImage(0, y, body)
+        if strip is not None and not label_above:
+            p.drawImage(0, body.height(), strip)
+        p.end()
+        cells.append(cell)
+
+    # 3. The grid: each column as wide as its widest cell, each row as tall as its
+    #    tallest, every cell centred in its place.
+    col_w = [0] * cols
+    row_h = [0] * rows
+    for i, c in enumerate(cells):
+        r, k = divmod(i, cols)
+        col_w[k] = max(col_w[k], c.width())
+        row_h[r] = max(row_h[r], c.height())
+    out_w = sum(col_w) + gap * (cols + 1)
+    out_h = sum(row_h) + gap * (rows + 1)
+    out = QImage(max(1, out_w), max(1, out_h), QImage.Format.Format_RGB888)
+    out.fill(ground)
+    p = QPainter(out)
+    for i, c in enumerate(cells):
+        r, k = divmod(i, cols)
+        x0 = gap + sum(col_w[:k]) + gap * k
+        y0 = gap + sum(row_h[:r]) + gap * r
+        p.drawImage(x0 + (col_w[k] - c.width()) // 2,
+                    y0 + (row_h[r] - c.height()) // 2, c)
+    p.end()
+    return out
+
+
+class _CollagePvSignals(QObject):
+    # names (tuple), {ts_ns: text}. One object for the tab's whole life, parented to
+    # the tab — a fresh signals object per fetch is the pattern that dies after hours.
+    done = Signal(object, object)
 
 #  What "Save all" and the animation can be written as.
 _SAVE_FORMATS = ("PNG", "TIFF", "JPEG")
@@ -5146,6 +5594,21 @@ class WorkshopWidget(QWidget):
             self._sensor_default_um = BASLER_PIXEL_UM
         if not self._sensor_default_um > 0:
             self._sensor_default_um = BASLER_PIXEL_UM
+
+        #  Collage: the settings (kept between sessions), the tile order, and the PV
+        #  values fetched for each frame's moment.
+        saved = self._ui_state.get("collage")
+        self._collage_opts = dict(_COLLAGE_DEFAULTS)
+        if isinstance(saved, dict):
+            self._collage_opts.update({k: v for k, v in saved.items()
+                                       if k in _COLLAGE_DEFAULTS})
+        self._collage_order: list = []
+        self._collage_pv_text: dict = {}           # (names, ts_ns) -> line
+        self._collage_pv_busy: set = set()         # (names, ts_ns) being fetched
+        self._collage_pv_sig = _CollagePvSignals(self)
+        self._collage_pv_sig.done.connect(self._on_collage_pvs)
+        self._collage_shown_once = False
+        self._collage_was_on = False
         self._build_ui()
         self._update_slot_list()
         self._set_tool(TOOL_PAN)
@@ -5178,12 +5641,26 @@ class WorkshopWidget(QWidget):
         # Opening a group can bring in a row wider than anything shown so far.
         self._fit_panel_width()
 
+    def _set_all_sections(self, expanded: bool):
+        """Expand all / Collapse all — the Image Slider's two buttons. One write of
+        the state file for the whole panel, one width check at the end."""
+        for key, sec in self._sections.items():
+            sec.blockSignals(True)
+            try:
+                sec.set_expanded(expanded)
+            finally:
+                sec.blockSignals(False)
+            self._ui_state[f"sec_{key}"] = bool(expanded)
+        self._save_ui_state()
+        self._fit_panel_width()
+
     def _add_section(self, key: str, title: str, default_expanded: bool = True,
                      tip: str = ""):
         cls = _section_cls()
         sec = cls(title, key, self._ui_state.get(f"sec_{key}", default_expanded),
                   accent=_SECTION_ACCENTS.get(key, "#4a78c0"))
         sec.toggled.connect(self._on_section_toggled)
+        self._sections[key] = sec
         # The tip goes on the coloured bar itself, not on the section, so hovering a
         # control inside never falls back to "what this whole group is for".
         hdr = getattr(sec, "_header", None) or getattr(sec, "_hdr", None)
@@ -5191,6 +5668,14 @@ class WorkshopWidget(QWidget):
             hdr.setToolTip(tip)
         self._panel_layout.addWidget(sec)
         return sec
+
+    def _part(self, group: str, heading: str = ""):
+        """The layout one part of the panel builds into: the group's body, under a
+        part heading when the group holds more than one part."""
+        lay = self._group_lay[group]
+        if heading:
+            lay.addWidget(_part_heading(heading))
+        return lay
 
     # ─────────────────────────────────────────────────── UI build ─
 
@@ -5218,14 +5703,34 @@ class WorkshopWidget(QWidget):
         self._panel_layout.setContentsMargins(2, 2, 6, 2)
         self._panel_layout.setSpacing(2)
 
+        # Expand all / Collapse all, as in the Image Slider's panel.
+        self._sections: dict = {}
+        exp_row = QHBoxLayout()
+        exp_row.setSpacing(4)
+        for text, tip, on in (("Expand all", "Expand all sections", True),
+                              ("Collapse all", "Collapse all sections", False)):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+            b.clicked.connect(lambda _=False, v=on: self._set_all_sections(v))
+            exp_row.addWidget(b)
+        self._panel_layout.addLayout(exp_row)
+
+        self._group_lay: dict = {}
+        for key, title, opened, tip, note in _PANEL_GROUPS:
+            sec = self._add_section(key, title, opened,
+                                    f"{tip} Click to open or shut the group.")
+            sec.body_layout.addWidget(_group_note(note))
+            self._group_lay[key] = sec.body_layout
         self._build_images_section()
+        self._build_combine_section()
         self._build_display_section()
+        self._build_collage_section()
         self._build_measure_section()
         self._build_beam_section()
+        self._build_analysis_section()
         self._build_filters_section()
         self._build_edit_section()
-        self._build_combine_section()
-        self._build_compare_section()
         self._build_save_section()
         self._panel_layout.addStretch(1)
         panel_scroll.setWidget(panel)
@@ -5538,7 +6043,6 @@ class WorkshopWidget(QWidget):
 
             ("Combine", "Ctrl+Alt+C", "Combine every open image into a new one",
              self._do_project, "Combine into a new image"),
-            ("Compare", "Ctrl+K", "Next comparison view", self._cycle_compare, ""),
 
             ("Measure", "Ctrl+Shift+W", "Measure the whole picture",
              self._measure_whole, "Whole image"),
@@ -5791,23 +6295,24 @@ class WorkshopWidget(QWidget):
             return
         self._activate_slot((self._active + delta) % len(self._slots))
 
-    def _cycle_compare(self):
-        self._compare_cb.setCurrentIndex(
-            (self._compare_cb.currentIndex() + 1) % self._compare_cb.count())
-
     def _measure_whole(self):
         self._canvas.select_index(-1)
         self._refresh_measure()
 
     # ---- sections ------------------------------------------------------------
 
+    _IMG_COLS = (
+        ("Show", "Ticked images are on screen. Two or more: side by side, in the "
+                 "order of this table."),
+        ("Ref", "The reference image — what Subtract and Difference in Change "
+                "picture take away. One at a time."),
+        ("#", "The image's number"),
+        ("Image", "Click a row: the tools and the numbers work on that image"),
+    )
+    _C_SHOW, _C_REF, _C_NUM, _C_NAME = range(4)
+
     def _build_images_section(self):
-        sec = self._add_section(
-            "images", "Images", True,
-            "The pictures the Workshop is holding, and which of them is the "
-            "reference the Compare and Combine groups work against. Click to open "
-            "or shut the group.")
-        lay = sec.body_layout
+        lay = self._part("images")
 
         self._info_lbl = QLabel("—")
         self._info_lbl.setWordWrap(True)
@@ -5816,10 +6321,56 @@ class WorkshopWidget(QWidget):
             " border: 1px solid #dcdcdc; border-radius: 3px; padding: 4px; }")
         lay.addWidget(self._info_lbl)
 
-        self._slot_list = QComboBox()
-        self._slot_list.setToolTip("Which image the tools work on")
-        self._slot_list.currentIndexChanged.connect(self._on_slot_selected)
-        lay.addWidget(self._slot_list)
+        # One table instead of three lists: which images are on screen, which one is
+        # the reference, and — the marked row — which one the tools work on.
+        t = QTableWidget(0, len(self._IMG_COLS))
+        t.setHorizontalHeaderLabels([c[0] for c in self._IMG_COLS])
+        for ci, (_name, tip) in enumerate(self._IMG_COLS):
+            t.horizontalHeaderItem(ci).setToolTip(tip)
+        url = _check_mark_url()
+        mark = f' image: url("{url}");' if url else ""
+        t.setStyleSheet(
+            _TABLE_QSS +
+            "QTableWidget::item:selected { background: #cfe0f7; color: #10243c; }"
+            f"QTableWidget::indicator {{ width: {_CHECK_PX}px; height: {_CHECK_PX}px;"
+            " border: 1px solid #7b8492; border-radius: 3px; background: #ffffff; }"
+            f"QTableWidget::indicator:checked {{ background: #2f6fb5;"
+            f" border-color: #24557f;{mark} }}")
+        t.setAlternatingRowColors(True)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        t.verticalHeader().setVisible(False)
+        t.setWordWrap(False)
+        t.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        tick = _CenteredCheckDelegate(t)
+        t.setItemDelegateForColumn(self._C_SHOW, tick)
+        t.setItemDelegateForColumn(self._C_REF, tick)
+        hh = t.horizontalHeader()
+        for ci in (self._C_SHOW, self._C_REF, self._C_NUM):
+            hh.setSectionResizeMode(ci, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(self._C_NAME, QHeaderView.ResizeMode.Stretch)
+        rh = QFontMetrics(t.font()).height() + 8
+        t.verticalHeader().setDefaultSectionSize(rh)
+        t.setFixedHeight(6 * rh + QFontMetrics(t.font()).height() + 14)
+        t.itemChanged.connect(self._on_img_table_changed)
+        t.currentCellChanged.connect(self._on_img_table_row)
+        self._img_table = t
+        lay.addWidget(t)
+
+        row_t = QHBoxLayout()
+        b_up = _btn("▲ Up", "Move the marked image one place earlier — the order of "
+                            "the table is the order of the pictures side by side")
+        b_up.clicked.connect(lambda: self._collage_move(-1))
+        b_dn = _btn("▼ Down", "Move the marked image one place later")
+        b_dn.clicked.connect(lambda: self._collage_move(1))
+        b_all = _btn("Show all", "Tick Show for every image — all side by side")
+        b_all.clicked.connect(lambda: self._collage_tick_all(True))
+        b_one = _btn("Show one", "Only the marked image on screen")
+        b_one.clicked.connect(lambda: self._collage_tick_all(False))
+        for b in (b_up, b_dn, b_all, b_one):
+            row_t.addWidget(b, 1)
+        lay.addLayout(row_t)
 
         row = QHBoxLayout()
         b_open = _btn("Open file", "Open one or more images from disk")
@@ -5849,34 +6400,18 @@ class WorkshopWidget(QWidget):
         lay.addLayout(row_b)
         lay.addWidget(self._btn_slider)
 
-        # The reference lives here, next to the active image, because both the
-        # subtraction in Edit and everything in Compare work against it.
-        lay.addWidget(_small_label("Reference image"))
-        self._ref_combo = QComboBox()
-        self._ref_combo.setToolTip("Used by subtraction and by the comparison views")
-        self._ref_combo.currentIndexChanged.connect(self._on_ref_changed)
-        lay.addWidget(self._ref_combo)
         b_ref_file = _btn("Load reference from file",
-                          "Bring in an image from disk and use it as the reference")
+                          "Bring in an image from disk and tick it as the reference")
         b_ref_file.clicked.connect(self._load_ref_from_file)
         lay.addWidget(b_ref_file)
 
     def _build_display_section(self):
-        sec = self._add_section(
-            "display", "Display", True,
-            "How the picture LOOKS: false colour, which values are shown, contrast, "
-            "brightness and gamma. The picture data stays as it arrived. Click to "
-            "open or shut the group.")
-        lay = sec.body_layout
-
-        note = _small_label("These settings only change how the image looks. "
-                            "The picture data stays as it arrived.")
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
-        lay.addWidget(note)
+        lay = self._part("view")
 
         lay.addWidget(_small_label("Palette"))
         self._palette_cb = QComboBox()
+        # Stated, not left to the theme: unstyled, the text came out white on white.
+        self._palette_cb.setStyleSheet("QComboBox { background: #ffffff; color: #111111; }")
         for name in PALETTE_NAMES:
             self._palette_cb.addItem(name)
         self._palette_cb.setToolTip("False-colour table used to show the values")
@@ -5901,7 +6436,7 @@ class WorkshopWidget(QWidget):
         self._gamma_sl, self._gamma_val, self._cb_auto_gamma = self._slider_row(
             lay, "Gamma", GAMMA_SLIDER_MIN, GAMMA_SLIDER_MAX, GAMMA_SLIDER_NEUTRAL,
             "Bends the scale so faint detail comes up without clipping the bright parts",
-            auto_tip="Choose the bend from the picture itself")
+            auto_tip="Choose the bend from the picture itself", scale=100, decimals=2)
 
         b_reset = _btn("Reset all display settings",
                        "Back to the plain picture as it arrived")
@@ -5909,18 +6444,24 @@ class WorkshopWidget(QWidget):
         lay.addWidget(b_reset)
 
     def _slider_row(self, lay, name: str, lo: int, hi: int, start: int, tip: str,
-                    auto_tip: str = ""):
-        """One labelled slider with a live number, a reset arrow and an Auto box.
+                    auto_tip: str = "", scale: int = 1, decimals: int = 0):
+        """One labelled slider with a number box, a reset arrow and an Auto box.
         Auto parks the slider on the value it computed, so the control always shows
-        what is actually on screen."""
+        what is actually on screen. `scale` turns slider units into the number shown
+        (gamma: 100 → 1.00)."""
         head = QHBoxLayout(); head.setSpacing(4)
         head.addWidget(_small_label(name))
-        val = QLabel(str(start))
-        val.setStyleSheet("color: #111; font-size: 11px; font-weight: 600;")
-        val.setMinimumWidth(34)
-        val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        head.addWidget(val)
+        sl = QSlider(Qt.Orientation.Horizontal)
+        sl.setRange(lo, hi)
+        sl.setValue(start)
+        sl.setToolTip(tip)
+        val = _SliderValueBox(sl, scale, decimals)
+        val.setToolTip(tip + "\nType a number and press Enter, or step it with the "
+                       "arrows.")
+        # The stretch goes before the box so the three boxes stand in one column
+        # beside Auto, whatever the length of the name.
         head.addStretch(1)
+        head.addWidget(val)
         cb = QCheckBox("Auto")
         cb.setStyleSheet(_check_qss())
         if auto_tip:
@@ -5931,11 +6472,6 @@ class WorkshopWidget(QWidget):
         b_reset.setFixedWidth(30)
         head.addWidget(b_reset)
         lay.addLayout(head)
-
-        sl = QSlider(Qt.Orientation.Horizontal)
-        sl.setRange(lo, hi)
-        sl.setValue(start)
-        sl.setToolTip(tip)
         lay.addWidget(sl)
 
         sl.valueChanged.connect(self._on_view_control)
@@ -5944,12 +6480,7 @@ class WorkshopWidget(QWidget):
         return sl, val, cb
 
     def _build_measure_section(self):
-        sec = self._add_section(
-            "measure", "Measure", False,
-            "Numbers out of the selected region or the whole picture, the table of "
-            "several regions, and how many micrometres one pixel is. Click to open "
-            "or shut the group.")
-        lay = sec.body_layout
+        lay = self._part("measure", "Numbers")
 
         self._measure_src_lbl = _small_label("—")
         self._measure_src_lbl.setWordWrap(True)
@@ -6000,7 +6531,7 @@ class WorkshopWidget(QWidget):
         #  It is always in force — there is no "measuring in pixels" mode, because every
         #  length is reported in pixels AND in real size side by side, so nothing is
         #  lost by knowing the size and everything is lost by having to switch it on.
-        lay.addWidget(_small_label("Scale"))
+        lay.addWidget(_part_heading("Scale"))
         srow_px = QHBoxLayout()
         self._sensor_guard = False          # True while the panel is writing the controls
         srow_px.addWidget(_small_label("One pixel is"))
@@ -6056,11 +6587,7 @@ class WorkshopWidget(QWidget):
     # ---- beam ---------------------------------------------------------------
 
     def _build_beam_section(self):
-        sec = self._add_section(
-            "beam", "Beam", False,
-            "Spot size and shape: width, roundness, the radial profile and how much "
-            "energy sits inside a circle. Click to open or shut the group.")
-        lay = sec.body_layout
+        lay = self._part("measure", "Beam")
         note = _small_label(
             "Spot size and shape, measured on the selected region or on the whole "
             "picture. A background is taken off first — a width is meaningless "
@@ -6104,22 +6631,173 @@ class WorkshopWidget(QWidget):
             grid.addWidget(b, i // 2, i % 2)
         lay.addLayout(grid)
 
+    # ---- image analysis -----------------------------------------------------
+
+    def _build_analysis_section(self):
+        """Image analysis — the Image Slider's Spatial Contrast, on the active image.
+
+        The same controls, the same maths (is_t.spatial_contrast) and the same
+        dialogs as the Slider's Analysis group, so a frame measured here and there
+        gives the same SC. Measured on the whole picture, exactly like the Slider."""
+        lay = self._part("measure", "Spatial contrast")
+
+        # Threshold row
+        thr_row = QHBoxLayout()
+        thr_row.addWidget(_small_label("Threshold:"))
+        self._sc_threshold_sb = QSpinBox()
+        self._sc_threshold_sb.setRange(0, 65535)
+        self._sc_threshold_sb.setValue(2000)
+        self._sc_threshold_sb.setFixedWidth(80)
+        self._sc_threshold_sb.setToolTip(
+            "Pixels with raw intensity ≤ threshold are treated as background.\n"
+            "Raise to include only the bright beam core; lower to include the full "
+            "beam halo.\nIn the units the panel measures in: native counts when the "
+            "source file has them, display codes 0–255 otherwise.")
+        self._sc_threshold_sb.valueChanged.connect(self._on_sc_threshold_changed)
+        thr_row.addWidget(self._sc_threshold_sb)
+        self._btn_sc_auto_thr = _btn("Auto", "Automatically set threshold using "
+                                             "Otsu's method\n(separates background "
+                                             "from beam)")
+        self._btn_sc_auto_thr.clicked.connect(self._run_sc_auto_threshold)
+        thr_row.addWidget(self._btn_sc_auto_thr)
+        self._btn_sc_hist = _btn("Manual", "Open histogram — click or drag to set "
+                                           "threshold manually")
+        self._btn_sc_hist.clicked.connect(self._open_sc_histogram)
+        thr_row.addWidget(self._btn_sc_hist)
+        thr_row.addStretch(1)
+        lay.addLayout(thr_row)
+
+        # Measure + Exclude
+        btn_row = QHBoxLayout()
+        self._btn_sc_measure = _btn("▶ Measure", "Compute Spatial Contrast for the "
+                                                 "active image")
+        self._btn_sc_measure.clicked.connect(self._run_spatial_contrast)
+        btn_row.addWidget(self._btn_sc_measure, 2)
+        self._btn_sc_draw = _btn("✏ Exclude", "Open exclusion editor — draw regions "
+                                             "to exclude from the measurement")
+        self._btn_sc_draw.clicked.connect(self._open_sc_exclusion_editor)
+        btn_row.addWidget(self._btn_sc_draw, 1)
+        lay.addLayout(btn_row)
+
+        # Top-N markers
+        topn_row = QHBoxLayout()
+        topn_row.addWidget(_small_label("Show top intensity:"))
+        self._sc_topn_sb = QSpinBox()
+        self._sc_topn_sb.setRange(0, 9999)
+        self._sc_topn_sb.setValue(0)
+        self._sc_topn_sb.setFixedWidth(70)
+        self._sc_topn_sb.setToolTip(
+            "Circle the top-N highest-intensity pixels on the image after measuring.\n"
+            "0 = disabled.")
+        self._sc_topn_sb.valueChanged.connect(self._update_sc_topn_overlay)
+        topn_row.addWidget(self._sc_topn_sb)
+        topn_row.addWidget(_small_label("px"))
+        topn_row.addStretch(1)
+        lay.addLayout(topn_row)
+
+        marker_row = QHBoxLayout()
+        marker_row.addWidget(_small_label("Marker radius:"))
+        self._sc_marker_r_sb = QSpinBox()
+        self._sc_marker_r_sb.setRange(1, 100)
+        self._sc_marker_r_sb.setValue(5)
+        self._sc_marker_r_sb.setFixedWidth(50)
+        self._sc_marker_r_sb.setToolTip("Circle radius in pixels for top-intensity "
+                                        "markers")
+        self._sc_marker_r_sb.valueChanged.connect(self._update_sc_topn_overlay)
+        marker_row.addWidget(self._sc_marker_r_sb)
+        marker_row.addWidget(_small_label("Thickness:"))
+        self._sc_marker_thick_sb = QSpinBox()
+        self._sc_marker_thick_sb.setRange(1, 20)
+        self._sc_marker_thick_sb.setValue(2)
+        self._sc_marker_thick_sb.setFixedWidth(45)
+        self._sc_marker_thick_sb.setToolTip("Line thickness for top-intensity markers")
+        self._sc_marker_thick_sb.valueChanged.connect(self._update_sc_topn_overlay)
+        marker_row.addWidget(self._sc_marker_thick_sb)
+        marker_row.addStretch(1)
+        lay.addLayout(marker_row)
+        # The number boxes say their own colours — left to the style they came out
+        # pale grey on grey when the app sheet was not the one painting them.
+        for sb in (self._sc_threshold_sb, self._sc_topn_sb, self._sc_marker_r_sb,
+                   self._sc_marker_thick_sb):
+            sb.setStyleSheet("QSpinBox { background: #ffffff; color: #111111; }"
+                             "QSpinBox:disabled { color: #8a8a8a; }")
+
+        # Results — compact 2-per-row grid, as in the Slider
+        sl = _get_slider_module()
+        val_cls = getattr(sl, "_SCValueLabel", QLabel) if sl else QLabel
+        grid = QGridLayout()
+        grid.setSpacing(3)
+        grid.setContentsMargins(0, 2, 0, 2)
+        val_style = ("font-size: 11px; font-family: monospace; color: #111; "
+                     "background: #f5f5f5; border: 1px solid #ccc; "
+                     "border-radius: 2px; padding: 1px 4px;")
+        lbl_style = "font-size: 11px; color: #444;"
+
+        def _cell(label: str, row: int, col: int) -> QLabel:
+            lbl = QLabel(label)
+            lbl.setStyleSheet(lbl_style)
+            val = val_cls("—")
+            val.setStyleSheet(val_style)
+            val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val.setToolTip("Double-click to copy")
+            grid.addWidget(lbl, row, col * 2)
+            grid.addWidget(val, row, col * 2 + 1)
+            grid.setColumnStretch(col * 2 + 1, 1)
+            return val
+
+        self._sc_val_min = _cell("Min:", 0, 0)
+        self._sc_val_max = _cell("Max:", 0, 1)
+        self._sc_val_mean = _cell("Mean:", 1, 0)
+        self._sc_val_beam = _cell("Pixels:", 1, 1)
+        sc_lbl = QLabel("SC (Max/Mean):")
+        sc_lbl.setStyleSheet(lbl_style)
+        self._sc_val_sc = val_cls("—")
+        self._sc_val_sc.setStyleSheet(
+            "font-size: 12px; font-weight: 700; font-family: monospace; color: #111; "
+            "background: #e8f0fe; border: 1px solid #90a8e0; "
+            "border-radius: 2px; padding: 1px 4px;")
+        self._sc_val_sc.setAlignment(Qt.AlignmentFlag.AlignRight
+                                     | Qt.AlignmentFlag.AlignVCenter)
+        self._sc_val_sc.setToolTip("Double-click to copy")
+        grid.addWidget(sc_lbl, 2, 0)
+        grid.addWidget(self._sc_val_sc, 2, 1, 1, 3)
+        lay.addLayout(grid)
+
+        self._sc_img_lbl = QLabel("")
+        self._sc_img_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        lay.addWidget(self._sc_img_lbl)
+        self._sc_status_lbl = QLabel("")
+        self._sc_status_lbl.setWordWrap(True)
+        self._sc_status_lbl.setStyleSheet("font-size: 10px; color: #c00;")
+        lay.addWidget(self._sc_status_lbl)
+
+        prev_cls = getattr(sl, "_SCPreviewLabel", None) if sl else None
+        self._sc_preview_lbl = prev_cls() if prev_cls else QLabel()
+        self._sc_preview_lbl.setToolTip(
+            "The measured beam (grey) and the background (red). Rest the pointer "
+            "here to see it large.")
+        self._sc_preview_lbl.hide()
+        lay.addWidget(self._sc_preview_lbl)
+
+        # State. A measurement belongs to one array: an edit makes a new array, so
+        # identity says whether the numbers on the panel still describe the picture.
+        self._sc_sig = _SCWorkSignals()
+        self._sc_sig.done.connect(self._on_sc_done)
+        self._sc_running = False
+        self._sc_pending = False
+        self._sc_token = 0
+        self._sc_arr_ref = None              # the array the shown result is of
+        self._sc_preview_pixmap = None
+        self._sc_exclusion_mask = None       # bool H×W, True = excluded
+        self._sc_exclusion_arr = None        # the array the mask was drawn on
+        self._sc_topn_points: "list[tuple[int, int]]" = []
+        self._sc_hist_dlg = None
+        self._sc_excl_dlg = None
+
     # ---- filters ------------------------------------------------------------
 
     def _build_filters_section(self):
-        sec = self._add_section(
-            "filters", "Filters", False,
-            "Smoothing, sharpening, edges and background removal. These CHANGE the "
-            "picture itself, and every step can be undone. Click to open or shut "
-            "the group.")
-        lay = sec.body_layout
-        warn = _small_label(
-            "These change the picture itself, and the measured intensity behind it the "
-            "same way, "
-            "so what you measure still matches what you see. Every step can be undone.")
-        warn.setWordWrap(True)
-        warn.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
-        lay.addWidget(warn)
+        lay = self._part("change", "Filters")
 
         grid = QGridLayout(); grid.setSpacing(3)
         ops = [("Median", "Replaces each pixel by the middle value of its "
@@ -6141,16 +6819,7 @@ class WorkshopWidget(QWidget):
         self._filter_buttons = [grid.itemAt(i).widget() for i in range(grid.count())]
 
     def _build_edit_section(self):
-        sec = self._add_section(
-            "edit", "Edit picture", False,
-            "Turning, mirroring, resizing, binning, straightening, and subtracting "
-            "the reference. These CHANGE the picture itself, and every step can be "
-            "undone. Click to open or shut the group.")
-        lay = sec.body_layout
-        warn = _small_label("These change the picture itself. Every step can be undone.")
-        warn.setWordWrap(True)
-        warn.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
-        lay.addWidget(warn)
+        lay = self._part("change", "Turn, mirror and resize")
 
         grid = QGridLayout(); grid.setSpacing(3)
         ops = [("Rotate left", "rotate_left", "Turn 90° anticlockwise",
@@ -6182,11 +6851,13 @@ class WorkshopWidget(QWidget):
             grid2.addWidget(b, i // 2, i % 2)
         lay.addLayout(grid2)
 
-        lay.addWidget(_small_label("Against the reference image"))
+        lay.addWidget(_part_heading("Against the reference image"))
         srow = QHBoxLayout()
-        b_sub = _btn("Subtract", "Active minus reference, negatives cut to zero")
+        b_sub = _btn("Subtract", "Active minus the reference (Ref in the Images "
+                                 "table), negatives cut to zero")
         b_sub.clicked.connect(lambda: self._do_diff(False))
-        b_abs = _btn("Difference", "How far apart the two are, in either direction")
+        b_abs = _btn("Difference", "How far apart the active image and the reference "
+                                   "are, in either direction")
         b_abs.clicked.connect(lambda: self._do_diff(True))
         srow.addWidget(b_sub); srow.addWidget(b_abs)
         lay.addLayout(srow)
@@ -6194,21 +6865,11 @@ class WorkshopWidget(QWidget):
     # ---- combine ------------------------------------------------------------
 
     def _build_combine_section(self):
-        sec = self._add_section(
-            "combine", "Combine images", False,
-            "Makes a NEW picture out of the ones already open — an average, an "
-            "envelope, a sum, or the active one and the reference in red and green. "
-            "Nothing existing is changed. Click to open or shut the group.")
-        lay = sec.body_layout
-        note = _small_label(
-            "Makes a NEW image out of the ones already open. Nothing existing is "
-            "changed.")
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
-        lay.addWidget(note)
+        lay = self._part("images", "Combine into a new image")
 
         lay.addWidget(_small_label("Across every open image"))
         self._project_cb = QComboBox()
+        self._project_cb.setStyleSheet("QComboBox { background: #ffffff; color: #111111; }")
         for m in (wk_ops.PROJECT_MODES if wk_ops is not None
                   else ("Average", "Maximum", "Sum", "Minimum")):
             self._project_cb.addItem(m)
@@ -6223,44 +6884,466 @@ class WorkshopWidget(QWidget):
         self._btn_project.clicked.connect(self._do_project)
         lay.addWidget(self._btn_project)
 
-        lay.addWidget(_small_label("Active image with the reference"))
-        self._btn_merge = _btn(
-            "Merge as red and green",
-            "The active image in red, the reference in green. A shift between them "
-            "shows as a red edge on one side and a green edge on the other.")
-        self._btn_merge.clicked.connect(self._do_merge)
-        lay.addWidget(self._btn_merge)
+    def _build_collage_section(self):
+        lay = self._part("view", "Several images side by side")
+        o = self._collage_opts
+        white_qss = ("QSpinBox, QComboBox { background: #ffffff; color: #111111; }"
+                     "QSpinBox:disabled, QComboBox:disabled { color: #8a8a8a; }")
 
-    def _build_compare_section(self):
-        sec = self._add_section(
-            "compare", "Compare", False,
-            "Shows the active picture against the reference — side by side, mixed "
-            "together, or as the difference. Only the view changes. Click to open "
-            "or shut the group.")
-        lay = sec.body_layout
-        self._compare_cb = QComboBox()
-        self._compare_cb.setToolTip("Show the active image against the reference image")
-        for m in COMPARE_MODES:
-            self._compare_cb.addItem(m)
-        self._compare_cb.currentIndexChanged.connect(self._update_compare)
-        lay.addWidget(self._compare_cb)
+        # Which images and in what order is the Images table's business (Show ticks);
+        # here is only how the grid looks once two or more are ticked.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(3)
 
-        self._blend_sl = QSlider(Qt.Orientation.Horizontal)
-        self._blend_sl.setRange(0, 100)
-        self._blend_sl.setValue(50)
-        self._blend_sl.setToolTip("0 % shows only the reference, 100 % only the active image")
-        self._blend_sl.valueChanged.connect(self._update_compare)
-        lay.addWidget(self._blend_sl)
-        self._blend_lbl = _small_label("Mix: 50 %")
-        lay.addWidget(self._blend_lbl)
+        self._collage_cols = QComboBox()
+        self._collage_cols.addItem("Auto", 0)
+        for n in range(1, 9):
+            self._collage_cols.addItem(str(n), n)
+        self._collage_cols.setToolTip("How many images side by side in one row. "
+                                      "Auto: as square as possible — 4 images 2 × 2.")
+        self._collage_cols.setCurrentIndex(max(0, min(8, int(o.get("columns") or 0))))
+        grid.addWidget(_small_label("Columns"), 0, 0)
+        grid.addWidget(self._collage_cols, 0, 1)
+
+        self._collage_tiles = QComboBox()
+        self._collage_tiles.addItems(list(COLLAGE_TILE_MODES))
+        self._collage_tiles.setToolTip(
+            "Same size — every image fitted into the same tile, so a small crop shows "
+            "as big as a full frame.\n1:1 pixels — every image at its own size.")
+        self._collage_tiles.setCurrentText(str(o.get("tiles")))
+        grid.addWidget(_small_label("Tiles"), 0, 2)
+        grid.addWidget(self._collage_tiles, 0, 3)
+
+        self._collage_gap = QSpinBox()
+        self._collage_gap.setRange(0, 50)
+        self._collage_gap.setSuffix(" px")
+        self._collage_gap.setValue(int(o.get("gap") or 0))
+        self._collage_gap.setToolTip("Space between the images and around the edge")
+        grid.addWidget(_small_label("Gap"), 1, 0)
+        grid.addWidget(self._collage_gap, 1, 1)
+
+        self._collage_bg = QComboBox()
+        self._collage_bg.addItems(list(COLLAGE_BACKGROUNDS))
+        self._collage_bg.setToolTip("Colour of the gaps and of the name strips")
+        self._collage_bg.setCurrentText(str(o.get("background")))
+        grid.addWidget(_small_label("Ground"), 1, 2)
+        grid.addWidget(self._collage_bg, 1, 3)
+
+        self._collage_label = QComboBox()
+        self._collage_label.addItems(list(COLLAGE_LABEL_MODES))
+        self._collage_label.setToolTip(
+            "The image's name on each tile. The time is the moment the frame was "
+            "taken — shown only for frames from the archive.")
+        self._collage_label.setCurrentText(str(o.get("label")))
+        grid.addWidget(_small_label("Name"), 2, 0)
+        grid.addWidget(self._collage_label, 2, 1)
+
+        self._collage_place = QComboBox()
+        self._collage_place.addItems(list(COLLAGE_LABEL_PLACES))
+        self._collage_place.setToolTip("Name above or below the picture")
+        self._collage_place.setCurrentText(str(o.get("label_place")))
+        grid.addWidget(_small_label("Place"), 2, 2)
+        grid.addWidget(self._collage_place, 2, 3)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        lay.addLayout(grid)
+
+        for w in (self._collage_cols, self._collage_tiles, self._collage_gap,
+                  self._collage_bg, self._collage_label, self._collage_place):
+            w.setStyleSheet(white_qss)
+        self._collage_cols.currentIndexChanged.connect(self._on_collage_opts)
+        self._collage_tiles.currentIndexChanged.connect(self._on_collage_opts)
+        self._collage_gap.valueChanged.connect(self._on_collage_opts)
+        self._collage_bg.currentIndexChanged.connect(self._on_collage_opts)
+        self._collage_label.currentIndexChanged.connect(self._on_collage_opts)
+        self._collage_place.currentIndexChanged.connect(self._on_collage_opts)
+
+        self._cb_collage_draw = QCheckBox("Drawings and measurements")
+        self._cb_collage_draw.setStyleSheet(_check_qss())
+        self._cb_collage_draw.setToolTip(
+            "Each image with what is drawn on it — text, arrows, regions, rulers, the "
+            "scale bar.")
+        self._cb_collage_draw.setChecked(bool(o.get("drawings", True)))
+        self._cb_collage_draw.toggled.connect(self._on_collage_opts)
+        lay.addWidget(self._cb_collage_draw)
+
+        pv_row = QHBoxLayout()
+        self._cb_collage_pvs = QCheckBox("PV values")
+        self._cb_collage_pvs.setStyleSheet(_check_qss())
+        self._cb_collage_pvs.setToolTip(
+            "Under each tile, the PV values from the archive at the moment that frame "
+            "was taken — the same line the Image Slider burns into a saved frame.\n"
+            "Images opened from the computer or pasted have no known moment and get "
+            "no PV line.")
+        self._cb_collage_pvs.setChecked(bool(o.get("show_pvs", False)))
+        self._cb_collage_pvs.toggled.connect(self._on_collage_opts)
+        pv_row.addWidget(self._cb_collage_pvs)
+        self._btn_collage_pvs = _btn("Choose PVs",
+                                     "Pick which PVs go under the tiles — the Image "
+                                     "Slider's PV window, with its shared list")
+        self._btn_collage_pvs.clicked.connect(self._pick_collage_pvs)
+        pv_row.addWidget(self._btn_collage_pvs, 1)
+        lay.addLayout(pv_row)
+        self._collage_pv_lbl = _small_label("")
+        self._collage_pv_lbl.setWordWrap(True)
+        lay.addWidget(self._collage_pv_lbl)
+        self._update_collage_pv_label()
+
+        self._btn_collage_new = _btn(
+            "Make a new image",
+            "Add the collage to the Workshop as an image of its own — to crop it, draw "
+            "on it or save it later")
+        self._btn_collage_new.clicked.connect(self._collage_to_slot)
+        lay.addWidget(self._btn_collage_new)
+        self._read_collage_opts()
+
+    # ───────────────────────────────────────────────── Collage ────
+
+    def _collage_on(self) -> bool:
+        """Two or more images ticked under Show: they are on screen side by side."""
+        return len(self._collage_slots()) >= 2
+
+    def _collage_slots(self) -> list:
+        # By identity: a slot's == compares its pixel arrays, which numpy refuses.
+        alive = {id(s) for s in self._slots}
+        return [s for s in self._collage_order if s.in_collage and id(s) in alive]
+
+    def _slot_index(self, slot) -> int:
+        for i, s in enumerate(self._slots):
+            if s is slot:
+                return i
+        return -1
+
+    def _sync_collage_order(self):
+        """Keep the table in step with the open images: a removed image leaves, a new
+        one joins at the end, the operator's own order is kept otherwise. The table's
+        order is the order of the pictures side by side."""
+        alive = {id(s) for s in self._slots}
+        order = [s for s in self._collage_order if id(s) in alive]
+        known = {id(s) for s in order}
+        order += [s for s in self._slots if id(s) not in known]
+        self._collage_order = order
+        t = getattr(self, "_img_table", None)
+        if t is None:
+            return
+        number = {id(s): i + 1 for i, s in enumerate(self._slots)}
+        active = self._slot()
+        ref = self._slots[self._ref] if 0 <= self._ref < len(self._slots) else None
+        centre = Qt.AlignmentFlag.AlignCenter
+        plain = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        t.blockSignals(True)
+        t.setRowCount(len(order))
+        for r, s in enumerate(order):
+            for c, on in ((self._C_SHOW, s.in_collage), (self._C_REF, s is ref)):
+                it = QTableWidgetItem()
+                it.setFlags(plain | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+                it.setToolTip(self._IMG_COLS[c][1])
+                t.setItem(r, c, it)
+            it = QTableWidgetItem(str(number[id(s)]))
+            it.setFlags(plain)
+            it.setTextAlignment(centre)
+            t.setItem(r, self._C_NUM, it)
+            it = QTableWidgetItem(s.label)
+            it.setFlags(plain)
+            it.setTextAlignment(centre)
+            it.setToolTip(s.label)
+            t.setItem(r, self._C_NAME, it)
+        self._mark_active_row()
+        t.blockSignals(False)
+
+    def _mark_active_row(self):
+        """The marked row is always the image the tools work on."""
+        t = getattr(self, "_img_table", None)
+        if t is None:
+            return
+        row = next((r for r, s in enumerate(self._collage_order)
+                    if s is self._slot()), -1)
+        was = t.blockSignals(True)
+        if row >= 0:
+            t.setCurrentCell(row, self._C_NAME)
+        else:
+            t.clearSelection()
+        t.blockSignals(was)
+
+    def _on_img_table_row(self, row: int, col: int, prev_row: int, _prev_col: int):
+        if col in (self._C_SHOW, self._C_REF):
+            # A click on a tick box ticks it and nothing else: the marked row goes
+            # back to the active image once the click is through.
+            QTimer.singleShot(0, self._mark_active_row)
+            return
+        if row == prev_row or not (0 <= row < len(self._collage_order)):
+            return
+        idx = self._slot_index(self._collage_order[row])
+        if idx >= 0 and idx != self._active:
+            self._activate_slot(idx)
+
+    def _on_img_table_changed(self, item):
+        r, c = item.row(), item.column()
+        if not (0 <= r < len(self._collage_order)):
+            return
+        s = self._collage_order[r]
+        on = item.checkState() == Qt.CheckState.Checked
+        if c == self._C_SHOW:
+            if not on and s.in_collage and len(self._collage_slots()) <= 1:
+                # Something is always on screen: the last tick stays.
+                self._sync_collage_order()
+                self._say("One image is always shown — tick another one first.")
+                return
+            s.in_collage = on
+            shown = self._collage_slots()
+            if len(shown) == 1 and shown[0] is not self._slot():
+                # Back to one picture: that one is the one the tools work on.
+                self._activate_slot(self._slot_index(shown[0]))
+                return
+            self._sync_collage_order()
+            self._collage_refresh()
+        elif c == self._C_REF:
+            self._ref = self._slot_index(s) if on else -1
+            self._sync_collage_order()
+            self._update_enabled()
+            self._say(f"Reference: {s.label}" if on else "No reference image.")
+
+    def _collage_move(self, delta: int):
+        row = next((r for r, s in enumerate(self._collage_order)
+                    if s is self._slot()), -1)
+        new = row + delta
+        if not (0 <= row < len(self._collage_order)) or \
+                not (0 <= new < len(self._collage_order)):
+            return
+        o = self._collage_order
+        o[row], o[new] = o[new], o[row]
+        self._sync_collage_order()
+        self._collage_refresh()
+
+    def _collage_tick_all(self, on: bool):
+        """Show all: every image side by side. Show one: only the active image."""
+        active = self._slot()
+        for s in self._collage_order:
+            s.in_collage = bool(on) or s is active
+        self._sync_collage_order()
+        self._collage_refresh()
+
+    def _read_collage_opts(self):
+        o = self._collage_opts
+        o["columns"] = int(self._collage_cols.currentData() or 0)
+        o["tiles"] = self._collage_tiles.currentText()
+        o["gap"] = int(self._collage_gap.value())
+        o["background"] = self._collage_bg.currentText()
+        o["label"] = self._collage_label.currentText()
+        o["label_place"] = self._collage_place.currentText()
+        o["drawings"] = bool(self._cb_collage_draw.isChecked())
+        o["show_pvs"] = bool(self._cb_collage_pvs.isChecked())
+        self._collage_place.setEnabled(o["label"] != "Off")
+
+    def _on_collage_opts(self, *_):
+        self._read_collage_opts()
+        self._ui_state["collage"] = dict(self._collage_opts)
+        self._save_ui_state()
+        self._update_collage_pv_label()
+        self._collage_refresh()
+
+    def _collage_refresh(self):
+        self._update_enabled()
+        self._update_compare(refit=True)
+
+    def _collage_time_text(self, slot) -> str:
+        if slot.ts_ns is None:
+            return ""
+        sl = _get_slider_module()
+        try:
+            if sl is not None:
+                return sl.fmt_prague_full_from_ns(int(slot.ts_ns))
+            return datetime.fromtimestamp(slot.ts_ns / 1e9, tz=_TZ_PRAGUE).strftime(
+                "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+
+    def _collage_pv_names(self) -> "tuple[str, ...]":
+        hidden = set(self._collage_opts.get("pv_hidden") or ())
+        return tuple(n for n in (self._collage_opts.get("pvs") or ()) if n not in hidden)
+
+    def _collage_tiles_now(self) -> list:
+        """The tiles as the collage draws them now. PV lines that are not here yet
+        are asked for in the background and shown with the loading dot meanwhile."""
+        o = self._collage_opts
+        names = self._collage_pv_names() if o.get("show_pvs") else ()
+        sl = _get_slider_module() if names else None
+        want: list = []
+        tiles = []
+        for s in self._collage_slots():
+            img = _np_to_qimage(render_view(s.base, s.view)).convertToFormat(
+                QImage.Format.Format_RGB888)
+            if o.get("drawings") and s.annots:
+                p = QPainter(img)
+                paint_annots(p, s.annots, lambda x, y: QPointF(x, y), 1.0)
+                p.end()
+            label = s.label
+            if o.get("label") == "Name + time":
+                t = self._collage_time_text(s)
+                # The Slider's own label already ends in the frame's time; saying it
+                # twice would only push the name off the tile.
+                if t and t[:19] not in label:
+                    label = f"{label}  {t}"
+            pv = None
+            if names and sl is not None and s.ts_ns is not None:
+                key = (names, int(s.ts_ns))
+                pv = self._collage_pv_text.get(key)
+                if pv is None:
+                    want.append(int(s.ts_ns))
+                    try:
+                        pv = "  |  ".join(f"{sl.pv_label_for(n)}: "
+                                          f"{sl.pv_bar_dot('loading')}" for n in names)
+                    except Exception:
+                        pv = ""
+            tiles.append({"image": img, "label": label, "pv": pv})
+        if want:
+            self._fetch_collage_pvs(names, want)
+        return tiles
+
+    def _render_collage(self) -> "QImage | None":
+        sl = _get_slider_module()
+        bar = getattr(sl, "qt_pv_bar_below", None) if sl is not None else None
+        return render_collage(self._collage_tiles_now(), self._collage_opts, pv_bar=bar)
+
+    def _show_collage(self, refit: bool = True):
+        img = self._render_collage()
+        if img is None:
+            self._canvas.set_compare(None)
+            self._say("Tick at least one image for the collage.")
+            return
+        n = len(self._collage_slots())
+        cols, rows = collage_grid(n, int(self._collage_opts.get("columns") or 0))
+        self._canvas.set_compare(img, "COLLAGE VIEW — editing is off",
+                                 refit=refit or not self._collage_shown_once)
+        self._collage_shown_once = True
+        self._say(f"Collage: {n} image(s), {cols} × {rows}, "
+                  f"{img.width()} × {img.height()} px.")
+
+    # ---- PV values per tile ------------------------------------------------
+
+    def _update_collage_pv_label(self):
+        lbl = getattr(self, "_collage_pv_lbl", None)
+        if lbl is None:
+            return
+        names = self._collage_pv_names()
+        if not names:
+            lbl.setText("No PVs chosen yet.")
+            return
+        sl = _get_slider_module()
+        try:
+            shown = [sl.pv_label_for(n) for n in names] if sl is not None else list(names)
+        except Exception:
+            shown = list(names)
+        lbl.setText("PVs: " + ", ".join(shown))
+
+    def _pick_collage_pvs(self):
+        """The Image Slider's PV window — one window, one shared list of PVs for every
+        tab. The shared part (added PVs, formulas, names, units, limits) goes back to
+        the shared store; which PVs the collage shows is the Workshop's own."""
+        sl = _get_slider_module()
+        if sl is None or not hasattr(sl, "PvConfigDialog"):
+            self._say("The PV list could not be loaded.")
+            return
+        o = self._collage_opts
+        dlg = sl.PvConfigDialog(list(o.get("pvs") or []), sl.PV_CUSTOM_CHANNELS,
+                                sl.PV_DERIVED, sl.PV_LABELS,
+                                hidden=set(o.get("pv_hidden") or ()),
+                                units=sl.PV_CUSTOM_UNITS,
+                                limits=sl.PV_LIMITS, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sl.PV_CUSTOM_CHANNELS.clear()
+        sl.PV_CUSTOM_CHANNELS.update(dlg.custom_channels())
+        sl.PV_DERIVED[:] = dlg.derived_defs()
+        sl.PV_LABELS.clear()
+        sl.PV_LABELS.update(dlg.labels())
+        sl.PV_CUSTOM_UNITS.clear()
+        sl.PV_CUSTOM_UNITS.update(dlg.custom_units())
+        sl.PV_LIMITS.clear()
+        sl.PV_LIMITS.update(dlg.limits())
+        sl.pv_registry_save()
+        names = list(dlg.selected_names())
+        o["pvs"] = names
+        o["pv_hidden"] = sorted(set(dlg.hidden_names()) & set(names))
+        # A PV picked just now means the user wants to see it.
+        if names and not self._cb_collage_pvs.isChecked():
+            self._cb_collage_pvs.blockSignals(True)
+            self._cb_collage_pvs.setChecked(True)
+            self._cb_collage_pvs.blockSignals(False)
+        # A formula or a name may have changed under the same PV — read everything anew.
+        self._collage_pv_text.clear()
+        self._on_collage_opts()
+
+    def _fetch_collage_pvs(self, names: tuple, ts_list: list):
+        """Read the PV values for these moments off the GUI thread: the archive days
+        are loaded once for all of them, then every line is an in-memory lookup — the
+        Image Slider's own route, with its hold-forward for PVs written only on
+        change."""
+        todo = sorted({t for t in ts_list if (names, t) not in self._collage_pv_busy})
+        if not todo:
+            return
+        for t in todo:
+            self._collage_pv_busy.add((names, t))
+        sl = _get_slider_module()
+        sig = self._collage_pv_sig
+
+        def work():
+            out: dict = {}
+            try:
+                channels = [c for c in (sl.pv_channel_for(b)
+                                        for b in sl.pv_source_names(list(names))) if c]
+                try:
+                    sl.pv_warm_days(channels, todo)
+                except Exception:
+                    pass          # the lookups below still try, one by one
+                for t in todo:
+                    try:
+                        out[t] = sl.pv_text_for_ts(t, list(names))
+                    except Exception:
+                        out[t] = None
+            except Exception:
+                pass
+            # A line that could not be read at all gets the grey "nothing there" dot
+            # for each PV — never a blank, which would read as "no PVs asked for".
+            for t in todo:
+                if not out.get(t):
+                    try:
+                        out[t] = "  |  ".join(f"{sl.pv_label_for(n)}: "
+                                              f"{sl.pv_bar_dot('none')}" for n in names)
+                    except Exception:
+                        out[t] = "PVs could not be read"
+            sig.done.emit(names, out)
+
+        threading.Thread(target=work, name="collage-pvs", daemon=True).start()
+
+    def _on_collage_pvs(self, names, texts):
+        for t, line in (texts or {}).items():
+            self._collage_pv_text[(names, int(t))] = line
+            self._collage_pv_busy.discard((names, int(t)))
+        if self._collage_on() and names == self._collage_pv_names():
+            self._show_collage(refit=False)
+
+    def _collage_to_slot(self):
+        img = self._render_collage() if self._collage_slots() else None
+        if img is None:
+            self._say("Tick at least one image for the collage.")
+            return
+        n = len(self._collage_slots())
+        new = self._add_derived_slot(_qimage_to_np(img), f"Collage of {n} images",
+                                     note="a collage — values are display codes")
+        # Back to an ordinary view: the new image alone, shown at once.
+        for s in self._slots:
+            s.in_collage = s is new
+        self._sync_collage_order()
+        self._update_compare()
+        self._after_change()
+        self._say(f"The collage is now image {len(self._slots)}: "
+                  f"{img.width()} × {img.height()} px.")
 
     def _build_save_section(self):
-        sec = self._add_section(
-            "save", "Save", True,
-            "Writing it out: the picture as a file, the measured values as a plain "
-            "TIFF, an animation of every open picture, and the drawing itself as a "
-            "session. Click to open or shut the group.")
-        lay = sec.body_layout
+        lay = self._part("save", "Picture files")
         self._cb_burn = QCheckBox("Save with overlay")
         self._cb_burn.setStyleSheet(_check_qss())
         self._cb_burn.setChecked(bool(self._ui_state.get("save_overlay", True)))
@@ -6301,7 +7384,7 @@ class WorkshopWidget(QWidget):
         self._btn_data_tiff.clicked.connect(self._save_data_tiff)
         lay.addWidget(self._btn_data_tiff)
 
-        lay.addWidget(_small_label("Animation from every open image"))
+        lay.addWidget(_part_heading("Animation from every open image"))
         arow = QHBoxLayout()
         arow.addWidget(_small_label("Frame time"))
         self._anim_ms = QSpinBox()
@@ -6330,7 +7413,8 @@ class WorkshopWidget(QWidget):
         arow2.addWidget(self._btn_play); arow2.addWidget(self._btn_anim)
         lay.addLayout(arow2)
 
-        lay.addWidget(_small_label("Session — the drawing, the regions and the scale"))
+        lay.addWidget(_part_heading("Session"))
+        lay.addWidget(_small_label("The drawing, the regions and the scale"))
         srow = QHBoxLayout()
         b_ssave = _btn("Save session",
                        "Write down everything drawn on every open image, so the work "
@@ -6362,13 +7446,27 @@ class WorkshopWidget(QWidget):
     def receive_image(self, arr: np.ndarray, label: str = "",
                       source_path: "Path | None" = None,
                       raw: "np.ndarray | None" = None,
-                      full_scale: "float | None" = None, camera: str = ""):
+                      full_scale: "float | None" = None, camera: str = "",
+                      raw_note: str = "", ts_ns="from file name"):
         """Called by Image Finder / Image Slider / Shot Finder.
 
         `arr` is the 8-bit picture as the sender rendered it. The optional `raw`,
         `full_scale` and `camera` let a sender hand over the native-precision data
         directly; without them the Workshop reads the source file itself in the
-        background, so the existing three senders need no change."""
+        background, so the existing three senders need no change.
+
+        `ts_ns` is the moment the frame was taken. Left out, it is read from the file
+        name, which for every archive frame the three senders hand over carries it.
+        open_files passes None on purpose: a file from the computer has no moment the
+        collage may put PV values against."""
+        if isinstance(ts_ns, str):
+            ts_ns = None
+            sl = _get_slider_module()
+            if source_path and sl is not None:
+                try:
+                    ts_ns = sl.parse_unix_ns_from_name(Path(source_path))
+                except Exception:
+                    ts_ns = None
         if arr.ndim == 2:
             base = np.ascontiguousarray(arr)
         elif arr.shape[2] == 4:
@@ -6380,7 +7478,8 @@ class WorkshopWidget(QWidget):
         slot = _WorkshopSlot(label=label or "image", base=base, source_base=base,
                              source_path=Path(source_path) if source_path else None,
                              raw=raw, source_raw=raw, full_scale=full_scale,
-                             camera=camera)
+                             camera=camera, raw_note=raw_note,
+                             ts_ns=None if ts_ns is None else int(ts_ns))
         if raw is None:
             slot.raw_note = "reading the source file…"
             QThreadPool.globalInstance().start(_RawLoadTask(slot, self._raw_sig))
@@ -6400,11 +7499,25 @@ class WorkshopWidget(QWidget):
                 continue
             try:
                 with _PilImg.open(str(p)) as im:
-                    a = np.array(im.convert("RGB") if im.mode not in ("L", "RGB") else im)
-                if a.dtype != np.uint8:
-                    a = np.clip(a.astype(np.float32) / max(1.0, float(a.max())) * 255.0,
-                                0, 255).astype(np.uint8)
-                self.receive_image(a, p.name, source_path=p)
+                    if im.mode in ("L", "RGB"):
+                        a, counts = np.array(im), None
+                    else:
+                        # A 16-bit grey camera frame must NOT go through convert("RGB"):
+                        # Pillow clips every value above 255 instead of scaling it, so
+                        # the picture came out white and the display window had nothing
+                        # left to work with.
+                        counts, fs, camera, note, bracketed = _read_native(im, p)
+                        a = None if counts is not None else np.array(im.convert("RGB"))
+                if counts is None:
+                    self.receive_image(a, p.name, source_path=p, ts_ns=None)
+                else:
+                    if not bracketed:
+                        fs = _file_full_scale(counts)
+                        note = (f"no bracket in the file — values are the stored "
+                                f"numbers, shown against 0 … {fs:.0f}")
+                    self.receive_image(_picture_from_counts(counts, fs), p.name,
+                                       source_path=p, raw=counts, full_scale=fs,
+                                       camera=camera, raw_note=note, ts_ns=None)
                 added += 1
             except Exception as e:
                 failed.append(f"{p.name}: {e}")
@@ -6455,6 +7568,7 @@ class WorkshopWidget(QWidget):
         new.px_per_mm = px_per_mm
         new.px_um = slot.px_um
         new.px_um_measured = slot.px_um_measured
+        new.ts_ns = slot.ts_ns
         new.view = _ViewSettings(**vars(slot.view))
         self._after_change()
         self._say(f"Duplicated the {what}: {base.shape[1]} × {base.shape[0]} px. "
@@ -6520,35 +7634,17 @@ class WorkshopWidget(QWidget):
         return None
 
     def _update_slot_list(self):
-        self._slot_list.blockSignals(True)
-        self._ref_combo.blockSignals(True)
-        cur = self._slot_list.currentIndex()
-        self._slot_list.clear()
-        self._ref_combo.clear()
-        self._ref_combo.addItem("— none —")
-        for i, s in enumerate(self._slots):
-            short = s.label[:44] + ("…" if len(s.label) > 44 else "")
-            self._slot_list.addItem(f"{i + 1}. {short}")
-            self._ref_combo.addItem(f"{i + 1}. {short}")
-        if 0 <= cur < len(self._slots):
-            self._slot_list.setCurrentIndex(cur)
-        elif self._slots:
-            self._slot_list.setCurrentIndex(len(self._slots) - 1)
-        if 0 <= self._ref < len(self._slots):
-            self._ref_combo.setCurrentIndex(self._ref + 1)
-        self._slot_list.blockSignals(False)
-        self._ref_combo.blockSignals(False)
-
-    def _on_slot_selected(self, idx: int):
-        if 0 <= idx < len(self._slots):
-            self._activate_slot(idx)
+        self._sync_collage_order()
 
     def _activate_slot(self, idx: int):
         self._active = idx
-        self._slot_list.blockSignals(True)
-        self._slot_list.setCurrentIndex(idx)
-        self._slot_list.blockSignals(False)
-        self._canvas.set_slot(self._slot())
+        slot = self._slot()
+        # With one picture on screen, the tick follows the image being worked on.
+        if slot is not None and len(self._collage_slots()) <= 1:
+            for s in self._slots:
+                s.in_collage = s is slot
+        self._sync_collage_order()
+        self._canvas.set_slot(slot)
         self._sync_view_controls()
         self._update_compare()
         self._after_change()
@@ -6556,8 +7652,9 @@ class WorkshopWidget(QWidget):
     def _remove_slot(self):
         if not self._slots or self._active < 0:
             return
+        ref = self._slots[self._ref] if 0 <= self._ref < len(self._slots) else None
         self._slots.pop(self._active)
-        self._ref = -1
+        self._ref = self._slot_index(ref) if ref is not None else -1
         self._active = min(self._active, len(self._slots) - 1)
         self._update_slot_list()
         if self._slots:
@@ -6565,6 +7662,7 @@ class WorkshopWidget(QWidget):
         else:
             self._canvas.set_slot(None)
             self._info_lbl.setText("—")
+            self._update_compare()
             self._after_change()
         self._say("Image removed.")
 
@@ -6579,6 +7677,7 @@ class WorkshopWidget(QWidget):
         self._active = self._ref = -1
         self._update_slot_list()
         self._canvas.set_slot(None)
+        self._update_compare()
         self._info_lbl.setText("—")
         self._after_change()
         self._say("Workshop cleared.")
@@ -6741,7 +7840,7 @@ class WorkshopWidget(QWidget):
             return
         self._canvas.refresh()
         self._sync_view_controls()
-        if self._compare_cb.currentIndex() > 0:
+        if self._collage_on():
             self._update_compare()
 
     def _on_palette_changed(self, name: str):
@@ -6751,6 +7850,8 @@ class WorkshopWidget(QWidget):
         slot.view.palette = name
         self._canvas.refresh()
         self._sync_view_controls()
+        if self._collage_on():
+            self._update_compare()
         self._say(f"Palette: {name}")
 
     def _reset_view(self):
@@ -6798,24 +7899,31 @@ class WorkshopWidget(QWidget):
             self._hist.set_data(hist_vals, hist_max, hist_unit)
             self._hist.set_window(lo, hi)
 
-            self._contrast_val.setText(f"{v.contrast:+d}" if v.contrast else "0")
-            self._bright_val.setText(f"{v.brightness:+d}" if v.brightness else "0")
+            self._contrast_val.show_value(v.contrast)
+            self._bright_val.show_value(v.brightness)
             gval = (_gamma_value(v, gray) if (v.auto_gamma and gray is not None)
                     else v.gamma_slider / 100.0)
-            self._gamma_val.setText(f"{gval:.2f}")
+            self._gamma_val.show_value(gval)
 
+            # Each number box is locked exactly when its slider is: under Auto only
+            # Auto decides, and the box just shows what it chose.
             cyclic = v.palette in CYCLIC_PALETTES
             for w in (self._contrast_sl, self._bright_sl, self._gamma_sl, self._hist,
+                      self._contrast_val, self._bright_val, self._gamma_val,
                       self._cb_auto_contrast, self._cb_auto_bright, self._cb_auto_gamma):
                 w.setEnabled(not cyclic)
             if not cyclic:
                 # Auto contrast owns the display window; Auto gamma is off the table
                 # while it is on.
                 self._hist.setEnabled(not v.auto_contrast)
-                self._gamma_sl.setEnabled(not v.auto_gamma and not v.auto_contrast)
+                gamma_free = not v.auto_gamma and not v.auto_contrast
+                self._gamma_sl.setEnabled(gamma_free)
+                self._gamma_val.setEnabled(gamma_free)
                 self._cb_auto_gamma.setEnabled(not v.auto_contrast)
                 self._contrast_sl.setEnabled(not v.auto_contrast)
+                self._contrast_val.setEnabled(not v.auto_contrast)
                 self._bright_sl.setEnabled(not v.auto_bright)
+                self._bright_val.setEnabled(not v.auto_bright)
         finally:
             self._sync_guard = False
 
@@ -6902,6 +8010,7 @@ class WorkshopWidget(QWidget):
         self._sync_view_controls()
         self._update_info()
         self._update_enabled()
+        self._sc_check_stale()
         self._canvas.update()
 
     def _update_enabled(self):
@@ -6920,11 +8029,11 @@ class WorkshopWidget(QWidget):
         self._btn_dup.setEnabled(has)
         self._btn_scalebar.setEnabled(has)
         self._btn_project.setEnabled(many and ops and not busy)
-        self._btn_merge.setEnabled(has and ops and 0 <= self._ref < len(self._slots)
-                                   and self._ref != self._active)
         self._btn_data_tiff.setEnabled(has and ops and not busy)
         self._btn_play.setEnabled(many)
         self._btn_anim.setEnabled(many and ops and not busy)
+        if hasattr(self, "_btn_collage_new"):
+            self._btn_collage_new.setEnabled(bool(self._collage_slots()))
         for b in getattr(self, "_filter_buttons", ()):
             b.setEnabled(has and ops)
         self._btn_slider.setEnabled(
@@ -7514,6 +8623,265 @@ class WorkshopWidget(QWidget):
         self._after_change()
         self._say(f"Centre of mass of the {what}: {st['cx']:.2f}, {st['cy']:.2f} px")
 
+    # ─────────────────────────────────────── Image analysis: SC ───
+
+    def _sc_input(self):
+        """(array, 2-D float array, full scale) of the active image, or None.
+
+        The first item is the slot's own measurement array — kept to tell later
+        whether the picture has been edited since. A colour frame is measured on
+        the mean of its channels (the Slider reads the file as greyscale)."""
+        slot = self._slot()
+        if slot is None:
+            return None
+        src = slot.measure_arr()
+        arr = np.asarray(src, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr.mean(axis=2)
+        if arr.size == 0:
+            return None
+        if slot.measures_raw():
+            bd = float(slot.full_scale) if slot.full_scale else (
+                65535.0 if float(arr.max()) > 255 else 255.0)
+        else:
+            bd = 255.0
+        return src, arr, bd
+
+    def _sc_set_enabled(self, enabled: bool):
+        for b in (self._btn_sc_measure, self._btn_sc_auto_thr, self._btn_sc_hist,
+                  self._btn_sc_draw):
+            b.setEnabled(enabled)
+
+    def _sc_clear_results(self):
+        for v in (self._sc_val_min, self._sc_val_max, self._sc_val_mean,
+                  self._sc_val_beam, self._sc_val_sc):
+            v.setText("—")
+        self._sc_topn_points = []
+        self._sc_arr_ref = None
+        self._update_sc_topn_overlay()
+
+    def _sc_check_stale(self):
+        """Called from _after_change: a result of another picture (another image
+        picked, or this one edited) is taken off the panel and the image."""
+        if not hasattr(self, "_sc_arr_ref"):
+            return
+        slot = self._slot()
+        cur = slot.measure_arr() if slot is not None else None
+        if self._sc_arr_ref is not None and cur is not self._sc_arr_ref:
+            self._sc_clear_results()
+            self._sc_status_lbl.setStyleSheet("font-size: 10px; color: #c00;")
+            self._sc_preview_pixmap = None
+            self._sc_preview_lbl.hide()
+            self._sc_img_lbl.setText("")
+            self._sc_status_lbl.setText(
+                "The picture changed — press Measure." if slot is not None else "")
+        if (self._sc_exclusion_mask is not None
+                and cur is not self._sc_exclusion_arr):
+            self._sc_exclusion_mask = None
+            self._sc_exclusion_arr = None
+        self._sc_set_enabled(slot is not None and not self._sc_running)
+
+    def _on_sc_threshold_changed(self, _value: int):
+        """Re-run straight away when a result is already on screen."""
+        if self._sc_preview_pixmap is not None:
+            if self._sc_running:
+                self._sc_pending = True
+            else:
+                self._run_spatial_contrast()
+
+    def _run_sc_auto_threshold(self):
+        """Otsu threshold of the active image, then measure with it."""
+        if self._sc_running:
+            return
+        inp = self._sc_input()
+        sl = _get_slider_module()
+        if inp is None or sl is None:
+            return
+        _src, arr, bd = inp
+        try:
+            thr = sl._SCTask.otsu_threshold_raw(arr, bd)
+        except Exception:
+            return
+        self._sc_threshold_sb.blockSignals(True)
+        self._sc_threshold_sb.setValue(int(thr))
+        self._sc_threshold_sb.blockSignals(False)
+        self._run_spatial_contrast()
+
+    def _open_sc_histogram(self):
+        """The Slider's histogram window, fed the frame in memory. Not modal: the
+        rest of the program stays usable while it is open."""
+        inp = self._sc_input()
+        sl = _get_slider_module()
+        if inp is None or sl is None:
+            return
+        if self._sc_hist_dlg is not None and self._sc_hist_dlg.isVisible():
+            self._sc_hist_dlg.raise_()
+            return
+        _src, arr, bd = inp
+        dlg = sl._SCHistogramDialog(None, self._sc_threshold_sb.value(), int(bd),
+                                    self, arr=arr)
+        debounce = QTimer(dlg)
+        debounce.setSingleShot(True)
+        debounce.setInterval(500)
+
+        def _set_thr(v: int):
+            self._sc_threshold_sb.blockSignals(True)
+            self._sc_threshold_sb.setValue(int(v))
+            self._sc_threshold_sb.blockSignals(False)
+
+        def _on_preview(v: int):
+            _set_thr(v)
+            debounce.start()
+
+        def _on_fire():
+            if self._sc_running:
+                self._sc_pending = True
+            else:
+                self._run_spatial_contrast()
+
+        def _on_accepted(v: int):
+            debounce.stop()
+            _set_thr(v)
+            self._run_spatial_contrast()
+
+        debounce.timeout.connect(_on_fire)
+        dlg.threshold_preview.connect(_on_preview)
+        dlg.threshold_accepted.connect(_on_accepted)
+        dlg.finished.connect(lambda _r: debounce.stop())
+        self._sc_hist_dlg = dlg
+        dlg.show()
+
+    def _open_sc_exclusion_editor(self):
+        """The Slider's exclusion painter, on the preview of the last measurement."""
+        inp = self._sc_input()
+        sl = _get_slider_module()
+        if inp is None or sl is None:
+            return
+        if self._sc_preview_pixmap is None or self._sc_arr_ref is not inp[0]:
+            self._run_spatial_contrast()
+            self._sc_status_lbl.setText("Run Measure first to generate a preview.")
+            return
+        if self._sc_excl_dlg is not None and self._sc_excl_dlg.isVisible():
+            self._sc_excl_dlg.raise_()
+            return
+        src, arr, bd = inp
+        dlg = sl._SCExclusionEditor(self._sc_preview_pixmap, arr.shape[:2],
+                                    img_path=None, existing_mask=None, parent=self,
+                                    arr=arr, bit_depth=bd)
+        dlg.exclusion_confirmed.connect(
+            lambda m, _s=src: self._on_sc_exclusion_set(m, _s))
+        self._sc_excl_dlg = dlg
+        dlg.show()
+
+    def _on_sc_exclusion_set(self, mask, src):
+        self._sc_exclusion_mask = mask
+        self._sc_exclusion_arr = src if mask is not None else None
+        if mask is not None:
+            self._sc_status_lbl.setText(
+                f"Exclusion: {int(mask.sum()):,} px masked — click Measure to "
+                f"recompute.")
+        else:
+            self._sc_status_lbl.setText("Exclusion cleared.")
+        self._run_spatial_contrast()
+
+    def _run_spatial_contrast(self):
+        if self._sc_running:
+            self._sc_pending = True
+            return
+        self._sc_pending = False
+        inp = self._sc_input()
+        sl = _get_slider_module()
+        if inp is None:
+            self._sc_status_lbl.setText("No image loaded.")
+            return
+        fn = getattr(sl, "spatial_contrast", None) if sl else None
+        if fn is None:
+            self._sc_status_lbl.setText("The Spatial Contrast maths could not be "
+                                        "loaded from the Image Slider.")
+            return
+        src, arr, bd = inp
+        excl = (self._sc_exclusion_mask
+                if self._sc_exclusion_arr is src else None)
+        self._sc_token += 1
+        self._sc_running = True
+        self._sc_set_enabled(False)
+        self._sc_status_lbl.setStyleSheet("font-size: 10px; color: #c00;")
+        self._sc_status_lbl.setText("Measuring…")
+        self._sc_measuring = (self._sc_token, src, self._slot())
+        QThreadPool.globalInstance().start(_SCWorkTask(
+            self._sc_token, arr, self._sc_threshold_sb.value(), excl, bd, fn,
+            self._sc_sig))
+
+    def _on_sc_done(self, token, result, arr_8bit, mask):
+        self._sc_running = False
+        _tok, src, slot = getattr(self, "_sc_measuring", (None, None, None))
+        cur_slot = self._slot()
+        self._sc_set_enabled(cur_slot is not None)
+        # Another picture (or another threshold) while this one ran: measure again
+        # instead of showing numbers that belong to something else.
+        stale = (token != self._sc_token or cur_slot is not slot
+                 or cur_slot is None or cur_slot.measure_arr() is not src)
+        if self._sc_pending or stale:
+            self._sc_pending = False
+            if cur_slot is not None:
+                self._run_spatial_contrast()
+            return
+
+        sl = _get_slider_module()
+        if arr_8bit is not None and mask is not None and sl is not None:
+            try:
+                pm = sl._SCTask._make_preview_pixmap(arr_8bit, mask)
+                self._sc_preview_pixmap = pm
+                self._sc_preview_lbl.show()
+                if hasattr(self._sc_preview_lbl, "set_full_pixmap"):
+                    self._sc_preview_lbl.set_full_pixmap(pm)
+                else:
+                    self._sc_preview_lbl.setPixmap(pm)
+            except Exception:
+                pass
+
+        if result is None:
+            self._sc_status_lbl.setText("Error: could not measure the image.")
+            return
+        self._sc_arr_ref = src
+        self._sc_img_lbl.setText(f"Image: {slot.label[:48]}")
+        err = result.get("error")
+        if err:
+            self._sc_status_lbl.setText(err)
+            for v in (self._sc_val_min, self._sc_val_max, self._sc_val_mean,
+                      self._sc_val_beam, self._sc_val_sc):
+                v.setText("—")
+            self._sc_topn_points = []
+            self._update_sc_topn_overlay()
+            return
+
+        bd = result.get("bit_depth", 255)
+        # Grey: this line is information here, not a problem. Every other text
+        # put on it is a problem or an instruction and stays red.
+        self._sc_status_lbl.setText(f"({slot.unit_name()}, full scale {bd})")
+        self._sc_status_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        self._sc_val_mean.setText(f"{result['mean']:.1f}")
+        self._sc_val_min.setText(f"{result['min']:.1f}")
+        self._sc_val_max.setText(f"{result['max']:.1f}")
+        sc = result["sc"]
+        self._sc_val_sc.setText(f"{sc:.4f}" if sc != float("inf") else "∞")
+        n_beam, n_total = result["n_beam"], result["n_total"]
+        pct = 100.0 * n_beam / n_total if n_total > 0 else 0.0
+        self._sc_val_beam.setText(f"{n_beam:,} ({pct:.1f}%)")
+        self._sc_topn_points = list(zip(result.get("top_xs", []),
+                                        result.get("top_ys", [])))
+        self._update_sc_topn_overlay()
+
+    def _update_sc_topn_overlay(self, *_a):
+        """Hand the top-N pixels to the canvas, tied to the image they belong to."""
+        n = self._sc_topn_sb.value()
+        pts = self._sc_topn_points[:n] if n > 0 else []
+        self._canvas.sc_marks = (
+            (self._sc_arr_ref, pts, self._sc_marker_r_sb.value(),
+             self._sc_marker_thick_sb.value())
+            if pts and self._sc_arr_ref is not None else None)
+        self._canvas.update()
+
     # ──────────────────────────────────────────────── Filters ────
 
     def _editing_blocked(self) -> bool:
@@ -7526,7 +8894,8 @@ class WorkshopWidget(QWidget):
         every operation that touches pixels."""
         if not self._canvas.comparing():
             return False
-        self._say("Comparison is a view only — set Compare to “Off” first.")
+        self._say("Several images side by side are a view only — click “Show one” in "
+                  "Images first.")
         return True
 
     def _need_ops(self) -> bool:
@@ -7859,10 +9228,6 @@ class WorkshopWidget(QWidget):
         self._after_change()
         self._say(f"Resized to {nw} × {nh} px.")
 
-    def _on_ref_changed(self, idx: int):
-        self._ref = idx - 1
-        self._update_compare()
-
     def _load_ref_from_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load reference image", str(self._last_save_dir or Path.home()),
@@ -7870,12 +9235,19 @@ class WorkshopWidget(QWidget):
         if not path:
             return
         before = len(self._slots)
+        was = self._slot()
         self.open_files([path])
         if len(self._slots) > before:
             self._ref = len(self._slots) - 1
-            self._update_slot_list()
-            self._ref_combo.setCurrentIndex(self._ref + 1)
-            self._say(f"Reference: {self._slots[self._ref].label}")
+            ref = self._slots[self._ref]
+            # The reference is something to subtract, not to look at: the image that
+            # was being worked on stays the active one, and on screen.
+            if was is not None:
+                ref.in_collage = False
+                self._activate_slot(self._slot_index(was))
+            else:
+                self._update_slot_list()
+            self._say(f"Reference: {ref.label}")
 
     def _do_diff(self, absolute: bool):
         slot = self._slot()
@@ -7980,66 +9352,21 @@ class WorkshopWidget(QWidget):
                   f"cover." + (f"  ({note})" if note else
                                "  Camera counts came along." if raw is not None else ""))
 
-    def _do_merge(self):
-        if not self._need_ops():
-            return
-        slot = self._slot()
-        if slot is None:
-            return
-        if not (0 <= self._ref < len(self._slots)) or self._ref == self._active:
-            QMessageBox.information(self, "Merge",
-                                    "Choose a different image as the reference first.")
-            return
-        ref = self._slots[self._ref]
-        try:
-            out = wk_ops.merge_rg(render_view(slot.base, slot.view),
-                                  render_view(ref.base, ref.view))
-        except Exception as e:
-            QMessageBox.warning(self, "Merge", f"{e}")
-            return
-        self._add_derived_slot(
-            out, f"Red {slot.label[:20]} / green {ref.label[:20]}",
-            note="two pictures in one — values are display codes")
-        self._after_change()
-        self._say("Merged: the active image is red, the reference is green. Yellow is "
-                  "where both have signal.")
+    # ──────────────────────────────────────────── Side by side ────
 
-    # ───────────────────────────────────────────────── Compare ────
-
-    def _update_compare(self, *_):
-        mode = self._compare_cb.currentText()
-        self._blend_lbl.setText(f"Mix: {self._blend_sl.value()} %")
-        self._blend_sl.setEnabled(mode == "Blend")
-        slot = self._slot()
-        if mode == "Off" or slot is None or not (0 <= self._ref < len(self._slots)) \
-                or self._ref == self._active:
+    def _update_compare(self, *_, refit: bool = False):
+        """Two or more images ticked under Show: the grid of them. Otherwise the
+        active image on its own. Every path that re-renders (a new image, a palette or
+        contrast change on one of them) comes through here."""
+        if self._collage_on():
+            if not self._collage_was_on:
+                self._collage_shown_once = False
+            self._collage_was_on = True
+            self._show_collage(refit=refit)
+            return
+        self._collage_was_on = False
+        if self._canvas.comparing():
             self._canvas.set_compare(None)
-            if mode != "Off":
-                self._say("Choose a different image as the reference to compare with.")
-            return
-        ref = self._slots[self._ref]
-        a = render_view(slot.base, slot.view)
-        b = render_view(ref.base, ref.view)
-        a = np.stack([a] * 3, axis=2) if a.ndim == 2 else a
-        b = np.stack([b] * 3, axis=2) if b.ndim == 2 else b
-
-        if mode == "Side by side":
-            h = max(a.shape[0], b.shape[0])
-            gap = 8
-            out = np.zeros((h, a.shape[1] + gap + b.shape[1], 3), np.uint8)
-            out[:a.shape[0], :a.shape[1]] = a
-            out[:b.shape[0], a.shape[1] + gap:] = b
-        else:
-            h = min(a.shape[0], b.shape[0])
-            w = min(a.shape[1], b.shape[1])
-            aa, bb = a[:h, :w].astype(np.int16), b[:h, :w].astype(np.int16)
-            if mode == "Blend":
-                t = self._blend_sl.value() / 100.0
-                out = np.clip(bb + (aa - bb) * t, 0, 255).astype(np.uint8)
-            else:
-                out = np.abs(aa - bb).astype(np.uint8)
-        self._canvas.set_compare(_np_to_qimage(out))
-        self._say(f"{mode}: {slot.label[:24]}  vs  {ref.label[:24]}")
 
     # ──────────────────────────────────────────────────── Save ────
 
@@ -8320,6 +9647,8 @@ class WorkshopWidget(QWidget):
                 "px_um": slot.px_um,
                 "px_um_measured": bool(slot.px_um_measured),
                 "camera": slot.camera,
+                "ts_ns": slot.ts_ns,
+                "shown": bool(slot.in_collage),
                 "view": dict(vars(slot.view)),
                 "annots": [a.to_dict() for a in slot.annots],
             })
@@ -8380,6 +9709,16 @@ class WorkshopWidget(QWidget):
                 slot.px_um_measured = bool(entry.get("px_um_measured", False))
             except (TypeError, ValueError):
                 pass
+            # The moment comes back only as it was written down: re-opening goes
+            # through open_files, which on its own gives a file no moment.
+            try:
+                slot.ts_ns = (None if entry.get("ts_ns") is None
+                              else int(entry["ts_ns"]))
+            except (TypeError, ValueError):
+                slot.ts_ns = None
+            # "shown" since the Images table; the older "in_collage" was ticked on every
+            # image by default and would open every old session as one big grid.
+            slot.in_collage = bool(entry.get("shown", False))
             slot.view = _view_from_dict(entry.get("view"))
             annots = [_Annot.from_dict(d) for d in (entry.get("annots") or [])]
             slot.annots = [a for a in annots if a is not None]
@@ -8393,7 +9732,9 @@ class WorkshopWidget(QWidget):
                 resized += 1
         self._update_slot_list()
         if self._slots:
-            self._activate_slot(len(self._slots) - 1)
+            shown = self._collage_slots()
+            self._activate_slot(self._slot_index(shown[0]) if len(shown) == 1
+                                else len(self._slots) - 1)
         self._after_change()
         msg = f"Session loaded: {opened} image(s) re-opened."
         if missing:

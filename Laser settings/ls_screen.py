@@ -205,7 +205,7 @@ def read_picture(pic, now_s=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # Finding and photographing the window (Windows only)
 # ─────────────────────────────────────────────────────────────────────────────
-# Adapted from Screenshots/s.py (`find_window_by_title_substring`,
+# Adapted from Screenshots/ssq_core.py (`find_window_by_title_substring`,
 # `take_screenshot_window_png`), kept to plain ctypes so the build needs nothing
 # new. Coordinates are physical pixels: Qt 6 makes the process per-monitor DPI
 # aware before any of this runs.

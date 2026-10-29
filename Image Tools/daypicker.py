@@ -55,7 +55,7 @@ from PySide6.QtGui import QColor, QPalette, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractScrollArea, QCalendarWidget, QCheckBox,
     QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QMenu, QMessageBox, QPushButton, QSpinBox, QStyle,
+    QLabel, QMenu, QMessageBox, QPushButton, QSizePolicy, QSpinBox, QStyle,
     QStyledItemDelegate, QTableWidget, QTableWidgetItem, QTimeEdit,
     QToolButton, QVBoxLayout, QWidget,
 )
@@ -522,6 +522,11 @@ def make_calendar(initial: "QDate | None" = None) -> "tuple[QFrame, QCalendarWid
     w_lay = QVBoxLayout(wrapper)
     w_lay.setContentsMargins(0, 0, 0, 0)
     w_lay.setSpacing(0)
+    # The nav bar and the day-name band never grow: in a tall window the spare
+    # height went into them and the header turned into a 70 px grey slab
+    # (PV Search, 13.10.2026). Only the day grid itself may take extra room.
+    for row in (nav_row, hdr_row):
+        row.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     w_lay.addWidget(nav_row)
     w_lay.addWidget(hdr_row)
     w_lay.addWidget(cal)

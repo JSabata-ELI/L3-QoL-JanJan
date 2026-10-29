@@ -18,8 +18,10 @@ says, per day, how fine it was read (``count`` = points asked for that day, or
 (SBW4 has two) and the units.
 
 Rules:
-  * Only whole Prague days that ended more than an hour ago are stored; today is
-    always read live.
+  * Only whole Prague days that ended more than an hour ago are stored on the
+    share. What was read of the open day is kept in memory only (one block per
+    signal, :meth:`DayCache.recent_get`), so a reload asks the archiver just
+    for what came since.
   * A day is stored only when it was read without a gap; a failed piece leaves
     the day out, so the next load asks the archiver again.
   * A day stored at a coarser level than the one asked for is NOT served — the
@@ -127,6 +129,9 @@ class DayCache:
         self._months: dict = {}            # (channel, "YYYY-MM") -> {day: entry}
         self._loaded: set = set()          # (channel, "YYYY-MM") already read
         self._dirty_set: set = set()       # (channel, "YYYY-MM", day) to write
+        self._recent: dict = {}            # (channel, day start) -> block, see recent_get
+        self._shared_hi: dict = {}         # (channel, day start) -> end saved on the share
+        self._loaded_at: dict = {}         # (channel, "YYYY-MM") -> when read
         self._root: Path | None = None
         self._resolved = threading.Event()
         self.hits = 0
@@ -134,6 +139,9 @@ class DayCache:
         env = os.environ.get(_ENV_OVERRIDE, "")
         if root is None and env:
             root = env
+        # "" switches the whole cache off, the days in memory too: a run from
+        # source (every test) must not serve one fake archive to the next.
+        self._recent_on = root != ""
         if root is None:
             threading.Thread(target=self._find_share, daemon=True,
                              name="cpva-cache-root").start()
@@ -209,9 +217,16 @@ class DayCache:
         so the per-day look-ups after it never touch the share."""
         if not self.ready():
             return 0
+        now = time.time()
+        recent_from = now * 1e9 - RECENT_DAYS * 86_400 * 10**9
         months = sorted({self.day_key(lo, tz)[:7] for lo, _hi in days})
+        # A month holding one of the recent days is read again after a while:
+        # another station may have saved more of today since.
+        fresh = {self.day_key(lo, tz)[:7] for lo, hi in days if hi > recent_from}
         todo = [(ch, m) for ch in channels for m in months
-                if (ch, m) not in self._loaded]
+                if (ch, m) not in self._loaded
+                or (m in fresh and now - self._loaded_at.get((ch, m), 0)
+                    > SHARE_PART_STEP_NS / 1e9)]
         if not todo:
             return 0
 
@@ -223,10 +238,41 @@ class DayCache:
         with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(todo)))) as ex:
             for key, days_map in ex.map(_one, todo):
                 with self._lock:
-                    self._months[key] = days_map
+                    # Days saved here and not written yet stay.
+                    mine = self._months.get(key, {})
+                    pending = {d for c, m, d in self._dirty_set if (c, m) == key}
+                    self._months[key] = {**days_map,
+                                         **{d: mine[d] for d in pending if d in mine}}
                     self._loaded.add(key)
+                    self._loaded_at[key] = now
+                self._adopt_parts(key[0], days_map)
                 found += bool(days_map)
         return found
+
+    def _adopt_parts(self, channel: str, days_map: dict) -> None:
+        """Take the part days a month file holds into the blocks in memory."""
+        if not self._recent_on:
+            return
+        now_ns = int(time.time() * 1e9)
+        for day, ent in days_map.items():
+            if not day.endswith(PART_SUFFIX) or ent.get("lo_ns") is None:
+                continue
+            day_lo = ent.get("day_lo")
+            if day_lo is None or day_lo < now_ns - RECENT_DAYS * 86_400 * 10**9:
+                continue
+            blk = {k: ent[k] for k in ("t", "v", "lo", "hi") if k in ent}
+            blk.update(units=ent.get("units", ""), lo_ns=int(ent["lo_ns"]),
+                       hi_ns=int(ent["hi_ns"]), src=ent.get("src"),
+                       density=ent.get("density"))
+            key = (channel, int(day_lo))
+            with self._lock:
+                old = self._recent.get(key)
+                joined = _join_blocks(old, blk) if old is not None else blk
+                if joined is None:      # not joinable: keep the one covering more
+                    joined = max((old, blk), key=lambda b: b["hi_ns"] - b["lo_ns"])
+                self._recent[key] = joined
+                self._shared_hi[key] = max(self._shared_hi.get(key, 0),
+                                           int(ent["hi_ns"]))
 
     def get(self, channel: str, lo_ns: int, hi_ns: int, count, tz):
         """The stored day as archiver-shaped sample dicts, or None.
@@ -290,11 +336,23 @@ class DayCache:
                 with self._lock:
                     mine = self._months.get((ch, month), {})
                     for day in days:
-                        if day in mine:
+                        if day not in mine:
+                            continue
+                        theirs = merged.get(day)
+                        if day.endswith(PART_SUFFIX) and theirs is not None:
+                            # Another station saved part of the same day: join
+                            # the two, or keep the one covering more.
+                            merged[day] = (_join_blocks(theirs, mine[day])
+                                           or max((theirs, mine[day]),
+                                                  key=lambda b: b["hi_ns"] - b["lo_ns"]))
+                        else:
                             merged[day] = mine[day]
-                    self._months[(ch, month)] = {**merged, **mine}
+                    _drop_stale_parts(merged)
+                    self._months[(ch, month)] = {**merged, **{
+                        d: e for d, e in mine.items() if d not in merged
+                        and not d.endswith(PART_SUFFIX)}}
                 _write_month_file(path, merged)
-                written += len(days)
+                written += sum(1 for d in days if not d.endswith(PART_SUFFIX))
             except Exception as exc:
                 self._note(f"day cache: could not save {ch} {month} ({exc})")
         self.stored += written
@@ -306,18 +364,189 @@ class DayCache:
             return
         threading.Thread(target=self.flush, daemon=True, name="cpva-cache-save").start()
 
+    # ── parts of recent days: what is already read, in memory only ──────────
+    # The share keeps whole closed days. A "last 24 hours" window holds none:
+    # it is the open day plus the afternoon of yesterday, so every reload read
+    # both again. The open day is the expensive one — the archiver has no
+    # thinned level for it, so it comes back exactly as archived (measured
+    # 12.10.2026: 78 000 samples of PAP1 by 15:00, one request 4–21 s, while a
+    # closed day was under a second). Neither part changes once read, so a
+    # reload asks only for what came since. Kept in this process only, one
+    # block per signal per Prague day, for the last RECENT_DAYS days.
+
+    def recent_get(self, channel: str, day_lo: int, lo_ns: int, hi_ns: int,
+                   src: str, density):
+        """``(a, b, samples)`` — the part of [lo, hi) already read, or None.
+
+        [lo, hi) lies inside the Prague day starting at ``day_lo``. ``samples``
+        are those inside [a, b) plus the one just before ``a`` when the block
+        holds it (a request brings that one too: it is the value the signal had
+        at ``a``). ``src`` is the archived name the caller would ask first; a
+        block another name answered is not served. ``density`` is the points
+        per nanosecond the caller would ask for (None = exactly as archived);
+        a block read coarser than that is not served."""
+        if not self._recent_on:
+            return None
+        with self._lock:
+            ent = self._recent.get((channel, int(day_lo)))
+        if ent is None or ent["src"] != src:
+            return None
+        have = ent["density"]
+        if have is not None and (density is None or density > have * COUNT_SLACK):
+            return None
+        a, b = max(int(lo_ns), ent["lo_ns"]), min(int(hi_ns), ent["hi_ns"])
+        if b <= a:
+            return None
+        t = ent["t"]
+        i0 = max(0, int(np.searchsorted(t, a, side="left")) - 1)
+        i1 = int(np.searchsorted(t, b, side="left"))
+        part = {k: ent[k][i0:i1] for k in ("t", "v", "lo", "hi") if k in ent}
+        part["units"] = ent["units"]
+        return a, b, _to_samples(part)
+
+    def recent_put(self, channel: str, day_lo: int, lo_ns: int, hi_ns: int,
+                   samples, src: str, density, now_ns: int, tz=None) -> bool:
+        """Remember what one load read over [lo, hi), inside the Prague day
+        starting at ``day_lo``.
+
+        Only the part older than RECENT_SETTLE_NS is kept, and only plain
+        numbers. It joins the block already held when it touches it and was
+        read at the same level of detail; otherwise it replaces that block.
+        With ``tz`` given (and a share), the block is also saved there as the
+        day's part (``<day>+part`` in the month file) — see :meth:`flush`."""
+        if not self._recent_on:
+            return False
+        now_ns = int(now_ns)
+        hi_ns = min(int(hi_ns), now_ns - RECENT_SETTLE_NS)
+        lo_ns, day_lo = int(lo_ns), int(day_lo)
+        if hi_ns <= lo_ns or day_lo < now_ns - RECENT_DAYS * 86_400 * 10**9:
+            return False
+        thinned = any((s.get("quality") or "Original") != "Original"
+                      for s in samples if lo_ns <= (s.get("time") or 0) < hi_ns)
+        if thinned and density is None:
+            return False                 # asked exact, got something else
+        # The newest sample before the block is kept with it: it is the value
+        # the signal had at the block's start. Without it a quiet signal (a
+        # motor position, a valve) served from here had nothing to hold from,
+        # and the load went looking for it in the archive afterwards.
+        before = [s.get("time") for s in samples
+                  if s.get("time") is not None and s.get("time") < lo_ns]
+        ent = _from_samples(samples, max(before) if before else lo_ns, hi_ns)
+        if ent is None:
+            return False                 # words or waveforms
+        if thinned and "lo" not in ent:
+            ent["lo"], ent["hi"] = ent["v"].copy(), ent["v"].copy()
+        elif not thinned:
+            ent.pop("lo", None)
+            ent.pop("hi", None)
+            density = None               # exact serves any level of detail
+        ent.update(lo_ns=lo_ns, hi_ns=hi_ns, src=src, density=density)
+        key = (channel, day_lo)
+        with self._lock:
+            old = self._recent.get(key)
+            if old is not None:
+                # Not joinable (another level, another name, a hole between):
+                # the one covering more stays — a block taken over from the
+                # share must not give way to a few minutes read elsewhere.
+                ent = _join_blocks(old, ent) or max(
+                    (old, ent), key=lambda b: b["hi_ns"] - b["lo_ns"])
+            for k in [k for k in self._recent
+                      if k[1] < now_ns - RECENT_DAYS * 86_400 * 10**9]:
+                del self._recent[k]
+                self._shared_hi.pop(k, None)
+            if len(ent["t"]) > RECENT_MAX_SAMPLES:
+                self._recent.pop(key, None)
+                return False
+            self._recent[key] = ent
+            # On the share too, once it has grown by SHARE_PART_STEP_NS since
+            # it was last saved there (a restart, or another station, then
+            # reads only what came after it).
+            if (tz is not None and self._root is not None
+                    and ent["hi_ns"] - self._shared_hi.get(key, ent["lo_ns"])
+                    >= SHARE_PART_STEP_NS):
+                day = self.day_key(day_lo, tz) + PART_SUFFIX
+                part = dict(ent, day_lo=day_lo, saved=int(time.time()), count=None)
+                self._months.setdefault((channel, day[:7]), {})[day] = part
+                self._dirty_set.add((channel, day[:7], day))
+                self._shared_hi[key] = ent["hi_ns"]
+        return True
+
+
+# What was read is kept only up to this long before "now": a sample stamped a
+# moment ago may still be on its way to the archive.
+RECENT_SETTLE_NS = int(120e9)
+# Days kept in memory, counted back from now (older ones are on the share).
+RECENT_DAYS = 3
+# One block is dropped beyond this (16 bytes a sample: 32 MB).
+RECENT_MAX_SAMPLES = 2_000_000
+# A block is saved on the share again once it has grown by this much: at most
+# one write per signal per half hour per station (today's raw energies are
+# ~1.3 MB a signal by the evening).
+SHARE_PART_STEP_NS = int(1800e9)
+# The month-file key of a day's part: "<YYYY-MM-DD>+part". Separate from the
+# whole day's own key, which the closed day takes later.
+PART_SUFFIX = "+part"
+
+
+def _same_level(a, b) -> bool:
+    """Two blocks read at the same level of detail (both exact, or thinned to
+    densities within COUNT_SLACK of each other)."""
+    da, db = a.get("density"), b.get("density")
+    if da is None or db is None:
+        return da is None and db is None
+    return max(da, db) <= min(da, db) * COUNT_SLACK
+
+
+def _join_blocks(old: dict, new: dict):
+    """One block of the two when they touch or overlap and match in level and
+    archived name — else None. Fields other than the arrays come from ``new``."""
+    if (old.get("src") != new.get("src") or not _same_level(old, new)
+            or old["lo_ns"] > new["hi_ns"] or new["lo_ns"] > old["hi_ns"]):
+        return None
+    if ("lo" in old) != ("lo" in new):
+        return None
+    out = dict(new)
+    t, idx = np.unique(np.concatenate([old["t"], new["t"]]), return_index=True)
+    for k in ("v", "lo", "hi"):
+        if k in new:
+            out[k] = np.concatenate([old[k], new[k]])[idx]
+    out.update(t=t, units=new.get("units") or old.get("units", ""),
+               lo_ns=min(old["lo_ns"], new["lo_ns"]),
+               hi_ns=max(old["hi_ns"], new["hi_ns"]))
+    return out
+
+
+def _drop_stale_parts(days: dict) -> None:
+    """Remove the part days a month file no longer needs: older than
+    RECENT_DAYS, or whose whole day is stored by now."""
+    oldest = time.time() * 1e9 - RECENT_DAYS * 86_400 * 10**9
+    for d in [d for d in days if d.endswith(PART_SUFFIX)]:
+        ent = days[d]
+        if (ent.get("day_lo") or 0) < oldest or d[:-len(PART_SUFFIX)] in days:
+            del days[d]
+
 
 def _to_samples(ent: dict) -> list:
     t, v = ent["t"], ent["v"]
     lo, hi = ent.get("lo"), ent.get("hi")
     units = ent.get("units", "")
     meta = {"units": units}
+    # The sample before the day comes first, as an archiver answer has it.
+    head = []
+    pre = ent.get("pre")
+    if pre and pre[1] is not None:
+        s = {"time": int(pre[0]), "value": float(pre[1]), "metaData": meta,
+             "quality": "Original"}
+        if pre[2] is not None and pre[3] is not None:
+            s.update(minimum=float(pre[2]), maximum=float(pre[3]),
+                     quality="Interpolated")
+        head.append(s)
     if lo is None:
-        return [{"time": int(a), "value": float(b), "quality": "Original",
-                 "metaData": meta} for a, b in zip(t.tolist(), v.tolist())]
-    return [{"time": int(a), "value": float(b), "minimum": float(c), "maximum": float(d),
-             "quality": "Interpolated", "metaData": meta}
-            for a, b, c, d in zip(t.tolist(), v.tolist(), lo.tolist(), hi.tolist())]
+        return head + [{"time": int(a), "value": float(b), "quality": "Original",
+                        "metaData": meta} for a, b in zip(t.tolist(), v.tolist())]
+    return head + [{"time": int(a), "value": float(b), "minimum": float(c),
+                    "maximum": float(d), "quality": "Interpolated", "metaData": meta}
+                   for a, b, c, d in zip(t.tolist(), v.tolist(), lo.tolist(), hi.tolist())]
 
 
 def _num(x):
@@ -338,8 +567,12 @@ def _from_samples(samples, lo_ns: int, hi_ns: int):
     t, v, lo, hi = [], [], [], []
     has_mm = False
     units = ""
+    pre = None                       # the newest numeric sample before the day
     for s in samples:
         ts = s.get("time")
+        if ts is not None and ts < lo_ns and (pre is None or ts > pre["time"]):
+            if _num(s.get("value")) is not None:
+                pre = s
         if ts is None or not (lo_ns <= ts < hi_ns):
             continue
         val = _num(s.get("value"))
@@ -359,6 +592,12 @@ def _from_samples(samples, lo_ns: int, hi_ns: int):
     if has_mm:
         ent["lo"] = np.asarray(lo, dtype=np.float64)
         ent["hi"] = np.asarray(hi, dtype=np.float64)
+    # Kept with the day so a load starting on it has the value before its
+    # start without asking the archiver (that look-back held the bar at 96 %
+    # for up to 20 s on a cached load).
+    if pre is not None:
+        ent["pre"] = [int(pre["time"]), _num(pre.get("value")),
+                      _num(pre.get("minimum")), _num(pre.get("maximum"))]
     return ent
 
 
@@ -372,7 +611,8 @@ def _write_month_file(path: Path, days: dict) -> None:
             arrays[f"{day}_lo"] = ent["lo"]
             arrays[f"{day}_hi"] = ent["hi"]
         meta["days"][day] = {k: ent.get(k) for k in
-                             ("count", "src", "units", "lo_ns", "hi_ns", "saved")}
+                             ("count", "src", "units", "lo_ns", "hi_ns", "saved",
+                              "density", "day_lo", "pre")}
     buf = io.BytesIO()
     np.savez_compressed(buf, meta=np.array(json.dumps(meta)), **arrays)
     tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")

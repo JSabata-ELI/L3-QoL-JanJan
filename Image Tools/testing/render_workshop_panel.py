@@ -67,6 +67,11 @@ def main() -> int:
 
     w = wk_t.WorkshopWidget()
     w.resize(1600, 1000)
+    # On screen (real fonts), but never taking the keyboard focus.
+    from PySide6.QtCore import Qt as _Qt
+    w.setAttribute(_Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+    w.setWindowFlags(_Qt.WindowType.Tool | _Qt.WindowType.WindowDoesNotAcceptFocus)
+    w.move(-3000, 0)
     w.show()
     app.processEvents()
 
@@ -157,7 +162,10 @@ def main() -> int:
                ("Table", wk_t._TableDialog("Results")),
                ("Curve", wk_t._CurveDialog("Radial profile")),
                ("Play", wk_t._PlayDialog())]
-    w._show_shortcuts()
+    # The shortcuts window is a real window that takes the keyboard focus when it
+    # opens — only on request (WK_RENDER_SHORTCUTS=1).
+    if os.environ.get("WK_RENDER_SHORTCUTS") == "1":
+        w._show_shortcuts()
     if getattr(w, "_keys_dlg", None) is not None:
         dialogs.append(("Shortcuts", w._keys_dlg))
     app.processEvents()

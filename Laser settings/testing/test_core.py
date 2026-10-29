@@ -353,7 +353,7 @@ def test_the_open_switch_answers_on_its_own():
     state, why = C.hall_state(cfg["shooting"], "E2", readings, last_ok, 1000.0)
     check("open means shooting into E2", state, C.STATE_SHOOTING)
     check("and it names the channel it read",
-          "SGV502_IN_OPEN_POSITION" in why, True)
+          "L3BT-MSS:SGV502_OPEN_IN" in why, True)
     cfg, readings, last_ok = _gate_scene(open_value=0.0, hall="E2")
     state, _why = C.hall_state(cfg["shooting"], "E2", readings, last_ok, 1000.0)
     check("not open means not shooting", state, C.STATE_IDLE)
@@ -379,15 +379,25 @@ def test_int_shoots_while_its_valve_is_shut():
 def test_only_the_open_switch_is_read():
     print("one channel a valve, not two")
     cfg = C.default_config()
+    # SGV501 publishes on the CPVA archiver, SGV502 to SGV505 only in the
+    # L3BT archive behind the proxy.
     for hall, number in (("Int", 501), ("E2", 502), ("E3", 503),
                          ("E4", 504), ("E5", 505)):
+        if number == 501:
+            want_open = f"L3-PSS:SGV{number}_IN_OPEN_POSITION"
+            want_closed = f"L3-PSS:SGV{number}_IN_CLOSED_POSITION"
+        else:
+            want_open = f"L3BT-MSS:SGV{number}_OPEN_IN"
+            want_closed = f"L3BT-MSS:SGV{number}_CLOSED_IN"
         check(f"{hall} reads its open switch",
               C.gate_channels(cfg["shooting"], hall, readings={}, last_ok={},
                               now_s=1000.0),
-              [f"L3-PSS:SGV{number}_IN_OPEN_POSITION"])
+              [want_open])
         check(f"{hall}'s fallback is in the program",
-              C.closed_channel(hall),
-              f"L3-PSS:SGV{number}_IN_CLOSED_POSITION")
+              C.closed_channel(hall), want_closed)
+        check(f"{hall}'s names say which way round they are",
+              (C.switch_sense(want_open), C.switch_sense(want_closed)),
+              (C.OPEN, C.CLOSED))
     check("and nothing has been read yet either",
           C.gate_channels(cfg["shooting"], "Int"),
           ["L3-PSS:SGV501_IN_OPEN_POSITION"])
@@ -651,7 +661,7 @@ def test_a_broken_file_is_not_a_lost_file():
     # than to nothing.
     check("an unreadable gate entry falls back to the default",
           C.gate_for(back["shooting"], "E2")["open"],
-          "L3-PSS:SGV502_IN_OPEN_POSITION")
+          "L3BT-MSS:SGV502_OPEN_IN")
     check("a real channel name is kept",
           C.gate_for(back["shooting"], "E3")["open"], "PV:S")
     check("a number is not a channel name",
@@ -666,8 +676,10 @@ def test_search_is_a_filter():
     matches, total = C.search_channels(names, "chl temp")
     check("both chillers", matches[:2],
           ["L3-UTIL-CHL03-001:Temp", "L3-UTIL-CHL04-001:Temp"])
-    check("in-order ranks first", matches[0], "L3-UTIL-CHL03-001:Temp")
+    check("best match first", matches[0], "L3-UTIL-CHL03-001:Temp")
     check("total counted", total, 3)
+    check("word order does not matter", C.search_channels(names, "temp chl"),
+          (matches, total))
     check("nothing typed is not the whole list",
           C.search_channels(names, "")[0], [])
 
@@ -896,7 +908,8 @@ def test_the_one_sentence_about_the_whole_program():
     line = C.status_line(rows, shooting, readings, last_ok, 1000.0)
     check("it names the valves that cannot be read",
           line.startswith("The E2, E3, E4, E5 valves cannot be read"), True)
-    check("Int's limits are in force", "Int's limits are in force" in line,
+    # Said with the name on screen, L3 — never "Int" (14.10.2026).
+    check("L3's limits are in force", "L3's limits are in force" in line,
           True)
     check("one channel, in range", line.endswith("1 channel watched, "
                                                  "all in range"), True)
@@ -1091,17 +1104,32 @@ def test_the_one_square_names_the_hall_in_force():
     row_w = lambda t: 12 * t                      # noqa: E731
     size, mark, side, word = C.fit_single(1000, 600, 560, 20, 5, row_h, row_w)
     check("the square is no taller than the window", side <= 600, True)
-    check("nor wider than its share", side <= 1000 * C.SINGLE_SQUARE_FRAC + 1,
-          True)
     check("the rows fit the height", 5 * row_h(size) <= 560, True)
     check("and the width beside the square",
           row_w(size) <= 1000 - side - C.SINGLE_GAP_PX - 20, True)
     check("the verdict square is 1.5x the text",
           mark, round(size * C.FIT_MARK_RATIO))
+    size, mark, side, word = C.fit_single(700, 600, 560, 20, 5, row_h, row_w)
+    check("the square first: as big as the list at the least text allows",
+          side, 700 - C.SINGLE_GAP_PX - 20 - row_w(C.FIT_TEXT_MIN_PX))
+    check("the text never under its least size", size >= C.FIT_TEXT_MIN_PX,
+          True)
+    size, mark, side, word = C.fit_single(2000, 600, 560, 20, 5, row_h, row_w)
+    check("a wide window: the square is the whole height", side, 600)
+    check("and the text grows into the rest",
+          size > C.FIT_TEXT_MIN_PX
+          and row_w(size) <= 2000 - 600 - C.SINGLE_GAP_PX - 20, True)
     size, mark, side, word = C.fit_single(400, 600, 560, 20, 5, row_h,
                                           lambda t: 30 * t)
     check("a wide list makes the square give way",
-          30 * 8 <= 400 - side - C.SINGLE_GAP_PX - 20, True)
+          30 * size <= 400 - side - C.SINGLE_GAP_PX - 20, True)
+    check("and the text drops under its least size only then",
+          size < C.FIT_TEXT_MIN_PX and size >= 8, True)
+
+    print("the five squares leave the list its least text size")
+    size, mark, band, word = C.fit_sizes(1500, 1480, 500, 10, row_h, row_w)
+    check("ten rows still at the least size",
+          10 * row_h(size) <= 500 - band and size >= C.FIT_TEXT_MIN_PX, True)
 
 
 def test_firing_needs_a_tenth_of_a_joule():
@@ -1149,9 +1177,11 @@ def test_a_shot_is_shooting_for_fifteen_seconds():
     check("15 s later idle", w.update(*scene(0.8, 2), now, 125.0)[0], False)
     check("the next shot switches it back",
           w.update(*scene(0.7, 3), now, 130.0)[0], True)
-    check("a new sample under 0.1 J is idle at once",
-          w.update(*scene(0.02, 4), now, 131.0)[0], False)
-    check("nothing readable claims nothing", w.update({}, {}, now, 132.0)[0],
+    check("a lone trigger under 0.1 J after it keeps it shooting",
+          w.update(*scene(0.02, 4), now, 131.0)[0], True)
+    check("until 15 s after the last real shot",
+          w.update(*scene(0.02, 4), now, 145.0)[0], False)
+    check("nothing readable claims nothing", w.update({}, {}, now, 146.0)[0],
           None)
 
 
@@ -1276,6 +1306,10 @@ def test_l3_waits_for_a_hall():
 
     check("Int's square is called L3", C.hall_shown("Int"), "L3")
     check("the others keep their names", C.hall_shown("E2"), "E2")
+    _r, _ok = scene(Int=0.0)
+    check("the valve's sentence says L3, not Int",
+          "going into L3" in C.hall_state(shooting, "Int", _r, _ok, now)[1],
+          True)
     check("SGV501 shut: not waiting (L3 shoots)",
           C.l3_waiting(shooting, *scene(Int=0.0), now)[0], False)
     check("SGV501 open, the others unreadable: waiting",
@@ -1287,6 +1321,33 @@ def test_l3_waits_for_a_hall():
           C.l3_waiting(shooting, *scene(Int=1.0, E3=1.0), now)[0], False)
     check("SGV501 unreadable: not waiting",
           C.l3_waiting(shooting, *scene(E2=0.0), now)[0], False)
+
+
+def test_dead_valve_names_move_to_the_l3bt_archive():
+    print("SGV502-505's old names, which never published, move to L3BT-MSS")
+    back = C.normalise({"shooting": {
+        "Int": {"open": "L3-PSS:SGV501_IN_OPEN_POSITION"},
+        "E2": {"open": "L3-PSS:SGV502_IN_OPEN_POSITION"},
+        "E3": "L3-PSS:SGV503_IN_OPEN_POSITION",
+        "E4": {"open": "PV:TYPED"},
+        "E5": {"open": ""}}})
+    sh = back["shooting"]
+    check("SGV501 stays where it publishes", sh["Int"]["open"],
+          "L3-PSS:SGV501_IN_OPEN_POSITION")
+    check("E2's dead default is moved", sh["E2"]["open"],
+          "L3BT-MSS:SGV502_OPEN_IN")
+    check("the old one-name shape is moved too", sh["E3"]["open"],
+          "L3BT-MSS:SGV503_OPEN_IN")
+    check("a name the operator typed is kept", sh["E4"]["open"], "PV:TYPED")
+    check("a cleared name stays cleared", sh["E5"]["open"], "")
+    print("a channel the archive marks as Disconnected is not a value")
+    import ls_cpva
+    raw = [{"time": 1, "severity": {"level": "OK", "hasValue": True},
+            "value": [1]},
+           {"time": 2, "severity": {"level": "INVALID", "hasValue": False},
+            "value": ["Disconnected"]}]
+    check("the Disconnected row is kept as no value",
+          ls_cpva.parse_samples(raw), [(1, 1.0), (2, None)])
 
 
 def main():
@@ -1335,7 +1396,8 @@ def main():
                  test_firing_needs_a_tenth_of_a_joule,
                  test_a_shot_is_shooting_for_fifteen_seconds,
                  test_shots_are_counted_off_new_samples,
-                 test_l3_waits_for_a_hall):
+                 test_l3_waits_for_a_hall,
+                 test_dead_valve_names_move_to_the_l3bt_archive):
         test()
     print()
     if FAILED:

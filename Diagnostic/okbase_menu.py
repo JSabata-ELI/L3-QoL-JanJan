@@ -3,7 +3,7 @@
 Deliberately Qt-free and importable on its own, like ``bot_commands.py`` and
 ``memstats.py``: the whole thing can be exercised from a shell
 (``python okbase_menu.py --week``) and unit-tested offline against a saved
-payload (``test_okbase_menu.py``).
+payload (``testing/test_okbase_menu.py``).
 
 Nothing here raises. Every function that touches the network or the disk
 returns a value plus an error string, the same discipline the notifiers follow

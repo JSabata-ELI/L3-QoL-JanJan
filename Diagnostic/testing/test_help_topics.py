@@ -35,7 +35,10 @@ COMMANDS = [
     "/status", "/alarms", "/list", "/plot", "/cancel", "/abort", "/nevermind",
     "/start", "/stop", "/window", "/yaxis", "/graph", "/enable", "/disable",
     "/datawatchdog", "/run", "/rundiagnostic", "/change", "/limit", "/limits",
-    "/undo",
+    "/undo", "/add", "/addpv", "/remove", "/removepv", "/delete", "/rename",
+    "/rules", "/rule", "/snooze", "/mute", "/unsnooze", "/unmute", "/ack",
+    "/acknowledge", "/history", "/log", "/test", "/channels", "/channel",
+    "/quiet", "/pacing", "/settings",
 ]
 
 # The cheat sheet is meant to be read on a phone at the machine. It has run to
@@ -153,7 +156,9 @@ def test_the_cheat_sheet_names_every_command():
     for cmd in ("/status", "/alarms", "/list", "/plot", "/cancel", "/change",
                 "/undo", "/start", "/stop", "/enable", "/disable",
                 "/datawatchdog", "/graph", "/window", "/yaxis", "/run",
-                "/food"):
+                "/food", "/add", "/remove", "/rename", "/rules", "/rule",
+                "/snooze", "/unsnooze", "/ack", "/history", "/test",
+                "/channels", "/quiet", "/pacing", "/settings"):
         assert cmd in text, f"{cmd} is missing from /help"
 
 

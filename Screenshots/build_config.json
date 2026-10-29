@@ -1,0 +1,28 @@
+{
+  "_comment": "Read by Dev Tools at build time. The Qt exclusions are the same ones Image Tools, Announcer, Laser settings and DevToolsTest use; nothing here touches QML, Quick or 3D. custom_presets.json is written beside the exe on first change, so there is nothing to ship but icon.ico, which the builder adds by itself. Pillow and numpy are imported lazily inside functions, hence listed.",
+  "hidden_imports": [
+    "ssq_core",
+    "ssq_common",
+    "ssq_preview",
+    "ssq_dialogs",
+    "numpy",
+    "PIL.ImageGrab",
+    "PIL.ImageDraw",
+    "zoneinfo",
+    "tzdata"
+  ],
+  "exclude_modules": [
+    "tkinter",
+    "PySide6.QtQml",
+    "PySide6.QtQuick",
+    "PySide6.QtQuick3D",
+    "PySide6.QtQuickControls2",
+    "PySide6.QtQuickWidgets",
+    "PySide6.Qt3DAnimation",
+    "PySide6.Qt3DCore",
+    "PySide6.Qt3DExtras",
+    "PySide6.Qt3DInput",
+    "PySide6.Qt3DLogic",
+    "PySide6.Qt3DRender"
+  ]
+}

@@ -16,17 +16,17 @@ nothing to the machine.
 | `ls_core.py` | **Every rule.** The halls, the inclusive range test, what a missing reading means, the formulas and `row_values`, the settings document and its repair (the look, the band, the arrangement), the channel search, the archiver's failures in plain language. No Qt. |
 | `ls_cpva.py` | The archiver. Copied from `Announcer/ann_cpva.py` (itself from `Image Tools/cpva_client.py`): pooled keep-alive HTTPS, one retry, `CpvaError` vs `CpvaBusyError`, `LastReader`, `PassReader`. No Qt. |
 | `ls_engine.py` | The clock. One pass a second, single-flight with a generation number, a watchdog on a pass that never returns. Also looks at the L3BT MSS window on its own thread while `C.screen_wanted` says so. |
-| `ls_screen.py` | The stopgap for SGV502–505: finds the window titled exactly "L3BT MSS", photographs it with `PrintWindow` (plain ctypes, adapted from `Screenshots/s.py`), and reads the four O/C boxes. Pure-Python pixel reading — no PIL, no numpy, no Qt. |
-| `ls_dm.py` | The deformable mirror: finds the Remote Desktop window to the mirror's PC (title contains `192.168.1.107`, `TscShellContainerClass` preferred), photographs it with `ls_screen.grab_window`, finds Mirror Control Window's right-hand **Set-up** 6 × 6 grid anywhere in it and reads the 36 cell colours. Matches them against the saved set-ups; writes / reads `dm_state.json` and `dm_setups.json` on the scratch share (`exchange`). Pure Python, no Qt. See "The deformable mirror" below. |
-| `dm_t.py` | **DM settings** tab: the set-up the mirror is on (big banner), the grid as read beside a saved one with the differing electrodes outlined (`DmGrid`), the shared list of saved set-ups with Save / Rename / Delete. |
+| `ls_screen.py` | The stopgap for SGV502–505: finds the window titled exactly "L3BT MSS", photographs it with `PrintWindow` (plain ctypes, adapted from `Screenshots/ssq_core.py`), and reads the four O/C boxes. Pure-Python pixel reading — no PIL, no numpy, no Qt. |
+| `ls_dm.py` | The deformable mirror: finds the Remote Desktop window to the mirror's PC (title contains `192.168.1.107`, `TscShellContainerClass` preferred), photographs it with `ls_screen.grab_window`, finds Mirror Control Window's LEFT-hand **Applied voltages** 6 × 6 grid anywhere in it (the right-hand Set-up grid until 12.10.2026) and reads the 36 cell colours. Matches them against the saved set-ups; writes / reads `dm_state.json` and `dm_setups.json` on the scratch share (`exchange`). Pure Python, no Qt. See "The deformable mirror" below. |
+| `dm_t.py` | **DM settings** tab: the set-up the mirror is on (big banner), the grid as read beside a saved one with the differing electrodes outlined (`DmGrid`), the shared list of saved set-ups with Save / Replace / Undo replace / Rename / Restore built-in / Delete, and a warning when two are ticked for the same power. |
 | `dw_t.py` | **DM writer** tab: the per-PC switch that makes this PC (OPR1) the one that reads the window, the title text, what this PC saw last and how long the look took. |
 | `ls_ui.py` | The look. Copied from `Announcer/ann_ui.py`, plus this program's two painted widgets: `HallSquare` (which also writes the SHOOTING / idle word inside itself) and `VerdictMark`. |
 | `ls_log.py` | The crash log. Copied from `Announcer/ann_log.py`. |
 | `ov_t.py` | Overview tab: `_HallBand` (the strip the five squares are placed in, by hand), and the readings as a LIST of row widgets — the name, the verdict square, the number, and nothing else. No table, no heading row; see "the list is not a table" below. |
 | `st_t.py` | **Limits** tab: the hall switcher, the gate valve channel, the limits table with its letters and formulas, the channel picker. |
 | `in_t.py` | The Info / Log page — built, kept working, and NOT on the tab bar. `ls_core.status_line` and `read_clock_text`, the settings and log paths, and every line `main.log()` has said. |
-| `ft_t.py` | **Settings** tab: `_LayoutBoard` (the free-form board the five squares are arranged on) and the band's own settings, plus the typeface, the size, bold and the square size of the Overview's list with a live example built from `ov_t._Row` itself. |
-| `build_config.json` | Read by `Dev Tools/b_t.py`. All four tab modules are hidden imports — `main.py` loads them by name, `in_t` included. |
+| `ft_t.py` | **Settings** tab: the "Saved settings" box at the top (sets on the share, see "Saved settings" below), `_LayoutBoard` (the free-form board the five squares are arranged on) and the band's own settings, plus the typeface, the size, bold and the square size of the Overview's list with a live example built from `ov_t._Row` itself. |
+| `build_config.json` | Read by `Dev Tools/dt_core.py`. All four tab modules are hidden imports — `main.py` loads them by name, `in_t` included. |
 | `testing/` | `test_core.py` (the rules), `test_screen_hall.py` (the MSS window's valve boxes, from `mss_window.png`), `test_window_builds.py` (the window and every tab, offline and offscreen), `test_hall_layout_drag.py` (the board driven through its own mouse handlers), `test_fit_to_window.py` (the fit, at four window sizes, against a real window that is never shown), `test_edit_in_place.py` (an edit repaints in place, the wheel guard, the Maximise debounce), `test_row_order_drag.py` (drag order, the Scanning box, rename on the Overview), `render_tabs.py` (`overview_idle.png` = the orange squares) (pictures, nothing shown on screen — including `overview_watching_int*.png`, the fallback, which is the only place the white "watch" square can be seen, plus `overview_big.png` / `overview_tiny.png` for the fit at both ends, `limits_tiny.png` for the squeezed Limits tab, `overview_arranged*.png`, `settings_tab_arranged.png`, `info.png` and `font.png`), `make_icon.py`. |
 
 ## The tabs, and the one that is not there
@@ -141,6 +141,22 @@ list's area is sized from `_Row.block_size` (not `sizeHint`, which is stale
 until the next event-loop turn). The Settings tab hides the board and
 "Arrange them again" in this mode.
 
+**`fit_single` is SQUARE FIRST** (12.10.2026, "the big square is too small").
+The side is `min(height, room beside a row at the text floor)`, the text floor
+being `FIT_TEXT_MIN_PX` (19) or, when even that does not fit with no square,
+the largest size that does (`_text_floor`); then the text grows into what is
+left. `SINGLE_SQUARE_FRAC` (35 % of the width) is gone. The caller measures
+names with the WHOLE width as their ceiling, so a name is never elided to make
+room for the square — the square gives way instead. `fit_sizes` uses the same
+`_text_floor` for the band's cap (it was the 8 px floor).
+
+**Fit OFF never runs past the edge** (12.10.2026). `_shrunk_to_window`
+draws the typed text smaller (`_largest` against the list's real width and
+height; the square keeps the typed mark/size ratio, `_row_measures`'
+`mark_ratio`) and leaves the document alone. What is drawn is
+`OverviewTab._shown_look`, which `_fit_columns` measures with — never
+`win.look()` directly.
+
 ## The list rows
 
 `name: -value  [square]` — the name with a colon (`ov_t.name_shown`) is flush
@@ -180,9 +196,12 @@ with no run going, a stamp within `LATE_TAIL_S` (2 s, at most `reset_s/2`) of it
 is a late channel's share of the last shot and opens nothing.
 
 **L3 and "waiting for hall"** (2.10.2026). `HALL_SHOWN` / `hall_shown` put "L3"
-on Int's squares (band, one square, the Settings board) and nowhere else — the
-file, the Limits tab and the limit sentences keep "Int", and `_hall_tip` keys
-`faults` by the REAL hall. `l3_waiting`: Int's `hall_state` IDLE (SGV501 open)
+on Int's squares (band, one square, the Settings board). **Since 14.10.2026
+everything a person reads goes through `hall_shown`** — the Limits tab's hall
+buttons and gate box (`st_t`), `hall_state`'s sentence, `status_line`,
+`_worst_verdict` and the row/square tooltips in `ov_t`. Only the stored key is
+still "Int" (`HALLS`, the file, saved sets), so there is no migration. Never
+print a raw hall key into UI text. `_hall_tip` keys `faults` by the REAL hall. `l3_waiting`: Int's `hall_state` IDLE (SGV501 open)
 and no E-hall SHOOTING (idle OR unknown/unset) → `ov_t.refresh` turns a plain
 "idle"/"watch" square into `STATE_WAITING` ("waiting for hall", white like
 idle). A "fault" is never overridden. Judging is unchanged — the Int fallback
@@ -198,15 +217,34 @@ formulas go by it); `_table_rows` is the table: shown rows,
 "table row i" lookup goes through `_table_rows`; `_fill_row(t, row, pos)` takes
 the list position for the letter.
 
-**Rows are dragged into order** (12.10.2026). `st_t._RowTable` is the table:
-`InternalMove`, and its `dropEvent` never lets Qt move items — it answers
-`IgnoreAction` (a MoveAction makes `startDrag` clear the source cells) and
-calls `SettingsTab.move_rows(table rows, drop row)`. That rewrites
+**Rows are dragged into order** (12.10.2026). `st_t._RowTable` is the table,
+and the move is ITS OWN MOUSE HANDLING, not Qt drag and drop. The first
+version used `InternalMove` + `dropEvent`: the drag started, but with no
+`dragMoveEvent` Qt's own refused almost every spot (cells without
+`ItemIsDropEnabled`, selected rows) and the drop never came — "it is working
+now as selection", the same day. Now: a plain left press on a movable row
+(cells with `ItemIsDragEnabled`; the "Not shown" line has none) remembers the
+point, and on a row of a picked GROUP defers the picking to the release; past
+`startDragDistance` the move starts, `super()` is not called (the picking
+does not grow), a blue `QFrame` on the viewport marks `drop_row_at`, a 40 ms
+timer scrolls near the edges; the release calls `on_drop(table rows, drop
+row)` unless the block lands on itself; Esc cancels. Ctrl / Shift presses go
+to Qt untouched. `on_drop` is `SettingsTab.move_rows(table rows, drop row)`,
+driven through the handlers by `test_row_order_drag.py`. That rewrites
 `win.rows()` IN PLACE, filling the slots the table's rows held with shown +
 hidden in their new order, so the shot counter (own table) keeps its slot. A
 drop on the other side of the "Not shown" line sets `show` to match. Then
 `_rows_changed` one event-loop turn later. Every cell gets `ItemIsDragEnabled`
-at the end of `_fill_row`. `testing/test_row_order_drag.py`.
+at the end of `_fill_row` — that flag is what `_RowTable.movable` reads.
+`testing/test_row_order_drag.py`.
+
+**The limits table takes the page's free height** (12.10.2026,
+`root.addWidget(self._table, 1)`, vertical scrollbar as needed, no trailing
+stretch). `_fit_heights` gives it only a MINIMUM (`_MIN_ROWS` = 6 rows) and
+keeps the shot counter's table fixed to its one row; it runs on reload,
+`resizeEvent` and `showEvent`. Before, both were `setFixedHeight` at reload
+and the spare height was an empty stretch: "first table is small and cannot
+be increased". `reload` keeps the table's own scroll position too.
 
 **A name is retyped on the Overview by double-click** (12.10.2026):
 `ov_t._Row.start_rename` lays a `_NameEdit` over the name label; `done(True)`
@@ -219,7 +257,8 @@ inside its own signal), so the Limits table's Name cell follows.
 archiver timestamp changing and times it on `time.monotonic()` — never the
 sample's stamp against `time.time()`, because this PC runs ~25 s ahead of the
 archiver. The sample already archived at start does not count; the square waits
-for the next one.
+for the next one. SHOOTING is a sample of at least `FIRING_MIN_J` noticed in
+the last 15 s, so a trigger under it right after a shot does not end it.
 
 ## Fitting the window
 
@@ -370,8 +409,9 @@ once a year, on the one day the open switch was down.
 
 `halls_in_force` sits on top of `hall_state` and is what everything on screen
 actually asks. It answers `(halls, fallback)`: normally the halls being shot
-into, and — because SGV502 to SGV505 publish nothing — `(["Int"], True)` while
-not one of those four can answer, whatever Int's own valve says. Without it
+into, and `(["Int"], True)` while not one of SGV502 to SGV505 can answer,
+whatever Int's own valve says (until 15.10.2026 those four published nothing
+the program could reach; now it is a fallback for an L3BT archive outage). Without it
 today's machine judges NOTHING: Int shoots while its valve is shut, the valve
 reads open, so no hall is ever "shooting" and the first tab is a wall of grey
 dashes. That was the bug report of 30.9.2026.
@@ -389,12 +429,49 @@ Two things it is easy to get wrong when touching it:
 because Int is internal shooting. It is a fact about the machine, not a
 setting, so nothing on screen can change it.
 
-All five valves are read. SGV502 to SGV505 do not publish yet; there is nothing
-to switch on when they come up.
+All five valves are read. **Since 15.10.2026 SGV502 to SGV505 are read from
+the L3BT archive**: `L3BT-MSS:SGV50x_OPEN_IN` (fallback `_CLOSED_IN`), the same
+switches the L3BT MSS window draws. They never published on the CPVA archiver
+under the old `L3-PSS:SGV50x_IN_*_POSITION` names; `normalise` moves a settings
+file still holding one of those old OPEN names onto the new default
+(`_DEAD_GATE_NAMES`), and leaves any other typed name alone. SGV501 stays on
+`L3-PSS:SGV501_…` on the CPVA archiver. Checked dead on 15.10.2026 (only
+"Disconnected" rows since 13.8.2026), so NOT to be used:
+`E3/E4/E5-PSS-SGV50x:VALVE_IN_*_POSITION`, `E3-PSS-SGV501:IN_*_POSITION`,
+`L3BT-MSS:SGV50x_CLOSED` and `_OPEN_FOR_BEAM`. `L3BT-VCS-SGV50x:OPEN/CLOSED/STATUS`
+are live too and say the same.
+
+### Two archives (`ls_cpva`)
+
+`fetch_samples` routes each channel (`archive_of`): to the **L3BT proxy**
+(`PROXY_HOSTS`, `10.78.0.64:8080` then its twin `.65`, path `PROXY_BASE_PATH`,
+plain HTTP) or the **FCT proxy** (`FCT_PROXY_BASE_PATH`) when that proxy's list
+holds the name and the CPVA list does not (`EXTRA_ARCHIVES`, in that order); to
+the CPVA archiver otherwise. Both lists are fetched once (`_load_lists`, retried after
+`_LIST_RETRY_S` on failure; the first pass waits on `_load_lock`). The twin is
+asked only when the first host cannot be reached — an HTTP error is an answer.
+`fetch_channels` returns all lists merged, so the Limits tab's picker offers
+the L3BT and FCT names. Probe: `testing/probe_gate_valves_live.py`.
+
+**Backup for the CPVA archiver.** CPVA is a front end over the L3 Cassandra,
+which the **L3 proxy** (`L3_PROXY_BASE_PATH`, same two hosts) serves directly —
+identical channel list, rows and speed (measured 15.10.2026). `_cpva_or_backup`
+wraps every CPVA question (samples and `/channels`): when `_request_json` marks
+the error `unreachable` (transport error, connection that never opened, HTTP
+502/503/504), the same question goes to the L3 proxy and the archiver is skipped
+for `CPVA_DOWN_S` (60 s). A read timeout, HTTP 500 or 4xx is never backed up.
+An HTTP error from the proxy is raised as it is; only "both unreachable" is one
+message naming both. Pools are keyed by (proxy, host); `STATS["backup"]` counts
+backup requests. Test: `testing/test_cpva_backup.py`.
+
+`parse_samples` keeps a row with `severity.hasValue == false` ("Disconnected")
+as `(t, None)`; when that is the NEWEST sample, `read_channel` reports
+"disconnected since …" as an error instead of holding an older value forward.
+Such rows are not counted by the shot counter.
 
 ### The L3BT MSS window (`ls_screen`)
 
-Until those four publish, `hall_state(..., screen)` takes the valve's box off the
+Now the last resort only: while a valve's channels cannot answer, `hall_state(..., screen)` takes the valve's box off the
 L3BT MSS window as a THIRD source, after the open and the closed channel. Its
 sentence then says "Read off the L3BT MSS window". `halls_in_force`,
 `single_hall` and `status_line` pass `screen` through, so a readable window turns
@@ -424,6 +501,29 @@ the old limit and a valve untouched since the summer would have left its square
 grey for ever.
 
 ## The deformable mirror (`ls_dm`, `dm_t`, `dw_t`)
+
+**THE LEFT GRID, Applied voltages, since 12.10.2026** — what is really on the
+mirror ("se musí kontrolovat to nastavení vlevo!! ne vpravo"). Until then the
+right grid, Set-up, was read, which is only what the operator is about to
+apply. `read_picture` calls `grid_right_of` (look RIGHT of a scale: Applied
+voltages' scale is on its left); `grid_left_of` finds Set-up.
+
+**The Set-up grid is read too since 14.10.2026, for SAVING only** ("uložit z
+pravé mřížky a sledovat levou mřížku v programu"). After the Applied grid is
+found, `read_setup_grid` walks a few rows near the top of the Applied scale to
+the right of the Applied grid, tries each red run as a scale (`_bar_at`) and
+takes the first with a grid on its left — no full search, ~0 ms. →
+`DmRead.setup_colours` → `state_document["setup_colours"]` → `setup_grid(state)`
+(fresh + status ok only) → `dm_t` "Save the Set-up grid". Never judged:
+`verdict` / `match` see only `colours`. Same set-up's two grids differ by 5–7
+levels (< `MATCH_TOL`), pinned in `test_dm_grid.test_the_set_up_grid_is_read_too`.
+Readers of an older writer's file find no key and the button stays grey. Both are `_grid_beside(pic, bar,
+step)`. The Set-up scale has only labels on its right, so it never yields a
+grid — no label reading needed. `REFERENCE_SETUPS` were re-read off the left
+grids of the two fixtures (≤ 5 levels off the old ones; OPR1's RDP fixture is
+7 off High power). A hint from before (the right scale) fails once and the
+full search takes over. Wherever this section says "Set-up grid" below, read
+"the grid that is read".
 
 Added 8.10.2026. Mirror Control Window runs on a PC with no share and no
 internet; OPR1 keeps a Remote Desktop window to it (192.168.1.107). On OPR1,
@@ -465,15 +565,33 @@ ta je k ničemu, ale musí to rozpoznat, jaký nastavení tam je použitý".
   only if it was read — an unreadable file is never replaced by a one-entry
   list. Edits (`engine.dm_edit`) are queued callables `setups → (setups|None,
   sentence)`; an exception in one is that edit's sentence, not the share's.
-* Delete takes two clicks (`_ARM_MS`), no modal dialog — `exec()` freezes the
-  other windows.
+* Everything that loses a grid — Delete, Replace, Undo replace, Save under a
+  name already on the list — takes two clicks (`DmTab._confirmed`, `_ARM_MS`,
+  `_armed = (button, what)`, `_disarm` restores every text from `_texts`), no
+  modal dialog — `exec()` freezes the other windows.
 * **Built-in Low / High power** (`REFERENCE_SETUPS`, colours of the two
   fixtures as literals: 7:27 = High, 7:31 = Low — swapped 9.10.2026, the
-  8.10 guess was backwards). `with_references` puts them
-  first in every `DmView.setups` and overrules a file entry of the same name;
-  edits see them (so their colours cannot be saved twice) but their colours
-  never go into `dm_setups.json`; `rename_setup` / `delete_setups` leave them
-  alone.
+  8.10 guess was backwards). Since 21.10.2026 only DEFAULTS (a new Low power
+  could not be saved over the old one). `with_references` puts them first in
+  every `DmView.setups`; the file's entry of that name decides: with colours
+  = replaced grid (used whole), `{"removed": true}` = deleted (left out),
+  `{"power"}` only = its tick. `is_builtin_entry` = the untouched built-in (by
+  `BUILT_IN_BY`, no `replaced` / `replaces`, colours equal) — only that one
+  is written as a tick alone by `for_file`, which also writes `removed` for a
+  built-in name missing from the list and not renamed. Edits see them (so
+  their colours cannot be saved twice).
+* **Replace / undo / restore** (21.10.2026). `replace_setup` keeps name,
+  place and tick, writes `replaced` / `replaced_by` and `previous` (`colours`,
+  the earlier `replaced*`) — one step for `undo_replace`. `restore_builtins`
+  returns `(setups, sentence)` and skips a built-in whose grid is saved under
+  another name. `delete_setups` deletes built-ins too.
+* **Names** compare by `name_key` (stripped, inner spaces collapsed,
+  casefold) via `find_name`; `tidy_name` writes a built-in name in its own
+  spelling. `add_setup` on a freed built-in name ticks it as named.
+  `ticked_twice` feeds the yellow line under the list in `dm_t`.
+* **Old versions** keep only a built-in name's tick (old `clean_setups`) and
+  write the file back from that — one edit on an old PC drops a replacement or
+  a removal. Every PC needs the 21.10.2026 build.
 * **Two ways in** (9.10.2026, OPR1 maximised RDP window gave no grid via
   PrintWindow): `_read_both_ways` tries `ls_screen.grab_window` then
   `ls_screen.grab_screen_of` (BitBlt of the window's DWM frame off the screen
@@ -497,20 +615,26 @@ ta je k ničemu, ale musí to rozpoznat, jaký nastavení tam je použitý".
   power writes an own entry under the new name holding `REFERENCE_SETUPS[old]`,
   its tick and `"replaces": old`; `replaced_references` → `with_references`
   then leaves the built-in out, everywhere, so every consumer still sees only
-  entries with colours. `clean_setups` keeps `replaces`. Deleting the entry
-  brings the built-in back; a built-in name can never be given to another
-  set-up (`add_setup`, `rename_setup`). Delete stays refused on the built-ins.
+  entries with colours. `clean_setups` keeps `replaces`. Since 21.10.2026
+  deleting the renamed entry does NOT bring the built-in back (`for_file`
+  writes it `removed`; Restore built-in does), and a built-in name nobody
+  carries can be given to another set-up.
 * **The Overview line** (asked 8.10.2026): a built-in row `kind: "dm"`
   (`new_dm_row`, `is_dm_row`, `is_builtin_row` = shot counter or DM), added by
   `normalise` with Show UNTICKED. `ls_dm.mirror_now(view)` gives the text and
   the tag (None = mirror not known, `TAG_NONE` also for an unsaved grid);
-  `ls_core.dm_judge(tag, FiringWatch.fresh_energy(mono), title)` the verdict —
+  `ls_core.dm_judge(tag, FiringWatch.fresh_energy(mono), title, shutter,
+  FiringWatch.high_age(mono))` the verdict —
   a fresh SBW4 shot (< `FIRING_HOLD_S`) over `DM_SPLIT_J` (0.05 J) on a set-up
-  not tagged high, or at/under it on one not tagged low, is BAD; tagged
-  neither with no shot is UNKNOWN. Low power is ALSO the SAST1 shutter open
-  (`DM_SHUTTER_CHANNEL`, State 1 = open, measured against SBW4 bursts of
-  6.10.2026) with no fresh shot over the split — `shutter_open`, passed in by
-  `_dm_line`; `main.channels` reads the shutter only while the DM row is shown. `OverviewTab._dm_line`
+  not tagged high, or a fresh low STREAM (`LP_STREAM_N` = 5 samples at/under
+  the split within `LP_STREAM_S` = 10 s) on one not tagged low, is BAD; tagged
+  neither with no shot is UNKNOWN. A lone low sample is a trigger (15.10.2026)
+  and is never fresh energy — `fresh_energy` keeps the last HP shot, and
+  `FiringWatch._look` reads every new sample from `Reading.recent_v`, so a
+  trigger in the same pass cannot hide an HP shot. Low power is ALSO the SAST1
+  shutter open (`DM_SHUTTER_CHANNEL`, State 1 = open, measured against SBW4
+  bursts of 6.10.2026) with no HP shot for `HP_HOLD_S` (120 s) —
+  `shutter_open`, passed in by `_dm_line`; `main.channels` reads the shutter only while the DM row is shown. `OverviewTab._dm_line`
   adds that fault to the halls in force AFTER the not-firing gate (a High power
   fault is a sub-threshold shot). The value is written with a non-breaking
   space so `split_value` keeps "High power" whole. `testing/test_dm_overview.py`.
@@ -519,6 +643,35 @@ ta je k ničemu, ale musí to rozpoznat, jaký nastavení tam je použitý".
   sharp and soft, framed, covered, moved, one electrode changed, speed, the
   verdict, the set-up edits); `test_dm_tabs.py` (the round trip through a temp
   folder standing in for the share, plus `dm_tab_*.png` / `dm_writer_*.png`).
+
+## Saved settings (`ls_core` sets, `ft_t` box, `main.apply_settings`)
+
+Added 12.10.2026: named sets of the settings document, one per operator, in
+`settings_sets.json` on the share beside `dm_setups.json` (`ls_dm.Share`,
+`read_json`, `write_json_atomic`). Shape `{"version": 1, "sets": {name:
+{"settings", "saved", "by"}}}`.
+
+* **Parts** (`SET_PARTS`): channels (`rows`, `shooting`, `scanning`,
+  `active_hall`), look (`look`, `halls`), shots, dm (`title`, `every_s` ONLY —
+  `dm.write` is per PC and never travels), window (`window_max`,
+  `window_geometry`, unticked by default). `settings_parts` cuts them out,
+  `apply_settings_parts` lays them over a deep copy and runs `normalise`;
+  `parts_in` says what a set holds. A part the set lacks is left alone.
+* **Edits** are `add_set` / `overwrite_set` / `rename_set` / `delete_set`,
+  shaped like `ls_dm.add_setup`: `(new sets | None, why not)`.
+* **I/O** is `FontTab._sets_run`: a daemon thread reads the file (unreadable
+  = refuse, never overwrite), applies the edit, writes; the reply is a plain
+  dict polled by a 100 ms `QTimer` (`_sets_poll`). One job at a time; buttons
+  off while busy. The list is fetched the first time the tab is shown, and
+  Load re-reads before applying.
+* **Applying**: `main.apply_settings` replaces `self._cfg` IN PLACE
+  (`clear` + `update`) — tabs ask for its pieces on every reload — then the
+  shot counter's reset, geometry (window part), `settings_changed(rebuild)`,
+  `look_changed`, both DM tabs' `reload`, `dm_changed`.
+* Delete is two clicks (`_ARM_MS`), no modal dialog.
+* `testing/test_settings_sets.py`: rules, and the round trip through the tab
+  with a temp folder for the share (another PC's set kept, writer switch
+  untouched, broken file not overwritten).
 
 ## Formulas
 
@@ -581,6 +734,14 @@ second.
   "energii zarovnej na setiny" — and everything else keeps the shortest form
   that loses nothing. `unit_text` lifts `^2` to `²`. Both at display time;
   see the trap about that below.
+* **One failed read keeps the last good value** (13.10.2026, GDD / TOD /
+  SBW4 flickering to a dash in the office). `PollEngine._pass_done` does not
+  store an error reading over a good one younger than `STALE_AFTER_S`; it
+  logs the first failure of a streak. After 30 s the error shows as before.
+  `testing/test_failed_read_holds.py`.
+* **The shot counter's line shrinks** (13.10.2026): its size setting is the
+  most it is drawn at; `_shot_fit_px` caps it at the list's drawn text and
+  the line's width, re-checked when the number changes.
 * **An empty limit box is not zero.** It switches that side off. Both empty is
   not a pass — it is `STATE_UNKNOWN`.
 * **A missing reading is never a tick.** Failed, nothing archived, or not read
@@ -647,9 +808,16 @@ second.
 * **The taskbar id is random per launch.** Windows caches the taskbar picture
   per AppUserModelID and never re-reads it; every stable id tried in this family
   eventually went blank.
-* **`icon.ico` is drawn per size, not resampled.** Below 48 px it is a
-  simplified drawing — five halls at 16 px merge into a grey band. Redraw with
-  `python testing/make_icon.py`.
+* **`icon.ico` is drawn per size, not resampled.** Since 14.10.2026 it is the
+  ONE lit hall with a white tick at every size — the five-hall drawing that the
+  big frames had was what the guide's title slide showed, and it read as the
+  wrong icon next to the taskbar's single square. Redraw with
+  `python testing/make_icon.py`; the guide's 2048 px copy comes from
+  `C:\Dev\presentation_builder\make_lasersettings_icon.py`.
+* **Every table cell's editor takes the cell's alignment** (`U.AlignedEditDelegate`
+  as the default delegate of the Limits and shot-counter tables). Qt's own line
+  edit is left-aligned whatever the cell says, so a centred number jumped left
+  while typed. Numbers in every table are centred (DM set-ups' Saved / On too).
 * **`ColumnFitter` takes a `stretch_col` and a `fixed_cols`.** Both are this
   copy's additions. `stretch_col`: the spare width can go to several columns,
   shared in proportion to their contents — handing it all to the last column
@@ -806,6 +974,7 @@ python testing/render_tabs.py            the pictures
 python testing/test_dm_grid.py           the DM grid off the screenshots
 python testing/test_dm_tabs.py           DM settings / writer round trip + pictures
 python testing/test_dm_overview.py       DM settings line: Low/High vs SBW4, blink
-python testing/test_row_order_drag.py    drag order, Scanning box, rename in place
+python testing/test_row_order_drag.py    drag order (mouse handlers too), Scanning box, rename in place
+python testing/test_settings_sets.py     saved settings: rules + round trip via a temp "share"
 python testing/make_icon.py --preview    icon.ico, and a contact sheet of it
 ```

@@ -202,13 +202,15 @@ def check_alias(m):
     # The window says which name it drew, rather than quietly drawing it.
     new_name = new
     dlg = types.SimpleNamespace(
-        _load_gen=1, _series={}, _day_status={}, _seeds={},
+        _load_gen=1, _series={}, _day_status={}, _ch_status={}, _seeds={},
+        _rebuild_day_status=lambda: None,
         _alias_used={}, _moments=[], _regions=[],
         _pv_meta_for=lambda ch: {},
         _shown_days=lambda: [],
         _pv_list=_FakeList([("SBW4", new)]),
         _pv_label_for=lambda ch: "SBW4",
         _status=_FakeLabel(), _redraw=lambda: None,
+        _redraw_measured=lambda: None,
         _refresh_day_list=lambda: None, _refresh_stats=lambda: None,
         _derived_reason={}, _checked_channels=lambda: [("SBW4", new)])
     # The row tooltips are built by the window itself — the real methods, so the

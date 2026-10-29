@@ -133,6 +133,8 @@ def check_edit_channel(m):
     # done from a timer inside its own event loop.
     from PySide6.QtCore import QTimer
     m._PV_CHANNEL_CACHE = [ENERGY_CH, NEW_CH, "L3-Pulser-HighPowerEnable"]
+    # The browser asks the archiver again on every opening; answer from here.
+    m.cpva.fetch_channels_cached = lambda *a, **k: list(m._PV_CHANNEL_CACHE)
     seen: dict = {}
 
     def drive():

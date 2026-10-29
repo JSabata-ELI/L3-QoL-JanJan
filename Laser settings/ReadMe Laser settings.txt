@@ -20,8 +20,9 @@ WHAT IT DOES
 THE FIRST TAB — OVERVIEW
 
   Five big squares across the top: L3, E2, E3, E4, E5. L3 is
-  internal shooting — on the Limits tab and in the settings it is
-  still called Int.
+  internal shooting. (Older versions called it Int on the Limits
+  tab; it is L3 everywhere now, and limits saved under Int carry
+  over as they are.)
 
     white           we are not shooting into that hall
     green           we are shooting into it, and everything is
@@ -38,7 +39,7 @@ THE FIRST TAB — OVERVIEW
     SHOOTING          the beam is going in there
     OUT OF RANGE      it is, and something watched is outside the
                       limits
-    WATCHING          see "WHILE ONLY INT CAN ANSWER" below
+    WATCHING          see "WHILE ONLY L3 CAN ANSWER" below
     idle              nobody is shooting into it
     waiting for hall  L3 only: SGV501 is open, but no hall's gate
                       valve is open (or none of them can be read)
@@ -88,12 +89,18 @@ THE FIRST TAB — OVERVIEW
   and L3-SBW4-PM311:Energy); the newer sample counts. Hover the
   square to see the energy it went by.
 
-    Int   SGV501      live
-    E2    SGV502      \
-    E3    SGV503       |  the names are already filled in, but
-    E4    SGV504       |  these four valves do not publish yet.
-    E5    SGV505      /   Until they do, they are read off the
-                          L3BT MSS window — see below.
+    L3    SGV501      L3-PSS:SGV501_IN_OPEN_POSITION
+    E2    SGV502      L3BT-MSS:SGV502_OPEN_IN    \
+    E3    SGV503      L3BT-MSS:SGV503_OPEN_IN     |  from the L3BT
+    E4    SGV504      L3BT-MSS:SGV504_OPEN_IN     |  archive (since
+    E5    SGV505      L3BT-MSS:SGV505_OPEN_IN    /   15.10.2026)
+
+  SGV502 to SGV505 are read from the L3BT archive (10.78.0.64, or
+  10.78.0.65 if that one is down) — the same switches the L3BT MSS
+  window shows. If that archive cannot be reached, the program falls
+  back to reading the window itself — see below. An older settings
+  file with the old L3-PSS:SGV502…505 names is moved onto the new
+  names by itself.
 
   Under the squares is the list of watched values, IN THE MIDDLE of
   the window. One line each, written straight onto the background,
@@ -158,9 +165,9 @@ THE FIRST TAB — OVERVIEW
 READING THE VALVES OFF THE L3BT MSS WINDOW
 
   On L3-OPR03 the L3BT MSS window shows every valve's state in a
-  little box under its name. While SGV502 to SGV505 do not publish,
-  the program reads those four boxes off that window, once a
-  second:
+  little box under its name. Only while SGV502 to SGV505 cannot be
+  read from the L3BT archive, the program reads those four boxes
+  off that window, once a second:
 
     O and a black square     the valve is OPEN — the beam goes in
                              there
@@ -173,29 +180,30 @@ READING THE VALVES OFF THE L3BT MSS WINDOW
   off the L3BT MSS window" when the answer came from there.
 
   If the window is closed or minimised, or a box cannot be made
-  out, those halls say "not read" and the program watches Int, as
+  out, those halls say "not read" and the program watches L3, as
   described below.
 
-  The day the valves publish, their channels win and the window is
-  not looked at any more. Nothing has to be switched off.
+  As long as the valves' channels answer, the window is not looked
+  at. Nothing has to be switched off.
 
 
-WHILE ONLY INT CAN ANSWER
+WHILE ONLY L3 CAN ANSWER
 
-  SGV502 to SGV505 do not publish yet. Int shoots while ITS valve
+  This is for when SGV502 to SGV505 cannot be read at all (the
+  L3BT archive is down and the L3BT MSS window is not open). L3 shoots while ITS valve
   is shut, so with the valve open no hall could say it was being
   shot into and nothing at all was being judged — the whole list
   was grey dashes.
 
   So: while none of those four valves can be read — not from their
-  channels and not off the L3BT MSS window either — Int's limits
-  are in force whatever Int's own valve says. The L3 square goes
+  channels and not off the L3BT MSS window either — L3's limits
+  are in force whatever L3's own valve says. The L3 square goes
   WHITE, not green, because nobody is really shooting into it — it
   says "waiting for hall" while SGV501 is open — but the rows are
   judged, and the square blinks red and white if something is out
   of range.
 
-  The day the first of those four valves publishes, this stops on
+  As soon as one of those four valves answers again, this stops on
   its own and the valves decide again. Hover a square and it says
   which it is.
 
@@ -238,7 +246,9 @@ THE SECOND TAB — LIMITS
     Remove           take the picked rows off the list, in every
                      hall. Several can be picked at once.
 
-  The table — one row per watched value. Click a cell and type.
+  The table — one row per watched value. Double-click a cell to
+  change it (or pick it and just start typing). Numbers stay in the
+  middle of their cells while you type them.
 
     Show                    watch this value — in EVERY hall
     Alarm                   report it when out of range. Untick it
@@ -248,7 +258,10 @@ THE SECOND TAB — LIMITS
     Letter                 what a formula calls this row
     Channel or formula      the real channel name, or a sum
     Name on the first tab   what the first tab calls it
-    Unit                    what it is measured in
+    Unit                    what it is measured in — any text,
+                            written after the number on the first
+                            tab; fs^2 is shown as fs². J and mJ
+                            are shown to two decimals
     Min, Max                the range that counts as right for
                             THIS hall
     Scan min, Scan max      the range while Scanning is ticked on
@@ -260,7 +273,7 @@ THE SECOND TAB — LIMITS
 
   There is one list of channels shared by all five halls. Adding a
   channel adds it everywhere, and so does Show: untick it in E2 and
-  the value stops being watched in Int and E5 as well, and the row
+  the value stops being watched in L3 and E5 as well, and the row
   leaves the first tab. Min and Max are the only things set per
   hall.
 
@@ -268,11 +281,16 @@ THE SECOND TAB — LIMITS
   grey "Not shown" line, so they are out of the way. Tick Show and
   the row moves back up.
 
-  YOUR OWN ORDER: grab a row (any cell) and drag it up or down. The
-  first tab shows the rows in this order. Drop a row under the "Not
-  shown" line and its Show goes off; drag it back up and it is on
-  again. The letters follow the new order, and every formula is
-  rewritten so it keeps meaning the same rows.
+  YOUR OWN ORDER: grab a row (any cell) and drag it up or down. A
+  blue line shows where it will land; Esc cancels. To move several
+  at once, pick them with Ctrl or Shift first, then drag one of
+  them. The first tab shows the rows in this order. Drop a row
+  under the "Not shown" line and its Show goes off; drag it back up
+  and it is on again. The letters follow the new order, and every
+  formula is rewritten so it keeps meaning the same rows.
+
+  The table takes all the height the window has and scrolls inside
+  itself when the rows do not fit.
 
   An empty Min or Max means that side is not limited. It does NOT
   mean zero. The limits themselves count as being in range:
@@ -322,7 +340,8 @@ A ROW THAT WORKS ITS NUMBER OUT
 
   A decimal comma is fine — 0,749 is stored as 0.749. The one place
   it is not is inside brackets, because there a comma separates the
-  arguments: write min(A, 0.749), never min(A, 0,749). The program
+  values: in min(A, 0.749) the comma after A is that separator, and
+  the number has to be written with a dot — never min(A, 0,749). The program
   cannot warn you about that one — min(1, 2) looks exactly the same
   and is perfectly correct — so it is the one thing to type
   carefully.
@@ -338,7 +357,34 @@ A ROW THAT WORKS ITS NUMBER OUT
 THE THIRD TAB — SETTINGS
 
   How the first tab LOOKS. Nothing here reads the machine and
-  nothing here can change a limit.
+  nothing here can change a limit — except a saved set of settings
+  loaded at the top.
+
+  Saved settings
+
+    Settings saved under a name, for example one set per operator.
+    They are on the scratch share, so every PC sees the same list.
+
+      Load          pick a set in the drop-down, press Load: the
+                    ticked parts of it replace this PC's settings
+      Save as new   type a name, press it: this PC's settings (the
+                    ticked parts) are saved under that name
+      Save          saves this PC's settings over the picked set
+      Rename        gives the picked set the name typed in the box
+      Delete        click twice; gone for every PC
+
+    Parts — tick what is saved and what is loaded:
+
+      Channels and limits     the list, every Min / Max, the gate
+                              valves, Scanning
+      Look (text, squares)    typeface, sizes, bold, the squares
+      Shot counter            its settings
+      DM reading              the Remote Desktop title, Look every
+      Window size and place   unticked to begin with
+
+    The DM writer switch is never saved or loaded: it belongs to
+    the PC (only OPR1 reads the mirror). The saved DM set-ups are on
+    the share already, for every PC.
 
   Fit everything to the window
 
@@ -351,6 +397,16 @@ THE THIRD TAB — SETTINGS
 
     The verdict square comes out one and a half times the text
     beside it.
+
+    The hall squares come first: as big as they can be while the
+    list still fits beside or under them at 19 px of text. Only when
+    the window is too small even for that does the text go smaller,
+    and only at the smallest text (8 px) can anything run past the
+    window's edge.
+
+    Switched off, your own sizes apply — but a text too big for the
+    window is drawn smaller (the verdict square with it), so nothing
+    runs past the edge. Your numbers stay in the boxes.
 
     Type into any of those four boxes and this switches itself off
     and your own number applies instead. Switch it back on and it
@@ -464,8 +520,12 @@ THE DM SETTINGS TAB — WHICH SET-UP THE MIRROR IS ON
 
   The deformable mirror is set in "Mirror Control Window" on a PC
   that is reached only through the Remote Desktop window on OPR1.
-  OPR1 reads the right-hand grid, Set-up, off that window every
-  5 seconds, and this tab shows what it found, on every PC:
+  OPR1 reads the LEFT-hand grid, Applied voltages, off that window
+  every 5 seconds — what is really on the mirror. The right-hand
+  grid, Set-up, is only what is about to be applied: it is read
+  too, but only so a set-up can be saved from it (see SAVING A
+  SET-UP). It is never checked. This tab shows what was found, on
+  every PC:
 
     the set-up's name   on green — the grid is one of the saved
                         set-ups (for example "High power")
@@ -488,12 +548,30 @@ THE DM SETTINGS TAB — WHICH SET-UP THE MIRROR IS ON
   you pick in the list. Electrodes that differ have a thick outline.
 
   SAVING A SET-UP. Type a name and click "Save the grid on the
-  mirror now". The list is shared by every PC. Pick one set-up and
+  mirror now" (the left grid, Applied voltages), or "Save the
+  Set-up grid" (the right grid, before it is applied — the mirror
+  does not have to be on it). Either way the Overview checks the
+  LEFT grid: once a set-up saved from the right grid is applied,
+  it is recognised by its name. The list is shared by every PC. Pick one set-up and
   click Rename to give it the name in the box. Pick one or more and
-  click Delete twice to delete them. "Low power" and "High power"
-  are built in: always on the list and never deleted, but they can
-  be renamed like any other. A renamed one keeps its colours and its
-  tick; deleting it brings back the built-in name.
+  click Delete twice to delete them.
+
+  A NEW GRID FOR AN EXISTING SET-UP (e.g. a new Low power). Either
+  pick it in the list and click "Replace with the grid on the mirror
+  now" twice, or type its name and click "Save the grid on the
+  mirror now" (or "Save the Set-up grid") twice. Its name and its
+  High power / Low power tick stay; the Saved column says
+  "replaced", when and on which PC. "Undo replace" (twice) gives it
+  back the grid it had before. Capital letters and spaces in names
+  do not count: "low power" is "Low power".
+
+  "Low power" and "High power" come with the program, but they are
+  set-ups like any other: replace, rename or delete them. "Restore
+  built-in" puts back the grids the program came with.
+
+  A yellow line under the list warns when two or more set-ups are
+  ticked for the same power — the Overview accepts the mirror on
+  any of them, so an old grid left ticked still counts as OK.
 
   HIGH POWER AND LOW POWER TICKS. Each saved set-up has two tick
   boxes in the list: High power and Low power. Tick every set-up
@@ -507,10 +585,13 @@ THE DM SETTINGS TAB — WHICH SET-UP THE MIRROR IS ON
   tab and the Overview shows "DM settings: High power" (the name of
   the set-up on the mirror) with a square. A cross, and the hall
   blinks, when a new SBW4 shot says otherwise: over 0.05 J while the
-  mirror is on a set-up not ticked High power, or 0.05 J and less
-  while on one not ticked Low power. Low power is also recognised
+  set-up on the mirror does not have High power ticked, or a stream
+  of shots of 0.05 J and less (5 or more within 10 seconds) while it
+  does not have Low power ticked. One or two such shots are a
+  trigger, not low power: they change nothing, and the hall stays
+  SHOOTING. Low power is also recognised
   by the SAST1 shutter: a hall's valve open, the shutter open and
-  no SBW4 shot over 0.05 J for 15 seconds means low power is being
+  no SBW4 shot over 0.05 J for 2 minutes means low power is being
   shot. A grid that is no saved
   set-up, or one ticked for neither, is a cross for any new shot. A
   shot counts for 15 seconds.
@@ -522,8 +603,8 @@ THE DM SETTINGS TAB — WHICH SET-UP THE MIRROR IS ON
 
 THE DM WRITER TAB — ONLY ON OPR1
 
-  Tick "Read the Set-up grid from the Remote Desktop window and
-  write it to the scratch share" on the PC that has the Remote
+  Tick "Read the Applied voltages grid from the Remote Desktop
+  window and write it to the scratch share" on the PC that has the Remote
   Desktop window open (OPR1), and on no other. The window is found
   by the text in its title, 192.168.1.107. "Look every" sets how
   often (1 to 10 s, 5 s at first); every other PC follows the same
@@ -540,7 +621,7 @@ WHAT IT READS
   to the machine — this program only looks.
 
   The deformable mirror's set-up comes from two files on the
-  scratch share (Software\LaserSettings): dm_state.json, what OPR1
+  scratch share (Software\Laser settings\shared): dm_state.json, what OPR1
   saw last, and dm_setups.json, the saved set-ups.
 
   A value that has not been read for half a minute stops being

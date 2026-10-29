@@ -48,6 +48,16 @@ def _rows(n, start_ns=1_700_000_000_000_000_000, step_ns=1_000_000_000):
     return out
 
 
+def _feed(w, n):
+    """The table rows AND the channels' samples of n shots — the cloud is
+    paired from the samples, the rows feed the Table tab."""
+    rows = _rows(n)
+    w._table_rows_unfiltered = rows
+    w._table_rows = list(rows)
+    w._samples_by_pv = {pv: [(ts, rd[pv][0], "") for ts, rd in rows]
+                        for pv in (PV_X, PV_Y)}
+
+
 def _widget():
     w = css.CSSLoggerWidget()
     w._xy_choice_map = {"X ch": PV_X, "Y ch": PV_Y}
@@ -66,8 +76,7 @@ def main() -> int:
     _ = app
 
     w = _widget()
-    w._table_rows = _rows(20)
-    w._table_rows_unfiltered = list(w._table_rows)
+    _feed(w, 20)
     w._notebook.setCurrentWidget(w._tab_xy)
     QApplication.processEvents()
 
@@ -82,8 +91,7 @@ def main() -> int:
     check("all rows are in it", n0 == 20, f"{n0} points")
 
     # ── 1. a live tick ────────────────────────────────────────────────────────
-    w._table_rows = _rows(30)
-    w._table_rows_unfiltered = list(w._table_rows)
+    _feed(w, 30)
     w._xy_refresh_live()
     QApplication.processEvents()
     n1 = len(w._xy_scatter.get_offsets())
@@ -94,8 +102,7 @@ def main() -> int:
     # ── the hidden tab is caught up on the way in ────────────────────────────
     w._notebook.setCurrentWidget(w._tab_table)
     QApplication.processEvents()
-    w._table_rows = _rows(40)
-    w._table_rows_unfiltered = list(w._table_rows)
+    _feed(w, 40)
     w._xy_refresh_live()
     QApplication.processEvents()
     check("a hidden tab is only marked, not redrawn",
@@ -131,7 +138,7 @@ def main() -> int:
 
     # ── 3. the toolbar's history ─────────────────────────────────────────────
     w._conditions = []
-    w._table_rows = _rows(40)
+    _feed(w, 40)
     w._plot_xy()
     QApplication.processEvents()
     tb = w._xy_toolbar
@@ -166,7 +173,7 @@ def main() -> int:
 
     # A zoomed view must not be dragged around by the next live tick.
     at_zoom = w._xy_figure.axes[0].get_xlim()
-    w._table_rows = _rows(60)
+    _feed(w, 60)
     w._xy_refresh_live()
     QApplication.processEvents()
     check("a live tick leaves the user's zoom alone",

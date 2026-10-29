@@ -2,17 +2,25 @@
 
 Run from the Launcher folder:  python testing/test_inplace_updates.py
 
-What used to go wrong: acknowledging an update, the 10 s version poll, moving a
-program to another group and opening a group with a longer name all tore down
-every card and built the window again (the visible flicker). The 🔽 list kept
-the versions of the first scan. After every scan, the tidy-up dialogs opened by
-themselves and took the keyboard.
+Puts nothing on screen (QT_QPA_PLATFORM=minimal:enable_fonts, real fonts).
+Pins what the Tk Launcher's test pinned: acknowledging an update, the version
+poll, moving a program and opening a group change the cards in place instead
+of building the window again; the version list is read when it opens; no
+tidy-up dialog opens after a scan. Plus: names are never cut, and the window
+is wide enough for two cards.
 """
+import os
+import sys
 import tempfile
-import tkinter as tk
 from pathlib import Path
 
-import hidden_tk  # noqa: F401  (before `import l`)
+os.environ.setdefault("QT_QPA_PLATFORM", "minimal:enable_fonts")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from PySide6.QtGui import QFontMetrics  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox  # noqa: E402
+from shiboken6 import isValid  # noqa: E402
+
 import l  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp())
@@ -28,7 +36,7 @@ def touch(p: Path):
 
 def make_programs() -> dict:
     progs = {}
-    for name in ("Image Tools", "Screenshots", "Foo", "A Very Long Program Name"):
+    for name in ("Image Tools", "Screenshots", "Foo", "A Very Long Program Name Indeed"):
         d = TMP / "root" / name
         exe = d / f"{name} v1.0.0.exe"
         touch(exe)
@@ -43,87 +51,97 @@ def make_programs() -> dict:
     return progs
 
 
-def toplevels(app) -> list:
-    return [w for w in app.winfo_children() if isinstance(w, tk.Toplevel)]
+def dialogs() -> list:
+    return [w for w in QApplication.topLevelWidgets()
+            if isinstance(w, (QDialog, QMessageBox)) and w.isVisible()]
+
+
+def name_fits(btn) -> bool:
+    fm = QFontMetrics(l._ui_font(9))
+    return fm.horizontalAdvance(btn.text()) + 24 + 6 + 16 + 2 <= btn.width()
 
 
 def main():
-    app = l.Launcher()
+    app = QApplication.instance() or QApplication(sys.argv)
+    l.apply_app_style(app)
+    win = l.Launcher()
+    win.show()
     progs = make_programs()
     stray = (TMP / "root" / "Foo" / "archive" / "Foo v0.9.0.exe", None)
-    app._apply_programs(progs, "Test", TMP / "root", app._scan_gen, tidy=([stray], []))
-    app.update_idletasks()
+    win._apply_programs(progs, "Test", TMP / "root", win._scan_gen, tidy=([stray], []))
+    app.processEvents()
 
     # -- nothing pops up; the Clean button says there is something to tidy --
-    assert not toplevels(app), "a dialog opened by itself after the scan"
-    assert app._clean_btn.cget("text") == "🧹 Clean (1)", app._clean_btn.cget("text")
-    assert str(app._clean_btn.cget("style")) == "Alert.TButton"
-    assert "To tidy" in app.status.cget("text")
+    assert not dialogs(), "a dialog opened by itself after the scan"
+    assert win._clean_btn.text() == "Clean (1)", win._clean_btn.text()
+    assert win._clean_btn.property("alert") is True
+    assert "To tidy" in win.status.text()
     print("  scan with misplaced files: no pop-up, Clean shows (1)")
 
-    it = app._prog_buttons["Image Tools"]
-    sc = app._prog_buttons["Screenshots"]
+    it = win._prog_buttons["Image Tools"]
+    sc = win._prog_buttons["Screenshots"]
+    assert it.text() == "Image Tools" and name_fits(it)
 
     # -- update highlight on and off: the same button, restyled --
-    app._apply_version_updates({"Screenshots"}, {
+    win._apply_version_updates({"Screenshots"}, {
         "Screenshots": (progs["Screenshots"]["exe_path"],
-                        progs["Screenshots"]["archive_versions"])}, app._scan_gen)
-    assert app._prog_buttons["Screenshots"] is sc and sc.winfo_exists()
-    assert str(sc.cget("style")) == "Update.Prog.TButton", sc.cget("style")
-    app._acknowledge_update("Screenshots")
-    assert app._prog_buttons["Screenshots"] is sc and sc.winfo_exists()
-    assert str(sc.cget("style")) == "Prog.TButton"
-    assert it.winfo_exists()
-    print("  update highlight + acknowledge: restyled in place")
+                        progs["Screenshots"]["archive_versions"])}, win._scan_gen)
+    assert win._prog_buttons["Screenshots"] is sc and isValid(sc)
+    assert sc.property("update") is True
+    win._acknowledge_update("Screenshots")
+    assert win._prog_buttons["Screenshots"] is sc and isValid(sc)
+    assert sc.property("update") is False
+    assert isValid(it)
+    assert l.CONFIG_PATH.exists()
+    print("  update highlight + acknowledge: restyled in place, config written")
 
-    # -- the 🔽 list shows a version found after the card was built --
+    # -- the version list shows a version found after the card was built --
     progs["Image Tools"]["archive_versions"].append(
         {"exe_path": progs["Image Tools"]["exe_path"], "py_path": None,
          "has_internal": False, "label": "v0.5.0"})
-    menu = tk.Menu(app, tearoff=0)
-    app._fill_version_menu(menu, "Image Tools")
-    labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+    menu = QMenu()
+    win._fill_version_menu(menu, "Image Tools")
+    labels = [a.text() for a in menu.actions()]
     assert labels == ["v1.0.0", "v0.5.0"], labels
     print("  version list is read when it opens:", labels)
 
     # -- moving a program: the other cards stay the same widgets --
-    app._move_to_group("Foo", "scripts")
-    assert it.winfo_exists() and app._prog_buttons["Image Tools"] is it
-    assert sc.winfo_exists() and app._prog_buttons["Screenshots"] is sc
-    assert "Foo" in app._prog_buttons and app._prog_buttons["Foo"].winfo_exists()
-    assert "(3)" in app._group_toggle_btns["scripts"].cget("text")
-    assert "(1)" in app._group_toggle_btns["external"].cget("text")
+    win._move_to_group("Foo", "scripts")
+    app.processEvents()
+    assert isValid(it) and win._prog_buttons["Image Tools"] is it
+    assert isValid(sc) and win._prog_buttons["Screenshots"] is sc
+    assert "Foo" in win._prog_buttons and isValid(win._prog_buttons["Foo"])
+    assert "(3)" in win._group_toggle_btns["scripts"].text()
+    assert "(1)" in win._group_toggle_btns["external"].text()
     print("  move to group: only the two groups changed, counts updated")
 
     # -- opening a group with a longer name: widths change in place --
-    before = int(str(it.cget("width")))
-    app._toggle_group("external")
-    after = int(str(it.cget("width")))
-    assert it.winfo_exists(), "the open group's cards were rebuilt"
+    before = it.maximumWidth()
+    win._toggle_group("external")
+    app.processEvents()
+    after = it.maximumWidth()
+    assert isValid(it), "the open group's cards were rebuilt"
     assert after > before, (before, after)
-    app._toggle_group("external")
-    assert int(str(it.cget("width"))) == before
-    assert sc.winfo_exists()
+    long_btn = win._prog_buttons["A Very Long Program Name Indeed"]
+    assert long_btn.text() == "A Very Long Program Name Indeed" and name_fits(long_btn)
+    # two cards side by side fit in the window, no horizontal scrolling
+    assert win.scroll.viewport().width() >= win._inner.minimumSizeHint().width(), \
+        (win.scroll.viewport().width(), win._inner.minimumSizeHint().width())
+    win._toggle_group("external")
+    app.processEvents()
+    assert it.maximumWidth() == before
+    assert isValid(sc)
     print(f"  open/close a group: button width {before} -> {after} -> {before}, same widgets")
 
     # -- moving into an empty group shows its header, moving out hides it --
-    app._move_to_group("Screenshots", "personal")
-    assert app._group_headers["personal"].winfo_manager() == "pack"
-    app._move_to_group("Screenshots", None)
-    assert app._group_headers["personal"].winfo_manager() == ""
+    win._move_to_group("Screenshots", "personal")
+    assert not win._group_toggle_btns["personal"].isHidden()
+    win._move_to_group("Screenshots", None)
+    assert win._group_toggle_btns["personal"].isHidden()
     print("  empty group header appears and disappears with its programs")
 
-    # -- the mouse wheel changes a value only in the field that has focus --
-    # (a class Tk gives no wheel binding has nothing to guard)
-    guard = 'if {[focus] ne "%W"} continue'
-    assert app.bind_class("TCombobox", "<MouseWheel>").startswith(guard)
-    for cls in app._WHEEL_VALUE_CLASSES:
-        script = app.bind_class(cls, "<MouseWheel>")
-        assert not script or script.startswith(guard), (cls, script[:60])
-    print("  wheel guard on value fields")
-
-    assert not toplevels(app), "a dialog is open at the end"
-    app.destroy()
+    assert not dialogs(), "a dialog is open at the end"
+    win.close()
     print("OK")
 
 

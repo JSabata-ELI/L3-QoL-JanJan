@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -24,15 +25,30 @@ from pr_t import PhotoRenamerWidget, load_ui_state, save_ui_state
 _APP_ID_PREFIX = "ELI.PhotoRenamer"
 
 
-def _app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
+def _app_version() -> str:
+    """Version of the running build, e.g. "v1.0.0", or "" when run from source.
+    The builder names every exe "<Program> vX.Y.Z.exe", so the exe's own file
+    name is the one place that always tells the truth."""
+    if not getattr(sys, "frozen", False):
+        return ""
+    m = re.search(r"\s(v\d+(?:\.\d+)*)$", Path(sys.executable).stem)
+    return m.group(1) if m else ""
 
 
 def _icon_file() -> Path | None:
-    p = _app_dir() / "icon.ico"
-    return p if p.exists() else None
+    """icon.ico next to the exe, then the copy bundled inside it (the builder
+    adds it with --add-data), then next to this file."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+    cands.append(Path(__file__).resolve().parent / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
 
 
 def _icon_app_id() -> str | None:
@@ -65,10 +81,62 @@ def _icon_app_id() -> str | None:
     return f"{_APP_ID_PREFIX}.{uuid.uuid4().hex[:12]}"
 
 
+def _nudge_taskbar_icon(hwnd) -> None:
+    """Make the taskbar re-read this window's icon a few times after start.
+
+    Explorer reads a taskbar button's picture once, when it creates the
+    button, and does not ask again by itself. When that one read misses, the
+    button keeps the blank window placeholder for the whole run although the
+    window holds the right icon -- measured on Diagnostic v1.3.4, 15.10.2026:
+    started from C:, a fresh per-launch id, WM_GETICON answering with the
+    magnifier, the button blank. Re-sending the same icon changed nothing;
+    taking the icon away and giving it back made Explorer re-read it, and the
+    same running window drew the magnifier at once. So that is done here a few
+    times while the button may still be appearing (a slow start, a busy
+    Explorer after logon). Runs on a daemon thread; the window's own icon
+    handles are put back, so nothing is created or leaked.
+    """
+    if not hwnd:
+        return
+    import threading
+
+    def run():
+        import ctypes
+        import ctypes.wintypes as wt
+        import time
+        user32 = ctypes.windll.user32
+        send = user32.SendMessageTimeoutW
+        send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT,
+                         wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send.restype = ctypes.c_size_t
+        res = ctypes.c_size_t()
+        for delay in (2, 8, 20, 30):          # at about 2, 10, 30 and 60 s
+            time.sleep(delay)
+            try:
+                if not user32.IsWindow(wt.HWND(hwnd)):
+                    return
+                held = {}
+                for which in (1, 0):          # ICON_BIG, ICON_SMALL
+                    res.value = 0
+                    # SMTO_ABORTIFHUNG: a frozen window just skips this round
+                    if send(hwnd, 0x007F, which, 0, 0x0002, 2000,
+                            ctypes.byref(res)) and res.value:
+                        held[which] = res.value
+                for which in held:
+                    send(hwnd, 0x0080, which, 0, 0x0002, 2000, ctypes.byref(res))
+                for which, h in held.items():
+                    send(hwnd, 0x0080, which, h, 0x0002, 2000, ctypes.byref(res))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="taskbar-icon").start()
+
+
 class PhotoRenamerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Photo Renamer")
+        ver = _app_version()
+        self.setWindowTitle(f"Photo Renamer {ver}" if ver else "Photo Renamer (source)")
         icon = _icon_file()
         if icon is not None:
             self.setWindowIcon(QIcon(str(icon)))
@@ -148,6 +216,7 @@ def main() -> int:
         app.setWindowIcon(QIcon(str(icon)))
     win = PhotoRenamerWindow()
     win.show()
+    _nudge_taskbar_icon(int(win.winId()))
     return app.exec()
 
 

@@ -33,9 +33,9 @@ at, and the box is redrawn from that. A formula may use any row on the list, and
 a formula that cannot be worked out wears a red box and says why it cannot.
 
 THE ORDER IS THE OPERATOR'S (12.10.2026): rows are dragged into place in the
-table (`_RowTable`). The order is the list's — the Overview and the letters
-follow it. Shown rows stay above the "Not shown" line and unticked ones below
-it; a drag moves a row within its own part.
+table (`_RowTable`, its own mouse handling — not Qt's drag and drop). The order
+is the list's — the Overview and the letters follow it. A row dropped on the
+other side of the "Not shown" line changes its Show to match.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ import time
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
                                QDialog, QDialogButtonBox, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QListWidget,
@@ -121,42 +121,173 @@ _HALL_BTN_QSS = (
 class _RowTable(QTableWidget):
     """The limits table, with rows dragged into a new order.
 
-    Qt is never allowed to move the items itself: `dropEvent` works out which
-    table rows were dragged and where to, hands that to `on_drop`, and answers
-    the drag with IgnoreAction — a MoveAction would make Qt clear the source
-    cells behind our back. The tab rewrites the list and rebuilds the table.
+    The move is this table's OWN mouse handling, not Qt's drag and drop
+    (12.10.2026). Qt's drag started, but its drop side refused almost every
+    spot — a cell without `ItemIsDropEnabled`, a selected row — so the drag
+    ended in nothing and all the operator saw was the row the press had
+    picked: "it is working now as selection". So:
+
+    * a left press on a row (no Ctrl / Shift) remembers where it was; the
+      press picks the row as usual, except on a row of a picked GROUP, where
+      the picking waits for the release so the whole group can be dragged;
+    * past the drag distance the mouse moves the rows: the picking does not
+      grow, a blue line shows where they will land, and the table scrolls
+      when the mouse is held near its top or bottom edge;
+    * the release hands (table rows moved, drop row) to `on_drop`. Esc
+      cancels.
+
+    Ctrl / Shift clicks pick rows as before. A row is movable when its cells
+    carry `ItemIsDragEnabled` — the "Not shown" line does not, so it is never
+    dragged, but rows can be dropped either side of it.
     """
+
+    _EDGE_PX = 24                   # the scroll zone at the top and bottom
 
     def __init__(self, rows, cols, parent=None):
         super().__init__(rows, cols, parent)
         self.on_drop = None             # (table rows dragged, drop row) → None
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.viewport().setAcceptDrops(True)
-        self.setDragDropOverwriteMode(False)
-        self.setDropIndicatorShown(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragEnabled(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self._press = None              # viewport point of a press that may move
+        self._deferred = None           # (row, col) picked on release instead
+        self._sources = []
+        self._moving = False
+        self._last_y = 0
+        self._line = QFrame(self.viewport())
+        self._line.setStyleSheet(f"background: {U.ACCENT}; border: 0px;")
+        self._line.hide()
+        self._scroller = QTimer(self)
+        self._scroller.setInterval(40)
+        self._scroller.timeout.connect(self._scroll_step)
 
     def drop_row_at(self, y):
         """The table row a drop at viewport height `y` goes in front of:
         the lower half of a row means after it."""
         t = self.rowAt(y)
         if t < 0:
-            return self.rowCount()
+            return 0 if y < 0 else self.rowCount()
         rect = self.visualRect(self.model().index(t, 0))
         return t + 1 if y > rect.center().y() else t
 
-    def dropEvent(self, ev):
-        if ev.source() is not self or self.on_drop is None:
-            ev.ignore()
+    def movable(self, t):
+        cell = self.item(t, 0) if 0 <= t < self.rowCount() else None
+        return (cell is not None
+                and bool(cell.flags() & Qt.ItemFlag.ItemIsDragEnabled))
+
+    def picked_rows(self):
+        return sorted({i.row() for i in self.selectedIndexes()
+                       if self.movable(i.row())})
+
+    def is_moving(self):
+        return self._moving
+
+    # ── the mouse ──────────────────────────────────────────────────────────
+    def mousePressEvent(self, ev):
+        self._end_move()
+        self._deferred = None
+        plain = not (ev.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                       | Qt.KeyboardModifier.ShiftModifier))
+        pos = ev.position().toPoint()
+        t = self.rowAt(pos.y())
+        if ev.button() == Qt.MouseButton.LeftButton and plain \
+                and self.movable(t):
+            self._press = pos
+            picked = self.picked_rows()
+            if t in picked and len(picked) > 1:
+                # Keep the group picked: it is what a drag would move.
+                self._deferred = (t, max(0, self.columnAt(pos.x())))
+                ev.accept()
+                return
+        else:
+            self._press = None
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._press is not None \
+                and ev.buttons() & Qt.MouseButton.LeftButton:
+            pos = ev.position().toPoint()
+            if not self._moving:
+                if (pos - self._press).manhattanLength() \
+                        < QApplication.startDragDistance():
+                    ev.accept()
+                    return
+                start = self.rowAt(self._press.y())
+                picked = self.picked_rows()
+                self._sources = picked if start in picked else [start]
+                self._moving = True
+                self._deferred = None
+                self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._scroller.start()
+            self._last_y = pos.y()
+            self._place_line()
+            ev.accept()
             return
-        sources = sorted({i.row() for i in self.selectedIndexes()})
-        target = self.drop_row_at(ev.position().toPoint().y())
-        ev.setDropAction(Qt.DropAction.IgnoreAction)
-        ev.accept()
-        if sources:
-            self.on_drop(sources, target)
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._moving:
+            target = self.drop_row_at(ev.position().toPoint().y())
+            sources = list(self._sources)
+            self._end_move()
+            ev.accept()
+            if self.on_drop is not None and sources \
+                    and not self._lands_in_place(sources, target):
+                self.on_drop(sources, target)
+            return
+        deferred, self._deferred, self._press = self._deferred, None, None
+        if deferred is not None:
+            self.setCurrentCell(*deferred)
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def keyPressEvent(self, ev):
+        if self._moving and ev.key() == Qt.Key.Key_Escape:
+            self._end_move()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    # ── while moving ───────────────────────────────────────────────────────
+    @staticmethod
+    def _lands_in_place(sources, target):
+        """One unbroken block dropped onto itself or its own edges."""
+        return (sources == list(range(sources[0], sources[-1] + 1))
+                and sources[0] <= target <= sources[-1] + 1)
+
+    def _place_line(self):
+        target = self.drop_row_at(self._last_y)
+        n = self.rowCount()
+        if n == 0:
+            self._line.hide()
+            return
+        if target < n:
+            y = self.rowViewportPosition(target)
+        else:
+            y = self.rowViewportPosition(n - 1) + self.rowHeight(n - 1)
+        y = max(0, min(self.viewport().height() - 3, y - 1))
+        self._line.setGeometry(0, y, self.viewport().width(), 3)
+        self._line.show()
+        self._line.raise_()
+
+    def _scroll_step(self):
+        bar = self.verticalScrollBar()
+        h = self.viewport().height()
+        if self._last_y < self._EDGE_PX:
+            bar.setValue(bar.value() - 1)
+        elif self._last_y > h - self._EDGE_PX:
+            bar.setValue(bar.value() + 1)
+        else:
+            return
+        self._place_line()
+
+    def _end_move(self):
+        self._moving = False
+        self._press = None
+        self._sources = []
+        self._scroller.stop()
+        self._line.hide()
+        self.viewport().unsetCursor()
 
 
 class ChannelPicker(QDialog):
@@ -223,7 +354,8 @@ class ChannelPicker(QDialog):
 
         def work():
             try:
-                box["names"] = A.fetch_channels(timeout=6.0)
+                # Fresh on every opening: channels added since are offered too.
+                box["names"] = A.fetch_channels(timeout=6.0, refresh=True)
             except Exception as exc:
                 box["error"] = exc
 
@@ -335,11 +467,14 @@ class SettingsTab(QWidget):
         self._group.setExclusive(True)
         self._hall_buttons = {}
         for hall in C.HALLS:
-            btn = QPushButton(hall)
+            # The button says L3 for Int (`ls_core.hall_shown`); the key the
+            # limits are stored under stays "Int".
+            shown = C.hall_shown(hall)
+            btn = QPushButton(shown)
             btn.setCheckable(True)
             btn.setStyleSheet(_HALL_BTN_QSS)
             btn.setToolTip(f"Show and edit the limits that apply while we are "
-                           f"shooting into {hall}.")
+                           f"shooting into {shown}.")
             btn.clicked.connect(lambda _c, h=hall: self._pick_hall(h))
             self._group.addButton(btn)
             switch.addWidget(btn)
@@ -422,6 +557,7 @@ class SettingsTab(QWidget):
             QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setItemDelegate(U.AlignedEditDelegate(self._table))
         for col in _CHECKS:
             self._table.setItemDelegateForColumn(
                 col, U.CenteredCheckDelegate(self._table))
@@ -435,11 +571,14 @@ class SettingsTab(QWidget):
         # window is a grey strip with a heading on it.
         self._fitter = U.ColumnFitter(self._table,
                                       stretch_col=(_C_PV, _C_NAME))
-        # As tall as its rows, no scrollbar of its own: the shot counter's
-        # table sits straight under the last row, and the page scrolls.
+        # The table takes every free pixel of the page's height and scrolls
+        # inside itself when that is not enough (12.10.2026). It was fixed to
+        # the height of its rows, with no scrollbar, and the free height went
+        # to an empty stretch under the shot counter — on a big window the
+        # table stayed small and nothing could make it bigger.
         self._table.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        root.addWidget(self._table)
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        root.addWidget(self._table, 1)
 
         # The shot counter: a table of its own at the very bottom, with
         # headings that say what its settings are (5.10.2026 — "ať se to
@@ -452,13 +591,13 @@ class SettingsTab(QWidget):
             QAbstractItemView.SelectionMode.NoSelection)
         self._shots.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._shots.setItemDelegate(U.AlignedEditDelegate(self._shots))
         for col in (_S_SHOW, _S_BOLD):
             self._shots.setItemDelegateForColumn(
                 col, U.CenteredCheckDelegate(self._shots))
         self._shots.itemChanged.connect(self._shot_edited)
         self._shot_fitter = U.ColumnFitter(self._shots, stretch_col=_S_NAME)
         root.addWidget(self._shots)
-        root.addStretch(1)
 
         self._menu = U.RowMenu(self._table, [
             ("Change the channel", "pencil", self._change_channel),
@@ -503,6 +642,7 @@ class SettingsTab(QWidget):
         # `refresh` skips while the tab is behind another one: catch up now.
         super().showEvent(ev)
         self.refresh()
+        QTimer.singleShot(0, self, self._fit_heights)
 
     # ── filling ────────────────────────────────────────────────────────────
     def _fill_gate(self):
@@ -511,10 +651,11 @@ class SettingsTab(QWidget):
         for hall, btn in self._hall_buttons.items():
             btn.setChecked(hall == self._hall)
         gate = C.gate_for(self._win.shooting(), self._hall)
-        self._gate_box.setTitle(f"Gate valve of {self._hall}")
+        shown = C.hall_shown(self._hall)
+        self._gate_box.setTitle(f"Gate valve of {shown}")
         self._gate_edit.setText(gate.get("open") or "")
         word = "shut" if C.shoot_when(self._hall) == C.CLOSED else "open"
-        tip = (f"We are shooting into {self._hall} while this valve is "
+        tip = (f"We are shooting into {shown} while this valve is "
                f"{word}.\n\nWhat a 1 on this channel means comes from the "
                f"channel's own name: an _IN_OPEN_POSITION channel reads 1 "
                f"while the valve is open, an _IN_CLOSED_POSITION one reads "
@@ -531,12 +672,15 @@ class SettingsTab(QWidget):
         # one paint.
         page = getattr(self, "_page", None)
         page_y = page.verticalScrollBar().value() if page is not None else None
+        table_bar = self._table.verticalScrollBar()
+        table_y = table_bar.value()
         current = (self._table.currentRow(), self._table.currentColumn())
         self.setUpdatesEnabled(False)
         try:
             self._reload()
             if 0 <= current[0] < self._table.rowCount():
                 self._table.setCurrentCell(*current)
+            table_bar.setValue(table_y)
             if page_y is not None:
                 bar = page.verticalScrollBar()
                 bar.setValue(page_y)
@@ -678,15 +822,19 @@ class SettingsTab(QWidget):
         it says and when it is a cross is fixed (`ls_core.dm_judge`)."""
         base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         rule = (f"Which saved set-up the deformable mirror is on, read off the "
-                f"Set-up grid by OPR1 (DM settings tab).\n\n"
+                f"Applied voltages grid by OPR1 (DM settings tab).\n\n"
                 f"A cross, and the hall blinks, when a fresh SBW4 shot "
                 f"contradicts it:\n"
-                f"    over {C.DM_SPLIT_J:g} J while on a set-up not ticked "
-                f"High power\n"
-                f"    {C.DM_SPLIT_J:g} J or less — or the "
+                f"    over {C.DM_SPLIT_J:g} J while the set-up on the mirror "
+                f"does not have High power ticked\n"
+                f"    {C.DM_SPLIT_J:g} J or less, {C.LP_STREAM_N} or more "
+                f"shots in {C.LP_STREAM_S:g} s — or the "
                 f"{C.DM_SHUTTER_NAME} shutter open "
-                f"with no shot over {C.DM_SPLIT_J:g} J — while on a set-up not "
-                f"ticked Low power\n"
+                f"with no shot over {C.DM_SPLIT_J:g} J for "
+                f"{C.HP_HOLD_S:g} s — while the set-up on "
+                f"the mirror does not have Low power ticked\n"
+                f"One or two shots of {C.DM_SPLIT_J:g} J or less are a "
+                f"trigger, not low power: they change nothing.\n"
                 f"Which set-ups are ticked is chosen on the DM settings tab.\n"
                 f"No fresh shot: a tick.")
         pv = self._table.item(i, _C_PV)
@@ -1175,18 +1323,38 @@ class SettingsTab(QWidget):
             if hook is not None:
                 hook()
 
+    # The limits table never gets shorter than this many rows; below that the
+    # page scrolls instead.
+    _MIN_ROWS = 6
+
     def _fit_heights(self):
-        """Both tables exactly as tall as their rows, so the shot counter's
-        sits straight under the last channel and nothing scrolls inside a
-        table — the page scrolls instead."""
+        """The shot counter's table exactly as tall as its one row; the limits
+        table at least `_MIN_ROWS` rows tall and otherwise as tall as the
+        page lets it be (its layout stretch does that), scrolling inside."""
         for table in (self._table, self._shots):
             height = table.horizontalHeader().sizeHint().height()
-            for r in range(table.rowCount()):
-                height += table.rowHeight(r)
+            n = table.rowCount()
+            if table is self._table:
+                n = min(n, self._MIN_ROWS)
+                row_h = (table.rowHeight(0) if table.rowCount()
+                         else table.verticalHeader().defaultSectionSize())
+                height += max(1, n) * row_h
+            else:
+                for r in range(n):
+                    height += table.rowHeight(r)
             bar = table.horizontalScrollBar()
             if bar.isVisible():
                 height += bar.sizeHint().height()
-            table.setFixedHeight(height + 2 * table.frameWidth())
+            height += 2 * table.frameWidth()
+            if table is self._table:
+                table.setMinimumHeight(height)
+            else:
+                table.setFixedHeight(height)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        # A width change can bring a table's horizontal scrollbar in or out.
+        QTimer.singleShot(0, self, self._fit_heights)
 
     def _add(self):
         dlg = ChannelPicker(self)

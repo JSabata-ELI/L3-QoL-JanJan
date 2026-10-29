@@ -2,7 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05  (cal.py, 1109 lines)
+Verified against source: 2026-10-15  (cal.py, 1259 lines)
+  Program folder: 124 kB in 5 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: Readme_calibrations.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

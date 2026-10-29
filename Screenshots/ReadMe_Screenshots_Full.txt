@@ -2,7 +2,9 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05  (s.py, 5472 lines)
+Verified against source: 2026-10-16  (main.py and the four ssq_*.py)
+  PySide6 since 16.10.2026; it replaced the Tk version (s.py) with the
+  same rules for picking, naming and copying.
 -----------------------------------------------------------------
 Short version: ReadMe Screenshots.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -126,7 +128,11 @@ from then on the same set is one button.
     button to see the cameras in it.
 
     Presets are toggles, and the active ones are highlighted. "Clear
-    all" resets cameras, monitors and presets together.
+    all", the red button at the bottom right of the Presets box,
+    resets cameras, monitors and presets together.
+
+    "Config presets" sits at the end of the Auto row, to the right of
+    Start live.
 
 3.5 CAMERAS PRESELECT THEIR MONITORS
 
@@ -238,9 +244,9 @@ appear in it as they are copied.
 
 5.1 THE DESTINATION
 
-    Pick a folder with the picker, or type or paste a path — network
+    Pick a folder with Browse, or type or paste a path — network
     paths are accepted. The default is the scratch share. The folder
-    button opens the destination in Explorer.
+    button next to Browse opens the destination in Explorer.
 
 5.2 FILE NAME OR FOLDER NAME
 
@@ -409,22 +415,24 @@ appear in it as they are copied.
     Hover a thumbnail for a larger popup; click it to open the
     editor. There you get, for that one image:
 
-      zoom, contrast and brightness with their Autos and ↺, gamma
-      with its ↺, palette
-      crop, with a preview of the crop and a Clear crop
-      drawing: freehand, straight line, rectangle, with a choice of
-              colour and thickness
+      contrast and brightness with their Autos and ↺, gamma with
+      its ↺; on the second row zoom, palette, Clear crop, Apply and
+      Revert
+      crop, dragged with the right mouse button, shown as a dashed
+              green box
+      drawing: rectangle, circle, cross or freehand, with a choice
+              of colour and thickness
       Undo, Clear drawing
-      Apply / Revert
 
-    The 🔍 Zoom tool only magnifies the dragged area — it never sets
-    the crop. The crop is set with the right mouse button alone.
+    The Zoom drawing tool only magnifies the dragged area — it never
+    sets the crop. The crop is set with the right mouse button alone.
     Drawings stay put when you zoom in and out, and the editor opens
     again at the zoom you applied.
 
     Everywhere in the program, the mouse wheel changes a drop-down
-    list or a number box only after you have clicked into it. Over a
-    box you have not clicked, the wheel just scrolls the page.
+    list, a number box or a slider only after you have clicked into
+    it, and only while the pointer is over it. Over a box you have not
+    clicked, the wheel just scrolls the page.
 
 6.4 WHAT SAVE ACTUALLY WRITES
 

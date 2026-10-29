@@ -125,10 +125,62 @@ def _icon_app_id(prefix, ico_path):
     return f"{prefix}.{uuid.uuid4().hex[:12]}"
 
 
-# Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
-# here. Measured on Win11 with the window icon and the window-class icon set to
-# two different pictures, the taskbar draws the WINDOW icon, so setWindowIcon is
-# already enough. That helper is only needed for the Tk programs.
+def _nudge_taskbar_icon(hwnd) -> None:
+    """Make the taskbar re-read this window's icon a few times after start.
+
+    Explorer reads a taskbar button's picture once, when it creates the
+    button, and does not ask again by itself. When that one read misses, the
+    button keeps the blank window placeholder for the whole run although the
+    window holds the right icon -- measured on Diagnostic v1.3.4, 15.10.2026:
+    started from C:, a fresh per-launch id, WM_GETICON answering with the
+    magnifier, the button blank. Re-sending the same icon changed nothing;
+    taking the icon away and giving it back made Explorer re-read it, and the
+    same running window drew the magnifier at once. So that is done here a few
+    times while the button may still be appearing (a slow start, a busy
+    Explorer after logon). Runs on a daemon thread; the window's own icon
+    handles are put back, so nothing is created or leaked.
+    """
+    if not hwnd:
+        return
+    import threading
+
+    def run():
+        import ctypes
+        import ctypes.wintypes as wt
+        import time
+        user32 = ctypes.windll.user32
+        send = user32.SendMessageTimeoutW
+        send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT,
+                         wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send.restype = ctypes.c_size_t
+        res = ctypes.c_size_t()
+        for delay in (2, 8, 20, 30):          # at about 2, 10, 30 and 60 s
+            time.sleep(delay)
+            try:
+                if not user32.IsWindow(wt.HWND(hwnd)):
+                    return
+                held = {}
+                for which in (1, 0):          # ICON_BIG, ICON_SMALL
+                    res.value = 0
+                    # SMTO_ABORTIFHUNG: a frozen window just skips this round
+                    if send(hwnd, 0x007F, which, 0, 0x0002, 2000,
+                            ctypes.byref(res)) and res.value:
+                        held[which] = res.value
+                for which in held:
+                    send(hwnd, 0x0080, which, 0, 0x0002, 2000, ctypes.byref(res))
+                for which, h in held.items():
+                    send(hwnd, 0x0080, which, h, 0x0002, 2000, ctypes.byref(res))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="taskbar-icon").start()
+
+
+# Note: setting the window-CLASS icon (SetClassLongPtr) does nothing for a Qt
+# app -- measured on Win11, the taskbar draws the WINDOW icon, so setWindowIcon
+# is what sets the picture. The one WM_SETICON use that does matter is the
+# re-read in _nudge_taskbar_icon() above, which only takes the window's own
+# icon away and gives it back.
 
 
 class AnnouncerWindow(QMainWindow):
@@ -711,6 +763,7 @@ def main():
 
     win = AnnouncerWindow()
     win.show()
+    _nudge_taskbar_icon(int(win.winId()))
     code = app.exec()
     sys.exit(code)
 

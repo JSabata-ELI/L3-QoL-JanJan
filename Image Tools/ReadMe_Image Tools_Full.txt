@@ -2,9 +2,12 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19
-  (main.py 283 lines, if_t.py 8821, is_t.py 24345, sf_t.py 4080,
-   wk_t.py 7281, cpva_client.py 1335, img_scale.py 673)
+Verified against source: 2026-10-15
+  (main.py 660 lines, is_t.py 35839, if_t.py 15940, wk_t.py 8943,
+   sf_t.py 7389, cpva_client.py 2343, daypicker.py 1083,
+   img_scale.py 857, slider_tabs.py 644,
+   sort_by_camera.py 120; 73818 lines in all)
+  Program folder: 10.7 MB in 19 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: Readme Image Tools.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -27,6 +30,14 @@ GENERAL NOTES
   - Daily CSV files (the fallback for older days): Z:\Salvation or
     the same folder on the scratch share.
   - CPVA archiver: https://10.78.0.57:8443 (SSL cert not verified)
+  - The PV search in every tab also finds the channels of the L3 beam
+    transport (L3BT) and facility (FCT) archives on 10.78.0.64 (twin
+    .65); a channel only they have is read from them.
+  - If the CPVA archiver cannot be reached at all, PV values are read
+    from its backup, the L3 proxy on 10.78.0.64 (twin .65), which
+    serves the same archive. The program stays on the backup for a
+    minute, then tries the archiver again. A slow archiver is not a
+    reason to switch: the backup reads the same data just as slowly.
   - Supported image formats: PNG, TIFF, JPG, BMP
   - 16-bit PNGs are stored scaled onto 65535 (the archiver multiplies
     raw counts by 65535/(2^bits - 1), with the bit count taken from
@@ -112,8 +123,9 @@ REFERENCE DAY
   - Pick one day as the reference and every other tile shows how
     far it differs from that day. That is the quickest way to see
     when something drifted.
-  - Right-click a day to make it the reference, right-click again
-    to drop it. The reference day itself stays shown as it is.
+  - Pick it from "Reference day" at the top of the Comparison group,
+    or right-click a day to make it the reference and right-click
+    again to drop it. The reference day itself stays shown as it is.
 
 SAVING THE VIEW
   - "Save view" writes the WHOLE view into one file — every row
@@ -148,22 +160,25 @@ THE DAY-BY-DAY TAB
     horizontal line.)
   - When a day carries several picks — four marked regions, or five
     picked moments — they sit side by side inside each camera's row,
-    that day owning one column per pick, and the banner says how
-    many. (Before, all four shared one slot and three of them were
+    that day owning one column per pick, and the camera's name says
+    how many. (Before, all four shared one slot and three of them were
     painted underneath the fourth.)
   - FOUR DAYS FILL THE WINDOW and the rest are off to the right:
     scroll sideways for them, and down for more cameras. Dividing the
     window by however many columns there are, which is what it did,
     turned twelve of them into twelve slivers a couple of centimetres
     wide, and a picture that size answers nothing.
-  - The grey banner runs the whole width of the row and names the
-    CAMERA, plus how many days its line reaches across. The name
-    stays at the left of the window however far you scroll sideways —
-    otherwise the row stops saying which camera it is. The day and the
-    time are written under each picture.
-  - About three rows fill the window and then it scrolls, and a plain
-    mouse wheel steps a WHOLE CAMERA per notch. Ctrl+wheel still
-    zooms.
+  - The CAMERA's name sits on a small plate at the left end of the
+    row's label line, the same line that carries the day and the time
+    under each picture — no separate band over the row, so the
+    pictures get that height. The name stays at the left of the
+    window however far you scroll sideways, and "Label size" makes it
+    bigger or smaller together with the day and time labels.
+  - About three rows fill the window and then it scrolls. When there
+    are more days than fit, a plain mouse wheel steps a WHOLE DAY
+    sideways per notch: wheel down goes right, wheel up goes left.
+    When every day fits, the wheel steps a WHOLE CAMERA down or up
+    instead. Ctrl+wheel still zooms.
   - Within one camera and one day the pictures are ordered BY TIME —
     the time of the picture that was found, whether a click or a
     marked stretch found it. A clicked moment and a marked stretch
@@ -384,11 +399,22 @@ PV SEARCH
     selected camera — three regions on a day give three pictures,
     not one.
 
-  - BY A NUMBER INSTEAD. Tick "Find the first moment a PV was...",
-    choose the value, the comparison (above / at or above / below /
-    at or below / between) and the number. The search then looks for
-    the FIRST moment the condition held and takes that one moment
-    from every camera, so the pictures really are of the same shot.
+  - BY A NUMBER INSTEAD. Tick "Each day, the first moment a PV
+    was...". Under it there is one row for every PV ticked in "PVs to
+    plot", formulas included (for example "compressed SBW4"). No row is
+    ticked to begin with; the rows can be ticked once "Each day, the
+    first moment a PV was..." is on. Tick the
+    rows you want and give each its comparison (above / at or above /
+    below / at or below / between) and number. When several rows are
+    ticked, ALL of them must hold at the same moment ("SBW4 at or
+    above 13 AND PTM1 above 3"). A PV that is unticked and ticked
+    again keeps its row as it was left. On EVERY marked day
+    the search looks for the FIRST moment the condition held — inside
+    that day's marked regions, or its Time window when none are
+    marked — and takes that one moment from every camera, so the
+    pictures of one day really are of the same shot. Twelve days give
+    up to twelve pictures per camera; the days where it never happened
+    are listed when the search ends.
     It only accepts a moment where the cameras were recording
     something, judged by each camera's own TotalPower; if no moment
     had all of them live it takes the first where some were, and
@@ -433,17 +459,46 @@ PV SEARCH
     even if you did not tick it, and the line BREAKS wherever one of
     those is missing rather than being drawn straight across the gap.
     A formula that cannot be worked out says why, on its row and on
-    the status line, instead of just not appearing. A formula is not
-    offered as the value to search BY: the peak inside a region and
-    "the first moment X was above Y" are asked of the archiver, and a
-    formula is not in the archive.
+    the status line, instead of just not appearing. A formula with no
+    unit of its own that is built on ONE value is drawn in that value's
+    unit — "compressed SBW4" (SBW4 x 0.749) sits on the joules scale
+    beside SBW4, as a lower curve. On a scale of its own it lay exactly
+    under the SBW4 curve and could not be seen. A formula CAN be used
+    in the condition rows (see "BY A NUMBER INSTEAD"); it is not
+    offered as "Primary (peak)", which is asked of the archiver.
+
+  - TICKING VALUES IS QUICK. What was read stays read: unticking a
+    value only redraws, ticking one reads just that value, and the
+    graph waits until you stop clicking (about half a second), so
+    several ticks in a row are one load and one redraw.
+    SIDE BY SIDE. Up to three values are read at once, and each is
+    drawn the moment it arrives — a slow PTM1 no longer keeps SBW4 off
+    the graph. The status line says what is still coming ("Loading
+    PAP1 (2/4)…"). The window stays clickable the whole time: values
+    are read in two-hour pieces, so ticking, unticking, the condition
+    rows and the days all work while the graph is still loading. A day
+    of hundreds of thousands of samples does not freeze the window
+    either: the graph draws the lowest and highest value of every pixel
+    column, so every spike is still there, and zooming in draws every
+    sample again.
+    EVERY TICKED VALUE IS IN THE LEGEND. A ticked value with no curve
+    says why, next to its name: "loading…", "no data in these hours"
+    or "archiver did not answer".
+
+  - ONLY THE PICKED TIME. The window reads and shows each day from
+    the time picked for it in the Time window (07:00–21:00 unless you
+    set it otherwise), not the whole day — the same hours the search
+    itself looks at. A day added in this window's own calendar gets
+    07:00–21:00. In "All days" each day is that window wide, so the
+    night is not on the axis at all.
 
   - THE STRIP UNDER THE GRAPH is the graph's settings: Grid, Legend,
     Log Y, "Y range" (type the two numbers, or leave them empty for
     automatic), "Time range" (part of one day, as two clock times),
-    "Ticks" (minutes between the time labels), "Whole day" (undo
-    every zoom and hand-set range), "Copy" (the graph to the
-    clipboard) and "Save" (the graph as a PNG).
+    "Ticks" (minutes between the time labels), "Whole window" (undo
+    every zoom and hand-set range, back to the day's picked time),
+    "Copy" (the graph to the clipboard) and "Save" (the graph as a
+    PNG).
 
   - EVERYTHING YOU PICKED, IN ONE TABLE. Under the graph is one
     list of the moments AND the marked stretches together, in time
@@ -588,6 +643,14 @@ LAYOUT TABS
     × on a tab closes it; the last tab cannot be closed.
     Double-click a tab's name to rename it (Enter or a click elsewhere
     keeps the new name). Tabs can be dragged into another order.
+  - Right-click a tab (20.10.2026): New tab, Duplicate, Rename, Move
+    left, Move right, Close, Close other tabs (asks first). Duplicate
+    puts "<name> (copy)" right after the tab with the same cameras and
+    time window (or live); the arrangement follows from the cameras.
+    Zoom and marks are not copied. Right-click on the empty part of
+    the row offers New tab only.
+  - The tab on screen is light blue with a thick dark-blue rim; the
+    others are white with a thin grey rim (20.10.2026).
   - Only the tab on screen works. A hidden tab sleeps:
       * no reads from the share, no drawing, no machine-value fetches,
         no preview preload, no playback;
@@ -609,14 +672,18 @@ LAYOUT TABS
   - F11 (focus mode) and Ctrl+F11 (watcher mode) act on the tab on
     screen. Watcher mode also hides the layout tabs.
   - Where the layout tabs are (05.10.2026): in the main tab row, right
-    after "Workshop" (a thin line separates them), with "+" after the
-    last one. They show only while the Image Slider is the main tab on
-    screen.
+    after "Workshop", as small chips on a light grey strip, with "+"
+    after the last one.
+    They show only while the Image Slider is the main tab on screen.
   - Remembered on close (in %APPDATA%\ELI_ImageTools\slider_tabs.json):
     the tab names and order, the tab that was open, and for each tab
     its cameras, time window and the picture on screen. The camera
     ARRANGEMENT comes back through the saved camera layouts as before.
-      * a live tab comes back live: this hour to the end of today;
+      * a live tab comes back live on today's current hour (e.g.
+        14:00–15:00); later hours come in through live mode. The same
+        when live mode reaches a new day: the first picture of the day
+        at 7:30 gives 7:00–8:00, and only ever onto today. The program
+        never sets "to 23:59" by itself (27.10.2026).
       * a recorded tab comes back on the same period and picture;
       * a single folder opened by hand comes back as that folder;
         pictures handed over by another tab (copied to a temporary
@@ -669,7 +736,20 @@ LOADING IMAGES
     browsing must not stall on it.
   - Refresh (⟳) reloads new frames without resetting position.
   - Live mode (⇢) jumps to the newest frame automatically; green =
-    on, red = off. Turns off when you move the slider manually.
+    on, red = off. Turns off the moment you move through time
+    yourself, however you do it: dragging a slider, the mouse wheel,
+    the arrow keys, clicking beside the handle, the frame arrows, or
+    jumping to a saved timestamp or a trip. (Before 21.10.2026 only a
+    drag did it, so the wheel or a jump left live running and the next
+    picture pulled the view back to the newest one.)
+  - While live mode runs, only the newest 3600 pictures per camera are
+    kept in memory (about 6 minutes for a camera taking 10 a second).
+    Turning it off reads the rest back from the share, which takes a
+    few seconds. When that is done the view stays on the moment you are
+    looking at by then — it used to go back to the moment live mode was
+    turned off — and every camera is put on the main camera's moment
+    again. Until then a fast camera may not move with the main one into
+    the past, simply because its older pictures are not loaded yet.
   - EVERY camera updates on every shot. The camera whose radio button
     is ticked (the main one) sets the moment the grid is showing, and
     the others are put on that same moment. A camera that receives a
@@ -700,6 +780,12 @@ PREVIEW PRELOAD
     from memory instead of reading the share frame by frame. The
     frame you stop on is then re-rendered at full resolution.
     Progress is shown next to the frame info and hides when done.
+  - Every way of stopping ends at full resolution, camera by camera as
+    each one's read finishes (27.10.2026): releasing a slider, but also
+    the arrow keys, the mouse wheel and the frame buttons, a zoomed
+    tile and the Binary palette. Before, those last ones could leave a
+    tile at grid size for good, and a slow read of the small picture
+    that arrived late could replace the sharp one.
   - Turn it off to keep all the share bandwidth for the frame you are
     looking at; the slider then loads on demand and lags on stretches
     it has not read yet.
@@ -764,6 +850,21 @@ PLAYBACK
     after you click one. Ctrl+F11 — watcher view: edge-to-edge, for a
     wall display; the PV panel stays above the cameras there too. ESC
     or the same key returns.
+  - Double-click a camera (26.10.2026): that one camera moves into a
+    window of its own — focus mode for one camera — and the other
+    cameras stay in the Slider, spread over the space it left. The
+    window still plays live. Drag it anywhere to move it, drag its edge
+    to make it bigger or smaller, drag with the RIGHT mouse button over
+    the picture to zoom into that part, middle-click to zoom back out.
+    A double-click inside the window, ESC, F11 or Alt+F4 puts the
+    camera back into its place. Several cameras can be out at once.
+    Each camera's window opens where you left it last time. A new time
+    window keeps the camera out. Starting focus mode (F11 in the main
+    window) or watcher view brings the lifted-out cameras back first.
+    The double-click does not change which cameras are selected. While
+    a drawing tool (Cross / Circle / Square) is armed, a double-click on
+    the picture stays a drawing click. (Until 26.10.2026 the
+    double-click filled the whole monitor with that one camera.)
 
 DISPLAY OPTIONS
   - WHICH CAMERAS A DISPLAY SETTING HITS (several cameras on screen):
@@ -810,6 +911,11 @@ DISPLAY OPTIONS
     pixels instead of averaging them, since the average of two cycle
     colours is a third, unrelated one and averaging turned the picture
     into grey mush. Expect it to look grainy — that grain is the data.
+    In live mode (26.10.2026) a Binary camera is read at full size
+    straight away: at 3.3 Hz it used to show a small first picture —
+    which on Binary is not just blurry but wrongly coloured — and the
+    full one half a second later. Drawing a Binary or False Colors frame
+    also got about six times faster.
     Rainbow goes blue to red with a wide green
     middle, black at 0 and white at 255.
     False Colors was MEASURED against the real NI viewer (October 2026)
@@ -929,8 +1035,18 @@ DISPLAY OPTIONS
         moment the box was unticked, and because the INFO panel sits
         ABOVE the settings column the whole column - the Subtraction
         checkbox included - jumped about 110 px up under the cursor.)
-        They go away when the REFERENCE goes: Remove ref, a new
-        reference, or a new scan.
+        They go away when the REFERENCE goes: Remove ref or a new
+        reference.
+      · A REFERENCE STAYS UNTIL THE PROGRAM IS CLOSED (26.10.2026).
+        Pick a reference at 8:30, then open a time window without
+        8:30 in it: the reference is still there, on the same camera,
+        with its green "Ref:" strip. It is remembered by camera name,
+        so it follows its camera whatever the order or the set of
+        cameras. Only Remove ref or closing the program forgets it.
+      · CHANGING THE DIFF THRESHOLD OR OFFSET MOVES NOTHING
+        (26.10.2026). The old numbers and histograms stay in place,
+        in amber with "...", until each camera's new ones arrive, so
+        the settings column under the cursor stays still.
       · THE HISTOGRAM STAYS EVEN WHEN NOTHING DIFFERS. On the
         reference frame itself the difference is zero everywhere, and
         the picture is then drawn as an empty box with its 0-255 axis
@@ -1076,24 +1192,39 @@ OVERLAYS
     moving or resizing a turned mark keeps its angle, and a turned box
     is resized along its own turned edges. The angle travels with the
     mark to the other marked cameras and into every saved picture.
-  - "⚙ Overlay settings" (each shape has its own rows):
-      color, thickness (and the cross's size);
+  - "⚙ Overlay settings" — one section each for Crosses, Circles and
+    Squares (rebuilt 20.10.2026). Each section starts with "Apply to",
+    and EVERYTHING below it is for that choice:
+      "All crosses – all cameras" (the default) — every cross on every
+      camera, and the look new crosses get; this is also the look
+      saved pictures use;
+      "All crosses – selected camera(s)" (only while cameras are
+      selected) — the crosses of the selected cameras only;
+      "Cross 1", "Cross 2", … — that one mark. It keeps its own look
+      (colour, thickness, size, outline) when it is moved, turned or
+      copied to other cameras, and in every saved picture. Setting
+      "All crosses – all cameras" again gives it back the common look.
+    While this window is open every mark on the pictures carries a
+    small white number tag — the same 1, 2, … — so you can see which
+    mark "Cross 2" is. Switching "Apply to" keeps what you already
+    changed for the previous choice; OK keeps it all, Cancel undoes it
+    all. The fields:
+      color, thickness;
+      size (crosses: arm length from the centre) — width and height
+      (circles, squares: in pixels of the camera picture, about the
+      mark's centre; shown only when such marks are drawn);
       outline — "On", its colour (black by default) and width in px
       on EACH side of the line. It is a rim under the line, so the
       mark stays visible on a blown-out beam and on a black field. On
       by default, 1 px. Drawn on screen and in every saved picture;
       on a large saved frame it grows with the line;
-      angle — a list ("All crosses", "Cross 1", "Cross 2", …) picks
-      which mark turns, the box beside it gives the angle in degrees,
-      counter-clockwise. The marks turn while you type; Cancel puts
-      them back. While this window is open every mark on the pictures
-      carries a small white number tag — the same 1, 2, … as in these
-      lists — so you can see which mark "Cross 2" is.
-    "All marks angle" turns every cross, circle and box at once. The
-    turns act on the cameras the overlay controls act on, or on every
-    camera with "Apply to all cameras" ticked. Colours, thicknesses
-    and outline are REMEMBERED between runs, and a camera opened for
-    the first time draws its marks in that remembered look.
+      angle in degrees, counter-clockwise — the marks turn while you
+      type (shown only when such marks are drawn).
+    No number has a made-up upper limit any more (the old "max ~"
+    hints were wrong for large frames). "All marks angle" at the
+    bottom turns every cross, circle and box on every camera at once.
+    The common look is REMEMBERED between runs, and a camera opened
+    for the first time draws its marks in it.
   - Overlay settings for the PV panel: configure size, opacity, and
     limits.
   - Overlays can be burned into exported images ("Save with overlay").
@@ -1112,15 +1243,53 @@ OVERLAYS
     columns and drag individual lines. Every line is stored as an
     absolute position in the image, so moving one does not shift the
     others, and cameras of the same type share one configuration.
-  - PCW3_NF carries the permanent reference square that is set on the
-    camera itself. The camera screen draws that square, but it is not
-    written into the stored picture, so the Slider draws it back on.
-    It is on from the start; right-click the picture to switch it off
-    or to nudge its edges, and the position is remembered. It is drawn
-    on screen only — a picture you save stays the plain stored frame.
-  - Right-clicking a picture opens settings ONLY on those cameras: the
-    diodes and PCW3_NF. Elsewhere there is nothing to set, so nothing
-    opens. Right-click and DRAG still zooms on every camera.
+    The window (26.10.2026) shows "Show grid" and the grid preview
+    first; the rest is in two folding groups, closed at the start:
+    "Grid layout" (Columns, Rows, Reverse columns, Equal columns /
+    rows) and "Lines and labels" (line width, transparency and colour,
+    label size, transparency, colour and outline). Click a group's
+    bar to open or close it; it stays that way until the program is
+    closed.
+  - REFERENCE FRAMES (26.10.2026). The camera program draws white
+    reference frames on its live screen (where the beam belongs), but
+    they are not written into the stored picture, so the Slider draws
+    them back on. Every camera can have several. Right-click the
+    picture (or right-click the camera's name bar -> "Reference
+    frames") to open the "Reference frames" window:
+      * The table lists the camera's frames: a Show tick, the name, where
+        it came from ("By hand" or "Camera window" with the date and
+        time it was read) and its colour. Tick the ones you want on the
+        picture; several can be shown at once, each in its own colour.
+        A tick is saved the moment you click it.
+      * "Add by hand" adds a new frame (a copy of the selected one, or
+        the middle of the picture). Set its edges, line width, opacity
+        and colour under the table.
+      * "Read from camera window" photographs the camera program's
+        window on THIS computer and adds the white frame it shows as a
+        new row. The window is found by the camera's name in its title
+        ("Automatic"); if its title does not say the camera, pick the
+        window in the "Camera window" list ("Refresh list" lists the
+        open windows again). The camera program must be open and not
+        minimised. If it is not open on this computer, the window says
+        "The window of camera ... was not found on this computer" and
+        nothing is added. Before the frame is added you see the
+        photographed window: the camera picture in blue and the frame
+        found in red. If the blue box is wrong, drag over the camera
+        picture with the mouse and it is read again (that area is
+        remembered for the camera). The camera program is assumed to
+        show the whole frame, not zoomed in.
+      * "Rename" (or double-click a name) and "Delete" (asks first).
+      * NOTHING IS OVERWRITTEN: every read and every "Add by hand" is a
+        new row. Renames, deletes and moved edges wait for OK; Cancel
+        puts everything back.
+    PCW3_NF keeps its hand-measured square as the frame "Measured by
+    hand" — its saved position, style and on/off state are taken over
+    unchanged; "Reset to measured default" puts that one back to the
+    measured position. Frames are drawn on screen only — a picture you
+    save stays the plain stored frame.
+  - Right-clicking a picture opens the diodes' measuring grid on the
+    diodes and the "Reference frames" window on every other camera.
+    Right-click and DRAG still zooms on every camera.
   - MIDDLE-CLICK a picture and that camera shows the whole frame
     again. It undoes the zoom on the camera you clicked and on no
     other one, whether that camera is selected or not — the "Reset
@@ -1659,6 +1828,11 @@ PVs
     stays listed in the table with its number — hiding is about the
     picture, not about the reading. The burn-in follows the eye, so a
     saved file shows what the screen showed.
+  - MASTER EYE — the eye in the table's header, above the eye column
+    (20.10.2026; Image Slider and Image Finder). One click hides every
+    PV (and the shot counter) on the picture; the next click brings
+    back exactly the ones that were shown before. A double-click shows
+    all of them. The header shows 🚫 while nothing is shown.
   - SHOT COUNTER — the last row of the PV table, always there, and
     shown on the PV panel over the picture (its eye works like a PV's).
     In live mode it counts shots (rewritten 06.10.2026). It keeps
@@ -1680,6 +1854,14 @@ PVs
         the shot rate is the one most cameras repeat at, and a moment
         is a shot when at least half of the cameras on that rate saw it
         (one camera alone: each of its pictures).
+      · Low power (13.10.2026): the archiver answers, but the energy
+        meters read only noise — no pulse. Once the cameras have gone on
+        for 7 shots (at least 10 s) past the last pulse, the cameras
+        decide as above, shot by shot. When a camera that saw the last
+        shots stops while others go on, the laser has stopped: nothing
+        more counts until it comes back. Limit: with only a camera that
+        runs free at the shot rate open (PD1M1DF & co.), a laser that is
+        off looks exactly like low power, and its pictures count.
     Checked against a real half hour (06.10.2026 12:30–13:00, 13
     cameras): 176 of 176 shots, whichever camera was on screen.
     Every camera writes its files with its own small delay; the counter
@@ -1804,6 +1986,28 @@ PVs
     exact moment and whether it was taken before or after the picture;
     and the grey dot when even that is too far, with the reason in
     the tooltip too.
+  - LIVE MODE IS A FEED, NOT A PAIRING (13.10.2026). Following the live
+    edge (Live mode on, newest frame shown) the PV values are the
+    NEWEST the archiver holds, read about once a second
+    (PV_LIVE_POLL_MS), and they are NOT matched to the picture on
+    screen: they may belong to a shot a second or two earlier or later.
+    The camera stores ~3 frames/s and the archiver answers in 1-7 s
+    from the office, so matching every live frame left the numbers
+    seconds behind and the dots lit all the time. No dot in live mode;
+    red until the first answer; grey when the archiver has not answered
+    for 20 s (PV_LIVE_STALE_S), the tooltip says since when. A value
+    nothing was written for in the last 60 s (a setting such as GDD)
+    is the last value written.
+    The moment the view leaves the live edge — an arrow, the slider,
+    Live mode off — every value is matched to its own frame exactly, as
+    described below. A picture saved with its values (burned-in bar)
+    always gets that frame's own values, in live mode too.
+  - WRITTEN ONLY ON CHANGE (13.10.2026). The archiver writes a sample
+    only when the value changes (SBW4 with the laser off flips between
+    two noise levels at irregular gaps; GDD can sit for hours). So a
+    frame with nothing inside its own window reads the last sample
+    before it, as its own value and with no dot, once the archiver's
+    own clock (its HTTP Date header) is 1 s past the frame's window.
   - HOW TO READ A VALUE — A DOT, NOT WORDS (05.10.2026). The panel over
     the picture, the PV table in the side panel and a burned-in bar
     show the number and, next to it, a coloured dot for its state:
@@ -1932,7 +2136,12 @@ ALARM LIMITS AND TRIPS
       · The list holds the last 50 and scrolls; it never grows past
         about four rows of the panel.
       · Every trip also writes a line to image_tools_diag.log.
-  - A CAMERA THAT STOPS DELIVERING leaves the same kind of line —
+  - A CAMERA THAT STOPS DELIVERING NO LONGER TRIPS (26.10.2026).
+    The trip list is for the energy limits only. A camera fault
+    still shows on the tile's red refresh dot and its tooltip. The
+    rest of this paragraph describes the switched-off behaviour
+    (CAM_FAULT_TRIPS = False in is_t.py brings it back).
+    It left the same kind of line —
     live mode only, for the same reason plus one of its own: outside
     live mode nothing is supposed to be refreshing, so "not
     refreshing" is not a fault. It leaves a line so a
@@ -2117,11 +2326,22 @@ PVs
   - Every PV whose EYE is open gets a row under the button. Shut the
     eye and the PV stays in the list for later but has no row here,
     so it is neither searched on nor shown.
-  - On a row: tick it to SEARCH by it, and type the target value and
-    the ±tolerance beside it. Leave it unticked and its value is only
-    reported in the results and on the pictures.
-  - The value and the tolerance you type stay put when you open the
-    picker again to add another PV.
+  - On a row: tick it to SEARCH by it. The box on the right of the
+    name says how the band is given, and the line under the name
+    holds its numbers:
+      "± value"    target ± tolerance (the old way)
+      "± %"        target ± a percentage of the target
+      "from – to"  a range, both ends included; typed the wrong way
+                   round it is swapped for the search (and marked)
+      "above"      this value or more
+      "below"      this value or less
+    Switching between them keeps the same band where it can: 20 ± 2
+    becomes 18 – 22 and back. Leave the row unticked and its value
+    is only reported in the results and on the pictures.
+  - "Δ from target" is measured from the target, from the middle of
+    a range, or from the one limit of "above" / "below".
+  - The numbers and the mode you choose stay put when you open the
+    picker again, and are remembered for the next start.
   - Formulas cannot be searched for here — this tab reads channels
     straight out of the archiver, so a computed row would be empty
     every day. One is left out of the list and the Log says so.
@@ -2859,10 +3079,20 @@ RIGHT CLICK ON THE PICTURE
   click already means something else.
 
 IMAGES
-  Every received image is a slot — switch between them, remove one,
-  or clear them all. "Open file" takes several files at once. The
-  reference image chosen here is what the subtraction, the merge and
-  the comparison views work against.
+  Every received image is one row of the table. "Open file" takes
+  several files at once; Remove and "Clear all" take images out.
+  - Click a row: that is the image the tools and the numbers work on
+    (the marked row).
+  - Show: the ticked images are on screen. One ticked is the normal
+    view of it — and then a click on another row moves the tick
+    there. Two or more ticked are shown side by side, in the order of
+    the table; "Up" / "Down" move the marked row. "Show all" ticks
+    every image, "Show one" leaves only the marked one. One image is
+    always shown, so the last tick cannot be taken away.
+  - Ref: the reference image, one at a time — what Subtract and
+    Difference in Change picture take away. "Load reference from
+    file" brings one in from disk and ticks it, without putting it on
+    screen.
   - Duplicate makes a copy as a new image. With a region selected it
     copies only that part, which is how you cut a detail out without
     touching the original. The copy keeps the sensor counts and the
@@ -2873,7 +3103,7 @@ IMAGES
     files on the share, so an edited picture is not something it can
     take back.
 
-DISPLAY (never changes the picture)
+IMAGE / DISPLAY (never changes the picture)
   - Palette — the same set and the same names as the other tabs.
   - Histogram — shows where the values are. Drag the black line and
     the red line to choose which values are shown; double-click to
@@ -2972,6 +3202,21 @@ BEAM (spot size and shape)
     the window says so.
   - "Mark the centre" drops a marker on the centre of mass.
 
+"Expand all" and "Collapse all" above the groups open or shut every
+group of the Workshop panel at once, as in the Image Slider.
+
+IMAGE ANALYSIS (Workshop)
+  - "Spatial Contrast" — the same measurement as in the Image
+    Slider's Analysis group, on the active image: SC = Max / Mean
+    over the beam, where the beam is every pixel above "Threshold"
+    with the dark gaps inside it filled. "Auto" picks the threshold
+    (Otsu), "Manual" opens the histogram to drag it, "✏ Exclude"
+    paints areas to leave out. "Show top intensity" circles the
+    brightest pixels on the picture. The numbers are in the units
+    the rest of the panel measures in — native counts when the
+    source file has them. Editing the picture or picking another
+    image takes the old result away; press "▶ Measure" again.
+
   The profile window (double-click a profile line) grew as well: it
   now prints FWHM, 1/e² width, D4σ, the centre of mass, the peak and
   the baseline, draws the half-maximum and 1/e² levels with both
@@ -3002,7 +3247,8 @@ FILTERS (changes the picture, undoable)
 
 EDIT PICTURE (changes the picture, undoable)
   Rotate left / right / 180°, flip across or down, Resize, and
-  Subtract or Difference against the reference image. Anything you
+  Subtract or Difference against the reference image (Ref in the
+  Images table). Anything you
   have drawn moves with the picture.
   - "Rotate by angle" turns by any angle you type. The picture
     grows so no corner is cut off, which means the corners it grows
@@ -3026,17 +3272,34 @@ COMBINE IMAGES
     been. If every image has the camera's own pixel intensity on the
     same scale the result keeps it, so it can still be measured that
     way; if not it says so.
-  - "Merge as red and green" puts the active image in red and the
-    reference in green. Where both have signal it is yellow, so a
-    shift between them shows as a red edge on one side and a green
-    edge on the other — far easier to see than a difference image.
 
-COMPARE
-  Off, Side by side, Blend (with a mixing slider) or Difference,
-  against the reference image. While a comparison is shown the
-  picture on screen is a combination of two images, so drawing,
-  measuring and every operation that changes pixels are switched
-  off — set Compare back to Off first.
+SEVERAL IMAGES SIDE BY SIDE (in Image / Display)
+  Tick two or more images under Show in the Images table and they
+  are shown in one picture, in rows and columns — for example four
+  frames as 2 x 2, left to right in the order of the table, then the
+  next row. How that grid looks is set here:
+  1. Columns: Auto keeps the grid as square as it can (4 images
+     2 x 2, 5 images 3 x 2), or pick 1 to 8.
+  2. Tiles: "Same size" fits every image into the same tile, so a
+     small crop shows as big as a full frame; "1:1 pixels" keeps
+     every image at its own size.
+  3. Gap and Ground: the space between the images and its colour
+     (black or white).
+  4. Name: off, the image's name, or name + the moment the frame was
+     taken; above or below the picture.
+  5. "Drawings and measurements": each image with what is drawn on
+     it.
+  6. "PV values" + "Choose PVs": under each tile, the PV values from
+     the archive at the moment that frame was taken — the same line
+     the Image Slider writes under a saved frame, picked in the same
+     PV window. Only frames from the archive (sent from the Image
+     Finder, Image Slider or Shot Finder) have a known moment; an
+     image opened from the computer or pasted gets no PV line.
+  Save PNG / TIFF / JPEG and Copy write the grid while it is shown.
+  "Make a new image" adds it to the Workshop as an image of its own
+  and shows that one alone. The grid is a view only: drawing and
+  editing are off while it is shown — "Show one" in Images brings
+  them back.
 
 SAVE
   "Save with overlay" decides what lands in the file. Ticked, and
@@ -3108,7 +3371,6 @@ KEYBOARD SHORTCUTS
   Ctrl+Alt+G        remove the background
 
   Ctrl+Alt+C        combine every open image into a new one
-  Ctrl+K            next comparison view
 
   Ctrl+Shift+W      measure the whole picture
   Ctrl+P            plot the profile line
@@ -3178,6 +3440,18 @@ FOR WHOEVER WORKS ON THE CODE
                              the Day-by-day wall can be LOOKED at
                              (needs a real screen, not offscreen)
     test_detail_view.py      the Detailed view tab and its arrows
+    test_finder_load_responsive.py  Image Finder stays clickable while its
+                             graph loads, values read side by side and in
+                             pieces, a ticked value without a curve says
+                             why, no condition row comes ticked
+    test_day_wall_vertical.py  Day by day Vertical/Horizontal, Picture size,
+                             the Detailed view camera list
+    render_caption_size.py   renders the captions under the pictures at
+                             two Label sizes, plus a saved view
+    bench_day_wall_paint.py  how long the Day-by-day wall takes to draw
+                             its tiles, thinned against every pixel
+    test_condition_window_and_day_list.py  PV condition keeps to the set time,
+                             07-21 default, PV search day list keeps its scroll
     test_moments_and_regions.py  clicked moments AND marked regions
                              both searched, on every camera
     test_wall_export.py      Save view: PNG or PDF, one tab or all
@@ -3193,6 +3467,8 @@ FOR WHOEVER WORKS ON THE CODE
     bench_pv_live_multi.py   the same with several cameras
     bench_pv_dots_live.py    the PV dots in real live mode, logged
                              (reads the real share and archiver)
+    test_pv_live_feed.py     live mode = newest values (a feed); off
+                             the live edge = exact per-frame values
     test_shot_counter_sources.py  the shot counter's rules
     test_shot_counter_replay.py   the shot counter on a real half
                              hour of 13 cameras: every shot, nothing more
@@ -3205,6 +3481,10 @@ FOR WHOEVER WORKS ON THE CODE
                              a camera you moved yourself staying put
     bench_live_slave_refresh.py  every camera repainting live
     bench_live_pv_load.py    PV reads not starving the pictures
+    test_live_leave_and_restore.py  any move through time leaves live
+                             mode; the history reload keeps the moment
+                             you are on and brings the other cameras
+                             along
     bench_drag.py            dragging the slider
     bench_play.py            playback
 

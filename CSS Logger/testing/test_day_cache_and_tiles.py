@@ -16,6 +16,9 @@ What this pins:
     time (no archiver request at all), a coarser stored day is not served for
     a finer request, today is never stored, words are never stored, and the
     month files survive two writers,
+  * the open day (which the archiver never thins) is read in pieces of at
+    most four hours, and a reload in the same program asks only for what came
+    since the last load (the rest is kept in memory, never on the share),
   * the look-back for the value before the window ends within its deadline
     even when the archiver refuses or times out on everything, and a cancel
     ends it at once.
@@ -220,6 +223,170 @@ def test_cache_rules():
     off = cpva_cache.DayCache("")
     check("an empty root means no cache at all",
           not off.ready(0.1) and off.get("P", d0, d1, 24, TZ_PRAGUE) is None)
+
+
+# ── the open day: read once, then only what came since ──────────────────────
+
+def test_open_day_is_read_once():
+    cache = cpva_cache.DayCache(tempfile.mkdtemp(prefix="cpva_cache_test_"))
+    names = ["L3-TEST:Energy", cpva_core.SBW4_HAPLS]
+    now = int(time.time() * 1e9)
+    start = now - 30 * HOUR                  # part of yesterday + the open day
+    fake = _install(_Fake(per_day=2400))
+    res1, _e1, _r1 = cpva_core.cpva_fetch_many_adaptive(
+        names, start, now, count=2000, preflight=False, cache=cache)
+    today = [c for c in fake.calls if c[2] > _midnight(0)]
+    check("the open day is asked for in pieces of at most four hours",
+          today and all(c[2] - c[1] <= cpva_core.OPEN_DAY_PIECE_NS for c in today),
+          f"{len(today)} requests, longest "
+          f"{max(c[2] - c[1] for c in today) / HOUR:.1f} h")
+
+    fake2 = _install(_Fake(per_day=2400))
+    later = now + int(30e9)
+    res2, _e2, rep2 = cpva_core.cpva_fetch_many_adaptive(
+        names, start, later, count=2000, preflight=False, cache=cache)
+    settled = now - cpva_cache.RECENT_SETTLE_NS
+    # (The density check's newest hour is left out: the program remembers it
+    # for half an hour, _install forgets it.)
+    asked = [c for c in fake2.calls if (c[1], c[2]) != (later - HOUR, later)]
+    check("a reload asks only for the last minutes, nothing of the part day",
+          asked and all(c[1] >= settled - 1 for c in asked),
+          str([(c[0][:8], (c[2] - c[1]) / 1e9) for c in asked]))
+    check("both names' signals came back whole",
+          all(len(res2[n]) >= len([s for s in res1[n] if s["time"] < settled])
+              for n in names),
+          str({n[:8]: (len(res1[n]), len(res2[n])) for n in names}))
+    same = lambda r: [(s["time"], s["value"]) for s in r  # noqa: E731
+                      if start <= s["time"] < settled and s["value"] != 0.5]
+    check("what was served from memory is what was read",
+          all(same(res1[n]) == same(res2[n]) for n in names))
+    check("the value from before the window comes along from memory",
+          all(any(s["time"] < start for s in res2[n]) for n in names))
+    check("it is not counted as a day from the day cache", rep2.cached == 0,
+          str(rep2.cached))
+
+    other = cpva_cache.DayCache(tempfile.mkdtemp(prefix="cpva_cache_test_"))
+    fake3 = _install(_Fake(per_day=2400))
+    cpva_core.cpva_fetch_many_adaptive(
+        names, start, later, count=2000, preflight=False, cache=other)
+    check("a fresh program start reads it all again",
+          any(c[1] <= start + HOUR for c in fake3.calls))
+
+    day = _midnight(0)
+    a, b = day + HOUR, day + 3 * HOUR
+    words = [{"time": a + 5, "value": "OPEN", "quality": "Original"}]
+    thinned = [{"time": a + i * 60_000_000_000, "value": 1.0, "minimum": 0.0,
+                "maximum": 2.0, "quality": "Interpolated"} for i in range(120)]
+    check("words are not kept",
+          not cache.recent_put("W", day, a, b, words, "W", None, now))
+    check("a thinned answer to an exact request is not kept",
+          not cache.recent_put("T", day, a, b, thinned, "T", None, now))
+    dens = 120 / (b - a)
+    cache.recent_put("T", day, a, b, thinned, "T", dens, now)
+    check("a thinned block serves the same level, with its min/max",
+          (got := cache.recent_get("T", day, a, b, "T", dens)) is not None
+          and got[2][1]["maximum"] == 2.0, str(got and got[2][:1]))
+    check("but not a finer one, nor an exact one",
+          cache.recent_get("T", day, a, b, "T", dens * 10) is None
+          and cache.recent_get("T", day, a, b, "T", None) is None)
+
+
+def test_open_day_on_the_share():
+    root = tempfile.mkdtemp(prefix="cpva_cache_test_")
+    names = ["L3-TEST:Energy", cpva_core.SBW4_HAPLS]
+    now = int(time.time() * 1e9)
+    start = now - 30 * HOUR
+    cache = cpva_cache.DayCache(root)
+    _install(_Fake(per_day=2400))
+    res1, _e, _r = cpva_core.cpva_fetch_many_adaptive(
+        names, start, now, count=2000, preflight=False, cache=cache)
+    deadline = time.time() + 10
+    while time.time() < deadline and not list(pathlib.Path(root).rglob("*.npz")):
+        time.sleep(0.05)
+    time.sleep(0.5)                          # let the writer finish
+    files = list(pathlib.Path(root).rglob("*.npz"))
+    check("the parts read were saved on the share", files, str(len(files)))
+
+    # A restart (a new cache on the same folder): only the last minutes are read.
+    fake = _install(_Fake(per_day=2400))
+    fresh = cpva_cache.DayCache(root)
+    seen = []
+    later = now + int(30e9)
+    res2, _e2, _r2 = cpva_core.cpva_fetch_many_adaptive(
+        names, start, later, count=2000, preflight=False, cache=fresh,
+        cached_fn=seen.append)
+    settled = now - cpva_cache.RECENT_SETTLE_NS
+    asked = [c for c in fake.calls if (c[1], c[2]) != (later - HOUR, later)]
+    check("after a restart the share serves what was read before",
+          asked and all(c[1] >= settled - 1 for c in asked),
+          str([(c[0][:8], (c[2] - c[1]) / 1e9) for c in asked][:4]))
+    same = lambda r: [(s["time"], s["value"]) for s in r  # noqa: E731
+                      if start <= s["time"] < settled and s["value"] != 0.5]
+    check("and it is the same data", all(same(res1[n]) == same(res2[n]) for n in names))
+    check("the caller hears that nearly all of it came from the cache",
+          seen and max(seen) >= 0.9, f"{max(seen) if seen else None}")
+
+    # No second write before the block has grown by half an hour.
+    c3 = cpva_cache.DayCache(root)
+    c3.prefetch(names, [(_midnight(0), now)], TZ_PRAGUE)
+    day = _midnight(0)
+    blk = c3._recent.get((names[0], day))
+    check("a part read from the share is taken into memory", blk is not None)
+    if blk is not None:
+        more = [{"time": blk["hi_ns"] + i, "value": 1.0, "quality": "Original"}
+                for i in range(5)]
+        c3.recent_put(names[0], day, blk["hi_ns"], blk["hi_ns"] + 10 * 60 * 10**9,
+                      more, blk["src"], None, now + HOUR, tz=TZ_PRAGUE)
+        check("ten more minutes are not written again", not c3._dirty_set,
+              str(c3._dirty_set))
+
+    old = {"2020-01-01+part": {"day_lo": 1, "lo_ns": 1, "hi_ns": 2},
+           "2026-01-01": {}, "2026-01-01+part": {"day_lo": now, "lo_ns": 1, "hi_ns": 2},
+           "x+part": {"day_lo": now, "lo_ns": 1, "hi_ns": 2}}
+    cpva_cache._drop_stale_parts(old)
+    check("old parts and parts of stored days are dropped",
+          sorted(old) == ["2026-01-01", "x+part"], str(sorted(old)))
+
+
+def test_cache_does_not_wait_for_the_archiver():
+    root = tempfile.mkdtemp(prefix="cpva_cache_test_")
+    cache = cpva_cache.DayCache(root)
+    names = ["L3-TEST:Energy"]
+    now = int(time.time() * 1e9)
+    start = now - 30 * HOUR
+    _install(_Fake(per_day=2400))
+    cpva_core.cpva_fetch_many_adaptive(names, start, now, count=2000,
+                                       preflight=False, cache=cache)
+    fast = _Fake(per_day=2400)
+
+    def slow(channel, a, b, timeout=10.0, count=None):
+        time.sleep(1.5)
+        return fast(channel, a, b, timeout, count)
+
+    cpva_core.cpva_fetch_samples = slow
+    t0 = time.monotonic()
+    when = []
+    cpva_core.cpva_fetch_many_adaptive(
+        names, start, now + int(10e9), count=2000, cache=cache,
+        cached_fn=lambda f: when.append((f, time.monotonic() - t0)))
+    first = next((t for f, t in when if f >= 0.9), None)
+    check("what memory holds is handed over before the slow archiver answers",
+          first is not None and first < 1.0, str(when[-1:] if when else None))
+
+    class _Dead(Exception):
+        pass
+
+    def dead(channel, a, b, timeout=10.0, count=None):
+        raise _Dead("no route to host")
+
+    cpva_core.cpva_fetch_samples = dead
+    res, err, rep = cpva_core.cpva_fetch_many_adaptive(
+        names, start, now + int(10e9), count=2000, cache=cache)
+    check("with the archiver gone, what memory holds is still the answer",
+          len([s for s in res[names[0]] if s["time"] >= start]) > 100
+          and rep.gaps[names[0]]
+          and all(a >= now - cpva_cache.RECENT_SETTLE_NS - 1 for a, _b in rep.gaps[names[0]]),
+          f"{len(res[names[0]])} samples, gaps {rep.gaps[names[0]]}")
 
 
 # ── the look-back always ends ───────────────────────────────────────────────

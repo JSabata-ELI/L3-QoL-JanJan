@@ -38,32 +38,40 @@ THE SOURCE BUTTONS AT THE TOP
   Office - Programs      the working copy on this computer
 
   Pick one and it is scanned. The two office paths are yours to set
-  with the gear button; they are remembered. On a lab machine the
-  office sources are switched off.
+  with the Set paths button; they are remembered. On a lab machine
+  the office sources are switched off.
 
 
 A PROGRAM CARD
 
-  Big button    starts the program. It shows the version, and turns
-                orange with an arrow when a newer version is sitting
-                on disk than the one you last used.
+  Big button    starts the program. It shows the program's icon and
+                name, and turns orange when a newer version is
+                sitting on disk than the one you last used.
   ReadMe        the short description of the program.
   Details       the long one, when the program has it.
-  Tick          "I know about the new version" — clears the orange
-                without starting anything.
   Folder        opens the program's folder.
-  Arrow down    a list of older versions; pick one to run it.
+  Clock         a list of older versions; pick one to run it.
 
-  Right-click a card to move that program into another group. Your
-  choice is remembered.
+  Right-click the big button for two more things:
+    Acknowledge update   "I know about the new version" — clears the
+                         orange without starting anything.
+    Move to group        puts the program into another group. Your
+                         choice is remembered; Reset to default undoes it.
+
+
+THE GROUPS
+
+  The cards are sorted into groups (Main scripts, Side scripts,
+  External, ...). Click a group's name to open or close it. Only Main
+  scripts is open when the Launcher starts.
 
 
 THE ORANGE HIGHLIGHT
 
   Every ten seconds the Launcher looks for newer program files. When
-  it finds one, that card goes orange with an arrow, and it stays
-  orange across restarts until you either start the program or press
-  the tick.
+  it finds one, that card goes orange, and it stays orange across
+  restarts until you either start the program or right-click it and
+  choose Acknowledge update.
 
 
 RUNNING AN OLD VERSION
@@ -88,19 +96,19 @@ RUNNING AN OLD VERSION
   there is Python on the computer.
 
   If a program is killed rather than closed, that swap can be left
-  half done. The Launcher then refuses to start it again; the broom
+  half done. The Launcher then refuses to start it again; the Clean
   button shows a count and puts it right when clicked.
 
 
 THE OTHER BUTTONS
 
-  Notes    the shared notes file on the current share.
-  Gear     set your two office paths.
-  Broom    tidy up: version files left in the wrong folder, and
-           programs stuck in a half-finished swap. Every scan checks
-           for these; when it finds any, the button gets an orange
-           frame and a count, e.g. "Clean (3)". Nothing opens until
-           you click it.
+  Notes       the shared notes file on the current share.
+  Set paths   set your two office paths.
+  Clean       tidy up: version files left in the wrong folder, and
+              programs stuck in a half-finished swap. Every scan checks
+              for these; when it finds any, the button turns orange
+              and shows a count, e.g. "Clean (3)". Nothing opens until
+              you click it.
 
 
 ONE RULE FOR DOCUMENTATION

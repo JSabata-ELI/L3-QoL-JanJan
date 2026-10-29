@@ -4,8 +4,18 @@ The deformable mirror (DM) is driven by "Mirror Control Window" on a PC that
 nothing here can reach: no network share, no internet, no way to install a
 program. The only way in is the Remote Desktop window that OPR1 keeps open to it
 (192.168.1.107). So OPR1 takes a picture of that window — exactly the way
-`ls_screen` photographs the L3BT MSS window — and finds the right-hand 6 × 6
-grid, "Set-up", in it.
+`ls_screen` photographs the L3BT MSS window — and finds the LEFT-hand 6 × 6
+grid, "Applied voltages", in it. That is what is really on the mirror; the
+right-hand "Set-up" grid is only what the operator is about to apply (user,
+12.10.2026: "se musí kontrolovat to nastavení vlevo!! ne vpravo"). It was the
+right-hand one until then.
+
+Since 14.10.2026 the Set-up grid is read TOO, but only so that a set-up can be
+saved from it before it is applied ("uložit z pravé mřížky a sledovat levou
+mřížku v programu"). The verdict — which set-up the mirror is on — still comes
+from the Applied grid alone. The two grids of one set-up differ by a few levels
+(see `REFERENCE_SETUPS`), well inside `MATCH_TOL`, so a set-up saved off the
+right grid is recognised on the left one once it is applied.
 
 WHAT IS READ, AND WHAT IS NOT
 -----------------------------
@@ -26,10 +36,11 @@ can lie over parts of it. So nothing is at a fixed place:
   1. The colour scale is found first: a vertical strip, pure red at the top,
      white in the middle, pure blue at the bottom. Red pixels are found with one
      byte-pattern search over the whole picture, which costs a few milliseconds.
-  2. Both grids have such a scale. Set-up's is on its RIGHT, so the grid wanted
-     is the one found by walking LEFT from a scale. Applied voltages has only
-     black background and the "150 / 0 / -150" labels there, so it is never
-     taken. SID4's own scale (red, yellow, green, blue) has no white middle.
+  2. Both grids have such a scale. Applied voltages' is on its LEFT, so the
+     grid wanted is the one found by walking RIGHT from a scale. Set-up's
+     scale has only black background and the "150 / 0 / -150" labels on its
+     right, so it is never taken. SID4's own scale (red, yellow, green, blue)
+     has no white middle.
   3. The cells touch each other with no lines between them, and every cell
      colour has red or blue at full strength. So the grid's edges are where that
      stops — at the grey frame — measured along several lines and the middle
@@ -46,8 +57,8 @@ easily; the same set-up read twice is identical to the last level.
 
 THE FILES ON THE SHARE
 ----------------------
-    <scratch>\\Software\\LaserSettings\\dm_state.json    what OPR1 saw last
-    <scratch>\\Software\\LaserSettings\\dm_setups.json   the saved set-ups
+    <scratch>\\Software\\Laser settings\\shared\\dm_state.json    what OPR1 saw last
+    <scratch>\\Software\\Laser settings\\shared\\dm_setups.json   the saved set-ups
 
 OPR1 rewrites the first every 5 s. When the Remote Desktop window is minimised
 it cannot be photographed (Windows does not draw a minimised window), and the
@@ -107,12 +118,12 @@ STATUS_NO_GRID = "no grid"
 STATUS_FAILED = "failed"
 
 STATUS_TEXT = {
-    STATUS_OK: "The Set-up grid was read.",
+    STATUS_OK: "The Applied voltages grid was read.",
     STATUS_MINIMISED: "The Remote Desktop window is minimised, so it cannot "
                       "be read.",
     STATUS_NO_WINDOW: "The Remote Desktop window is not open.",
-    STATUS_NO_GRID: "The Set-up grid of Mirror Control Window is not visible "
-                    "in the Remote Desktop window.",
+    STATUS_NO_GRID: "The Applied voltages grid of Mirror Control Window is "
+                    "not visible in the Remote Desktop window.",
     STATUS_FAILED: "The Remote Desktop window could not be read.",
 }
 
@@ -139,6 +150,11 @@ class DmRead(NamedTuple):
     `colours` is 36 (r, g, b) tuples, electrode 0 first, only when `status` is
     STATUS_OK — otherwise None. `bar` is where the scale was, to try first next
     time. `problem` is a sentence for the operator when something went wrong.
+
+    `setup_colours` is the right-hand Set-up grid, read the same way, when it
+    could be seen — None otherwise. It is never judged: it is only there so a
+    set-up can be SAVED from it before it is applied (14.10.2026, "uložit z
+    pravé mřížky a sledovat levou mřížku v programu").
     """
     status: str
     colours: list | None
@@ -149,6 +165,7 @@ class DmRead(NamedTuple):
     picture: Picture | None = None  # what was photographed; dropped once used
     screen_picture: Picture | None = None   # the screen copy, when also tried
     how: str | None = None          # HOW_WINDOW or HOW_SCREEN: what was read
+    setup_colours: list | None = None   # the right-hand Set-up grid, if seen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,29 +332,56 @@ def _walk(pic, x, y, dx, dy):
 
 
 def grid_left_of(pic, bar):
-    """The 6 × 6 grid whose scale is `bar`, on the scale's LEFT, or None."""
+    """The 6 × 6 grid whose scale is `bar`, on the scale's LEFT, or None.
+    That is the Set-up grid — what the operator means to apply."""
+    return _grid_beside(pic, bar, -1)
+
+
+def grid_right_of(pic, bar):
+    """The 6 × 6 grid whose scale is `bar`, on the scale's RIGHT, or None.
+    That is the Applied voltages grid — what is really on the mirror."""
+    return _grid_beside(pic, bar, 1)
+
+
+def _grid_beside(pic, bar, step):
+    """The grid next to a scale: `step` -1 looks left of it, +1 right."""
     height = bar.y1 - bar.y0 + 1
     reach = max(6, int(height * 0.12))
     rows = _lines(bar.y0, bar.y1)
 
-    rights = []
+    start = bar.x0 - 1 if step < 0 else bar.x1 + 1
+    stop = (max(-1, start - reach) if step < 0
+            else min(pic.width, start + reach))
+    nears = []
     for y in rows:
-        for x in range(bar.x0 - 1, max(-1, bar.x0 - 1 - reach), -1):
+        # The scale's own edge column may lie just past `bar`: its width is
+        # measured on one row near the top, where Remote Desktop blended that
+        # column, while further down it is plain scale colour — (255, 23, 20)
+        # on OPR1, 27.10.2026, which passes for a red cell, so the grid was
+        # "found" one pixel wide. Step over what is still on the scale first;
+        # three pixels at most, so the grey frame can never carry the search
+        # into the grid.
+        first = start
+        while (first != stop and abs(first - start) < 3
+               and _on_scale(_rgb(pic, first, y))):
+            first += step
+        for x in range(first, stop, step):
             if _is_cell(_rgb(pic, x, y)):
-                rights.append(x)
+                nears.append(x)
                 break
-    if len(rights) < GRID_N - 1:
+    if len(nears) < GRID_N - 1:
         return None
-    x_right = _median(rights)
+    x_near = _median(nears)
 
-    lefts = []
+    fars = []
     for y in rows:
-        if not _is_cell(_rgb(pic, x_right, y)):
+        if not _is_cell(_rgb(pic, x_near, y)):
             continue
-        lefts.append(_walk(pic, x_right, y, -1, 0)[0])
-    if len(lefts) < GRID_N - 1:
+        fars.append(_walk(pic, x_near, y, step, 0)[0])
+    if len(fars) < GRID_N - 1:
         return None
-    x_left = _median(lefts)
+    x_far = _median(fars)
+    x_left, x_right = min(x_near, x_far), max(x_near, x_far)
     width = x_right - x_left + 1
     if width < 30:
         return None
@@ -427,7 +471,8 @@ def cell_colours(pic, spot):
 
 
 def read_picture(pic, hint=None, now_s=None):
-    """Find the Set-up grid in a picture of the Remote Desktop window."""
+    """Find the Applied voltages grid in a picture of the Remote Desktop
+    window — the LEFT one, what is really on the mirror (12.10.2026)."""
     now = time.time() if now_s is None else now_s
     if pic.width < 60 or pic.height < 60:
         return DmRead(STATUS_NO_GRID, None, now,
@@ -440,12 +485,13 @@ def read_picture(pic, hint=None, now_s=None):
     tried_all = False
     while True:
         for bar in candidates:
-            spot = grid_left_of(pic, bar)
+            spot = grid_right_of(pic, bar)
             if spot is None:
                 continue
             colours = cell_colours(pic, spot)
             if colours is not None:
-                return DmRead(STATUS_OK, colours, now, bar=bar)
+                return DmRead(STATUS_OK, colours, now, bar=bar,
+                              setup_colours=read_setup_grid(pic, bar, spot))
         if tried_all:
             break
         tried_all = True
@@ -453,6 +499,42 @@ def read_picture(pic, hint=None, now_s=None):
     return DmRead(STATUS_NO_GRID, None, now,
                   problem=f"{STATUS_TEXT[STATUS_NO_GRID]} "
                           f"({describe_picture(pic, candidates)})")
+
+
+def read_setup_grid(pic, applied_bar, applied_spot):
+    """The right-hand Set-up grid's 36 colours, or None when it is not seen.
+
+    Its scale stands on its RIGHT and level with the Applied voltages scale, so
+    it is looked for along a few rows near the top of that scale, to the right
+    of the Applied grid: every red run met there is tried as a scale, and the
+    first one with a grid on its left is it. A red cell of the Set-up grid's
+    own top row is met first and turned down by `_bar_at` (it is not a red →
+    white → blue strip). No full search of the picture, so this costs about
+    nothing on top of the Applied grid's read.
+
+    Never needed for the verdict, so a covered or missing Set-up grid is
+    simply None — it cannot make the Applied grid unreadable.
+    """
+    height = applied_bar.y1 - applied_bar.y0 + 1
+    for dy in (1, 3, max(4, height // 20)):
+        y = applied_bar.y0 + dy
+        if y >= pic.height:
+            break
+        x = applied_spot.x1 + 1
+        while x < pic.width:
+            if not _is_red(_rgb(pic, x, y)):
+                x += 1
+                continue
+            end = x
+            while end + 1 < pic.width and _is_red(_rgb(pic, end + 1, y)):
+                end += 1
+            bar = _bar_at(pic, (x + end) // 2, y)
+            if bar is not None:
+                spot = grid_left_of(pic, bar)
+                if spot is not None and spot.x0 > applied_spot.x1:
+                    return cell_colours(pic, spot)
+            x = end + 1
+    return None
 
 
 def describe_picture(pic, bars=None):
@@ -480,7 +562,7 @@ def describe_picture(pic, bars=None):
     if not bars:
         return f"{words}, no red-white-blue colour scale in it"
     return (f"{words}, {len(bars)} colour scale{'s' if len(bars) != 1 else ''} "
-            f"found, but no 6 × 6 grid on the left of "
+            f"found, but no 6 × 6 grid on the right of "
             f"{'them' if len(bars) != 1 else 'it'}")
 
 
@@ -565,44 +647,52 @@ def match(colours, setups):
 # ─────────────────────────────────────────────────────────────────────────────
 # Low power and High power are the two set-ups the Overview judges against
 # SBW4's energy, so they cannot depend on somebody having saved them first. The
-# colours are the Set-up grid of the two screenshots the user sent on 8.10.2026
+# colours are the Applied voltages grid (the left one; re-read 12.10.2026 when
+# the reading moved there — up to 5 levels off the Set-up grid's, which was
+# what they were before) of the two screenshots the user sent on 8.10.2026
 # (testing/dm_0727.png = High power, testing/dm_0731.png = Low power), read with
 # `read_picture` and written in here so the program never needs the pictures.
 # The names came with the pictures but only their times survived; 8.10 guessed
 # 7:27 = Low and it was the wrong way round — on 9.10.2026 OPR1 read the 7:27
 # grid while the mirror was on high power ("když tam je high power nastavení,
 # tak to ukazuje low power a naopak").
-# They are on the saved list of every PC as "built in": they cannot be deleted,
-# and an entry of the same name in the shared file is overruled. Since
-# 12.10.2026 they CAN be renamed — see `rename_setup` and `"replaces"`.
+# They are on the saved list of every PC as "built in" — but only as DEFAULTS
+# (21.10.2026: a new Low power grid could not be saved over the old one, and the
+# crew had to make a third set-up). Since then the shared file can:
+#   - replace their grid: an entry of that name WITH colours (`replace_setup`;
+#     the grid it replaced is kept as "previous" for `undo_replace`),
+#   - delete them: an entry `{"removed": true}` (`for_file`), brought back by
+#     `restore_builtins`,
+#   - rename them (12.10.2026): an entry under the new name with `"replaces"`.
+# An entry of that name holding only "power" is just its tick, as before.
 
 POWER_LOW = "Low power"
 POWER_HIGH = "High power"
 
 REFERENCE_SETUPS = {
     POWER_HIGH: [
-        (195, 195, 255), (205, 205, 255), (255, 181, 181), (230, 230, 255),
+        (200, 200, 255), (205, 205, 255), (255, 181, 181), (230, 230, 255),
         (255, 255, 255), (255, 245, 245),
-        (195, 195, 255), (101, 101, 255), (225, 225, 255), (108, 108, 255),
+        (200, 200, 255), (101, 101, 255), (225, 225, 255), (108, 108, 255),
         (125, 125, 255), (255, 235, 235),
-        (255, 255, 255), (255, 230, 230), (255, 230, 230), (195, 195, 255),
+        (255, 255, 255), (255, 230, 230), (255, 230, 230), (200, 200, 255),
         (205, 205, 255), (255, 245, 245),
-        (255, 205, 205), (255, 158, 158), (83, 83, 255), (255, 240, 240),
-        (195, 195, 255), (185, 185, 255),
+        (255, 205, 205), (255, 158, 158), (80, 80, 255), (255, 240, 240),
+        (200, 200, 255), (185, 185, 255),
         (255, 255, 255), (255, 220, 220), (185, 185, 255), (133, 133, 255),
         (255, 200, 200), (163, 163, 255),
         (145, 145, 255), (255, 210, 210), (255, 210, 210), (255, 255, 255),
         (181, 181, 255), (225, 225, 255),
     ],
     POWER_LOW: [
-        (195, 195, 255), (200, 200, 255), (255, 230, 230), (240, 240, 255),
+        (200, 200, 255), (200, 200, 255), (255, 230, 230), (240, 240, 255),
         (255, 255, 255), (255, 210, 210),
         (200, 200, 255), (122, 122, 255), (230, 230, 255), (122, 122, 255),
-        (145, 145, 255), (255, 230, 230),
-        (255, 240, 240), (255, 200, 200), (255, 225, 225), (195, 195, 255),
-        (225, 225, 255), (255, 215, 215),
+        (145, 145, 255), (255, 235, 235),
+        (255, 240, 240), (255, 200, 200), (255, 225, 225), (200, 200, 255),
+        (220, 220, 255), (255, 215, 215),
         (255, 210, 210), (255, 141, 141), (111, 111, 255), (255, 215, 215),
-        (195, 195, 255), (195, 195, 255),
+        (200, 200, 255), (200, 200, 255),
         (255, 225, 225), (255, 200, 200), (220, 220, 255), (145, 145, 255),
         (255, 176, 176), (181, 181, 255),
         (137, 137, 255), (255, 205, 205), (255, 220, 220), (255, 210, 210),
@@ -625,8 +715,44 @@ REFERENCE_TAGS = {POWER_LOW: TAG_LOW, POWER_HIGH: TAG_HIGH}
 
 
 def is_reference(name):
-    """True for Low power and High power, the two set-ups nobody can delete."""
+    """True for the names Low power and High power (built in, or replaced)."""
     return name in REFERENCE_SETUPS
+
+
+def is_builtin_entry(name, entry):
+    """True when `entry` is the built-in set-up `name` as the program knows
+    it — not replaced, not renamed onto. Only its tick goes into the file."""
+    if not is_reference(name) or not isinstance(entry, dict):
+        return False
+    return (entry.get("by") == BUILT_IN_BY and not entry.get("replaced")
+            and not entry.get("replaces")
+            and colour_difference(entry.get("colours"),
+                                  REFERENCE_SETUPS[name]) == 0)
+
+
+def name_key(name):
+    """What two names are compared by: case and spacing do not count, so
+    "low power " is "Low power" (21.10.2026)."""
+    return " ".join(str(name or "").split()).casefold()
+
+
+def find_name(setups, name):
+    """The set-up in `setups` called `name` (any case, any spacing), or None."""
+    key = name_key(name)
+    for existing in (setups or {}):
+        if name_key(existing) == key:
+            return existing
+    return None
+
+
+def tidy_name(name):
+    """The name as it is saved: spacing tidied, and a built-in name in its
+    own spelling ("low power" → "Low power")."""
+    name = " ".join(str(name or "").split())
+    for ref in REFERENCE_SETUPS:
+        if name_key(ref) == name_key(name):
+            return ref
+    return name
 
 
 def replaced_references(setups):
@@ -636,27 +762,53 @@ def replaced_references(setups):
             if isinstance(e, dict) and is_reference(e.get("replaces"))}
 
 
-def with_references(setups):
-    """The saved set-ups with the two built-in ones first, overruling an entry
-    of the same name in the shared file — all but its tick.
+def _has_colours(entry):
+    return isinstance(entry, dict) and isinstance(entry.get("colours"), list)
 
-    A built-in one that has been renamed is not added: its colours are on the
-    list under the new name, as an entry of the file (`rename_setup`).
+
+def with_references(setups):
+    """The saved set-ups with the two built-in ones first.
+
+    The shared file's entry of a built-in name decides what it is: one with
+    colours replaces the built-in grid, `{"removed": true}` takes it off the
+    list, one with only "power" is its tick. A built-in one that has been
+    renamed is not added either: its colours are on the list under the new
+    name, as an entry of the file (`rename_setup`).
     """
     setups = setups or {}
     gone = replaced_references(setups)
     out = {}
     for name in (POWER_LOW, POWER_HIGH):            # this order on the list
-        if name in gone:
+        entry = setups.get(name) or {}
+        tag = entry.get("power")
+        tag = tag if tag in TAGS else REFERENCE_TAGS[name]
+        if _has_colours(entry):
+            out[name] = {**entry, "power": tag}
+            continue
+        if entry.get("removed") or name in gone:
             continue
         colours = REFERENCE_SETUPS[name]
-        tag = (setups.get(name) or {}).get("power")
         out[name] = {"colours": [list(c) for c in colours], "saved": "",
-                     "by": BUILT_IN_BY,
-                     "power": tag if tag in TAGS else REFERENCE_TAGS[name]}
+                     "by": BUILT_IN_BY, "power": tag}
     for name, entry in setups.items():
-        if name not in out:
+        if name not in out and not is_reference(name):
             out[name] = entry
+    return out
+
+
+def missing_builtins(setups):
+    """The built-in names no set-up on the list carries (deleted or renamed)."""
+    return [n for n in (POWER_LOW, POWER_HIGH) if find_name(setups, n) is None]
+
+
+def ticked_twice(setups):
+    """{TAG_HIGH / TAG_LOW: [names]} where more than one set-up is ticked for
+    it — the Overview then accepts any of them, an old grid as well."""
+    out = {}
+    for tag in (TAG_HIGH, TAG_LOW):
+        names = [n for n in (setups or {}) if tag_of(n, setups) == tag]
+        if len(names) > 1:
+            out[tag] = names
     return out
 
 
@@ -681,16 +833,22 @@ def set_tag(setups, name, tag):
 
 
 def for_file(setups):
-    """What of `setups` goes into the shared file: every own set-up, and of the
-    built-in two only a tick that differs from their name."""
+    """What of `setups` goes into the shared file: every own set-up; of a
+    built-in one as the program knows it only a tick that differs from its
+    name; a replaced built-in one whole; and a built-in one missing from the
+    list (deleted, not renamed) as `{"removed": true}`."""
     out = {}
     for name, entry in setups.items():
-        if not is_reference(name):
+        if not is_builtin_entry(name, entry):
             out[name] = entry
             continue
         tag = tag_of(name, setups)
         if tag != REFERENCE_TAGS[name]:
             out[name] = {"power": tag}
+    renamed = replaced_references(setups)
+    for name in REFERENCE_SETUPS:
+        if name not in setups and name not in renamed:
+            out[name] = {"removed": True}
     return out
 
 
@@ -750,6 +908,27 @@ def age_text(seconds):
     if seconds < 172800:
         return f"{seconds // 3600} h"
     return f"{seconds // 86400} days"
+
+
+def setup_grid(state, now_s=None):
+    """The right-hand Set-up grid from the state file — 36 colours, only while
+    the file is fresh and the Applied grid was read with it; otherwise None.
+
+    For saving a set-up before it is applied. Never judged: what is on the
+    mirror is the Applied voltages grid alone.
+    """
+    if not isinstance(state, dict) or state.get("status") != STATUS_OK:
+        return None
+    now = time.time() if now_s is None else now_s
+    try:
+        if now - float(state.get("at")) > STALE_AFTER_S:
+            return None
+    except (TypeError, ValueError):
+        return None
+    colours = state.get("setup_colours")
+    if not isinstance(colours, list) or len(colours) != CELLS:
+        return None
+    return colours
 
 
 def verdict(state, setups, now_s=None):
@@ -936,7 +1115,10 @@ SHARE_CANDIDATES = (
     r"\\hapls-share.cs.eli-beams.eu\scratch\Software",     # office leg
     r"\\hapls-share.lcs.local\scratch\Software",           # lab leg
 )
-SHARE_SUBDIR = "LaserSettings"
+# Inside the program's own folder on the share (14.10.2026), not a second
+# top-level folder beside it. Dev Tools never deletes a "shared" subfolder on
+# deploy (SHARED_DATA_DIR_NAMES in Dev Tools/dt_core.py).
+SHARE_SUBDIR = os.path.join("Laser settings", "shared")
 STATE_NAME = "dm_state.json"
 SETUPS_NAME = "dm_setups.json"
 PROBE_TIMEOUT_S = 3.0
@@ -993,7 +1175,7 @@ class Share:
         self._missed_at = None
 
     def folder(self):
-        """The LaserSettings folder on the share, or None when out of reach."""
+        """Laser settings\\shared on the share, or None when out of reach."""
         if not self._root:
             if (self._missed_at is not None
                     and time.monotonic() - self._missed_at < REPROBE_AFTER_S):
@@ -1032,6 +1214,8 @@ def state_document(read, setups=None, every_s=PERIOD_S):
     writing PC looks; the reading PCs read the file that often."""
     colours = ([list(c) for c in read.colours]
                if read.status == STATUS_OK and read.colours else None)
+    setup_colours = ([list(c) for c in read.setup_colours]
+                     if colours and read.setup_colours else None)
     m = match(read.colours, setups) if colours else None
     return {
         "version": 1,
@@ -1049,6 +1233,9 @@ def state_document(read, setups=None, every_s=PERIOD_S):
         "how": read.how,
         "every_s": every_s,
         "colours": colours,
+        # The right-hand Set-up grid, for "Save the Set-up grid" on every PC.
+        # A reader of an older writer's file simply finds no key.
+        "setup_colours": setup_colours,
     }
 
 
@@ -1061,8 +1248,23 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _clean_colours(colours):
+    """36 [r, g, b] lists, or None when `colours` is not that."""
+    if not isinstance(colours, list) or len(colours) != CELLS:
+        return None
+    try:
+        colours = [[max(0, min(255, int(v))) for v in c] for c in colours]
+    except (TypeError, ValueError):
+        return None
+    if any(len(c) != 3 for c in colours):
+        return None
+    return colours
+
+
 def clean_setups(raw):
-    """{name: {"colours": [[r, g, b] × 36], "saved", "by"}}, bad ones dropped."""
+    """{name: {"colours": [[r, g, b] × 36], "saved", "by", "power", …}}, bad
+    ones dropped. A built-in name may also hold only its tick ({"power"}) or
+    `{"removed": true}`."""
     out = {}
     if not isinstance(raw, dict):
         return out
@@ -1074,26 +1276,33 @@ def clean_setups(raw):
             continue
         name = name.strip()
         tag = entry.get("power")
-        if is_reference(name):
-            # Only the tick of a built-in set-up is kept in the file.
-            if tag in TAGS:
+        colours = _clean_colours(entry.get("colours"))
+        if is_reference(name) and colours is None:
+            if entry.get("removed"):
+                out[name] = {"removed": True}
+            elif tag in TAGS:
                 out[name] = {"power": tag}
             continue
-        colours = entry.get("colours")
-        if not isinstance(colours, list) or len(colours) != CELLS:
+        if colours is None:
             continue
-        try:
-            colours = [[max(0, min(255, int(v))) for v in c] for c in colours]
-        except (TypeError, ValueError):
-            continue
-        if any(len(c) != 3 for c in colours):
-            continue
+        default_tag = REFERENCE_TAGS.get(name, TAG_NONE)
         out[name] = {"colours": colours,
                      "saved": str(entry.get("saved") or ""),
                      "by": str(entry.get("by") or ""),
-                     "power": tag if tag in TAGS else TAG_NONE}
+                     "power": tag if tag in TAGS else default_tag}
         if is_reference(entry.get("replaces")):
             out[name]["replaces"] = entry["replaces"]
+        if entry.get("replaced"):
+            out[name]["replaced"] = str(entry["replaced"])
+            out[name]["replaced_by"] = str(entry.get("replaced_by") or "")
+        prev = entry.get("previous")
+        prev_colours = _clean_colours(prev.get("colours")) \
+            if isinstance(prev, dict) else None
+        if prev_colours is not None:
+            out[name]["previous"] = {
+                "colours": prev_colours,
+                "replaced": str(prev.get("replaced") or ""),
+                "replaced_by": str(prev.get("replaced_by") or "")}
     return out
 
 
@@ -1101,28 +1310,133 @@ def setups_document(setups):
     return {"version": 1, "setups": setups}
 
 
+def _stamp(now_s=None):
+    now = time.time() if now_s is None else now_s
+    return datetime.datetime.fromtimestamp(now).isoformat(timespec="seconds")
+
+
+def _saved_elsewhere(colours, setups, but=None):
+    """The other set-up these colours already are, or None."""
+    others = {n: e for n, e in (setups or {}).items() if n != but}
+    return match(colours, others).name
+
+
 def add_setup(setups, name, colours, now_s=None):
-    """A copy of `setups` with this one added, or (None, why not)."""
-    name = (name or "").strip()
+    """A copy of `setups` with this one added, or (None, why not).
+
+    A deleted built-in name can be taken again ("Low power" saved anew); it
+    starts ticked as its name says, like the built-in one did.
+    """
+    name = tidy_name(name)
     if not name:
         return None, "Type a name for the set-up first."
-    if is_reference(name):
-        return None, f"\"{name}\" is the name of a built-in set-up."
-    if name in setups:
-        return None, (f"A set-up called \"{name}\" already exists. Delete it "
-                      f"first, or pick another name.")
+    existing = find_name(setups, name)
+    if existing is not None:
+        return None, (f"A set-up called \"{existing}\" already exists. Click "
+                      f"the save button again to replace its grid.")
     if not colours or len(colours) != CELLS:
         return None, "There is no fresh reading of the grid to save."
-    m = match(colours, setups)
-    if m.name is not None:
-        return None, (f"These colours are already saved, as \"{m.name}\".")
-    now = time.time() if now_s is None else now_s
+    twin = _saved_elsewhere(colours, setups)
+    if twin is not None:
+        return None, (f"These colours are already saved, as \"{twin}\".")
     out = dict(setups)
     out[name] = {"colours": [list(c) for c in colours],
-                 "saved": datetime.datetime.fromtimestamp(now).isoformat(
-                     timespec="seconds"),
+                 "saved": _stamp(now_s),
                  "by": socket.gethostname()}
+    if is_reference(name):
+        out[name]["power"] = REFERENCE_TAGS[name]
     return out, None
+
+
+def replace_setup(setups, name, colours, now_s=None):
+    """A copy of `setups` with the grid of `name` replaced by `colours`, or
+    (None, why not) — 21.10.2026.
+
+    The name, its place on the list and its High power / Low power tick stay.
+    The grid it had is kept as "previous", so `undo_replace` can bring it back.
+    A built-in one becomes an entry of the file holding the new grid.
+    """
+    actual = find_name(setups, name)
+    if actual is None:
+        return None, f"\"{name}\" is not a saved set-up any more."
+    if not colours or len(colours) != CELLS:
+        return None, "There is no fresh reading of the grid to save."
+    twin = _saved_elsewhere(colours, setups, but=actual)
+    if twin is not None:
+        return None, (f"These colours are already saved, as \"{twin}\".")
+    entry = setups[actual]
+    d = colour_difference(colours, entry.get("colours"))
+    if d is not None and d <= MATCH_TOL:
+        return None, f"\"{actual}\" already has this grid."
+    new = {k: v for k, v in entry.items() if k != "previous"}
+    new.update({
+        "colours": [list(c) for c in colours],
+        "power": tag_of(actual, setups),
+        "replaced": _stamp(now_s),
+        "replaced_by": socket.gethostname(),
+        "previous": {"colours": [list(c) for c in entry.get("colours") or []],
+                     "replaced": str(entry.get("replaced") or ""),
+                     "replaced_by": str(entry.get("replaced_by") or "")},
+    })
+    if colour_difference(new["previous"]["colours"], colours) is None:
+        del new["previous"]
+    out = dict(setups)
+    out[actual] = new
+    return out, None
+
+
+def undo_replace(setups, name):
+    """A copy of `setups` with `name` back on the grid it had before its last
+    replace, or (None, why not). Only one step back is kept."""
+    if name not in setups:
+        return None, f"\"{name}\" is not a saved set-up any more."
+    entry = setups[name]
+    prev = entry.get("previous")
+    if not isinstance(prev, dict) or not prev.get("colours"):
+        return None, f"\"{name}\" has not been replaced: nothing to undo."
+    twin = _saved_elsewhere(prev["colours"], setups, but=name)
+    if twin is not None:
+        return None, (f"The previous grid of \"{name}\" is saved, as "
+                      f"\"{twin}\", already.")
+    new = {k: v for k, v in entry.items()
+           if k not in ("previous", "replaced", "replaced_by")}
+    new["colours"] = [list(c) for c in prev["colours"]]
+    if prev.get("replaced"):
+        new["replaced"] = prev["replaced"]
+        new["replaced_by"] = prev.get("replaced_by", "")
+    out = dict(setups)
+    out[name] = new
+    return out, None
+
+
+def restore_builtins(setups):
+    """(a copy of `setups` with the deleted built-in set-ups back first,
+    the sentence to show) — (None, why not) when there is none to bring back.
+
+    One whose grid is already saved under another name is not brought back
+    twice; the sentence says where it is.
+    """
+    missing = missing_builtins(setups)
+    if not missing:
+        return None, "Low power and High power are both on the list."
+    back, notes = [], []
+    for name in missing:
+        twin = _saved_elsewhere(REFERENCE_SETUPS[name], setups)
+        if twin is not None:
+            notes.append(f"The built-in {name} grid is saved, as \"{twin}\".")
+        else:
+            back.append(name)
+    if not back:
+        return None, " ".join(notes)
+    out = {}
+    for name in (POWER_LOW, POWER_HIGH):
+        if name in back:
+            out[name] = {"colours": [list(c) for c in REFERENCE_SETUPS[name]],
+                         "saved": "", "by": BUILT_IN_BY,
+                         "power": REFERENCE_TAGS[name]}
+    out.update(setups)
+    words = " and ".join(back)
+    return out, " ".join([f"Built-in {words} restored."] + notes)
 
 
 def rename_setup(setups, old, new):
@@ -1131,32 +1445,35 @@ def rename_setup(setups, old, new):
     A built-in set-up can be renamed too (12.10.2026): it becomes an entry of
     the shared file under the new name, holding the built-in colours, its
     tick and `"replaces": old`, and `with_references` stops adding the
-    built-in one. Deleting that entry brings the built-in name back.
+    built-in one. A built-in name nobody carries can be given to another
+    set-up (21.10.2026).
     """
-    new = (new or "").strip()
+    new = tidy_name(new)
     if old not in setups:
         return None, f"\"{old}\" is not a saved set-up any more."
     if not new:
         return None, "Type the new name first."
     if new == old:
         return None, None
-    if is_reference(new):
-        return None, f"\"{new}\" is the name of a built-in set-up."
-    if new in setups:
-        return None, f"A set-up called \"{new}\" already exists."
+    clash = find_name(setups, new)
+    if clash is not None and clash != old:
+        return None, f"A set-up called \"{clash}\" already exists."
     out = {}
     for name, entry in setups.items():
-        if name == old and is_reference(old):
+        if name == old and is_builtin_entry(old, entry):
             entry = {"colours": [list(c) for c in REFERENCE_SETUPS[old]],
                      "saved": "", "by": BUILT_IN_BY,
                      "power": tag_of(old, setups), "replaces": old}
+        elif name == old:
+            entry = {**entry, "power": tag_of(old, setups)}
         out[new if name == old else name] = entry
     return out, None
 
 
 def delete_setups(setups, names):
-    """Without `names`. The two built-in set-ups stay whatever is asked."""
-    gone = {n for n in names if not is_reference(n)}
+    """Without `names` — the built-in ones too since 21.10.2026 (`for_file`
+    then writes them as removed; `restore_builtins` brings them back)."""
+    gone = set(names)
     return {n: e for n, e in setups.items() if n not in gone}
 
 

@@ -344,6 +344,32 @@ def test_new_band_reloads(app, w):
     w._pv_cfg[0]["target"] = 10.0
 
 
+def test_band_modes(app, w):
+    """The day's ten shots are 10.00 … 10.09; each mode keeps its own slice."""
+    print("\nEvery band mode picks its own shots")
+    cases = [
+        ({"mode": "range", "lo": 10.02, "hi": 10.05}, 4),
+        ({"mode": "range", "lo": 10.05, "hi": 10.02}, 4),      # typed the other way
+        ({"mode": "above", "lo": 10.07}, 3),
+        ({"mode": "below", "hi": 10.01}, 2),
+        ({"mode": "pct", "target": 10.05, "pct": 0.3}, 7),     # 10.02 … 10.08
+        ({"mode": "tol", "target": 10.0, "tol": 1.0}, 10),
+    ]
+    for band, want in cases:
+        cfg = w._pv_cfg[0]
+        for k in ("mode", "lo", "hi", "pct"):
+            cfg.pop(k, None)
+        cfg.update(band)
+        run(app, w, False)
+        got = [len(r.rows_in_tol) for r in w._cam_results[CAMS[0]]]
+        check(f"{sf_t._band_text(cfg)}", all(n == want for n in got),
+              f"{got}, want {want}")
+    cfg = w._pv_cfg[0]
+    for k in ("mode", "lo", "hi", "pct"):
+        cfg.pop(k, None)
+    cfg.update({"target": 10.0, "tol": 1.0})
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     app.setStyle("Fusion")
@@ -362,6 +388,7 @@ def main():
     test_frames_overlap(app, w)
     test_blank_frame_is_the_previews_job(app, w)
     test_new_band_reloads(app, w)
+    test_band_modes(app, w)
 
     print()
     if FAILURES:

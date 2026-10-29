@@ -69,6 +69,14 @@ def white_bbox(img, area):
     return left, top, right, bottom
 
 
+def quiet(view):
+    """Shown without ever taking the keyboard focus from the user."""
+    from PySide6.QtCore import Qt
+    view.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+    view.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+    return view
+
+
 def render(view):
     view.repaint()
     return view.grab().toImage()
@@ -104,19 +112,23 @@ def main():
           f"got {m._ref_rect_key(PCW3)!r}")
     check("PCW3_NF display name recognised", m._ref_rect_key("C03-081_PCW3_NF") == "PCW3_NF",
           f"got {m._ref_rect_key('C03-081_PCW3_NF')!r}")
-    check("other cameras have none", m._ref_rect_key(OTHER) == "" and m._ref_rect_key(DIODE) == "")
-    check("PCW3_DF is not PCW3_NF", m._ref_rect_key("C03-084-PCW3DF-_-IMG") == "")
+    check("PCW3_DF is not PCW3_NF", m._ref_rect_key("C03-084-PCW3DF-_-IMG") != "PCW3_NF",
+          f"got {m._ref_rect_key('C03-084-PCW3DF-_-IMG')!r}")
 
-    cfg = m.get_ref_rect_config(PCW3)
-    check("config exists for PCW3_NF", cfg is not None)
+    frames = m.get_ref_frames(PCW3)
+    cfg = frames[0] if frames else None
+    check("PCW3_NF has exactly its measured square", len(frames) == 1, f"{len(frames)} frames")
     check("on by default", cfg is not None and cfg.show is True)
-    check("no config for other cameras", m.get_ref_rect_config(OTHER) is None)
+    check("named 'Measured by hand'", cfg is not None and cfg.name == "Measured by hand"
+          and cfg.source == "hand")
+    check("other cameras start with none",
+          m.get_ref_frames(OTHER) == [] and m.get_ref_frames(DIODE) == [])
 
     print("\n-- the square lands where it was measured --")
-    view = m.ImageView()
+    view = quiet(m.ImageView())
     view.resize(VIEW_W, VIEW_H)
     view.pdxm1_cam_name = PCW3
-    view.ref_rect_cfg = cfg
+    view.ref_rect_cfg = frames
     view.set_pixmap(dark_frame())
     view.show()
     app.processEvents()
@@ -186,24 +198,61 @@ def main():
 
     print("\n-- switching it off --")
     off_cfg = m.CamRefRectConfig(show=False)
-    view.ref_rect_cfg = off_cfg
+    view.ref_rect_cfg = [off_cfg]
     app.processEvents()
     check("nothing drawn when off", white_bbox(render(view), view._img_rect()) is None)
 
+    print("\n-- two frames, each with its own switch --")
+    second = m.CamRefRectConfig(left=0.10, top=0.10, right=0.20, bottom=0.20,
+                                id="x2", name="Second", source="window")
+    view.ref_rect_cfg = [off_cfg, second]
+    app.processEvents()
+    box2 = white_bbox(render(view), view._img_rect())
+    exp2 = expected_edges(m, view, second)
+    check("only the shown one is drawn", box2 is not None
+          and max(abs(a - b) for a, b in zip(box2, exp2)) <= 2, f"drawn={box2} expected={exp2}")
+
     print("\n-- saving and reloading a nudged position --")
     nudged = m.CamRefRectConfig(left=0.30, top=0.20, right=0.80, bottom=0.70, show=False)
-    m.save_ref_rect_config(PCW3, nudged)
-    back = m.get_ref_rect_config("C03-081_PCW3_NF")   # the other spelling reads it too
+    m.save_ref_frames(PCW3, [nudged])
+    back = m.get_ref_frames("C03-081_PCW3_NF")   # the other spelling reads it too
+    back = back[0] if back else None
     check("nudged position comes back", back is not None and abs(back.left - 0.30) < 1e-9
           and abs(back.bottom - 0.70) < 1e-9)
     check("the off switch is remembered", back is not None and back.show is False)
+    m.save_ref_frame_show(PCW3, "hand-1", True)
+    check("one switch saved on its own",
+          m.get_ref_frames(PCW3)[0].show is True and abs(m.get_ref_frames(PCW3)[0].left - 0.30) < 1e-9)
+    m._CAM_REF_RECT_PATH.unlink(missing_ok=True)
+
+    print("\n-- the square saved by the previous version is kept --")
+    import json as _json
+    old = {"PCW3_NF": {"left": 0.31, "top": 0.17, "right": 0.85, "bottom": 0.66,
+                       "color": "#00ff00", "width": 2, "alpha": 180, "show": False}}
+    m._CAM_REF_RECT_PATH.write_text(_json.dumps(old), encoding="utf-8")
+    fr = m.get_ref_frames(PCW3)
+    check("old entry becomes one frame", len(fr) == 1, f"{len(fr)} frames")
+    if fr:
+        f0 = fr[0]
+        check("its position, style and switch are unchanged",
+              (f0.left, f0.top, f0.right, f0.bottom, f0.color, f0.width, f0.alpha, f0.show)
+              == (0.31, 0.17, 0.85, 0.66, "#00ff00", 2, 180, False))
+        check("it is the hand-made one", f0.name == "Measured by hand" and f0.source == "hand")
+    # Adding a frame later must leave it as it is.
+    m.save_ref_frames(PCW3, fr + [second])
+    fr2 = m.get_ref_frames(PCW3)
+    check("adding a frame keeps the old one", len(fr2) == 2 and fr2[0].left == 0.31
+          and fr2[0].color == "#00ff00" and fr2[1].name == "Second")
+    m.save_ref_frames(OTHER, [second])
+    check("frames of another camera are its own", len(m.get_ref_frames(OTHER)) == 1
+          and len(m.get_ref_frames(PCW3)) == 2)
     m._CAM_REF_RECT_PATH.unlink(missing_ok=True)
 
     print("\n-- other cameras stay clean --")
-    v2 = m.ImageView()
+    v2 = quiet(m.ImageView())
     v2.resize(VIEW_W, VIEW_H)
     v2.pdxm1_cam_name = OTHER
-    v2.ref_rect_cfg = m.get_ref_rect_config(OTHER)
+    v2.ref_rect_cfg = m.get_ref_frames(OTHER)
     v2.set_pixmap(dark_frame(600))
     v2.show()
     app.processEvents()

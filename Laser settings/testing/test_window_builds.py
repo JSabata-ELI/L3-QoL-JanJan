@@ -111,8 +111,9 @@ def main():
     check("a fresh install watches no values", win.rows(), [])
     check("one channel per valve, the open switch, then SBW4's energy",
           win.channels(),
-          [f"L3-PSS:SGV{n}_IN_OPEN_POSITION"
-           for n in (501, 502, 503, 504, 505)] + list(C.FIRING_CHANNELS))
+          ["L3-PSS:SGV501_IN_OPEN_POSITION"]
+          + [f"L3BT-MSS:SGV{n}_OPEN_IN" for n in (502, 503, 504, 505)]
+          + list(C.FIRING_CHANNELS))
 
     print("a channel added on the Limits tab reaches the Overview")
     row = C.new_row(C.next_id(win.rows()), "TEST:PV", "Test value", "ns")
@@ -123,6 +124,23 @@ def main():
     check("the Limits lists it", win._settings._table.rowCount(), 1)
     check("and there is no counting line under that table",
           hasattr(win._settings, "_foot"), False)
+
+    print("the Limits tab says L3, never Int (14.10.2026)")
+    check("the hall buttons",
+          [b.text() for b in win._settings._hall_buttons.values()],
+          ["L3", "E2", "E3", "E4", "E5"])
+    check("the gate valve box", win._settings._gate_box.title(),
+          "Gate valve of L3")
+    print("a centred number stays centred while it is typed")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QLineEdit, QStyleOptionViewItem
+    table = win._settings._table
+    index = table.model().index(0, 6)               # Min
+    editor = table.itemDelegate(index).createEditor(
+        table.viewport(), QStyleOptionViewItem(), index)
+    check("the editor is centred", isinstance(editor, QLineEdit)
+          and bool(editor.alignment() & Qt.AlignmentFlag.AlignHCenter), True)
+    editor.deleteLater()
     print("an Overview row is a name, a square and a number — and no table")
     row_widget = win._overview._row_widgets[0]
     check("no table on the Overview", hasattr(win._overview, "_table"), False)
@@ -159,9 +177,15 @@ def main():
                  "mark_px": 36})
     win.settings_changed(rebuild=True)
     row_widget = win._overview._row_widgets[0]
-    check("a bigger size reaches the list",
-          row_widget._name.font().pixelSize(), 24)
-    check("and the square", row_widget._mark.side(), 36)
+    # As big as typed, or as big as the (never shown, small) tab lets it be:
+    # since 12.10.2026 a typed size never runs past the window's edge.
+    ov = win._overview
+    want = ov._shrunk_to_window(look, 24, 36, win.halls()["band_px"])
+    check("a bigger size reaches the list (as far as the tab has room)",
+          (row_widget._name.font().pixelSize(), row_widget._mark.side()),
+          want)
+    check("and it is bigger than the default",
+          want[0] > C.LOOK_DEFAULTS["size_px"] or want[0] == 24, True)
     # The typeface is checked on the STYLESHEET, not on `font().family()`: the
     # offscreen platform used here has no real fonts and reports whatever it
     # substituted. That the family reaches the font as well is checked by
@@ -261,7 +285,8 @@ def main():
           win._settings._table.item(1, st_t._C_PV).text(), "= A * 0.749")
     check("nothing is wrong with it", C.formula_problems(calc, win.rows()), [])
     check("a formula reads no channel of its own",
-          [c for c in win.channels() if not c.startswith("L3-PSS")
+          [c for c in win.channels()
+           if not c.startswith(("L3-PSS", "L3BT-MSS:SGV"))
            and c not in C.FIRING_CHANNELS],
           ["TEST:PV"])
 

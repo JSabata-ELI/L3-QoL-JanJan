@@ -1062,20 +1062,30 @@ class NotificationHub:
     def is_any_configured(self) -> bool:
         return bool(self._active_channels())
 
+    def active_channels(self) -> list[str]:
+        """The channels an alert would go out over right now."""
+        return self._active_channels()
+
     def dispatch(self, payload: AlertPayload,
-                 png_bytes: bytes | None = None) -> dict[str, str]:
+                 png_bytes: bytes | None = None,
+                 only=None) -> dict[str, str]:
         """Send to every enabled+configured channel. Return {channel: error}.
 
+        `only`, when given, narrows that to the channels named in it — the
+        caller's mutes and quiet hours; the hub itself keeps no schedule.
         Safe to call from a worker thread; never raises.
         """
+        def wanted(ch: str) -> bool:
+            return only is None or ch in only
+
         errors: dict[str, str] = {}
-        if self.teams_enabled and self.teams.is_configured():
+        if wanted("teams") and self.teams_enabled and self.teams.is_configured():
             if not self.teams.post_payload(payload, png_bytes):
                 errors["teams"] = self.teams.last_error
-        if self.email_enabled and self.email.is_configured():
+        if wanted("email") and self.email_enabled and self.email.is_configured():
             if not self.email.send_payload(payload, png_bytes):
                 errors["email"] = self.email.last_error
-        if self.webex_enabled and self.webex.is_configured():
+        if wanted("webex") and self.webex_enabled and self.webex.is_configured():
             if not self.webex.send(payload, png_bytes):
                 errors["webex"] = self.webex.last_error
         return errors
@@ -1102,16 +1112,20 @@ class NotificationHub:
                 errors["webex"] = self.webex.last_error
         return errors
 
-    def send_all_tests(self) -> dict[str, str]:
-        """Send a test message to every enabled+configured channel."""
+    def send_all_tests(self, only=None) -> dict[str, str]:
+        """Send a test message to every enabled+configured channel, or only to
+        those named in `only`."""
+        def wanted(ch: str) -> bool:
+            return only is None or ch in only
+
         errors: dict[str, str] = {}
-        if self.teams_enabled and self.teams.is_configured():
+        if wanted("teams") and self.teams_enabled and self.teams.is_configured():
             if not self.teams.send_test():
                 errors["teams"] = self.teams.last_error
-        if self.email_enabled and self.email.is_configured():
+        if wanted("email") and self.email_enabled and self.email.is_configured():
             if not self.email.send_test():
                 errors["email"] = self.email.last_error
-        if self.webex_enabled and self.webex.is_configured():
+        if wanted("webex") and self.webex_enabled and self.webex.is_configured():
             if not self.webex.send_test():
                 errors["webex"] = self.webex.last_error
         return errors

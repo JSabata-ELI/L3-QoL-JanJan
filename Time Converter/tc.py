@@ -5,6 +5,7 @@ from tkinter import (Tk, filedialog, Toplevel, Button, Label, messagebox,
 from pathlib import Path
 import re
 import shutil
+import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import time
@@ -22,6 +23,20 @@ TS_MAX_NS = int(datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp() * 1_000_00
 
 
 # --------- helpers ----------
+def _app_version():
+    """Version of the running build, e.g. "v1.4.3", or "" when run from source.
+    The builder names every exe "<Program> vX.Y.Z.exe", so the exe's own file
+    name is the one place that always tells the truth."""
+    if not getattr(sys, "frozen", False):
+        return ""
+    m = re.search(r"\s(v\d+(?:\.\d+)*)$", Path(sys.executable).stem)
+    return m.group(1) if m else ""
+
+
+APP_TITLE = (f"Time Converter {_app_version()}" if _app_version()
+             else "Time Converter (source)")
+
+
 def _fmt_hms(seconds):
     if seconds is None or seconds != seconds or seconds < 0:
         return "--:--"
@@ -108,7 +123,7 @@ def show_intro_and_get_options(parent):
     win = Toplevel(parent)
     # The program's own name, not a second one: the root window is withdrawn,
     # so this is the window the title bar and the taskbar button are read from.
-    win.title("Time Converter")
+    win.title(APP_TITLE)
     win.resizable(False, False)
 
     Label(
@@ -449,6 +464,57 @@ def _icon_app_id(prefix, ico_path):
     return f"{prefix}.{uuid.uuid4().hex[:12]}"
 
 
+def _nudge_taskbar_icon(hwnd) -> None:
+    """Make the taskbar re-read this window's icon a few times after start.
+
+    Explorer reads a taskbar button's picture once, when it creates the
+    button, and does not ask again by itself. When that one read misses, the
+    button keeps the blank window placeholder for the whole run although the
+    window holds the right icon -- measured on Diagnostic v1.3.4, 15.10.2026:
+    started from C:, a fresh per-launch id, WM_GETICON answering with the
+    magnifier, the button blank. Re-sending the same icon changed nothing;
+    taking the icon away and giving it back made Explorer re-read it, and the
+    same running window drew the magnifier at once. So that is done here a few
+    times while the button may still be appearing (a slow start, a busy
+    Explorer after logon). Runs on a daemon thread; the window's own icon
+    handles are put back, so nothing is created or leaked.
+    """
+    if not hwnd:
+        return
+    import threading
+
+    def run():
+        import ctypes
+        import ctypes.wintypes as wt
+        import time
+        user32 = ctypes.windll.user32
+        send = user32.SendMessageTimeoutW
+        send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT,
+                         wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send.restype = ctypes.c_size_t
+        res = ctypes.c_size_t()
+        for delay in (2, 8, 20, 30):          # at about 2, 10, 30 and 60 s
+            time.sleep(delay)
+            try:
+                if not user32.IsWindow(wt.HWND(hwnd)):
+                    return
+                held = {}
+                for which in (1, 0):          # ICON_BIG, ICON_SMALL
+                    res.value = 0
+                    # SMTO_ABORTIFHUNG: a frozen window just skips this round
+                    if send(hwnd, 0x007F, which, 0, 0x0002, 2000,
+                            ctypes.byref(res)) and res.value:
+                        held[which] = res.value
+                for which in held:
+                    send(hwnd, 0x0080, which, 0, 0x0002, 2000, ctypes.byref(res))
+                for which, h in held.items():
+                    send(hwnd, 0x0080, which, h, 0x0002, 2000, ctypes.byref(res))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="taskbar-icon").start()
+
+
 def set_app_icon(win, ico_path, app_id=None):
     """Apply icon.ico to the title bar AND the Windows taskbar button.
 
@@ -457,6 +523,17 @@ def set_app_icon(win, ico_path, app_id=None):
     default feather. We force every slot from icon.ico via Win32.
     """
     import ctypes
+    import os
+    import sys
+    # The Builder bundles icon.ico inside the exe (--add-data), and a copy next
+    # to the exe is not guaranteed -- without this fallback iconbitmap failed
+    # and the title bar kept Tk's feather. Resolved before the id is made, so
+    # the id and every icon call below see the same file.
+    if not ico_path or not os.path.exists(str(ico_path)):
+        _mp = getattr(sys, "_MEIPASS", None)
+        _alt = os.path.join(_mp, "icon.ico") if _mp else None
+        if _alt and os.path.exists(_alt):
+            ico_path = _alt
     _aumid = _icon_app_id(app_id, ico_path) if app_id else None
     if _aumid:
         try:
@@ -467,19 +544,38 @@ def set_app_icon(win, ico_path, app_id=None):
         win.iconbitmap(default=ico_path)
     except Exception:
         pass
+    # The outer window (title bar, taskbar button) exists only once Tk has
+    # mapped the window; forcing it with update_idletasks() showed the window
+    # before it was built. So the slots are set just after the first map.
+    def _apply(tries=0):
+        try:
+            if not win.winfo_ismapped() and tries < 50:
+                win.after(200, lambda: _apply(tries + 1))
+                return
+            u = ctypes.windll.user32
+            try:
+                hwnd = int(win.wm_frame(), 16)
+            except Exception:
+                hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+            try:
+                big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
+                sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
+                for which, h in ((1, big), (0, sm), (2, sm)):
+                    if h:
+                        u.SendMessageW(hwnd, 0x0080, which, h)
+                set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+                if big:
+                    set_cls(hwnd, -14, big)
+                if sm:
+                    set_cls(hwnd, -34, sm)
+            except Exception:
+                pass
+            _nudge_taskbar_icon(hwnd)
+        except Exception:
+            pass                              # the window is gone: just stop
+
     try:
-        u = ctypes.windll.user32
-        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
-        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
-        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
-        for which, h in ((1, big), (0, sm), (2, sm)):
-            if h:
-                u.SendMessageW(hwnd, 0x0080, which, h)
-        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
-        if big:
-            set_cls(hwnd, -14, big)
-        if sm:
-            set_cls(hwnd, -34, sm)
+        win.after(100, _apply)
     except Exception:
         pass
 
@@ -488,7 +584,7 @@ def set_app_icon(win, ico_path, app_id=None):
 def main():
     root = Tk()
     root.withdraw()
-    root.title("Time Converter")
+    root.title(APP_TITLE)
     import sys as _sys
     if getattr(_sys, "frozen", False):
         _base = Path(_sys.executable).resolve().parent

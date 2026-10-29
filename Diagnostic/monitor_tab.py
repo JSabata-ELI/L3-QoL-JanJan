@@ -56,7 +56,8 @@ import cpva_api as api
 import shared_pvs
 from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
-    NotificationHub, Thresholds, Trend, _raw_severity, classify_trend,
+    Notification, NotificationHub, Thresholds, Trend, _raw_severity,
+    classify_trend,
     describe_reason, fmt_duration, write_run_status,
 )
 import bot_commands
@@ -294,8 +295,15 @@ DEFAULT_SETTINGS = {
     # Data watchdog: alerts once when every monitored PV fails to fetch data
     # for this many consecutive polls (a network/archiver outage, not a
     # single PV's own no-data), and once more when data flow resumes.
+    # Short outages in a row count as one episode: while it lasts the alarm is
+    # repeated only every `data_watchdog_remind_hours`, and the OK is sent only
+    # once data has flowed with no fully-failed poll for
+    # `data_watchdog_ok_after_minutes` — so a flapping archiver gives one
+    # ALARM and one OK, not a pair every few minutes.
     "data_watchdog_enabled": True,
     "data_watchdog_fail_polls": 2,
+    "data_watchdog_remind_hours": 12.0,
+    "data_watchdog_ok_after_minutes": 15.0,
     # "Not updating" check: the archiver answers, but its newest sample for this
     # PV stops advancing, so the value shown is old. Reported in the State
     # column and, with frozen_alert_enabled, once per episode over the alert
@@ -310,9 +318,24 @@ DEFAULT_SETTINGS = {
     "alarm_k_default": 5.0,
     # Sensor-error sanity range applied to every PV unless it overrides:
     # readings outside [valid_min_default, valid_max_default] are discarded.
-    # None = no bound on that side.
+    # None = no bound on that side. The ceiling has two values: pressure PVs
+    # (Torr, mbar, Pa, …) use valid_max_pressure_default, everything else
+    # (temperatures, flow, unit-less) uses valid_max_default — a ceiling of
+    # 80 that suits a chiller threw away a vented chamber's ~800 Torr.
     "valid_min_default": None,
     "valid_max_default": 80.0,
+    "valid_max_pressure_default": None,
+    # Sensor-error ranges per kind of PV (Settings → "Sensor-error ranges"):
+    #   [{"name": "Pressure", "groups": [...], "units": [...],
+    #     "min": <float|None>, "max": <float|None>}, ...]
+    # A PV takes the first row naming its group or subgroup; failing that, the
+    # first row listing its unit; failing that, valid_min_default /
+    # valid_max_default above ("everything else"). None on a side = no bound.
+    # None as a whole = not set up yet: _seed_valid_ranges builds the rows
+    # from the old temperature/pressure fields, so nothing changes on upgrade.
+    # valid_max_pressure_default is still written (from the "Pressure" row)
+    # for copies of the program older than this table.
+    "valid_ranges": None,
     "graph_window_minutes": 60,
     # Graph legend placement, set from the graph's right-click menu. Local-only
     # (a per-user view preference, see SHARE_LOCAL_ONLY_KEYS): "best" lets
@@ -367,6 +390,18 @@ DEFAULT_SETTINGS = {
     "webex_commands_enabled": True,
     "webex_command_poll_s": 5,   # <5 s tends to trip Webex HTTP 429 rate limits
     "webex_command_allowlist": [],   # sender emails allowed; empty = anyone in room
+    # Muting the alert channels — set from the chat (/channels, /quiet) and,
+    # for the rules, in Settings. LOCAL-ONLY like the channels themselves, and
+    # deliberately NOT the *_enabled flags above: those come from the build
+    # and are never saved, so a mute written into them would be gone after a
+    # restart. See bot_commands.channel_hold_reason for how they are judged.
+    #   channel_off_until: {"email": <end ns> | "forever"} — manual mutes.
+    #   quiet_rules: recurring windows, see bot_commands.parse_quiet_rule.
+    #   quiet_rules_enabled: master switch — off suspends every rule at once
+    #   without losing them.
+    "channel_off_until": {},
+    "quiet_rules_enabled": True,
+    "quiet_rules": [],
     # canteen menu (/food) — read from the OKbase portal, see okbase_menu.py.
     # LOCAL-ONLY, every one of them: the credentials are this Windows account's
     # DPAPI blobs, and the rest only makes sense next to them.
@@ -430,6 +465,9 @@ SHARE_LOCAL_ONLY_KEYS = (
     "okbase_keepalive_min", "okbase_account", "okbase_order_emails",
     "okbase_order_codes", "okbase_remind_enabled", "okbase_remind_hour",
     "okbase_remind_email", "okbase_remind_sent_day",
+    # Channel mutes belong to the channels, which are this PC's (from the
+    # build): another copy may alert through different ones.
+    "channel_off_until", "quiet_rules_enabled", "quiet_rules",
 )
 
 
@@ -525,6 +563,56 @@ def load_config() -> dict:
     data["settings"] = settings
     data.setdefault("pvs", [])
     return data
+
+
+# The units of the two kinds of PV the program started out with, as the seed
+# for the "Sensor-error ranges" table. Compared lower-case.
+PRESSURE_UNITS = ("pa", "kpa", "mpa", "bar", "mbar", "torr", "mtorr",
+                  "psi", "psig", "psia")
+TEMPERATURE_UNITS = ("degc", "°c", "c", "k", "degf")
+
+
+def _seed_valid_ranges(settings: dict) -> bool:
+    """Build the sensor-error table from the old fields, once.
+
+    Run after the shared settings are merged, so the seed carries the
+    group's own ceilings, not this PC's. True when it built something.
+    """
+    if settings.get("valid_ranges") is not None:
+        return False
+    floor = settings.get("valid_min_default")
+    settings["valid_ranges"] = [
+        {"name": "Pressure", "groups": [], "units": list(PRESSURE_UNITS),
+         "min": floor, "max": settings.get("valid_max_pressure_default")},
+        {"name": "Temperature", "groups": [],
+         "units": list(TEMPERATURE_UNITS),
+         "min": floor, "max": settings.get("valid_max_default")},
+    ]
+    return True
+
+
+def valid_range_for(settings: dict, group: str, subgroup: str,
+                    units: str) -> tuple:
+    """(min, max, row name) of the sensor-error range a PV falls under.
+
+    A row naming the PV's group or subgroup wins over a row listing its
+    unit — a group is the more deliberate choice ("Helium" says more than
+    "psi") — and within each kind the first row wins. No row = the
+    "Everything else" pair.
+    """
+    rows = settings.get("valid_ranges") or []
+    names = {(group or "").strip().lower(), (subgroup or "").strip().lower()}
+    names.discard("")
+    for row in rows:
+        if names & {g.strip().lower() for g in row.get("groups") or []}:
+            return row.get("min"), row.get("max"), row.get("name") or "?"
+    key = (units or "").strip().lower()
+    if key:
+        for row in rows:
+            if key in {u.strip().lower() for u in row.get("units") or []}:
+                return row.get("min"), row.get("max"), row.get("name") or "?"
+    return (settings.get("valid_min_default"),
+            settings.get("valid_max_default"), "Everything else")
 
 
 def _migrate_settings(settings: dict) -> None:
@@ -710,6 +798,12 @@ class PVConfig:
     frozen_check: bool = True
     learned_at: Optional[str] = None
     learn_stats: Optional[dict] = None
+    # Snoozed from the chat (/snooze): no alert for this PV goes out until
+    # then — an end in ns, or bot_commands.FOREVER; None = not snoozed. Kept on
+    # the PV rather than in memory so a restart cannot end a snooze early, and
+    # shared with the PV list like `enabled` is.
+    snoozed_until: object = None
+    snoozed_by: str = ""
 
     def __post_init__(self):
         if not self.display_name:
@@ -767,6 +861,8 @@ class PVConfig:
             "valid_min": self.valid_min, "valid_max": self.valid_max,
             "frozen_check": self.frozen_check,
             "learned_at": self.learned_at, "learn_stats": self.learn_stats,
+            "snoozed_until": self.snoozed_until,
+            "snoozed_by": self.snoozed_by,
         }
 
     @classmethod
@@ -784,6 +880,8 @@ class PVConfig:
             valid_min=d.get("valid_min"), valid_max=d.get("valid_max"),
             frozen_check=bool(d.get("frozen_check", True)),
             learned_at=d.get("learned_at"), learn_stats=d.get("learn_stats"),
+            snoozed_until=d.get("snoozed_until"),
+            snoozed_by=d.get("snoozed_by") or "",
         )
 
     @staticmethod
@@ -1209,6 +1307,16 @@ class PVRuntime:
     frozen_reason: str = ""
     # One notification per episode (and one when it clears).
     frozen_notified: bool = False
+    # Acknowledged from the chat (/ack): the level somebody said they know
+    # about. Reminders of that level are held; any other level — worse, or
+    # back to OK — clears it and is announced as usual. Memory only: after a
+    # restart the alert episode itself starts over anyway.
+    acked_level: Optional[AlertLevel] = None
+    acked_by: str = ""
+    acked_ns: int = 0
+    # A snooze that ran out while this PV was still bad owes one fresh alert;
+    # set when an alert was held by the snooze, cleared when it is paid.
+    snooze_owed: bool = False
 
     def in_grace(self, now_ns: int = 0) -> bool:
         """True while alerting is held because the limits in force just
@@ -1779,6 +1887,11 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     committed alert has nothing to send yet ("pending")."""
     if rt is None or not pv.enabled:
         return ""
+    # Snoozed from the chat: said first, because it outranks everything below
+    # — whatever the state, nothing about this PV is being sent.
+    if bot_commands.mute_live(pv.snoozed_until, api.now_ns()):
+        return "snoozed " + bot_commands.until_text(
+            pv.snoozed_until, api.now_ns()).replace("until ", "→ ")
     # Held because the limits themselves just changed. Shown even while the
     # state is still OK: the value may already be outside the new band, and
     # this is the only cell that says why nothing is being raised about it.
@@ -1796,6 +1909,10 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
         return "⚠ not sent"
     if rt.notify_status == "sending":
         return "sending…"
+    if rt.notify_status == "held":
+        return "held (quiet)"
+    if rt.acked_level is not None and rt.acked_level == rt.alert.level:
+        return "acknowledged"
     if rt.alert.first_notified_ns:
         return "sent " + api.ns_to_prague(
             rt.alert.first_notified_ns).strftime("%H:%M:%S")
@@ -1815,6 +1932,14 @@ def _grace_tooltip(rt: "PVRuntime") -> str:
 def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     if rt is None or not pv.enabled:
         return "Alerting off for this PV."
+    if bot_commands.mute_live(pv.snoozed_until, api.now_ns()):
+        who = f" by {pv.snoozed_by}" if pv.snoozed_by else ""
+        return (f"Snoozed{who} "
+                f"{bot_commands.until_text(pv.snoozed_until, api.now_ns())}: "
+                f"the PV is read and judged as usual, but no alert about it "
+                f"is sent. If it is still out of its limits when the snooze "
+                f"ends, one alert goes out then. /unsnooze in the chat ends "
+                f"it early.")
     if rt.in_grace():
         return _grace_tooltip(rt)
     if rt.alert.level == AlertLevel.OK:
@@ -1835,11 +1960,18 @@ def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     if rt.alert.last_notified_ns:
         lines.append("Last notified: " + api.ns_to_prague(
             rt.alert.last_notified_ns).strftime("%Y-%m-%d %H:%M:%S"))
+    if rt.acked_level is not None and rt.acked_level == rt.alert.level:
+        lines.append(f"Acknowledged by {rt.acked_by or 'someone'} at "
+                     + api.ns_to_prague(rt.acked_ns).strftime("%H:%M:%S")
+                     + " — reminders held until the level changes.")
     if rt.notify_status == "failed":
         lines.append("Delivery FAILED — alert not sent:")
         lines.append("  " + (rt.notify_error or "unknown error"))
     elif rt.notify_status == "sending":
         lines.append("Delivery in progress…")
+    elif rt.notify_status == "held":
+        lines.append("Not sent — every channel is muted or in quiet hours "
+                     f"({rt.notify_error}).")
     elif rt.notify_status == "sent":
         lines.append("Delivered to all enabled channels.")
     return "\n".join(lines)
@@ -2703,7 +2835,7 @@ class PVBrowserDialog(QDialog):
 
         lay = QVBoxLayout(self)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Filter (space = AND, * = wildcard)…")
+        self.search.setPlaceholderText('Filter — words in any order (e.g. "chl temp")')
         self.search.setToolTip(
             "Type to filter the full CPVA channel list below. Space-separated "
             "words must all match (AND); * matches any run of characters. "
@@ -2743,22 +2875,52 @@ class PVBrowserDialog(QDialog):
             self._apply_filter()
         else:
             self.count.setText("Loading channels…")
-            self._load_channels()
+        # Asked again on every opening, even with a list in hand: channels added
+        # to the archiver while the program is open (SPIDER GDD, TPD and FOG on
+        # 2026-10-13) were not offered until a restart. Measured 2026-10-13: the
+        # whole list, 9747 names, comes back in ~0.03 s.
+        self._load_channels()
 
     def _load_channels(self):
         sig = _ChannelsSignals(self)
         sig.done.connect(self._on_loaded)
-        sig.error.connect(lambda e: self.count.setText(f"Channel load failed: {e}"))
+        sig.error.connect(self._on_load_failed)
         self._sig = sig
         QThreadPool.globalInstance().start(_ChannelsWorker(sig, self._timeout))
 
+    def _on_load_failed(self, err: str):
+        if not self._all:              # an older list on screen stays usable
+            self.count.setText(f"Channel load failed: {err}")
+
     def _on_loaded(self, channels):
+        if not channels and self._all:
+            return
+        parent = self.parent()
+        if channels and parent is not None and hasattr(parent, "_all_channels"):
+            parent._all_channels = channels      # the next opening starts from it
+        if channels == self._all:
+            return                     # nothing new — keep the list and the picks
+        picked = {i.text() for i in self.list.selectedItems()}
         self._all = channels
         self._apply_filter()
+        for i in range(self.list.count()):
+            if self.list.item(i).text() in picked:
+                self.list.item(i).setSelected(True)
 
     def _apply_filter(self):
-        pat = self.search.text()
-        matches = [c for c in self._all if api._matches_wildcard(c, pat)]
+        # The house PV search (bot_commands): every word must be in the name,
+        # in any order, best hits first. An empty box lists every channel.
+        tokens = bot_commands.split_query(self.search.text())
+        if tokens:
+            scored = []
+            for i, c in enumerate(self._all):
+                s = bot_commands.rank_pv_match(c, c, tokens)
+                if s is not None:
+                    scored.append((s, i, c))
+            scored.sort(key=lambda t: (t[0], t[1]))
+            matches = [c for _s, _i, c in scored]
+        else:
+            matches = list(self._all)
         capped = matches[:2000]
         self.list.clear()
         for c in capped:
@@ -2883,10 +3045,10 @@ class PVEditDialog(QDialog):
         vrl.addWidget(self.f_valid_max)
         self.f_valid_min.set_value(pv.valid_min)
         self.f_valid_max.set_value(pv.valid_max)
-        gmin = parent.settings.get("valid_min_default")
-        gmax = parent.settings.get("valid_max_default")
-        hint = QLabel(f"Unchecked = use global default "
-                      f"[{_fmt(gmin)} .. {_fmt(gmax)}]. "
+        gmin, gmax, row = parent._global_valid_range(pv)
+        hint = QLabel(f"Unchecked = use the global range for “{row}” "
+                      f"[{_fmt(gmin)} .. {_fmt(gmax)}] (Settings → "
+                      "Sensor-error ranges, chosen by group, then unit). "
                       "Out-of-range readings are dropped everywhere "
                       "(plot, alarms, Learn).")
         hint.setWordWrap(True)
@@ -2966,12 +3128,15 @@ class PVEditDialog(QDialog):
         self._learn_sig = sig
         # Learn honours the same valid range that would be saved for this PV,
         # using the checkbox values live (falling back to the global default).
+        glo, ghi, _ = self._win._global_valid_range(
+            self.pv, units=(self.units_combo.currentText().strip()
+                            or self._win._pv_units_of(self.pv)))
         vmin = self.f_valid_min.value()
         if vmin is None:
-            vmin = self._win.settings.get("valid_min_default")
+            vmin = glo
         vmax = self.f_valid_max.value()
         if vmax is None:
-            vmax = self._win.settings.get("valid_max_default")
+            vmax = ghi
         worker = _LearnWorker(
             sig, self.pv.name, self.days.value(),
             self.warn_k.value(), self.alarm_k.value(),
@@ -3459,6 +3624,256 @@ class EmailContactsWidget(QWidget):
         return [c["address"] for c in self.rows() if c["enabled"]]
 
 
+class ValidRangesWidget(QWidget):
+    """Editable sensor-error ranges — one row per kind of PV.
+
+    A row applies to PVs by GROUP (or subgroup) name, or by UNIT; see
+    valid_range_for for which row wins. An empty limit cell = no bound on
+    that side.
+    """
+
+    COLS = ["Name", "Groups", "Units", "Reject below <", "Reject above >"]
+    _TIPS = [
+        "What this row is about — shown in Edit PV as the range in force.",
+        "Group or subgroup names this row applies to, separated by commas "
+        "(e.g. Helium). A group match wins over a unit match.",
+        "Units this row applies to, separated by commas (e.g. psi, bar). "
+        "Used when no row names the PV's group.",
+        "Readings below this are dropped as a sensor fault. Empty = no lower "
+        "bound.",
+        "Readings above this are dropped as a sensor fault. Empty = no upper "
+        "bound. Keep it above the PV's alarm limit, or the alarm can never "
+        "fire.",
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        for c, tip in enumerate(self._TIPS):
+            self.table.horizontalHeaderItem(c).setToolTip(tip)
+        hh = self.table.horizontalHeader()
+        for c in range(len(self.COLS)):
+            hh.setSectionResizeMode(c, QHeaderView.Stretch)
+        # The unit list of the Pressure row is long; it is sized to its text
+        # rather than cut to "mba…".
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(130)
+        lay.addWidget(self.table)
+        row = QHBoxLayout()
+        add = QPushButton("Add")
+        add.setStyleSheet(SECONDARY_STYLE)
+        add.setToolTip("Add a row for a new kind of PV — e.g. Humidity with "
+                       "the units %, %RH — then fill in its range.")
+        add.clicked.connect(self._add_empty)
+        rm = QPushButton("Remove selected")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.setToolTip("Delete the selected row(s). Their PVs fall back to "
+                      "the next matching row, or to 'Everything else'.")
+        rm.clicked.connect(self._remove_selected)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _add_empty(self):
+        self._add_row({"name": "", "groups": [], "units": [],
+                       "min": None, "max": None})
+        r = self.table.rowCount() - 1
+        self.table.setCurrentCell(r, 0)
+        self.table.editItem(self.table.item(r, 0))
+
+    def _add_row(self, rng: dict):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        texts = [rng.get("name", ""), ", ".join(rng.get("groups") or []),
+                 ", ".join(rng.get("units") or []),
+                 "" if rng.get("min") is None else _fmt_num(rng["min"]),
+                 "" if rng.get("max") is None else _fmt_num(rng["max"])]
+        for c, t in enumerate(texts):
+            item = QTableWidgetItem(t)
+            item.setToolTip(self._TIPS[c])
+            self.table.setItem(r, c, item)
+
+    def _remove_selected(self):
+        for r in sorted({i.row() for i in self.table.selectedIndexes()},
+                        reverse=True):
+            self.table.removeRow(r)
+
+    def set_rows(self, ranges: list):
+        self.table.setRowCount(0)
+        for rng in ranges or []:
+            self._add_row(rng)
+
+    def rows(self) -> tuple:
+        """(ranges, problems) — a row that cannot be read is named in
+        `problems` instead of being saved half-right."""
+        out, problems = [], []
+        for r in range(self.table.rowCount()):
+            cells = [(self.table.item(r, c).text().strip()
+                      if self.table.item(r, c) else "")
+                     for c in range(len(self.COLS))]
+            name, groups, units, lo_t, hi_t = cells
+            if not any(cells):
+                continue
+            split = (lambda t: [p.strip() for p in t.replace(";", ",")
+                                .split(",") if p.strip()])
+            g, u = split(groups), split(units)
+            lo = _to_float(lo_t) if lo_t else None
+            hi = _to_float(hi_t) if hi_t else None
+            where = f"Row {r + 1} ({name or 'no name'})"
+            if not name:
+                problems.append(f"{where}: give it a name.")
+            elif not g and not u:
+                problems.append(f"{where}: name at least one group or unit, "
+                                f"or it applies to nothing.")
+            elif (lo_t and lo is None) or (hi_t and hi is None):
+                problems.append(f"{where}: the limits must be numbers.")
+            elif lo is not None and hi is not None and lo >= hi:
+                problems.append(f"{where}: 'below' must be lower than "
+                                f"'above'.")
+            else:
+                out.append({"name": name, "groups": g, "units": u,
+                            "min": lo, "max": hi})
+        return out, problems
+
+
+class QuietRulesWidget(QWidget):
+    """Editable quiet hours — the same rules the chat's /quiet edits.
+
+    Plain text cells, read back through bot_commands.parse_quiet_rule, so the
+    window and the chat accept exactly the same spellings and can never
+    disagree about what a rule means.
+    """
+
+    COLS = ["On", "Channels", "Days", "Hours", "Hold", "Label"]
+    _TIPS = [
+        "Untick to keep the rule but stop it applying.",
+        "webex, email, teams — or all. Several separated by commas.",
+        "mon-fri, sat,sun, weekend, weekdays, daily.",
+        "22:00-06:00, all day, or a start and a length: 12:00 for 1h. A "
+        "window past midnight belongs to the day it starts on.",
+        "all = nothing goes out; warnings = warnings and reminders held, "
+        "alarms still go; reminders = only the reminders held.",
+        "Optional name, shown in the chat and in /history.",
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        for c, tip in enumerate(self._TIPS):
+            self.table.horizontalHeaderItem(c).setToolTip(tip)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 32)
+        for c in range(1, len(self.COLS)):
+            hh.setSectionResizeMode(c, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(110)
+        lay.addWidget(self.table)
+
+        row = QHBoxLayout()
+        add = QPushButton("Add")
+        add.setStyleSheet(SECONDARY_STYLE)
+        add.setToolTip("Add a rule: e-mail quiet on weeknights, warnings "
+                       "held — then edit the cells.")
+        add.clicked.connect(self._add_default)
+        rm = QPushButton("Remove selected")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.setToolTip("Delete the selected rule(s).")
+        rm.clicked.connect(self._remove_selected)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    @staticmethod
+    def _hours_text(rule: dict) -> str:
+        if rule.get("duration_min"):
+            m = int(round(float(rule["duration_min"])))
+            length = f"{m // 60}h" if m % 60 == 0 else f"{m}m"
+            return f"{rule.get('start', '')} for {length}"
+        if rule.get("start") == "00:00" and rule.get("end") in ("24:00",
+                                                               "00:00"):
+            return "all day"
+        return f"{rule.get('start', '')}-{rule.get('end', '')}"
+
+    def _add_default(self):
+        self._add_row({"on": True, "channels": ["email"],
+                       "days": list(range(5)), "start": "22:00",
+                       "end": "06:00", "hold": "warnings", "label": ""})
+        self.table.setCurrentCell(self.table.rowCount() - 1, 1)
+
+    def _add_row(self, rule: dict):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        chk = QCheckBox()
+        chk.setChecked(bool(rule.get("on", True)))
+        cell = QWidget()
+        cl = QHBoxLayout(cell)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setAlignment(Qt.AlignCenter)
+        cl.addWidget(chk)
+        self.table.setCellWidget(r, 0, cell)
+        texts = [", ".join(rule.get("channels") or []),
+                 bot_commands.days_text(rule.get("days")),
+                 self._hours_text(rule), rule.get("hold", "all"),
+                 rule.get("label", "")]
+        for c, t in enumerate(texts, 1):
+            item = QTableWidgetItem(t)
+            item.setToolTip(self._TIPS[c])
+            self.table.setItem(r, c, item)
+
+    def _remove_selected(self):
+        for r in sorted({i.row() for i in self.table.selectedIndexes()},
+                        reverse=True):
+            self.table.removeRow(r)
+
+    def set_rows(self, rules: list):
+        self.table.setRowCount(0)
+        for rule in rules or []:
+            self._add_row(rule)
+
+    def rows(self) -> tuple:
+        """(rules, problems) — every row read back; a row that does not
+        parse is named in `problems` instead."""
+        rules, problems = [], []
+        for r in range(self.table.rowCount()):
+            cells = [(self.table.item(r, c).text().strip()
+                      if self.table.item(r, c) else "")
+                     for c in range(1, len(self.COLS))]
+            chans, days, hours, hold, label = cells
+            if not any(cells):
+                continue
+            if not chans:
+                problems.append(f"Row {r + 1}: no channel — webex, email, "
+                                f"teams or all.")
+                continue
+            hours_segs = [s.strip() for s in hours.split(" for ")] \
+                if " for " in hours else [hours]
+            segs = [chans, days] + hours_segs + [hold or "all"]
+            if label:
+                segs.append(f"label {label}")
+            try:
+                rule = bot_commands.parse_quiet_rule(segs)
+            except bot_commands.CommandError as e:
+                problems.append(f"Row {r + 1}: {str(e).replace('`', '')}")
+                continue
+            cell = self.table.cellWidget(r, 0)
+            chk = cell.findChild(QCheckBox) if cell else None
+            rule["on"] = chk.isChecked() if chk else True
+            rules.append(rule)
+        return rules, problems
+
+
 #  The one thing about the Webex bot nobody can guess, so it is written on screen in
 #  both places the Webex settings can appear: the editable group box (a source run) and
 #  the read-only summary of the built-in channels (the deployed build). Webex shows a
@@ -3742,6 +4157,23 @@ class SettingsDialog(QDialog):
             "differently with `; 300dpi` on /plot.")
         self.chart_dpi.setValue(int(s.get("chart_dpi", CHART_DPI)))
         cl.addRow("Picture resolution (dpi)", self.chart_dpi)
+        # Quiet hours — the same rules the chat edits with /quiet.
+        self.quiet_en = QCheckBox("Apply the quiet hours below")
+        self.quiet_en.setStyleSheet(_CHK_STYLE)
+        self.quiet_en.setToolTip(
+            "Master switch for the quiet hours. Off = every rule is suspended "
+            "and every alert goes out, but the rules are kept. The chat's "
+            "/quiet on and /quiet off flip the same switch.")
+        self.quiet_en.setChecked(bool(s.get("quiet_rules_enabled", True)))
+        cl.addRow("", self.quiet_en)
+        self.quiet_rules = QuietRulesWidget()
+        self.quiet_rules.setToolTip(
+            "Regular times when a channel keeps quiet — e.g. no warning "
+            "e-mails on weeknights while alarms still go. Held alerts are "
+            "listed by /history in the chat. Mutes set with /channels in the "
+            "chat are separate and end by themselves.")
+        self.quiet_rules.set_rows(s.get("quiet_rules") or [])
+        cl.addRow("Quiet hours", self.quiet_rules)
         lay.addWidget(ch)
 
         # --- Teams ---------------------------------------------------------
@@ -4309,20 +4741,30 @@ class SettingsDialog(QDialog):
         form.addRow("", self.frozen_alert)
         self.frozen_alert.setEnabled(self.frozen_en.isChecked())
         self.frozen_en.toggled.connect(self.frozen_alert.setEnabled)
+        self.valid_ranges = ValidRangesWidget()
+        self.valid_ranges.setToolTip(
+            "Sensor-error ranges: readings outside a PV's range are treated "
+            "as a sensor fault and dropped everywhere (graph, alarms, Learn). "
+            "A PV takes the first row naming its group (or subgroup); "
+            "failing that, the first row listing its unit; failing that, "
+            "'Everything else' below. A PV's own range in Edit PV wins over "
+            "all of them.")
+        self.valid_ranges.set_rows(s.get("valid_ranges") or [])
+        form.addRow("Sensor-error ranges", self.valid_ranges)
         self.valid_min = OptionalDoubleField("enable")
         self.valid_min.setToolTip(
-            "Default sensor-error floor for every PV: readings below this are "
-            "discarded as bad. Individual PVs can override it. Unticked = no "
-            "lower bound by default.")
+            "Sensor-error floor for every PV that no row above covers: "
+            "readings below this are discarded as bad. Unticked = no lower "
+            "bound.")
         self.valid_min.set_value(s.get("valid_min_default"))
-        form.addRow("Global reject below <", self.valid_min)
+        form.addRow("Everything else: reject below <", self.valid_min)
         self.valid_max = OptionalDoubleField("enable")
         self.valid_max.setToolTip(
-            "Default sensor-error ceiling for every PV: readings above this are "
-            "discarded as bad. Individual PVs can override it. Unticked = no "
-            "upper bound by default.")
+            "Sensor-error ceiling for every PV that no row above covers: "
+            "readings above this are discarded as bad. Unticked = no upper "
+            "bound.")
         self.valid_max.set_value(s.get("valid_max_default"))
-        form.addRow("Global reject above >", self.valid_max)
+        form.addRow("Everything else: reject above >", self.valid_max)
         self.autostart = QCheckBox("Start monitoring on launch")
         self.autostart.setStyleSheet(_CHK_STYLE)
         self.autostart.setToolTip(
@@ -4793,6 +5235,24 @@ class SettingsDialog(QDialog):
 
     def _save(self):
         s = self._win.settings
+        # Quiet hours first: a row that does not read keeps the dialog open,
+        # before anything else has been written.
+        quiet, problems = self.quiet_rules.rows()
+        if problems:
+            QMessageBox.warning(
+                self, "Quiet hours",
+                "These quiet-hour rows cannot be read — fix or remove them:"
+                "\n\n" + "\n".join(problems))
+            return
+        ranges, problems = self.valid_ranges.rows()
+        if problems:
+            QMessageBox.warning(
+                self, "Sensor-error ranges",
+                "These sensor-error rows cannot be read — fix or remove "
+                "them:\n\n" + "\n".join(problems))
+            return
+        s["quiet_rules"] = quiet
+        s["quiet_rules_enabled"] = self.quiet_en.isChecked()
         s["alert_plot_hours"] = self.plot_hours.value()
         s["chart_dpi"] = self.chart_dpi.value()
         # Channels: skipped entirely when they are provisioned by the build —
@@ -4889,6 +5349,12 @@ class SettingsDialog(QDialog):
         s["frozen_alert_enabled"] = self.frozen_alert.isChecked()
         s["valid_min_default"] = self.valid_min.value()
         s["valid_max_default"] = self.valid_max.value()
+        s["valid_ranges"] = ranges
+        # Older copies of the program still read the one pressure ceiling.
+        press = next((r for r in ranges
+                      if r["name"].strip().lower() == "pressure"), None)
+        if press is not None:
+            s["valid_max_pressure_default"] = press["max"]
         s["start_monitoring_on_launch"] = self.autostart.isChecked()
         # shared PV list
         s["shared_pv_list_enabled"] = self.shared_en.isChecked()
@@ -5554,8 +6020,12 @@ class GraphPanel(QWidget):
 
     def _capture_user_view(self):
         """Pin the current axes view (called after a toolbar zoom/pan) so
-        periodic redraws stop snapping back to the rolling window."""
-        self._user_view = (self.ax.get_xlim(), self.ax.get_ylim())
+        periodic redraws stop snapping back to the rolling window. A zoom
+        also moves the right-hand axes, so their Y ranges are pinned too —
+        otherwise the next poll autoscaled them back under a zoomed left axis."""
+        self._user_view = (self.ax.get_xlim(), self.ax.get_ylim(),
+                           {i: a.get_ylim()
+                            for i, a in enumerate(self._extra_axes)})
 
     def reset_zoom(self):
         """Unpin the user's zoom/pan and return to the live rolling window."""
@@ -5566,6 +6036,7 @@ class GraphPanel(QWidget):
     def reset_view(self):
         """Reload the PV list, drop any fixed Y range and redraw autoscaled."""
         self._yaxis = None
+        self._extra_yaxis.clear()
         self._user_view = None
         self.toolbar.update()
         self.refresh_combo()
@@ -5630,9 +6101,13 @@ class GraphPanel(QWidget):
             menu.addAction("Set X range…", lambda: self._prompt_xrange(ax))
             menu.addAction("Reset X to rolling window", self.reset_zoom)
         else:
-            menu.addAction("Set Y range…", lambda: self._prompt_yrange(ax))
+            # The actions carry which axis, not the axis object: a poll that
+            # lands while the menu is open redraws the graph and replaces every
+            # right-hand axis, and the old object then matches nothing.
+            key = self._axis_key(ax)
+            menu.addAction("Set Y range…", lambda: self._prompt_yrange(key))
             menu.addAction("Autoscale this Y axis",
-                            lambda: self._clear_yrange(ax))
+                            lambda: self._clear_yrange(key))
         menu.addSeparator()
         self._add_view_actions(menu)
         menu.exec(global_pos)
@@ -5947,29 +6422,48 @@ class GraphPanel(QWidget):
             return
         new_lo = new_lo.replace(tzinfo=api.TZ_PRAGUE)
         new_hi = new_hi.replace(tzinfo=api.TZ_PRAGUE)
+        extra = self._user_view[2] if self._user_view is not None else {}
         self._user_view = ((mdates.date2num(new_lo), mdates.date2num(new_hi)),
-                            ax.get_ylim())
+                            ax.get_ylim(), extra)
         self.redraw()
 
-    def _prompt_yrange(self, ax):
+    def _axis_key(self, ax):
+        """"main" for the left axis, else the right-hand axis's index."""
+        return "main" if ax is self.ax else self._extra_axes.index(ax)
+
+    def _axis_of_key(self, key):
+        """The axis drawn now for a key from _axis_key, or None if gone."""
+        if key == "main":
+            return self.ax
+        return self._extra_axes[key] if key < len(self._extra_axes) else None
+
+    def _prompt_yrange(self, key):
+        ax = self._axis_of_key(key)
+        if ax is None:
+            return
         lo, hi = ax.get_ylim()
         dlg = _AxisRangeDialog(self, "Y range", lo, hi)
         if dlg.exec() == QDialog.Accepted:
             new_lo, new_hi = dlg.values()
-            if ax is self.ax:
+            if key == "main":
                 self.set_yaxis(new_lo, new_hi)
             else:
-                idx = self._extra_axes.index(ax)
-                self._extra_yaxis[idx] = (new_lo, new_hi)
+                self._extra_yaxis[key] = (new_lo, new_hi)
+                self._drop_pinned_extra(key)
                 self.redraw()
 
-    def _clear_yrange(self, ax):
-        if ax is self.ax:
+    def _clear_yrange(self, key):
+        if key == "main":
             self.set_yaxis(None, None)
         else:
-            idx = self._extra_axes.index(ax)
-            self._extra_yaxis.pop(idx, None)
+            self._extra_yaxis.pop(key, None)
+            self._drop_pinned_extra(key)
             self.redraw()
+
+    def _drop_pinned_extra(self, idx: int):
+        """Forget a zoom pinned on one right-hand axis (the rest stay)."""
+        if self._user_view is not None:
+            self._user_view[2].pop(idx, None)
 
     def select_pv(self, name_or_all: Optional[str]):
         """Set the combo to a PV name (or None for 'All PVs'). Returns True if found."""
@@ -5983,13 +6477,15 @@ class GraphPanel(QWidget):
         return False
 
     def refresh_combo(self):
-        cur = self.combo.currentText()
+        # Restored by the archiver name, not the text shown: a PV renamed
+        # (from the chat or the window) must stay selected under its new name.
+        cur = self.combo.currentData()
         self.combo.blockSignals(True)
         self.combo.clear()
         self.combo.addItem("All PVs")
         for pv in self._win.pvs:
             self.combo.addItem(pv.display_name, pv.name)
-        idx = self.combo.findText(cur)
+        idx = self.combo.findData(cur) if cur else -1
         self.combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo.blockSignals(False)
         # The PV list just changed, so drop reduced curves for PVs that are no
@@ -6064,6 +6560,11 @@ class GraphPanel(QWidget):
         "mbar": "Pressure [mbar]",
         "l/min": "Flow [l/min]", "lpm": "Flow [l/min]",
         "torr": "Pressure [Torr]", "mtorr": "Pressure [mTorr]",
+        # The helium compressors report PSI. Without these the PV counted as
+        # a temperature, and the temperature sensor-error ceiling (80) threw
+        # every reading of a few hundred PSI away as a sensor fault.
+        "psi": "Pressure [psi]", "psig": "Pressure [psi]",
+        "psia": "Pressure [psi]",
     }
 
     # Units that count as temperature — kept on the familiar left axis.
@@ -6253,6 +6754,9 @@ class GraphPanel(QWidget):
         if self._user_view is not None:
             self.ax.set_xlim(self._user_view[0])
             self.ax.set_ylim(self._user_view[1])
+            for idx, ylim in self._user_view[2].items():
+                if idx < len(self._extra_axes):
+                    self._extra_axes[idx].set_ylim(ylim)
             return
         # Limit x to the configured window if we have data. orig=False gives
         # the unit-converted float date numbers (the original data are
@@ -6477,10 +6981,11 @@ class _AlertWorker(QRunnable):
     def __init__(self, sig: _AlertSignals, hub: NotificationHub,
                  payload: AlertPayload, thr: Thresholds, hours: float,
                  timeout: float, tag: str, vmin=None, vmax=None,
-                 stale_after_s: float = 0.0, dpi: int = 0):
+                 stale_after_s: float = 0.0, dpi: int = 0, only=None):
         super().__init__()
         self._sig = sig
         self._hub = hub
+        self._only = only        # channels left after mutes; None = all
         self._payload = payload
         self._thr = thr
         self._hours = hours
@@ -6501,8 +7006,30 @@ class _AlertWorker(QRunnable):
                                     dpi=self._dpi)
             except Exception:  # noqa: BLE001 - alert must still go out text-only
                 png = None
-        errors = self._hub.dispatch(self._payload, png)
+        errors = self._hub.dispatch(self._payload, png, only=self._only)
         _safe_emit(self._sig.done.emit, (self._tag, errors, png is not None))
+
+
+class _TestSignals(QObject):
+    done = Signal(object)   # (channels tried, {channel: error})
+
+
+class _TestWorker(QRunnable):
+    """/test — one test message per channel, off the UI thread (an SMTP
+    server that does not answer would otherwise freeze the window)."""
+
+    def __init__(self, sig: _TestSignals, hub: NotificationHub, only):
+        super().__init__()
+        self._sig = sig
+        self._hub = hub
+        self._only = only
+
+    def run(self):
+        try:
+            errors = self._hub.send_all_tests(only=self._only)
+        except Exception as e:  # noqa: BLE001 - the chat must still hear back
+            errors = {ch: str(e) for ch in self._only}
+        _safe_emit(self._sig.done.emit, (list(self._only), errors))
 
 
 class _CancelToken:
@@ -6733,25 +7260,61 @@ CHANGE_SESSION_TTL_S = 900
 
 @dataclass
 class _ChangeSession:
-    """A /change listing that has been printed and not yet answered."""
+    """A question the bot asked one person and is waiting on.
+
+    Three kinds, all answered the same way — a bare line in a one-to-one
+    chat, or the line after a tag in a room:
+      "limits"  a /change listing; `rows` are the numbered LimitRows
+      "add"     /add found several archive names; `choices` are those names
+      "remove"  /remove asks for `ano` before a PV goes
+    """
     pv_name: str
     rows: list          # bot_commands.LimitRow, exactly as they were numbered
     asked_ns: int
+    kind: str = "limits"
+    choices: list = field(default_factory=list)
 
     def stale(self, now_ns: int) -> bool:
         return (now_ns - self.asked_ns) > CHANGE_SESSION_TTL_S * 1_000_000_000
 
 
+# How many bot changes /undo can walk back through.
+UNDO_DEPTH = 20
+
+# The PVConfig fields each kind of chat change touches — what is snapshotted
+# for /undo. The rule fields carry gate_pvs, which is also how undo tells a
+# rule edit (rebuild the dependency dropdown) from a plain limit change.
+_LIMIT_KEYS = ("alarm_low", "warn_low", "warn_high", "alarm_high", "profiles")
+_RULE_KEYS = ("gate_pvs", "profiles")
+
+
 @dataclass
-class _ChangeUndo:
-    """What the last /change replaced, so /undo can put it back."""
-    pv_name: str
-    display_name: str
-    # (prof_index or None, attr, old value) — the value BEFORE the change.
-    before: list
+class _UndoStep:
+    """One change made from the chat, and what it takes to put it back.
+
+    Only what the change touched is kept, so undoing a limit change does not
+    also roll back an unrelated edit made in the window since.
+      pv_fields  {pv name: {field: value BEFORE}} — PVConfig fields
+      settings   {key: value BEFORE}
+      added      PV names the change added (undo removes them)
+      removed    [(index, pv dict)] the change removed (undo puts them back)
+    """
     what: str           # the same wording the change itself was announced with
     email: str
     at_ns: int
+    pv_fields: dict = field(default_factory=dict)
+    settings: dict = field(default_factory=dict)
+    added: list = field(default_factory=list)
+    removed: list = field(default_factory=list)
+
+
+# Every alert sent (or held) and every change made from the chat, newest last.
+# Local to this PC like the Log tab, but on disk, so /history still answers
+# after a restart. Trimmed to HISTORY_KEEP lines when it grows past
+# HISTORY_TRIM_AT.
+HISTORY_FILE = api.APP_DIR / "bot_history.jsonl"
+HISTORY_KEEP = 2000
+HISTORY_TRIM_AT = 2500
 
 
 # ---------------------------------------------------------------------------
@@ -6869,6 +7432,9 @@ class MonitorWidget(QWidget):
         if choice.settings:
             self.settings.update(choice.settings)
             self.settings.update(notify_provision.load())
+        # The sensor-error table, built from the old two ceilings the first
+        # time — after the share, so it carries the group's values.
+        _seed_valid_ranges(self.settings)
 
         self.pvs: list[PVConfig] = [PVConfig.from_dict(d) for d in choice.pv_dicts]
         self.runtime: dict[str, PVRuntime] = {}
@@ -6916,6 +7482,9 @@ class MonitorWidget(QWidget):
         self._chart_jobs: list[_CancelToken] = []
         self._watchdog_fail_streak = 0   # consecutive fully-failed polls
         self._watchdog_bad = False       # True once the "no data" alert fired
+        self._watchdog_since_ns = 0      # when the open episode's ALARM fired
+        self._watchdog_last_alarm_ns = 0  # last ALARM or reminder sent
+        self._watchdog_ok_since_ns = 0   # data flowing again since (0 = failing)
         # Refresh watchdog — the program's own heartbeat, as opposed to the
         # data watchdog above (which is about the archiver answering). A poll
         # that never comes back leaves every number on screen, in the table and
@@ -6965,7 +7534,11 @@ class MonitorWidget(QWidget):
         # different PVs at once and a bare number can only ever answer the
         # question its own sender asked.
         self._change_pending: dict = {}
-        self._change_undo: Optional[_ChangeUndo] = None
+        # Bot changes, newest last — what /undo walks back through.
+        self._undo_stack: list = []
+        # /history: alerts and bot changes, mirrored from HISTORY_FILE.
+        self._history: deque = deque(maxlen=HISTORY_KEEP)
+        self._history_load()
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -7192,6 +7765,52 @@ class MonitorWidget(QWidget):
     def _log(self, msg: str):
         ts = datetime.now(api.TZ_PRAGUE).strftime("%H:%M:%S")
         self.log.append_line(f"[{ts}] {msg}")
+
+    # --- /history: alerts sent or held, and changes made from the chat -----
+    def _history_load(self):
+        """Fill the in-memory history from HISTORY_FILE. A missing or damaged
+        file is an empty history, never a failed launch."""
+        self._history_disk_lines = 0
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        self._history_disk_lines = len(lines)
+        for ln in lines[-HISTORY_KEEP:]:
+            try:
+                row = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and "t" in row:
+                self._history.append(row)
+
+    def _history_add(self, kind: str, text: str, pv: str = "",
+                     who: str = ""):
+        """One /history row: kind is alert | held | failed | change | test."""
+        row = {"t": api.now_ns(), "kind": kind, "pv": pv, "text": text}
+        if who:
+            row["who"] = who
+        self._history.append(row)
+        try:
+            if self._history_disk_lines >= HISTORY_TRIM_AT:
+                # Rewrite from memory, which already holds the newest
+                # HISTORY_KEEP rows. Atomic, like the config.
+                tmp = HISTORY_FILE.with_suffix(".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    for r in self._history:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                os.replace(tmp, HISTORY_FILE)
+                self._history_disk_lines = len(self._history)
+            else:
+                with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                self._history_disk_lines += 1
+        except OSError as e:
+            # /history still answers from memory; only the restart loses it.
+            if not getattr(self, "_histfile_warned", False):
+                self._histfile_warned = True
+                self._log(f"History file could not be written: {e}")
 
     def _channel_summary(self) -> str:
         chans = []
@@ -7514,12 +8133,25 @@ class MonitorWidget(QWidget):
         return [pv for pv in out if pv is not None]
 
     def _valid_range(self, pv: PVConfig):
-        """Effective (min, max) sanity range: per-PV override else global default."""
-        lo = pv.valid_min if pv.valid_min is not None \
-            else self.settings.get("valid_min_default")
-        hi = pv.valid_max if pv.valid_max is not None \
-            else self.settings.get("valid_max_default")
+        """Effective (min, max) sanity range: the PV's own override, side by
+        side, else the Settings row it falls under."""
+        glo, ghi, _ = self._global_valid_range(pv)
+        lo = pv.valid_min if pv.valid_min is not None else glo
+        hi = pv.valid_max if pv.valid_max is not None else ghi
         return lo, hi
+
+    def _global_valid_range(self, pv: PVConfig, units: Optional[str] = None,
+                            group: Optional[str] = None) -> tuple:
+        """(min, max, row name) from Settings → Sensor-error ranges.
+        `units` / `group` stand in for values still being typed in Edit PV."""
+        return valid_range_for(
+            self.settings, pv.group if group is None else group,
+            pv.subgroup, self._pv_units_of(pv) if units is None else units)
+
+    def _pv_units_of(self, pv: PVConfig) -> str:
+        """The PV's unit: what the archiver reports, else the configured one."""
+        rt = self.runtime.get(pv.name)
+        return (rt.current_units if rt and rt.current_units else pv.units) or ""
 
     def _gate_pv_names(self) -> set[str]:
         """Every dependency PV referenced by a monitored PV (may or may not
@@ -8092,6 +8724,9 @@ class MonitorWidget(QWidget):
                 rt.notify_error = ""
             self._watchdog_fail_streak = 0
             self._watchdog_bad = False
+            self._watchdog_since_ns = 0
+            self._watchdog_last_alarm_ns = 0
+            self._watchdog_ok_since_ns = 0
             self._log("Monitoring stopped — values keep updating, but no "
                       "thresholds are evaluated and no alerts are sent.")
         self.model.refresh_all()
@@ -8441,16 +9076,28 @@ class MonitorWidget(QWidget):
             # live at all, so an alert raised below can say if it is not.
             self._update_frozen(pv, rt, now)
             thr = self._reevaluate_pv(pv, rt, now)
+            self._expire_snooze(pv, rt, now)
             if not self._monitoring:
                 continue
             if pv.enabled and thr.is_active() and not rt.in_grace(now):
                 scale, worsening = self._trend_cooldown_scale(rt, thr, now)
                 note = self.evaluator.evaluate(rt.alert, val, thr, now,
                                                cooldown_scale=scale)
+                # An acknowledgement covers one level only: the moment the
+                # state moves (worse, better, or back to OK) it is spent.
+                if rt.acked_level is not None \
+                        and rt.alert.level != rt.acked_level:
+                    rt.acked_level, rt.acked_by = None, ""
                 if note is not None:
                     if worsening and note.kind == "reminder":
                         note.reason += " — worsening"
-                    self._dispatch_alert(pv, rt, note)
+                    held = self._pv_hold_reason(pv, rt, note, now)
+                    if held:
+                        self._hold_alert(pv, rt, note, held)
+                    else:
+                        self._dispatch_alert(pv, rt, note)
+                else:
+                    self._settle_snooze(pv, rt, val, now)
             if rt.alert.level == AlertLevel.OK:
                 rt.notify_status = ""      # episode over — clear the status cell
                 rt.notify_error = ""
@@ -8546,6 +9193,14 @@ class MonitorWidget(QWidget):
 
     def _send_frozen_alert(self, pv: PVConfig, rt: PVRuntime,
                            level: AlertLevel):
+        if bot_commands.mute_live(pv.snoozed_until, api.now_ns()):
+            # Snoozed means nothing about this PV goes out — its data faults
+            # included. Said in the log and kept for /history all the same.
+            what = ("updating again" if level == AlertLevel.OK
+                    else "NOT UPDATING")
+            self._log(f"Held (snoozed): {pv.display_name} {what}.")
+            self._history_add("held", f"{what} — snoozed", pv.display_name)
+            return
         value = rt.current_value if rt.current_value is not None else 0.0
         units = (rt.current_units or pv.units) or ""
         if level == AlertLevel.OK:
@@ -8742,7 +9397,12 @@ class MonitorWidget(QWidget):
     def _check_data_watchdog(self, results: dict):
         """Alert once when every monitored PV stops getting data (fetch errors
         across the board — an archiver/network outage), and once more when it
-        recovers. Distinct from a single PV's own no-data/threshold alerts."""
+        recovers. Distinct from a single PV's own no-data/threshold alerts.
+
+        Outages close together are one episode: while it lasts, a reminder
+        goes out only every `data_watchdog_remind_hours`, and the OK only after
+        `data_watchdog_ok_after_minutes` with no fully-failed poll. A failure
+        inside that wait restarts it quietly — no new ALARM, no OK."""
         if not self._monitoring or not self.pvs \
                 or not self.settings.get("data_watchdog_enabled", True):
             return
@@ -8755,24 +9415,58 @@ class MonitorWidget(QWidget):
             val, _units, _ts, err, rejected = res[:5]
             return val is None and rejected == 0 and bool(err)
 
+        now = api.now_ns()
+        remind_ns = int(max(0.0, float(self.settings.get(
+            "data_watchdog_remind_hours", 12.0))) * 3600e9)
+        ok_after_ns = int(max(0.0, float(self.settings.get(
+            "data_watchdog_ok_after_minutes", 15.0))) * 60e9)
         all_failed = all(_is_conn_failure(results.get(pv.name)) for pv in self.pvs)
         if all_failed:
             self._watchdog_fail_streak += 1
+            self._watchdog_ok_since_ns = 0
             threshold = max(1, int(self.settings.get("data_watchdog_fail_polls", 2)))
-            if not self._watchdog_bad and self._watchdog_fail_streak >= threshold:
-                self._watchdog_bad = True
+            if not self._watchdog_bad:
+                if self._watchdog_fail_streak >= threshold:
+                    self._watchdog_bad = True
+                    self._watchdog_since_ns = now
+                    self._watchdog_last_alarm_ns = now
+                    self._send_watchdog_alert(
+                        AlertLevel.ALARM,
+                        "No data received from any monitored PV for "
+                        f"{self._watchdog_fail_streak} consecutive polls.")
+            elif remind_ns and now - self._watchdog_last_alarm_ns >= remind_ns:
+                self._watchdog_last_alarm_ns = now
                 self._send_watchdog_alert(
                     AlertLevel.ALARM,
-                    "No data received from any monitored PV for "
-                    f"{self._watchdog_fail_streak} consecutive polls.")
+                    "Still no data from any monitored PV (outage started "
+                    f"{self._watchdog_hhmm(self._watchdog_since_ns)}).",
+                    prev=AlertLevel.ALARM)
         else:
             self._watchdog_fail_streak = 0
             if self._watchdog_bad:
-                self._watchdog_bad = False
-                self._send_watchdog_alert(AlertLevel.OK, "Data flow restored.")
+                if not self._watchdog_ok_since_ns:
+                    self._watchdog_ok_since_ns = now
+                if now - self._watchdog_ok_since_ns >= ok_after_ns:
+                    stable = fmt_duration(
+                        (now - self._watchdog_ok_since_ns) / 1e9)
+                    started = self._watchdog_hhmm(self._watchdog_since_ns)
+                    self._watchdog_bad = False
+                    self._watchdog_since_ns = 0
+                    self._watchdog_last_alarm_ns = 0
+                    self._watchdog_ok_since_ns = 0
+                    self._send_watchdog_alert(
+                        AlertLevel.OK,
+                        f"Data flow restored (stable for {stable}; "
+                        f"outage started {started}).")
 
-    def _send_watchdog_alert(self, level: AlertLevel, reason: str):
-        prev = AlertLevel.ALARM if level == AlertLevel.OK else AlertLevel.OK
+    @staticmethod
+    def _watchdog_hhmm(ts_ns: int) -> str:
+        return api.ns_to_prague(ts_ns).strftime("%d.%m. %H:%M") if ts_ns else "?"
+
+    def _send_watchdog_alert(self, level: AlertLevel, reason: str,
+                             prev: AlertLevel | None = None):
+        if prev is None:
+            prev = AlertLevel.ALARM if level == AlertLevel.OK else AlertLevel.OK
         self._log(f"WATCHDOG: {reason}")
         payload = AlertPayload(
             level=level, prev_level=prev,
@@ -8861,6 +9555,72 @@ class MonitorWidget(QWidget):
             rt.notify_status = "failed"
             rt.notify_error = "no notification channel configured"
 
+    # --- snooze, acknowledge, quiet hours --------------------------------
+    def _pv_hold_reason(self, pv: PVConfig, rt: PVRuntime, note,
+                        now: int) -> str:
+        """'' when this PV's alert may go out, else why it is held back."""
+        if bot_commands.mute_live(pv.snoozed_until, now):
+            return "snoozed " + bot_commands.until_text(pv.snoozed_until, now)
+        if (note.kind == "reminder" and rt.acked_level is not None
+                and rt.acked_level == note.level):
+            return f"acknowledged by {rt.acked_by or 'someone'}"
+        return ""
+
+    def _hold_alert(self, pv: PVConfig, rt: PVRuntime, note, why: str):
+        """An alert the evaluator wanted to send, kept back — logged and put
+        in /history, so 'why did nobody hear about it' has an answer."""
+        self._log(f"Held ({why}): {pv.display_name} "
+                  f"{note.prev_level.label}→{note.level.label}")
+        self._history_add(
+            "held", f"{note.prev_level.label}→{note.level.label} "
+                    f"({note.kind}) — {why}", pv.display_name)
+        if why.startswith("snoozed"):
+            # Still bad when the snooze ends = one alert then. A recovery
+            # that happened under the snooze pays the debt off instead.
+            rt.snooze_owed = note.level != AlertLevel.OK
+
+    def _expire_snooze(self, pv: PVConfig, rt: PVRuntime, now: int):
+        """Clear a snooze whose time is up, once, with a log line."""
+        if pv.snoozed_until in (None, "", 0):
+            return
+        if bot_commands.mute_live(pv.snoozed_until, now):
+            return
+        pv.snoozed_until, pv.snoozed_by = None, ""
+        self._log(f"Snooze over: {pv.display_name}.")
+        self._history_add("change", "snooze over", pv.display_name)
+        self.persist()
+
+    def _settle_snooze(self, pv: PVConfig, rt: PVRuntime, val, now: int):
+        """After a snooze: one alert if the PV is still not OK, otherwise the
+        debt is simply dropped."""
+        if not rt.snooze_owed or bot_commands.mute_live(pv.snoozed_until, now):
+            return
+        rt.snooze_owed = False
+        if rt.alert.level == AlertLevel.OK or val is None:
+            return
+        rt.alert.last_notified_ns = now       # reminders count from here
+        if not rt.alert.first_notified_ns:
+            rt.alert.first_notified_ns = now
+        self._dispatch_alert(pv, rt, Notification(
+            level=rt.alert.level, prev_level=AlertLevel.OK, value=val,
+            reason=f"Snooze over — still {rt.alert.level.label.lower()}",
+            kind="transition"))
+
+    def _channel_plan(self, payload: AlertPayload) -> tuple:
+        """(channels to send to, {channel: why held}) for one alert, after the
+        manual mutes and the quiet rules."""
+        send, held = [], {}
+        now = api.now_ns()
+        for ch in self.hub.active_channels():
+            why = bot_commands.channel_hold_reason(
+                self.settings, ch, int(payload.level),
+                int(payload.prev_level), payload.kind, now)
+            if why:
+                held[ch] = why
+            else:
+                send.append(ch)
+        return send, held
+
     def _launch_alert_worker(self, payload: AlertPayload, thr: Thresholds, tag: str,
                              valid_range=(None, None), render_plot: bool = True) -> bool:
         """Start the render+dispatch worker. Returns True if a worker was
@@ -8870,6 +9630,29 @@ class MonitorWidget(QWidget):
             if tag == "manual":
                 self.btn_sendplot.setEnabled(True)
             return False
+        only = None
+        if tag != "manual":
+            # A plot somebody asked for in the window is not an alert; the
+            # mutes and quiet hours only hold back what the monitor raises.
+            only, held = self._channel_plan(payload)
+            what = (f"{payload.prev_level.label}→{payload.level.label} "
+                    f"({payload.kind})")
+            if held:
+                self._log(f"  Held for {payload.display_name}: "
+                          + "; ".join(f"{c} — {w}" for c, w in held.items()))
+            if not only:
+                self._history_add("held", f"{what} — "
+                                  + "; ".join(sorted(set(held.values()))),
+                                  payload.display_name)
+                rt = self.runtime.get(tag)
+                if rt is not None and payload.level != AlertLevel.OK:
+                    rt.notify_status = "held"
+                    rt.notify_error = "; ".join(sorted(set(held.values())))
+                return True
+            self._history_add(
+                "alert", f"{what} → {', '.join(only)}"
+                + (f" (held: {', '.join(held)})" if held else ""),
+                payload.display_name)
         hours = float(self.settings.get("alert_plot_hours", 12)) if render_plot else 0.0
         timeout = float(self.settings["http_timeout_s"])
         vmin, vmax = valid_range
@@ -8883,13 +9666,19 @@ class MonitorWidget(QWidget):
         QThreadPool.globalInstance().start(
             _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag,
                          vmin, vmax, self._sample_age_limit_s(),
-                         dpi=int(self.settings.get("chart_dpi", CHART_DPI))))
+                         dpi=int(self.settings.get("chart_dpi", CHART_DPI)),
+                         only=only))
         return True
 
     def _on_alert_result(self, result):
         tag, errors, had_png = result
         for ch, err in errors.items():
             self._log(f"  {ch} send failed: {err}")
+        if errors and tag != "manual":
+            pv = next((p for p in self.pvs if p.name == tag), None)
+            self._history_add(
+                "failed", "; ".join(f"{c}: {e}" for c, e in errors.items()),
+                pv.display_name if pv else tag)
         if tag == "manual":
             self.btn_sendplot.setEnabled(True)
             if not errors:
@@ -9781,17 +10570,35 @@ class MonitorWidget(QWidget):
                     self._reply(f"Data watchdog is {state}. "
                                 "Use `/datawatchdog on|off` to change.")
             elif cmd in ("/enable", "/disable"):
-                pvs, errors = self._resolve_pvs(pc.items)
-                if errors or not pvs:
-                    self._reply("⚠ " + "; ".join(errors or ["missing PV name"]))
-                else:
-                    for pv in pvs:
-                        pv.enabled = (cmd == "/enable")
-                    self.model.refresh_all()
-                    self.persist()
-                    state = "enabled" if cmd == "/enable" else "disabled"
-                    names = ", ".join(pv.display_name for pv in pvs)
-                    self._reply(f"Alerting {state} for {names}.")
+                self._cmd_enable(pc, email, cmd == "/enable")
+            elif cmd in ("/add", "/addpv"):
+                self._cmd_add(pc, email)
+            elif cmd in ("/remove", "/removepv", "/delete"):
+                self._cmd_remove(pc, email)
+            elif cmd == "/rename":
+                self._cmd_rename(pc, email)
+            elif cmd == "/rules":
+                self._cmd_rules(pc, email)
+            elif cmd == "/rule":
+                self._cmd_rule(pc, email)
+            elif cmd in ("/snooze", "/mute"):
+                self._cmd_snooze(pc, email)
+            elif cmd in ("/unsnooze", "/unmute"):
+                self._cmd_unsnooze(pc, email)
+            elif cmd in ("/ack", "/acknowledge"):
+                self._cmd_ack(pc, email)
+            elif cmd in ("/history", "/log"):
+                self._cmd_history(pc, email)
+            elif cmd == "/test":
+                self._cmd_test(pc, email)
+            elif cmd in ("/channels", "/channel"):
+                self._cmd_channels(pc, email)
+            elif cmd == "/quiet":
+                self._cmd_quiet(pc, email)
+            elif cmd == "/pacing":
+                self._cmd_pacing(pc, email)
+            elif cmd == "/settings":
+                self._cmd_settings(pc, email)
             elif cmd in ("/run", "/rundiagnostic"):
                 # This command belongs to the standalone listener
                 # (remote_launcher.py), which starts the app when it is closed.
@@ -9912,34 +10719,41 @@ class MonitorWidget(QWidget):
         if dropped is not None:
             self._log(f"Webex: /change question for {email} dropped.")
         if not stopped:
-            self._reply("Dropped the limits question — nothing changed."
+            self._reply("Dropped my question — nothing changed."
                         if dropped is not None else
                         "Nothing is running — there is nothing to cancel.")
             return
         names = "; ".join(stopped)
         self._log(f"Webex: plot cancelled ({names}).")
-        tail = " The limits question is dropped too." if dropped else ""
+        tail = " My open question is dropped too." if dropped else ""
         self._reply(f"🛑 Cancelled: {names}. "
                     f"Requests already sent still have to come back, so it can "
                     f"take a few seconds — but nothing will be sent.{tail}")
 
     # -- /change ------------------------------------------------------------
 
-    def _is_change_answer(self, text: str, email: str) -> bool:
-        """True when `text` reads as a reply to a listing this person asked for.
+    def _is_change_answer(self, text: str, email: str, kinds=None) -> bool:
+        """True when `text` reads as a reply to a question this person was
+        asked — a /change listing, an /add pick, a /remove confirmation.
 
         Both halves matter: there has to be a live question from THIS sender,
-        and the line has to parse. That is what keeps ordinary conversation in
-        the room — and a number typed by somebody who never asked — out of the
-        limits.
+        and the line has to parse as an answer to it. That is what keeps
+        ordinary conversation in the room — and a number typed by somebody who
+        never asked — out of the limits.
         """
         sess = self._change_pending.get((email or "").lower())
         if sess is None or sess.stale(api.now_ns()):
             return False
+        if kinds is not None and sess.kind not in kinds:
+            return False
+        if sess.kind == "add":
+            return self._add_picks(text, sess) is not None
+        if sess.kind == "remove":
+            return bot_commands.is_yes(text) is not None
         return bot_commands.looks_like_answer(text, sess.rows)
 
     def _answer_change(self, text: str, email: str):
-        """A reply to the listing, however it arrived — bare, or as /change."""
+        """A reply to a question, however it arrived — bare, or as a command."""
         key = (email or "").lower()
         sess = self._change_pending.get(key)
         now = api.now_ns()
@@ -9949,10 +10763,18 @@ class MonitorWidget(QWidget):
             return
         if sess.stale(now):
             del self._change_pending[key]
-            self._reply(f"⚠ That limits list is more than "
+            again = {"add": "/add", "remove": "/remove"}.get(sess.kind,
+                                                             "/change")
+            self._reply(f"⚠ That question is more than "
                         f"{CHANGE_SESSION_TTL_S // 60} minutes old, so I have "
-                        f"forgotten it — nothing changed. Send `/change "
+                        f"forgotten it — nothing changed. Send `{again} "
                         f"{sess.pv_name}` again.")
+            return
+        if sess.kind == "add":
+            self._answer_add(text, email, sess)
+            return
+        if sess.kind == "remove":
+            self._answer_remove(text, email, sess)
             return
         pv = next((p for p in self.pvs if p.name == sess.pv_name), None)
         if pv is None:
@@ -9973,7 +10795,8 @@ class MonitorWidget(QWidget):
         raw = pc.args.strip()
         if not raw:
             sess = self._change_pending.get(key)
-            if sess is not None and not sess.stale(api.now_ns()):
+            if sess is not None and sess.kind == "limits" \
+                    and not sess.stale(api.now_ns()):
                 pv = next((p for p in self.pvs if p.name == sess.pv_name), None)
                 if pv is not None:
                     self._reply(self._change_listing(pv, sess.rows))
@@ -9986,7 +10809,7 @@ class MonitorWidget(QWidget):
             return
         # An answer typed as a command — "/change 6 15" — is how the follow-up
         # is sent in a room, because a bare line there never reaches me.
-        if self._is_change_answer(raw, email):
+        if self._is_change_answer(raw, email, kinds=("limits",)):
             self._answer_change(raw, email)
             return
         # "/change DA1; warn high 25" — the house separator, so a PV name with
@@ -10114,12 +10937,12 @@ class MonitorWidget(QWidget):
                              if r.prof_index == prof_index)
                 self._reply(f"⚠ {scope}: {problem} Nothing changed.")
                 return
-        before, lines, notes = [], [], []
+        lines, notes = [], []
+        before = self._pv_snapshot(pv, _LIMIT_KEYS)
         rt = self.runtime.get(pv.name)
         now_val = rt.current_value if rt else None
         for row, value in pairs:
             old = self._limit_get(pv, row.prof_index, row.field)
-            before.append((row.prof_index, row.field, old))
             self._limit_set(pv, row.prof_index, row.field, value)
             shown_old = "not set" if old is None else _fmt(old)
             shown_new = "cleared" if value is None else _fmt(value)
@@ -10131,8 +10954,11 @@ class MonitorWidget(QWidget):
         what = "; ".join(lines)
         self._log(f"Webex /change from {email}: {pv.display_name} — {what}")
         self._change_pending.pop((email or "").lower(), None)
-        self._change_undo = _ChangeUndo(pv.name, pv.display_name, before,
-                                        what, email, api.now_ns())
+        self._push_undo(_UndoStep(
+            f"{pv.display_name}: {what}", email, api.now_ns(),
+            pv_fields={pv.name: before}))
+        self._history_add("change", f"limits — {what}", pv.display_name,
+                          email)
         self._reply(self._change_done(pv, lines, notes,
                                       "`/undo` puts it back."))
 
@@ -10190,44 +11016,994 @@ class MonitorWidget(QWidget):
                        "change is saved on this PC only.")
         return "\n".join(out)
 
+    # -- /undo: a stack of every change made from the chat -------------------
+
+    @staticmethod
+    def _pv_snapshot(pv: PVConfig, keys) -> dict:
+        """The named fields of one PV, deep-copied — what /undo restores."""
+        return {k: copy.deepcopy(getattr(pv, k)) for k in keys}
+
+    def _push_undo(self, step: "_UndoStep"):
+        self._undo_stack.append(step)
+        del self._undo_stack[:-UNDO_DEPTH]
+
+    def _pv_named(self, name: str) -> Optional[PVConfig]:
+        return next((p for p in self.pvs if p.name == name), None)
+
+    def _after_pv_change(self, structural: bool = False, rules=()):
+        """Show a chat change everywhere: the table, the graph, the status.
+
+        `structural` = a PV came, went or was renamed, so the rows and the
+        graph's PV list are rebuilt; `rules` = PVs whose dependency PVs or
+        rules changed, whose dropdown and verdict are redone at once.
+        """
+        if structural:
+            self._recluster()
+            self.model.reset()
+            self.graph.refresh_combo()
+            self.graph.refresh_data()
+            self._update_status()
+        for pv in rules:
+            self._apply_pv_edit(pv)
+        self.model.refresh_all()
+
     def _cmd_undo(self, email: str):
-        """One step back from the last /change."""
-        u = self._change_undo
-        if u is None:
-            self._reply("Nothing to undo — I have not changed a limit since "
-                        "the program started.")
+        """One step back through the changes made from the chat."""
+        if not self._undo_stack:
+            self._reply("Nothing to undo — nothing has been changed from the "
+                        "chat since the program started.")
             return
-        pv = next((p for p in self.pvs if p.name == u.pv_name), None)
+        step = self._undo_stack.pop()
+        gone, structural, rules = [], False, []
+        for idx, d in step.removed:
+            if self._pv_named(d["name"]) is not None:
+                continue            # somebody added it back in the meantime
+            pv = PVConfig.from_dict(copy.deepcopy(d))
+            self.pvs.insert(min(idx, len(self.pvs)), pv)
+            self.runtime[pv.name] = PVRuntime(history=self._new_history())
+            self._backfill_one(pv)
+            structural = True
+        for name in step.added:
+            pv = self._pv_named(name)
+            if pv is not None:
+                self._drop_pv(pv)
+                structural = True
+        for name, fields in step.pv_fields.items():
+            pv = self._pv_named(name)
+            if pv is None:
+                gone.append(name)
+                continue
+            for k, v in fields.items():
+                setattr(pv, k, copy.deepcopy(v))
+            if "display_name" in fields:
+                structural = True
+            if "gate_pvs" in fields:
+                rules.append(pv)
+        for k, v in step.settings.items():
+            self.settings[k] = copy.deepcopy(v)
+        if step.settings:
+            self._settings_changed(step.settings)
+        self._after_pv_change(structural, rules)
+        self.persist()
+        self._log(f"Webex /undo from {email}: {step.what}")
+        self._history_add("change", f"undo — {step.what}", "", email)
+        when = api.ns_to_prague(step.at_ns).strftime("%H:%M")
+        who = step.email.split("@")[0] if step.email else "someone"
+        out = [f"↩ **Undone:** {step.what}", f"_(by {who} at {when})_"]
+        if gone:
+            out.append(f"⚠ Not put back for {', '.join(gone)} — that PV is "
+                       f"no longer configured.")
+        left = len(self._undo_stack)
+        out.append(f"{left} more step{'s' if left != 1 else ''} can be "
+                   f"undone." if left else "That was the last step I keep.")
+        if not self.shared_ok:
+            out.append("⚠ The shared PV list could not be reached, so this "
+                       "is saved on this PC only.")
+        self._reply("\n".join(out))
+
+    # -- PVs: /add, /remove, /rename ---------------------------------------
+
+    def _bot_tag(self) -> str:
+        return bot_commands.bot_tag(getattr(self.hub.webex, "bot_name", ""))
+
+    def _drop_pv(self, pv: PVConfig):
+        """Take one PV out of the list and everything kept about it."""
+        if pv in self.pvs:
+            self.pvs.remove(pv)
+        self.runtime.pop(pv.name, None)
+        self._gate_values.pop(pv.name, None)
+        for key in [k for k, s in self._change_pending.items()
+                    if s.pv_name == pv.name]:
+            del self._change_pending[key]
+
+    def _backfill_one(self, pv: PVConfig):
+        """Fetch the graph history of one PV just added from the chat, so its
+        curve does not start empty. The same span the others already hold."""
+        end = api.now_ns()
+        span = min(float(self.settings.get("graph_window_minutes", 60)),
+                   float(self.settings["history_minutes"]))
+        start = self._backfill_start_ns or end - int(span * 60e9)
+        sig = _BackfillSignals(self)
+        sig.log.connect(self._log)
+        sig.done.connect(sig.deleteLater)
+        sig.done.connect(self._on_backfill_one)
+        QThreadPool.globalInstance().start(_BackfillWorker(
+            sig, [pv.name], start, end, float(self.settings["http_timeout_s"]),
+            {pv.name: self._valid_range(pv)}, self._history_cap(), 2))
+
+    def _on_backfill_one(self, results: dict):
+        for name, pairs in results.items():
+            rt = self.runtime.get(name)
+            if rt is None or pairs is None or not len(pairs[0]):
+                continue
+            rt.history.prepend_samples(*pairs)
+            self.graph.redraw()
+
+    @staticmethod
+    def _add_picks(text: str, sess) -> Optional[list]:
+        """'2' / '2, 5' / '2 5' → the archive names picked, None if the line
+        is not a pick from this list."""
+        parts = [p for p in re.split(r"[\s,;]+", (text or "").strip()) if p]
+        if not parts:
+            return None
+        names = []
+        for p in parts:
+            if not p.isdigit():
+                return None
+            n = int(p)
+            if not (1 <= n <= len(sess.choices)):
+                return None
+            if sess.choices[n - 1] not in names:
+                names.append(sess.choices[n - 1])
+        return names
+
+    def _cmd_add(self, pc, email: str):
+        """`/add <search>` — a PV from the archive, by any part of its name."""
+        raw = pc.args.strip()
+        if not raw:
+            self._reply("**`/add <archive name>`** — start monitoring a PV. "
+                        "Any part of the name works; several matches are "
+                        "listed to pick from. `/help add` has the rest.")
+            return
+        if self._is_change_answer(raw, email, kinds=("add",)):
+            self._answer_change(raw, email)
+            return
+        channels = self._all_channels
+        if not channels:
+            self._prefetch_channels()
+            self._reply("⚠ The archive's list of PV names has not loaded yet "
+                        "— I have asked for it again; try in a minute.")
+            return
+        exact = [c for c in channels if c.lower() == raw.lower()]
+        if exact:
+            self._add_named(exact[:1], email)
+            return
+        tokens = bot_commands.split_query(raw)
+        scored = []
+        for i, c in enumerate(channels):
+            s = bot_commands.rank_pv_match(c, c, tokens)
+            if s is not None:
+                scored.append((s, i, c))
+        scored.sort()
+        hits = [c for _, _, c in scored]
+        if not hits:
+            self._reply(f"⚠ No archive PV matches `{raw}`. Words are matched "
+                        f"anywhere in the name, all of them have to appear.")
+            return
+        if len(hits) == 1:
+            self._add_named(hits, email)
+            return
+        show = hits[:15]
+        key = (email or "").lower()
+        self._change_pending[key] = _ChangeSession(
+            raw, [], api.now_ns(), kind="add", choices=show)
+        configured = {p.name for p in self.pvs}
+        out = [f"**{len(hits)} archive PVs match `{raw}`**"
+               + (f" — the first {len(show)}:" if len(hits) > len(show)
+                  else ":")]
+        for n, c in enumerate(show, 1):
+            mark = " — *already monitored*" if c in configured else ""
+            out.append(f"`{n}` {c}{mark}")
+        who = self._bot_tag()
+        out += ["", f"Answer `{who} 2` (several: `2, 5`), or "
+                    f"`{who} /add 2`. `/cancel` drops it."]
+        if len(hits) > len(show):
+            out.append("Not in the list? Add another word to narrow it.")
+        self._reply("\n".join(out))
+
+    def _answer_add(self, text: str, email: str, sess):
+        names = self._add_picks(text, sess)
+        if names is None:
+            self._reply(f"⚠ Answer with a number from the list, 1 to "
+                        f"{len(sess.choices)}.")
+            return
+        self._change_pending.pop((email or "").lower(), None)
+        self._add_named(names, email)
+
+    def _add_named(self, names: list, email: str):
+        """Add these archive names as PVs: alerting off, no limits yet."""
+        configured = {p.name for p in self.pvs}
+        new = [n for n in names if n not in configured]
+        if not new:
+            shown = ", ".join(self._pv_named(n).display_name for n in names)
+            self._reply(f"ℹ️ Already monitored: {shown}.")
+            return
+        added = []
+        for name in new:
+            pv = PVConfig(name=name)          # off until it has limits
+            self.pvs.append(pv)
+            self.runtime[pv.name] = PVRuntime(history=self._new_history())
+            self._backfill_one(pv)
+            added.append(pv)
+        self._after_pv_change(structural=True)
+        self.persist()
+        what = ", ".join(p.display_name for p in added)
+        self._push_undo(_UndoStep(f"added {what}", email, api.now_ns(),
+                                  added=[p.name for p in added]))
+        self._history_add("change", f"added — {', '.join(new)}", what, email)
+        self._log(f"Webex /add from {email}: {', '.join(new)}")
+        first = added[0].display_name
+        out = ["✅ **Added:** " + "; ".join(
+            f"{p.display_name} (`{p.name}`)" for p in added),
+            "",
+            f"It is read and plotted from now on, but **alerting is off** "
+            f"until it has limits: `/change {first}` sets them, then "
+            f"`/enable {first}`. It sits in no group — groups are set in the "
+            f"window. `/undo` takes it out again."]
+        if not self.shared_ok:
+            out.append("⚠ The shared PV list could not be reached, so this "
+                       "is saved on this PC only.")
+        self._reply("\n".join(out))
+
+    def _cmd_remove(self, pc, email: str):
+        """`/remove <pv>` — asks first; `ano` answers."""
+        raw = pc.args.strip()
+        if not raw:
+            self._reply("**`/remove <pv>`** — stop monitoring one PV. I ask "
+                        "before it goes, and `/undo` brings it back with its "
+                        "limits and rules.")
+            return
+        if self._is_change_answer(raw, email, kinds=("remove",)):
+            self._answer_change(raw, email)
+            return
+        pv, err = self._find_pv(raw)
         if pv is None:
-            self._change_undo = None
-            self._reply(f"⚠ {u.display_name} is not configured any more — "
-                        f"nothing to put back.")
+            tail = (" — one PV at a time, so name one of them."
+                    if "several" in err else "")
+            self._reply(f"⚠ {err}{tail}")
             return
-        lines = []
-        for prof_index, attr, old in u.before:
-            if prof_index is not None and prof_index >= len(pv.profiles):
-                continue        # the rule has been deleted in the window since
-            now_v = self._limit_get(pv, prof_index, attr)
-            self._limit_set(pv, prof_index, attr, old)
-            scope = ("Global" if prof_index is None
-                     else bot_commands.profile_label(pv.profiles[prof_index],
-                                                      prof_index))
-            label = dict(bot_commands.LIMIT_FIELDS)[attr]
-            lines.append(f"**{scope}** {label}: "
-                         f"{'cleared' if now_v is None else _fmt(now_v)} → "
-                         f"**{'not set' if old is None else _fmt(old)}**")
-        if not lines:
-            self._change_undo = None
-            self._reply("⚠ The rules that change touched are gone — nothing "
-                        "to put back.")
+        self._change_pending[(email or "").lower()] = _ChangeSession(
+            pv.name, [], api.now_ns(), kind="remove")
+        users = [p.display_name for p in self.pvs if pv.name in p.gate_pvs]
+        n_rules = len(pv.profiles)
+        what = f"**{pv.display_name}** (`{pv.name}`)"
+        if n_rules:
+            what += f" with its {n_rules} rule{'s' if n_rules != 1 else ''}"
+        out = [f"Remove {what}?"]
+        if users:
+            out.append(f"⚠ It is a dependency PV of {', '.join(users)}: "
+                       f"their rules keep reading it, but it leaves the "
+                       f"table and the graph.")
+        who = self._bot_tag()
+        out.append(f"Answer `{who} ano` (or `{who} /remove ano`); `ne` or "
+                   f"`/cancel` keeps it. `/undo` would bring it back.")
+        self._reply("\n".join(out))
+
+    def _answer_remove(self, text: str, email: str, sess):
+        yes = bot_commands.is_yes(text)
+        self._change_pending.pop((email or "").lower(), None)
+        pv = self._pv_named(sess.pv_name)
+        if not yes:
+            self._reply("Kept — nothing removed.")
             return
+        if pv is None:
+            self._reply("⚠ That PV is already gone.")
+            return
+        idx = self.pvs.index(pv)
+        snap = copy.deepcopy(pv.to_dict())
+        self._drop_pv(pv)
+        self._after_pv_change(structural=True)
+        self.persist()
+        self._push_undo(_UndoStep(f"removed {pv.display_name}", email,
+                                  api.now_ns(), removed=[(idx, snap)]))
+        self._history_add("change", f"removed — {pv.name}", pv.display_name,
+                          email)
+        self._log(f"Webex /remove from {email}: {pv.display_name}")
+        out = [f"🗑 **Removed {pv.display_name}.** `/undo` brings it back "
+               f"with its limits and rules."]
+        if not self.shared_ok:
+            out.append("⚠ The shared PV list could not be reached, so this "
+                       "is saved on this PC only.")
+        self._reply("\n".join(out))
+
+    def _cmd_rename(self, pc, email: str):
+        """`/rename <pv>; <new name>` — the name shown everywhere."""
+        head, sep, new = pc.args.partition(bot_commands.OPT_SEP)
+        new = " ".join(new.split())
+        if not sep or not head.strip() or not new:
+            self._reply("**`/rename <pv>; <new name>`** — e.g. `/rename "
+                        "CHL03-001; DA1 Chiller`. The `;` keeps a name with "
+                        "spaces in one piece.")
+            return
+        pv, err = self._find_pv(head)
+        if pv is None:
+            self._reply(f"⚠ {err}")
+            return
+        clash = next((p for p in self.pvs if p is not pv and
+                      p.display_name.lower() == new.lower()), None)
+        if clash is not None:
+            self._reply(f"⚠ `{new}` is already the name of `{clash.name}` — "
+                        f"two PVs with one name could not be told apart.")
+            return
+        old = pv.display_name
+        if old == new:
+            self._reply(f"ℹ️ It is already called {new}.")
+            return
+        before = self._pv_snapshot(pv, ("display_name",))
+        pv.display_name = new
+        self._after_pv_change(structural=True)
+        self.persist()
+        self._push_undo(_UndoStep(f"renamed {old} → {new}", email,
+                                  api.now_ns(), pv_fields={pv.name: before}))
+        self._history_add("change", f"renamed from {old}", new, email)
+        self._reply(f"✅ **{old}** is now **{new}** (`{pv.name}`). "
+                    f"`/undo` puts the old name back.")
+
+    # -- rules --------------------------------------------------------------
+
+    def _rules_listing(self, pv: PVConfig) -> str:
+        """Gates and numbered rules of one PV, the rule in force marked."""
+        out = [f"**{pv.display_name}** — rules"]
+        if not pv.gate_pvs:
+            out.append("No dependency PVs, so no rules: the Global limits "
+                       "always apply. `/rule <pv>; gate 1 <archive name>` "
+                       "adds one.")
+            return "\n".join(out)
+        for i, g in enumerate(pv.gate_pvs, 1):
+            v = self._gate_value(g)
+            now = f" — now **{_fmt(v)}**" if v is not None else ""
+            out.append(f"Dependency {i}: `{g}`{now}")
+        live = self._limits_label(pv, self._match_profile(pv))
+        out.append("")
+        if not pv.profiles:
+            out.append("No rules yet — `/rule <pv>; add <label>; <condition>` "
+                       "adds one.")
+        for i, prof in enumerate(pv.profiles, 1):
+            label = bot_commands.profile_label(prof, i - 1)
+            cond = _profile_rule_text(pv, prof) or "any value"
+            thr = pv.profile_thresholds(prof)
+            lim = " / ".join(
+                "–" if v is None else _fmt(v)
+                for v in (thr.alarm_low, thr.warn_low, thr.warn_high,
+                          thr.alarm_high))
+            mark = "  ← in force now" if label == live else ""
+            if not thr.is_active():
+                lim += " — *no limits yet, so it never applies*"
+            out.append(f"`{i}` **{label}**: when {cond} · limits {lim}{mark}")
+        g = pv.thresholds()
+        out.append("Global: " + " / ".join(
+            "–" if v is None else _fmt(v)
+            for v in (g.alarm_low, g.warn_low, g.warn_high, g.alarm_high))
+            + ("  ← in force now" if live == "Global" else ""))
+        out += ["", "_Limits read alarm low / warn low / warn high / alarm "
+                    "high. The first rule that matches wins; `/change` "
+                    "moves the numbers._"]
+        return "\n".join(out)
+
+    def _cmd_rules(self, pc, email: str):
+        pv, err = self._find_pv(pc.args.split(bot_commands.OPT_SEP)[0])
+        if pv is None:
+            self._reply(f"⚠ {err}" if pc.args.strip() else
+                        "**`/rules <pv>`** — a PV's dependency PVs and "
+                        "rules. `/help rule` shows how to change them.")
+            return
+        self._reply(self._rules_listing(pv))
+
+    @staticmethod
+    def _bot_cond(text: str) -> list:
+        """A dependency condition typed in the chat → [lo, hi]. Raises."""
+        t = (text or "").strip()
+        cond = _parse_cond(t)
+        if cond == [None, None] and t.lower().replace(" ", "") not in (
+                "", "any", "*", "-", "—"):
+            raise bot_commands.CommandError(
+                f"`{t}` is not a condition — `1`, `0.2-3`, `>=5`, `<=2` or "
+                f"`any`.")
+        return cond
+
+    def _rule_index(self, pv: PVConfig, word: str) -> int:
+        n = bot_commands.parse_number(word)
+        if n is None or not float(n).is_integer() \
+                or not (1 <= int(n) <= len(pv.profiles)):
+            raise bot_commands.CommandError(
+                f"`{word}` is not a rule of {pv.display_name} — "
+                + (f"they go 1 to {len(pv.profiles)}." if pv.profiles
+                   else "it has none."))
+        return int(n) - 1
+
+    def _cmd_rule(self, pc, email: str):
+        """`/rule <pv>; <action> …` — edit the conditional rules."""
+        segs = [s.strip() for s in pc.args.split(bot_commands.OPT_SEP)]
+        if len(segs) < 2 or not segs[0] or not segs[1]:
+            self._reply(bot_commands.command_help("rule"))
+            return
+        pv, err = self._find_pv(segs[0])
+        if pv is None:
+            self._reply(f"⚠ {err}")
+            return
+        action, _, rest = segs[1].partition(" ")
+        action, rest = action.lower(), rest.strip()
+        extra = [s for s in segs[2:]]
+        before = self._pv_snapshot(pv, _RULE_KEYS)
+        try:
+            what = self._rule_edit(pv, action, rest, extra)
+        except bot_commands.CommandError as e:
+            # Nothing half-done is left behind: the edit works on the PV
+            # directly, so a refusal puts the snapshot back.
+            for k, v in before.items():
+                setattr(pv, k, v)
+            self._reply(f"⚠ {e}")
+            return
+        self._after_pv_change(rules=[pv])
+        self.persist()
+        self._push_undo(_UndoStep(f"{pv.display_name}: {what}", email,
+                                  api.now_ns(), pv_fields={pv.name: before}))
+        self._history_add("change", f"rules — {what}", pv.display_name, email)
+        self._log(f"Webex /rule from {email}: {pv.display_name} — {what}")
+        tail = ("" if self.shared_ok else
+                "\n⚠ The shared PV list could not be reached, so this is "
+                "saved on this PC only.")
+        self._reply(f"✅ {what}. `/undo` puts it back.\n\n"
+                    + self._rules_listing(pv) + tail)
+
+    def _rule_edit(self, pv: PVConfig, action: str, rest: str,
+                   extra: list) -> str:
+        """Apply one /rule action to `pv`; return what was done. Raises."""
+        CE = bot_commands.CommandError
+        if action in ("add", "new"):
+            label = rest or f"rule {len(pv.profiles) + 1}"
+            if any((p.get("label") or "").strip().lower() == label.lower()
+                   for p in pv.profiles):
+                raise CE(f"There is already a rule called `{label}`.")
+            if len(extra) > len(pv.gate_pvs):
+                raise CE(f"{pv.display_name} has {len(pv.gate_pvs)} "
+                         f"dependency PV(s), so a rule takes at most "
+                         f"{len(pv.gate_pvs)} condition(s). `gate 1 <name>` "
+                         f"adds a dependency PV first.")
+            conds = [self._bot_cond(c) for c in extra]
+            conds += [[None, None]] * (len(pv.gate_pvs) - len(conds))
+            pv.profiles.append({"label": label, "conds": conds,
+                                "warn_low": None, "warn_high": None,
+                                "alarm_low": None, "alarm_high": None})
+            return (f"rule `{len(pv.profiles)}` **{label}** added — it has "
+                    f"no limits yet: `/change {pv.display_name}` sets them")
+        if action in ("remove", "delete", "del"):
+            i = self._rule_index(pv, rest)
+            prof = pv.profiles.pop(i)
+            return f"rule **{bot_commands.profile_label(prof, i)}** removed"
+        if action in ("label", "name", "rename"):
+            num, _, label = rest.partition(" ")
+            i = self._rule_index(pv, num)
+            label = label.strip()
+            if not label:
+                raise CE("Say the new label: `label 2 Night`.")
+            old = bot_commands.profile_label(pv.profiles[i], i)
+            pv.profiles[i]["label"] = label
+            return f"rule {i + 1} renamed {old} → **{label}**"
+        if action in ("cond", "conds", "condition", "when"):
+            i = self._rule_index(pv, rest)
+            if not extra:
+                raise CE("Give the condition after a `;`: "
+                         "`cond 2; 1; 0.2`.")
+            if len(extra) > len(pv.gate_pvs):
+                raise CE(f"{pv.display_name} has only {len(pv.gate_pvs)} "
+                         f"dependency PV(s).")
+            conds = [self._bot_cond(c) for c in extra]
+            conds += [[None, None]] * (len(pv.gate_pvs) - len(conds))
+            pv.profiles[i]["conds"] = conds
+            label = bot_commands.profile_label(pv.profiles[i], i)
+            return (f"rule **{label}** now applies when "
+                    f"{_profile_rule_text(pv, pv.profiles[i]) or 'any value'}")
+        if action in ("move", "order"):
+            words = rest.split()
+            if len(words) != 2:
+                raise CE("`move <rule> <position>` — e.g. `move 3 1` makes "
+                         "rule 3 the first one checked.")
+            i = self._rule_index(pv, words[0])
+            j = self._rule_index(pv, words[1])
+            pv.profiles.insert(j, pv.profiles.pop(i))
+            label = bot_commands.profile_label(pv.profiles[j], j)
+            return f"rule **{label}** moved to position {j + 1}"
+        if action in ("gate", "dep", "dependency"):
+            words = rest.split(maxsplit=1)
+            if len(words) != 2 or words[0] not in ("1", "2"):
+                raise CE("`gate 1 <archive name>` or `gate 2 none`.")
+            slot, name = int(words[0]) - 1, words[1].strip()
+            if bot_commands.parse_on_off(name) is False or name.lower() in (
+                    "none", "clear", "remove"):
+                if slot >= len(pv.gate_pvs):
+                    raise CE(f"There is no dependency {slot + 1} to clear.")
+                gone = pv.gate_pvs.pop(slot)
+                for prof in pv.profiles:
+                    conds = list(prof.get("conds") or [])
+                    if slot < len(conds):
+                        conds.pop(slot)
+                    prof["conds"] = conds
+                return (f"dependency {slot + 1} (`{gone}`) cleared; the "
+                        f"rules' conditions on it are gone with it")
+            if slot > len(pv.gate_pvs):
+                raise CE("Set dependency 1 first.")
+            if self._all_channels and name not in self._all_channels:
+                hits = [c for c in self._all_channels
+                        if c.lower() == name.lower()]
+                if not hits:
+                    raise CE(f"`{name}` is not an archive PV name — give the "
+                             f"full name exactly (`/add` can find it).")
+                name = hits[0]
+            if name == pv.name:
+                raise CE("A PV cannot depend on itself.")
+            if slot == len(pv.gate_pvs):
+                pv.gate_pvs.append(name)
+                for prof in pv.profiles:
+                    conds = list(prof.get("conds") or [])
+                    conds += [[None, None]] * (len(pv.gate_pvs) - len(conds))
+                    prof["conds"] = conds
+                return f"dependency {slot + 1} set to `{name}`"
+            old = pv.gate_pvs[slot]
+            pv.gate_pvs[slot] = name
+            return f"dependency {slot + 1} changed `{old}` → `{name}`"
+        raise CE(f"`{action}` — the actions are `add`, `remove`, `label`, "
+                 f"`cond`, `move` and `gate`. `/help rule` has examples.")
+
+    # -- alerting: /snooze, /unsnooze, /ack ---------------------------------
+
+    def _split_pvs_and_time(self, pc) -> tuple:
+        """'/snooze DA1, DA2; 2h' or '/snooze DA1 2h' → (pv items, time text).
+        Without a `;` the time is read off the end — at most three words, the
+        longest reading first, so `until 18:00` is not cut to `18:00`."""
+        if pc.options:
+            return pc.items, " ".join(pc.options)
+        words = pc.args.split()
+        for cut in range(min(3, len(words) - 1), 0, -1):
+            tail = " ".join(words[-cut:])
+            try:
+                bot_commands.parse_until(tail, api.now_ns())
+            except bot_commands.CommandError:
+                continue
+            head = " ".join(words[:-cut])
+            return [i.strip() for i in head.split(",") if i.strip()], tail
+        return pc.items, ""
+
+    def _cmd_snooze(self, pc, email: str):
+        now = api.now_ns()
+        if not pc.args.strip():
+            snoozed = [p for p in self.pvs
+                       if bot_commands.mute_live(p.snoozed_until, now)]
+            if not snoozed:
+                self._reply("Nothing is snoozed. `/snooze <pv>; 2h` mutes "
+                            "one PV's alerts for a while.")
+                return
+            self._reply("**Snoozed:**\n" + "\n".join(
+                f"- **{p.display_name}** "
+                f"{bot_commands.until_text(p.snoozed_until, now)}"
+                + (f" (by {p.snoozed_by.split('@')[0]})" if p.snoozed_by
+                   else "") for p in snoozed))
+            return
+        items, spec = self._split_pvs_and_time(pc)
+        if not spec:
+            self._reply("⚠ For how long? `/snooze DA1; 2h`, `; 30m`, "
+                        "`; until 8:00`, `; until tomorrow 8:00` or "
+                        "`; forever`.")
+            return
+        end = bot_commands.parse_until(spec, now)
+        pvs, errors = self._resolve_pvs(items)
+        if errors or not pvs:
+            self._reply("⚠ " + "; ".join(errors or ["missing PV name"]))
+            return
+        before = {p.name: self._pv_snapshot(p, ("snoozed_until",
+                                                "snoozed_by"))
+                  for p in pvs}
+        for p in pvs:
+            p.snoozed_until, p.snoozed_by = end, email
         self.model.refresh_all()
         self.persist()
-        self._change_undo = None
-        self._log(f"Webex /undo from {email}: {pv.display_name} — "
-                  f"{'; '.join(lines)}")
-        self._reply(self._change_done(
-            pv, lines, [], "That was the only step back I keep."))
+        names = ", ".join(p.display_name for p in pvs)
+        until = bot_commands.until_text(end, now)
+        self._push_undo(_UndoStep(f"snoozed {names} {until}", email, now,
+                                  pv_fields=before))
+        self._history_add("change", f"snoozed {until}", names, email)
+        self._log(f"Webex /snooze from {email}: {names} {until}")
+        off = [p.display_name for p in pvs if not p.enabled]
+        note = (f"\n_{', '.join(off)}: alerting is off anyway._"
+                if off else "")
+        self._reply(f"🔕 **Snoozed {until}:** {names}.\nStill read and "
+                    f"plotted; if one is still out of its limits when the "
+                    f"snooze ends, one alert goes out then. `/unsnooze` ends "
+                    f"it early.{note}")
+
+    def _cmd_unsnooze(self, pc, email: str):
+        now = api.now_ns()
+        if pc.items and not (len(pc.items) == 1 and
+                             pc.items[0].lower() == "all"):
+            pvs, errors = self._resolve_pvs(pc.items)
+            if errors or not pvs:
+                self._reply("⚠ " + "; ".join(errors or ["missing PV name"]))
+                return
+        else:
+            pvs = self.pvs
+        pvs = [p for p in pvs if bot_commands.mute_live(p.snoozed_until, now)]
+        if not pvs:
+            self._reply("Nothing of that is snoozed.")
+            return
+        before = {p.name: self._pv_snapshot(p, ("snoozed_until",
+                                                "snoozed_by"))
+                  for p in pvs}
+        for p in pvs:
+            p.snoozed_until, p.snoozed_by = None, ""
+        self.model.refresh_all()
+        self.persist()
+        names = ", ".join(p.display_name for p in pvs)
+        self._push_undo(_UndoStep(f"unsnoozed {names}", email, now,
+                                  pv_fields=before))
+        self._history_add("change", "snooze ended", names, email)
+        self._reply(f"🔔 **Alerts back on:** {names}. One still out of its "
+                    f"limits alerts at the next reading.")
+
+    def _cmd_ack(self, pc, email: str):
+        """Acknowledge what is in warning/alarm: its reminders stop until the
+        level changes."""
+        if pc.items and not (len(pc.items) == 1 and
+                             pc.items[0].lower() == "all"):
+            pool, errors = self._resolve_pvs(pc.items)
+            if errors or not pool:
+                self._reply("⚠ " + "; ".join(errors or ["missing PV name"]))
+                return
+        else:
+            pool = self.pvs
+        now = api.now_ns()
+        got = []
+        for p in pool:
+            rt = self.runtime.get(p.name)
+            if rt is None or not p.enabled \
+                    or rt.alert.level == AlertLevel.OK:
+                continue
+            rt.acked_level, rt.acked_by, rt.acked_ns = (
+                rt.alert.level, email, now)
+            got.append((p, rt.alert.level))
+        if not got:
+            self._reply("Nothing to acknowledge — no PV of that is in "
+                        "warning or alarm right now.")
+            return
+        self.model.refresh_all()
+        names = ", ".join(f"{p.display_name} ({lv.label.lower()})"
+                          for p, lv in got)
+        self._history_add("change", "acknowledged", names, email)
+        self._log(f"Webex /ack from {email}: {names}")
+        self._reply(f"👍 **Acknowledged:** {names}.\nNo more reminders "
+                    f"while they stay at that level; getting worse, or "
+                    f"recovering, is announced as usual.")
+
+    # -- /history, /test ----------------------------------------------------
+
+    _HISTORY_ICON = {"alert": "📣", "held": "🔇", "failed": "⚠",
+                     "change": "✏️", "test": "🧪"}
+
+    def _cmd_history(self, pc, email: str):
+        now = api.now_ns()
+        rows = list(self._history)
+        if pc.options:
+            tr = bot_commands.parse_time_spec(pc.options[0], now)
+            rows = [r for r in rows if tr.start_ns <= r["t"] <= tr.end_ns]
+            span = f" — {tr.label}"
+        else:
+            span = ""
+        what = ""
+        if pc.items:
+            tokens = bot_commands.split_query(" ".join(pc.items))
+            rows = [r for r in rows if r.get("pv") and all(
+                t in r["pv"].lower() for t in tokens)]
+            what = f" — {', '.join(pc.items)}"
+        if not rows:
+            self._reply(f"Nothing in the history{what}{span}.")
+            return
+        shown = rows[-20:]
+        today = api.ns_to_prague(now).date()
+        out = [f"**History{what}{span}** — the last {len(shown)} of "
+               f"{len(rows)}, newest last:"]
+        for r in shown:
+            t = api.ns_to_prague(r["t"])
+            stamp = t.strftime("%H:%M") if t.date() == today \
+                else t.strftime("%d.%m. %H:%M")
+            icon = self._HISTORY_ICON.get(r.get("kind"), "•")
+            pv = f"**{r['pv']}** " if r.get("pv") else ""
+            who = (f" — {r['who'].split('@')[0]}" if r.get("who") else "")
+            out.append(f"`{stamp}` {icon} {pv}{r.get('text', '')}{who}")
+        out.append("")
+        out.append("_📣 sent · 🔇 held back · ⚠ failed · ✏️ changed from the "
+                   "chat. `/history <pv>; 24h` narrows it._")
+        self._reply("\n".join(out))
+
+    def _cmd_test(self, pc, email: str):
+        active = self.hub.active_channels()
+        if not active:
+            self._reply("⚠ No alert channel is configured on this PC, so "
+                        "there is nothing to test.")
+            return
+        only = active
+        if pc.args.strip():
+            want = bot_commands.parse_channels(pc.args)
+            only = [c for c in want if c in active]
+            if not only:
+                self._reply(f"⚠ {', '.join(want)} is not set up here — the "
+                            f"working channels are {', '.join(active)}.")
+                return
+        sig = _TestSignals(self)
+        sig.done.connect(sig.deleteLater)
+        sig.done.connect(lambda res: self._on_test_done(res, email))
+        self._test_sig = sig
+        QThreadPool.globalInstance().start(_TestWorker(sig, self.hub, only))
+        self._reply(f"🧪 Sending a test message to {', '.join(only)}…")
+
+    def _on_test_done(self, result, email: str):
+        tried, errors = result
+        parts = [f"{c} ✗ ({errors[c]})" if c in errors else f"{c} ✓"
+                 for c in tried]
+        self._history_add("test", ", ".join(parts), "", email)
+        muted = [c for c in tried if bot_commands.channel_hold_reason(
+            self.settings, c, bot_commands.LEVEL_ALARM, 0, "transition",
+            api.now_ns())]
+        tail = (f"\n_A test ignores mutes and quiet hours; real alerts on "
+                f"{', '.join(muted)} are held right now — `/channels`._"
+                if muted else "")
+        self._reply(("✅ " if not errors else "⚠ ") + "Test: "
+                    + ", ".join(parts) + "." + tail)
+
+    # -- channels and quiet hours -------------------------------------------
+
+    def _channel_lines(self, now: int) -> list:
+        out = []
+        active = set(self.hub.active_channels())
+        offs = self.settings.get("channel_off_until") or {}
+        for ch in bot_commands.CHANNELS:
+            if ch not in active:
+                out.append(f"- **{ch}** — not set up on this PC")
+                continue
+            if bot_commands.mute_live(offs.get(ch), now):
+                out.append(f"- **{ch}** — 🔇 muted "
+                           f"{bot_commands.until_text(offs[ch], now)}")
+                continue
+            quiet = []
+            if self.settings.get("quiet_rules_enabled", True):
+                for i, r in enumerate(self.settings.get("quiet_rules") or [],
+                                      1):
+                    if ch in (r.get("channels") or []) and \
+                            bot_commands.quiet_rule_active(r, now):
+                        quiet.append(f"quiet rule {i} "
+                                     f"({bot_commands.HOLD_TEXT[r['hold']]})")
+            out.append(f"- **{ch}** — " + ("🌙 " + "; ".join(quiet)
+                                          if quiet else "✅ on"))
+        return out
+
+    def _cmd_channels(self, pc, email: str):
+        now = api.now_ns()
+        words = pc.args.replace(",", " ").split()
+        if not words:
+            out = ["**Alert channels**"] + self._channel_lines(now)
+            n = len(self.settings.get("quiet_rules") or [])
+            master = self.settings.get("quiet_rules_enabled", True)
+            out += ["", f"{n} quiet rule{'s' if n != 1 else ''}"
+                        + ("" if master else " — *all suspended*")
+                        + " (`/quiet`). `/channels email off 4h` mutes one, "
+                          "`/channels email on` ends it."]
+            self._reply("\n".join(out))
+            return
+        idx = next((i for i, w in enumerate(words)
+                    if bot_commands.parse_on_off(w) is not None), None)
+        if idx is None or idx == 0:
+            self._reply("⚠ `/channels <channel> off [how long]` or "
+                        "`/channels <channel> on` — e.g. `/channels email "
+                        "off 4h`.")
+            return
+        chans = bot_commands.parse_channels(" ".join(words[:idx]))
+        on = bot_commands.parse_on_off(words[idx])
+        spec = " ".join(words[idx + 1:])
+        offs = dict(self.settings.get("channel_off_until") or {})
+        before = {"channel_off_until": copy.deepcopy(offs)}
+        if on:
+            for c in chans:
+                offs.pop(c, None)
+            text = f"{', '.join(chans)} on"
+        else:
+            end = (bot_commands.parse_until(spec, now) if spec
+                   else bot_commands.FOREVER)
+            for c in chans:
+                offs[c] = end
+            text = (f"{', '.join(chans)} muted "
+                    f"{bot_commands.until_text(end, now)}")
+        self.settings["channel_off_until"] = offs
+        self.persist()
+        self._push_undo(_UndoStep(text, email, now, settings=before))
+        self._history_add("change", text, "", email)
+        self._log(f"Webex /channels from {email}: {text}")
+        warn = ""
+        active = self.hub.active_channels()
+        if not on and active and all(
+                bot_commands.mute_live(offs.get(c), now) for c in active):
+            warn = ("\n⚠ **Every channel is muted now — no alert reaches "
+                    "anybody.**")
+        self._reply(f"✅ {text}.{warn}\n\n" + "\n".join(
+            self._channel_lines(now)))
+
+    def _quiet_listing(self, now: int) -> str:
+        rules = self.settings.get("quiet_rules") or []
+        master = self.settings.get("quiet_rules_enabled", True)
+        out = ["**Quiet rules**" + ("" if master else
+                                    " — ⏸ *all suspended* (`/quiet on`)")]
+        if not rules:
+            out.append("None. Example: `/quiet add email; mon-fri; "
+                       "22:00-06:00; warnings`.")
+        for i, r in enumerate(rules, 1):
+            live = (" — 🌙 *in force now*" if master and
+                    bot_commands.quiet_rule_active(r, now) else "")
+            out.append(f"`{i}` {bot_commands.quiet_rule_text(r)}{live}")
+        out.append("")
+        out.append("_`/quiet remove 2`, `/quiet off 2` / `on 2`, `/quiet off` "
+                   "suspends them all. `/help quiet` has the rest._")
+        return "\n".join(out)
+
+    def _cmd_quiet(self, pc, email: str):
+        now = api.now_ns()
+        segs = [s.strip() for s in pc.args.split(bot_commands.OPT_SEP)]
+        first = segs[0].split()
+        if not first:
+            self._reply(self._quiet_listing(now))
+            return
+        action, rest = first[0].lower(), first[1:]
+        rules = copy.deepcopy(self.settings.get("quiet_rules") or [])
+        before = {"quiet_rules": copy.deepcopy(rules),
+                  "quiet_rules_enabled":
+                      self.settings.get("quiet_rules_enabled", True)}
+        if action in ("add", "new"):
+            rule = bot_commands.parse_quiet_rule([" ".join(rest)] + segs[1:])
+            rules.append(rule)
+            self.settings["quiet_rules"] = rules
+            text = f"quiet rule {len(rules)} added: " \
+                   f"{bot_commands.quiet_rule_text(rule)}"
+        elif action in ("remove", "delete", "del"):
+            i = self._quiet_index(rules, rest)
+            rule = rules.pop(i)
+            self.settings["quiet_rules"] = rules
+            text = f"quiet rule {i + 1} removed: " \
+                   f"{bot_commands.quiet_rule_text(rule)}"
+        elif bot_commands.parse_on_off(action) is not None:
+            on = bot_commands.parse_on_off(action)
+            if rest:
+                i = self._quiet_index(rules, rest)
+                rules[i]["on"] = on
+                self.settings["quiet_rules"] = rules
+                text = f"quiet rule {i + 1} {'on' if on else 'off'}"
+            else:
+                self.settings["quiet_rules_enabled"] = on
+                text = ("quiet rules on" if on else
+                        "quiet rules suspended — every alert goes out")
+        else:
+            raise bot_commands.CommandError(
+                "`/quiet add …`, `/quiet remove 2`, `/quiet on|off [n]` — "
+                "`/help quiet` has examples.")
+        self.persist()
+        self._push_undo(_UndoStep(text, email, now, settings=before))
+        self._history_add("change", text, "", email)
+        self._log(f"Webex /quiet from {email}: {text}")
+        self._reply(f"✅ {text}.\n\n" + self._quiet_listing(now))
+
+    @staticmethod
+    def _quiet_index(rules: list, rest: list) -> int:
+        n = bot_commands.parse_number(rest[0]) if len(rest) == 1 else None
+        if n is None or not float(n).is_integer() \
+                or not (1 <= int(n) <= len(rules)):
+            raise bot_commands.CommandError(
+                "Say the rule's number from `/quiet` — "
+                + (f"1 to {len(rules)}." if rules else "there are none."))
+        return int(n) - 1
+
+    # -- pacing and the overview --------------------------------------------
+
+    def _settings_changed(self, keys):
+        """Put settings changed from the chat (or by /undo) into effect."""
+        if any(p[1] in keys for p in bot_commands.PACING):
+            self.evaluator = AlertEvaluator(self._eval_config())
+
+    def _pacing_lines(self) -> list:
+        out = []
+        for word, key, label, unit, _lo, _hi in bot_commands.PACING:
+            v = self.settings.get(key)
+            shown = ("on" if v else "off") if unit == "" else \
+                f"{_fmt(float(v))} {unit}"
+            out.append(f"- `{word}` {label}: **{shown}**")
+        return out
+
+    def _cmd_pacing(self, pc, email: str):
+        if not pc.args.strip():
+            self._reply("**Alert pacing** (the same as Settings → "
+                        "Monitoring)\n" + "\n".join(self._pacing_lines())
+                        + "\n\n_`/pacing reminder 60, recovery off` changes "
+                          "them; `/help pacing` says what each does._")
+            return
+        pairs = bot_commands.parse_pacing(pc.args)
+        before = {k: self.settings.get(k) for k, _ in pairs}
+        for k, v in pairs:
+            self.settings[k] = v
+        self._settings_changed(before)
+        self.persist()
+        labels = {p[1]: p for p in bot_commands.PACING}
+        text = "; ".join(
+            f"{labels[k][2]} "
+            + (("on" if v else "off") if labels[k][3] == "" else
+               f"{_fmt(float(v))} {labels[k][3]}") for k, v in pairs)
+        now = api.now_ns()
+        self._push_undo(_UndoStep(f"pacing: {text}", email, now,
+                                  settings=before))
+        self._history_add("change", f"pacing — {text}", "", email)
+        self._log(f"Webex /pacing from {email}: {text}")
+        self._reply(f"✅ {text}.\n_Shared with the PV list, so every copy "
+                    f"of the program paces the same._")
+
+    def _cmd_settings(self, pc, email: str):
+        now = api.now_ns()
+        mon = ("▶ MONITORING" if self._monitoring
+               else "⏹ stopped (reading only)")
+        if not self._monitoring and self._resume_at_ns:
+            mon += " — back on at " + api.ns_to_prague(
+                self._resume_at_ns).strftime("%H:%M")
+        out = [f"**Diagnostic — {mon}**", "", "**Channels**"]
+        out += self._channel_lines(now)
+        rules = self.settings.get("quiet_rules") or []
+        if rules:
+            out += ["", "**Quiet rules**"
+                    + ("" if self.settings.get("quiet_rules_enabled", True)
+                       else " — suspended")]
+            out += [f"`{i}` {bot_commands.quiet_rule_text(r)}"
+                    for i, r in enumerate(rules, 1)]
+        out += ["", "**Pacing**"] + self._pacing_lines()
+        snoozed = [f"{p.display_name} "
+                   f"{bot_commands.until_text(p.snoozed_until, now)}"
+                   for p in self.pvs
+                   if bot_commands.mute_live(p.snoozed_until, now)]
+        acked = [p.display_name for p in self.pvs
+                 if (rt := self.runtime.get(p.name)) is not None
+                 and rt.acked_level is not None]
+        off = [p.display_name for p in self.pvs if not p.enabled]
+        out += ["", "**PVs**",
+                f"- {len(self.pvs)} configured, {len(self.pvs) - len(off)} "
+                f"with alerting on"]
+        if snoozed:
+            out.append("- 🔕 snoozed: " + "; ".join(snoozed))
+        if acked:
+            out.append("- 👍 acknowledged: " + ", ".join(acked))
+        if off:
+            out.append("- alerting off: " + ", ".join(off))
+        wd = "on" if self.settings.get("data_watchdog_enabled", True) \
+            else "off"
+        out += ["", f"Data watchdog: {wd} · Shared PV list: "
+                    + ("reachable" if self.shared_ok else "⚠ NOT reachable")]
+        self._reply("\n".join(out))
+
+    def _cmd_enable(self, pc, email: str, enable: bool):
+        pvs, errors = self._resolve_pvs(pc.items)
+        if errors or not pvs:
+            self._reply("⚠ " + "; ".join(errors or ["missing PV name"]))
+            return
+        before = {p.name: self._pv_snapshot(p, ("enabled",)) for p in pvs}
+        for pv in pvs:
+            pv.enabled = enable
+        self.model.refresh_all()
+        self.persist()
+        state = "enabled" if enable else "disabled"
+        names = ", ".join(pv.display_name for pv in pvs)
+        self._push_undo(_UndoStep(f"alerting {state} for {names}", email,
+                                  api.now_ns(), pv_fields=before))
+        self._history_add("change", f"alerting {state}", names, email)
+        self._reply(f"Alerting {state} for {names}.")
 
     def _on_chart_result(self, result):
         token, errors, had_png, cancelled = result
@@ -10295,27 +12071,35 @@ class MonitorWidget(QWidget):
             "\n"
             + bot_commands.SYNTAX_HELP + "\n"
             "\n"
-            "**Commands**\n"
-            "- `/status [pv]` — value and state; no PV means all of them, and "
-            f"`{NOT_REFRESHED_LABEL}` in place of `ok` means I stopped reading\n"
-            "- `/alarms [pv]` — only what is in warning or alarm right now\n"
+            "**Reading**\n"
+            "- `/status [pv]` — value and state; "
+            f"`{NOT_REFRESHED_LABEL}` means I stopped reading\n"
+            "- `/alarms [pv]` — only what is in warning or alarm now\n"
             "- `/list [pv]` — the configured PVs\n"
-            "- `/plot <pv, …>[; window][; y lo-hi]` — one picture, a curve per "
-            "PV; a long window takes minutes\n"
-            "- `/cancel` — drop a plot that is still being fetched, or an "
-            "unanswered limits question (`/abort` does the same)\n"
-            "- `/change <pv>` — move a warning or alarm limit; one PV at a "
-            "time, and I ask which limit\n"
-            "- `/undo` — put the last limit change back\n"
-            "- `/start`, `/stop [hours]` — alerting on and off; PVs are read "
-            "and plotted either way\n"
-            "- `/enable <pv>`, `/disable <pv>` — alerting for one PV or a "
-            "whole group\n"
-            "- `/datawatchdog on|off` — the 'no data at all' alert; no "
-            "argument shows the state\n"
-            "- `/graph <pv|all>`, `/window <minutes>`, `/yaxis <lo-hi>|auto` — "
-            "the live graph in the app's own window, not a picture in the "
-            "chat; `/graph` takes a single PV\n"
+            "- `/plot <pv, …>[; window]` — one picture, a curve per PV\n"
+            "- `/history [pv][; window]` — alerts sent or held, and changes\n"
+            "- `/cancel` — drop a running plot or my open question\n"
+            "\n"
+            "**PVs and limits**\n"
+            "- `/change <pv>` — move a warning or alarm limit\n"
+            "- `/add <name>`, `/remove <pv>`, `/rename <pv>; <name>` — the "
+            "PV list\n"
+            "- `/rules <pv>`, `/rule <pv>; …` — dependency PVs and rules\n"
+            "- `/undo` — the last change made here, step by step\n"
+            "\n"
+            "**Alerting**\n"
+            "- `/start`, `/stop [hours]` — all alerting on and off\n"
+            "- `/enable <pv>`, `/disable <pv>` — one PV or a group\n"
+            "- `/snooze <pv>; 2h`, `/unsnooze` — mute PVs for a while\n"
+            "- `/ack [pv]` — no more reminders until the level changes\n"
+            "- `/channels` — mute one channel; `/quiet` — regular quiet "
+            "hours\n"
+            "- `/pacing` — reminder interval and the other waits\n"
+            "- `/test`, `/settings`, `/datawatchdog on|off`\n"
+            "\n"
+            "**Window and app**\n"
+            "- `/graph <pv|all>`, `/window <min>`, `/yaxis <lo-hi>|auto` — "
+            "the app's live graph\n"
             "- `/run` — start the app when it is closed\n"
             + food_line +
             "\n"
@@ -10358,6 +12142,13 @@ class MonitorWidget(QWidget):
                           .strftime("%H:%M"))
         else:
             state = "no data"
+        now = api.now_ns()
+        if p.enabled and bot_commands.mute_live(p.snoozed_until, now):
+            state += ", snoozed " + bot_commands.until_text(p.snoozed_until,
+                                                           now)
+        elif rt and rt.acked_level is not None \
+                and rt.acked_level == rt.alert.level:
+            state += ", acknowledged"
         return f"- **{p.display_name}**: {val} {units} [{state}]"
 
     def _cmd_list(self, items: Optional[list[str]] = None) -> str:
@@ -10506,6 +12297,12 @@ class MonitorWidget(QWidget):
             held = (" — limits just changed, held until "
                     + api.ns_to_prague(rt.grace_until_ns).strftime("%H:%M")
                     if self._monitoring and rt.in_grace() else "")
+            if bot_commands.mute_live(p.snoozed_until, api.now_ns()):
+                held += " — snoozed " + bot_commands.until_text(
+                    p.snoozed_until, api.now_ns())
+            elif rt.acked_level is not None \
+                    and rt.acked_level == rt.alert.level:
+                held += " — acknowledged"
             lines.append(f"- **{p.display_name}**: {val} {units} "
                          f"[{level.label.lower()}{held}]")
         out = []

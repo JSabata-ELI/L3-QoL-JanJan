@@ -146,7 +146,7 @@ def main() -> int:
 
     slider.save()
     saved = json.loads(st_mod.TABS_PATH.read_text(encoding="utf-8"))
-    check([t["name"] for t in saved["tabs"]] == ["Tab 1", "B", "static"],
+    check([t["name"] for t in saved["tabs"]] == ["Panel 1", "B", "static"],
           "tab names saved")
     check(saved["tabs"][0].get("live") is True, "live flag saved")
 

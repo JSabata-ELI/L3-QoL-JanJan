@@ -2,8 +2,9 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05
-  (sp_t.py 10414 lines, daypicker.py 1078)
+Verified against source: 2026-10-15
+  (sp_t.py 10480 lines, daypicker.py 1078; 11558 lines in all)
+  Program folder: 2.4 MB in 132 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_Spectra tab.txt  ("ReadMe" button)
 Code map:      STRUCTURE_Spectra_tab.md
@@ -262,9 +263,9 @@ comparison — is a way of looking at those averages.
     HOW THE SEARCH WORKS. Type words, separated by spaces (commas,
     semicolons and asterisks work as separators too). Every word has
     to appear somewhere in the channel name — so "l3 sbw4" finds a
-    channel containing both, wherever they are. Words found in the
-    order you typed them rank above the same words scrambled, and
-    camera channels are pushed to the bottom of the list because
+    channel containing both, wherever they are. The order of the
+    words does not matter: "sbw4 l3" gives exactly the same list.
+    Camera channels are pushed to the bottom of the list because
     there are hundreds of them and they would otherwise bury what you
     were looking for.
 

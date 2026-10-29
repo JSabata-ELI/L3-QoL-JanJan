@@ -1,7 +1,7 @@
 """
 The server-thinned ("Optimized") series is not taken on trust.
 
-With "Avg to" above zero the Logger asks the archiver for decimated samples
+With "Detail" above zero the Logger asks the archiver for decimated samples
 instead of the archived ones. Measured against the real archiver on 2026-09-21,
 over the period 10.-12.9.2026, that answer is wrong in three different ways and
 every one of them is silent:
@@ -31,7 +31,7 @@ What this pins:
   * a dense signal whose thinned series is genuinely flat is left alone,
   * a re-read too big to hold is refused and said out loud,
   * the carry-forward never returns a sample from after the window,
-  * "Avg to" = 0 still reads raw and never probes.
+  * "Detail" = 0 ("all") still reads raw and never probes.
 
 Runs headless with the network faked — no archiver needed.
 

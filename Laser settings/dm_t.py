@@ -1,7 +1,7 @@
 """Laser settings — the DM settings tab: which set-up the deformable mirror is on.
 
 OPR1 photographs the Remote Desktop window to the mirror's PC every 5 s and
-writes what the Set-up grid shows into a file on the scratch share (`ls_dm`,
+writes what the Applied voltages grid (the left one) shows into a file on the scratch share (`ls_dm`,
 switched on there on the DM writer tab). This tab, on every PC, reads that file
 and says which SAVED set-up the 36 colours are:
 
@@ -18,7 +18,10 @@ one it matches, or the one picked in the list — with every electrode that
 differs drawn with a thick outline.
 
 The list of saved set-ups is shared by every PC (it is a file on the share).
-Save the grid that is on the mirror NOW under a name, rename one, delete some.
+Save the grid that is on the mirror NOW under a name, replace the grid of a
+saved one (and undo that), rename one, delete some — Low power and High power
+too since 21.10.2026, with Restore built-in to bring them back. Whatever loses
+a grid (replace, undo, delete) wants a second click.
 The edits are done on the engine's dm thread, never here: the share can take
 48 s to answer and the window must not stop for it.
 """
@@ -29,7 +32,7 @@ import time
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractItemView, QFrame, QGridLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QFrame,
                                QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QScrollArea, QSizePolicy,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
@@ -47,8 +50,12 @@ _BANNER = {
     D.VERDICT_NONE: U.STATE_COLORS["unknown"],
 }
 
-# How long the Delete button waits for its second click.
+# How long a button that loses a grid waits for its second click.
 _ARM_MS = 4000
+
+_TIP_SAVE_EXISTING = ("\nA name that is already on the list (any case) replaces "
+                      "that set-up's grid after a second click; its High "
+                      "power / Low power tick stays.")
 
 # The list's columns.
 _C_NAME, _C_HIGH, _C_LOW, _C_SAVED, _C_ON = range(5)
@@ -160,7 +167,8 @@ class DmTab(QWidget):
         self._view = None
         self._names = []
         self._shown = None
-        self._armed = []
+        self._armed = None              # (button, what) awaiting click two
+        self._texts = {}                # button -> its own text
         self._pending = {}              # name -> tag clicked, not yet back
         self._arm_timer = QTimer(self)
         self._arm_timer.setSingleShot(True)
@@ -210,7 +218,9 @@ class DmTab(QWidget):
         grids.addStretch(1)
         self._now = DmGrid("On the mirror now")
         self._saved = DmGrid("Saved set-up")
-        self._now.setToolTip("The Set-up grid of Mirror Control Window, as "
+        self._now.setToolTip("The Applied voltages grid (the left one) of "
+                             "Mirror Control Window — what is really on the "
+                             "mirror — as "
                              "read off the Remote Desktop window on OPR1.\n"
                              "Electrodes drawn with a thick outline differ "
                              "from the saved set-up beside it.")
@@ -228,11 +238,14 @@ class DmTab(QWidget):
         self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(
             ["Name", "High power", "Low power", "Saved", "On"])
-        for col, words in ((_C_HIGH, "a fresh SBW4 shot over"),
-                           (_C_LOW, "a fresh SBW4 shot at or under")):
+        for col, words in ((_C_HIGH, "a fresh SBW4 shot over 0.05 J "
+                                     "arrives"),
+                           (_C_LOW, "SBW4 shots at or under 0.05 J keep "
+                                    "coming (one or two are a trigger, not "
+                                    "low power)")):
             self._table.horizontalHeaderItem(col).setToolTip(
                 f"Ticked set-ups are accepted on the Overview's DM settings "
-                f"line when {words} 0.05 J arrives.\nTick as many as you like: "
+                f"line when {words}.\nTick as many as you like: "
                 f"the mirror on any one of them is OK. A set-up ticked for "
                 f"neither is a cross whenever a shot arrives.")
         self._table.setStyleSheet(U.TABLE_QSS)
@@ -257,37 +270,93 @@ class DmTab(QWidget):
         self._table.itemChanged.connect(self._ticked)
         lay.addWidget(self._table)
 
-        tools = QGridLayout()
-        tools.setHorizontalSpacing(8)
-        tools.setVerticalSpacing(6)
-        tools.addWidget(QLabel("Name"), 0, 0)
+        # Two ticked for the same power: the Overview takes either, so an old
+        # grid left ticked beside its replacement still counts as OK.
+        self._twice = QLabel("")
+        self._twice.setWordWrap(True)
+        ground, ink = U.STATE_COLORS["warn"]
+        self._twice.setStyleSheet(
+            f"QLabel {{ background: {ground}; color: {ink};"
+            f" border: 1px solid {ink}; border-radius: 4px;"
+            f" font-size: 12px; padding: 4px 8px; }}")
+        self._twice.hide()
+        lay.addWidget(self._twice)
+
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        tools.addWidget(QLabel("Name"))
         self._name = QLineEdit()
         self._name.setPlaceholderText("e.g. High power")
         self._name.setMinimumWidth(220)
         self._name.returnPressed.connect(self._save)
-        tools.addWidget(self._name, 0, 1)
+        self._name.textEdited.connect(lambda _t: self._disarm())
+        tools.addWidget(self._name)
         self._save_btn = U.button(
             "Save the grid on the mirror now", icon_name="save", primary=True,
-            tip="Save the colours of the Set-up grid as they are on the mirror "
+            tip="Save the colours of the Applied voltages grid as they are on "
+                "the mirror "
                 "now, under the name typed beside it.\nEvery PC sees the same "
-                "list.")
+                "list." + _TIP_SAVE_EXISTING)
         self._save_btn.clicked.connect(self._save)
-        tools.addWidget(self._save_btn, 0, 2)
+        tools.addWidget(self._save_btn)
+        # The right-hand grid (14.10.2026): a set-up can be saved while it is
+        # only prepared in Set-up, before it is applied. The Overview still
+        # judges the Applied voltages grid alone.
+        self._save_setup_btn = U.button(
+            "Save the Set-up grid", icon_name="save",
+            tip="Save the colours of the right-hand Set-up grid — what is about "
+                "to be applied, not yet on the mirror — under the name typed "
+                "beside it.\nOnce it is applied, the Applied voltages grid shows "
+                "the same set-up and it is recognised by this name."
+                + _TIP_SAVE_EXISTING)
+        self._save_setup_btn.clicked.connect(self._save_setup)
+        tools.addWidget(self._save_setup_btn)
+        tools.addStretch(1)
+        lay.addLayout(tools)
+
+        edits = QHBoxLayout()
+        edits.setSpacing(8)
+        self._replace_btn = U.button(
+            "Replace with the grid on the mirror now", icon_name="refresh",
+            tip="Give the set-up picked in the list the Applied voltages grid "
+                "as it is on the mirror now. Its name and its High power / "
+                "Low power tick stay.\nClick once, then once more to confirm. "
+                "Undo replace brings the old grid back.")
+        self._replace_btn.clicked.connect(self._replace)
+        edits.addWidget(self._replace_btn)
+        self._undo_btn = U.button(
+            "Undo replace",
+            tip="Give the set-up picked in the list back the grid it had "
+                "before its last replace.\nClick once, then once more to "
+                "confirm.")
+        self._undo_btn.clicked.connect(self._undo)
+        edits.addWidget(self._undo_btn)
         self._rename_btn = U.button(
             "Rename", icon_name="pencil",
             tip="Give the set-up picked in the list the name typed in the box."
-                "\nLow power and High power can be renamed too; deleting a "
-                "renamed one brings its built-in name back.")
+                "\nLow power and High power can be renamed too, and a deleted "
+                "one's name can be given to another set-up.")
         self._rename_btn.clicked.connect(self._rename)
-        tools.addWidget(self._rename_btn, 0, 3)
+        edits.addWidget(self._rename_btn)
+        self._restore_btn = U.button(
+            "Restore built-in", icon_name="plus",
+            tip="Put the built-in Low power and High power set-ups back on the "
+                "list after they were deleted or renamed — the grids the "
+                "program came with.")
+        self._restore_btn.clicked.connect(self._restore)
+        edits.addWidget(self._restore_btn)
         self._delete_btn = U.button(
             "Delete", icon_name="trash", danger=True,
-            tip="Delete the set-ups picked in the list. Click once, then once "
-                "more to confirm.")
+            tip="Delete the set-ups picked in the list — Low power and High "
+                "power too. Click once, then once more to confirm.\nRestore "
+                "built-in brings Low power and High power back.")
         self._delete_btn.clicked.connect(self._delete)
-        tools.addWidget(self._delete_btn, 0, 4)
-        tools.setColumnStretch(5, 1)
-        lay.addLayout(tools)
+        edits.addWidget(self._delete_btn)
+        edits.addStretch(1)
+        lay.addLayout(edits)
+        for b in (self._save_btn, self._save_setup_btn, self._replace_btn,
+                  self._undo_btn, self._delete_btn):
+            self._texts[b] = b.text()
 
         self._note = QLabel("")
         self._note.setWordWrap(True)
@@ -354,12 +423,17 @@ class DmTab(QWidget):
                 entry = setups[name]
                 saved = entry.get("saved", "").replace("T", " ")
                 by = entry.get("by", "")
-                if D.is_reference(name):
-                    when = "built in"
-                elif entry.get("replaces"):
+                if entry.get("replaces"):
                     when = f"built in, was \"{entry['replaces']}\""
+                elif by == D.BUILT_IN_BY:
+                    when = "built in"
                 else:
                     when = f"{saved}  ({by})" if by else saved
+                if entry.get("replaced"):
+                    again = entry["replaced"].replace("T", " ")
+                    who = entry.get("replaced_by", "")
+                    when += (f", replaced {again}  ({who})" if who
+                             else f", replaced {again}")
                 # A tick clicked here shows at once, before the dm thread has
                 # written it and handed back a view that carries it.
                 tag = D.tag_of(name, setups)
@@ -384,6 +458,11 @@ class DmTab(QWidget):
                             Qt.CheckState.Checked
                             if tag == _TAG_OF_COLUMN[col]
                             else Qt.CheckState.Unchecked)
+                    # The date and the "on the mirror now" mark sit in the
+                    # middle of their columns, like every value in this
+                    # program's tables; only the name reads from the left.
+                    if col in (_C_SAVED, _C_ON):
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     if col == _C_ON and text:
                         ground, ink = U.STATE_COLORS["ok"]
                         item.setBackground(QColor(ground))
@@ -395,6 +474,27 @@ class DmTab(QWidget):
                 U.empty_table_note(self._table, "Nothing saved yet.")
         finally:
             self._table.blockSignals(False)
+        self._show_twice(setups)
+
+    def _show_twice(self, setups):
+        # The ticks as shown — one clicked a moment ago counts already.
+        shown = {n: {**e, "power": self._pending.get(n, D.tag_of(n, setups))}
+                 for n, e in setups.items()}
+        twice = D.ticked_twice(shown)
+        lines = []
+        for tag, words in ((D.TAG_HIGH, "High power"),
+                           (D.TAG_LOW, "Low power")):
+            names = twice.get(tag)
+            if names:
+                lines.append(
+                    f"{len(names)} set-ups are ticked for {words}: "
+                    + ", ".join(f"\"{n}\"" for n in names)
+                    + " — the Overview accepts the mirror on any of them. "
+                      "Untick the ones no longer in use.")
+        text = "\n".join(lines)
+        if self._twice.text() != text:
+            self._twice.setText(text)
+        self._twice.setVisible(bool(text))
 
     def _show_grids(self, setups, v):
         colours = v.colours
@@ -433,30 +533,125 @@ class DmTab(QWidget):
         v = D.verdict(view.state, view.setups)
         return v.colours
 
+    def _fresh_setup_colours(self):
+        view = self._view
+        return D.setup_grid(view.state) if view is not None else None
+
+    def _setups(self):
+        return self._view.setups if self._view is not None else {}
+
     def _enable(self):
         picked = self._picked_names()
-        self._save_btn.setEnabled(self._fresh_colours() is not None)
-        # Low power and High power are built in: never deleted, but renamed
-        # like any other (12.10.2026) — see `ls_dm.rename_setup`.
-        own = [n for n in picked if not D.is_reference(n)]
-        self._rename_btn.setEnabled(len(picked) == 1)
-        self._delete_btn.setEnabled(bool(own))
+        setups = self._setups()
+        fresh = self._fresh_colours() is not None
+        self._save_btn.setEnabled(fresh)
+        self._save_setup_btn.setEnabled(
+            self._fresh_setup_colours() is not None)
+        one = picked[0] if len(picked) == 1 else None
+        self._replace_btn.setEnabled(one is not None and fresh)
+        self._undo_btn.setEnabled(
+            one is not None
+            and bool((setups.get(one) or {}).get("previous")))
+        self._rename_btn.setEnabled(one is not None)
+        # Low power and High power are deleted like any other since
+        # 21.10.2026; this brings them back.
+        self._restore_btn.setEnabled(
+            self._view is not None and bool(D.missing_builtins(setups)))
+        self._delete_btn.setEnabled(bool(picked))
 
-    # ── the three edits, done on the dm thread ─────────────────────────────
+    def _confirmed(self, button, what, text):
+        """True on the second click of `button` for the same `what` within
+        _ARM_MS; the first click only turns its text into `text`."""
+        if self._armed == (button, what):
+            self._disarm()
+            return True
+        self._disarm()
+        self._armed = (button, what)
+        button.setText(text)
+        self._arm_timer.start()
+        return False
+
+    # ── the edits, done on the dm thread ───────────────────────────────────
     def _save(self):
-        colours = self._fresh_colours()
-        name = self._name.text().strip()
+        self._save_colours(self._fresh_colours(),
+                           "There is no fresh reading of the grid to save.",
+                           self._save_btn)
+
+    def _save_setup(self):
+        self._save_colours(
+            self._fresh_setup_colours(),
+            "The Set-up grid has not been read — it may be covered in the "
+            "Remote Desktop window, or OPR1 runs an older version.",
+            self._save_setup_btn)
+
+    def _save_colours(self, colours, missing, button):
+        name = D.tidy_name(self._name.text())
         if colours is None:
-            self._note.setText("There is no fresh reading of the grid to save.")
+            self._note.setText(missing)
             return
         if not name:
             self._note.setText("Type a name for the set-up first.")
             return
         frozen = [list(c) for c in colours]
+        existing = D.find_name(self._setups(), name)
+        if existing is not None:
+            # A name on the list: its grid is replaced, after a second click
+            # (21.10.2026 — before, it was refused and a third set-up made).
+            if not self._confirmed(button, existing,
+                                   f"Click again to replace \"{existing}\""):
+                self._note.setText(
+                    f"\"{existing}\" is already on the list. Click again to "
+                    f"replace its grid; its High power / Low power tick "
+                    f"stays.")
+                return
+            self._send_replace(existing, frozen)
+            return
+        self._disarm()
         self._note.setText(f"Saving \"{name}\"…")
         self._win.engine().dm_edit(
             lambda setups: self._result(D.add_setup(setups, name, frozen),
                                         f"Saved \"{name}\"."))
+
+    def _replace(self):
+        picked = self._picked_names()
+        colours = self._fresh_colours()
+        if len(picked) != 1:
+            return
+        if colours is None:
+            self._note.setText("There is no fresh reading of the grid to save.")
+            return
+        name = picked[0]
+        if not self._confirmed(self._replace_btn, name,
+                               f"Click again to replace \"{name}\""):
+            return
+        self._send_replace(name, [list(c) for c in colours])
+
+    def _send_replace(self, name, colours):
+        self._note.setText(f"Replacing the grid of \"{name}\"…")
+        self._win.engine().dm_edit(
+            lambda setups: self._result(
+                D.replace_setup(setups, name, colours),
+                f"The grid of \"{name}\" is replaced. Undo replace brings "
+                f"the old one back."))
+
+    def _undo(self):
+        picked = self._picked_names()
+        if len(picked) != 1:
+            return
+        name = picked[0]
+        if not self._confirmed(self._undo_btn, name,
+                               f"Click again to undo \"{name}\""):
+            return
+        self._note.setText(f"Bringing back the old grid of \"{name}\"…")
+        self._win.engine().dm_edit(
+            lambda setups: self._result(
+                D.undo_replace(setups, name),
+                f"\"{name}\" has its previous grid again."))
+
+    def _restore(self):
+        self._disarm()
+        self._note.setText("Restoring the built-in set-ups…")
+        self._win.engine().dm_edit(D.restore_builtins)
 
     def _rename(self):
         picked = self._picked_names()
@@ -470,21 +665,21 @@ class DmTab(QWidget):
                                         f"\"{old}\" is now \"{new}\"."))
 
     def _delete(self):
-        picked = [n for n in self._picked_names() if not D.is_reference(n)]
+        picked = self._picked_names()
         if not picked:
             return
-        if self._armed != picked:
-            self._armed = picked
-            self._delete_btn.setText(f"Click again to delete {len(picked)}")
-            self._arm_timer.start()
+        if not self._confirmed(self._delete_btn, tuple(picked),
+                               f"Click again to delete {len(picked)}"):
             return
-        self._disarm()
         names = list(picked)
+        built = [n for n in names if D.is_reference(n)]
+        after = (" Restore built-in brings " + " and ".join(built) + " back."
+                 if built else "")
         self._note.setText("Deleting…")
         self._win.engine().dm_edit(
             lambda setups: (D.delete_setups(setups, names),
                             "Deleted " + ", ".join(f"\"{n}\"" for n in names)
-                            + "."))
+                            + "." + after))
 
     def _ticked(self, item):
         """A High power / Low power tick clicked: one of the two or neither."""
@@ -513,9 +708,11 @@ class DmTab(QWidget):
                                         f"\"{name}\" is {words}."))
 
     def _disarm(self):
-        self._armed = []
+        self._armed = None
         self._arm_timer.stop()
-        self._delete_btn.setText("Delete")
+        for button, text in self._texts.items():
+            if button.text() != text:
+                button.setText(text)
 
     @staticmethod
     def _result(outcome, done):

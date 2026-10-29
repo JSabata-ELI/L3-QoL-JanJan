@@ -284,6 +284,35 @@ def test_fit_off_uses_the_numbers_verbatim(win):
           C.halls_of(win._cfg)["fit"], False)
 
 
+def test_fit_off_never_past_the_edge(win):
+    print("with the fit off, a text too big for the window is drawn smaller")
+    import ls_core as C
+    look = C.look_of(win._cfg)
+    halls = C.halls_of(win._cfg)
+    look["size_px"], look["mark_px"] = 200, 300
+    for single in (False, True):
+        halls["single"] = single
+        win.settings_changed(rebuild=True)
+        tab = resize(win, 1180, 720)
+        mode = "one square" if single else "five squares"
+        drawn = tab._row_widgets[0]._name.font().pixelSize()
+        at_most(f"{mode}: drawn smaller than typed", drawn, 199)
+        check(f"{mode}: the typed number stays in the file",
+              (look["size_px"], look["mark_px"]), (200, 300))
+        check(f"{mode}: the square keeps the typed proportion",
+              tab._row_widgets[0]._mark.side(), round(drawn * 1.5))
+        check(f"{mode}: no row is wider than the list",
+              max(r.width() for r in tab._row_widgets)
+              <= tab._scroll.viewport().width(), True)
+        at_most(f"{mode}: and the rows fit its height",
+                sum(r.sizeHint().height() + tab._list.spacing()
+                    for r in tab._row_widgets),
+                tab._scroll.viewport().height())
+    halls["single"] = False
+    look["size_px"], look["mark_px"] = 22, 40
+    win.settings_changed(rebuild=True)
+
+
 def test_typing_switches_the_fit_off(win):
     print("typing a size switches the fit off and that number stands")
     import ls_core as C
@@ -691,9 +720,16 @@ def test_one_square_beside_the_list(win):
     halls["single"] = True
     halls["fit"] = True
     win.settings_changed(rebuild=True)
-    for w, h in ((1180, 720), (806, 470), (420, 300)):
+    for w, h in ((1920, 1080), (1180, 720), (806, 470), (420, 300)):
         tab = resize(win, w, h)
         sq = tab._single
+        if (w, h) == (1920, 1080):
+            # 12.10.2026: the square first — the whole height, since three
+            # rows fit beside it at the least text size with room to spare.
+            check(f"{w}x{h}: the square takes the whole height",
+                  sq.height(), tab.height() - 2 * tab.MARGIN)
+            at_least(f"{w}x{h}: the text is at least its least size",
+                     C.look_of(win._cfg)["size_px"], C.FIT_TEXT_MIN_PX)
         check(f"{w}x{h}: the one square is there", sq.isVisible(), True)
         check(f"{w}x{h}: the five are not", tab._band.isVisible(), False)
         check(f"{w}x{h}: it is square", sq.width(), sq.height())
@@ -722,6 +758,34 @@ def test_one_square_beside_the_list(win):
     check("and the board is back", win._font._board.isHidden(), False)
 
 
+def test_the_shot_counter_shrinks_too(win):
+    """13.10.2026: a 40 px shot counter stayed 40 px on a small window and ran
+    under the Scanning box."""
+    print("the shot counter's line shrinks with everything else")
+    import ls_core as C
+    from PySide6.QtGui import QFontMetrics
+    add_rows(win, ["GDD", "TOD", "SBW4 Compressed"])
+    win.rows().append(C.new_shot_row(99))
+    win.shot_settings()["size_px"] = 40
+    halls = C.halls_of(win._cfg)
+    for single in (True, False):
+        halls["single"], halls["fit"] = single, True
+        win.settings_changed(rebuild=True)
+        for w, h in ((812, 494), (500, 400), (1920, 1080)):
+            tab = resize(win, w, h)
+            tab.refresh()
+            label = tab._shot_label
+            text_w = QFontMetrics(label.font()).horizontalAdvance(label.text())
+            mode = "one square" if single else "five"
+            at_most(f"{mode} {w}x{h}: the counter fits its line", text_w,
+                    label.width())
+            at_most(f"{mode} {w}x{h}: and is no bigger than the list's text",
+                    label.font().pixelSize(),
+                    max(8, tab._row_widgets[0]._name.font().pixelSize()))
+    halls["single"] = False
+    win.settings_changed(rebuild=True)
+
+
 def main():
     win, tmp = build()
     for test in (test_the_band_is_what_the_box_says,
@@ -732,6 +796,7 @@ def main():
                  test_a_bigger_window_means_bigger_everything,
                  test_nothing_watched_gives_the_squares_the_window,
                  test_fit_off_uses_the_numbers_verbatim,
+                 test_fit_off_never_past_the_edge,
                  test_typing_switches_the_fit_off,
                  test_parking_does_not_switch_the_fit_off,
                  test_switching_the_fit_off_gives_his_numbers_back,
@@ -745,7 +810,8 @@ def main():
                  test_the_board_is_the_real_size,
                  test_the_maximise_size_is_kept,
                  test_rows_read_name_value_square,
-                 test_one_square_beside_the_list):
+                 test_one_square_beside_the_list,
+                 test_the_shot_counter_shrinks_too):
         test(win)
     win.close()
     tmp.cleanup()

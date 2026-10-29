@@ -7,13 +7,18 @@ Offscreen has no fonts and lies about text size, so run this with a real platfor
 Five cameras over five days, no share and no network — the frames are generated.
 What to check in `day_wall.png`:
 
-  * ONE ROW PER CAMERA, and the grey banner over each row names that camera and
-    says how many days its line reaches across
+  * ONE ROW PER CAMERA, with no band over it: the camera's name is a plate at the
+    left end of the row's caption strip
   * the days run left to right, FOUR of them filling the pane, and the widget is
     wider than the pane so the fifth is reached by the sideways bar
-  * the caption under each tile names the DAY and the time, not the camera — the
-    banner already said which camera it is
+  * the caption under each tile names the DAY and the time, not the camera, and
+    never runs under the name plate
   * three rows fit the pane, so the vertical bar steps whole cameras
+  * `day_wall_big.png`: Label size 17.5 pt and scrolled sideways — the name grows
+    with the captions and stays at the pane's left edge
+
+An optional first argument is the folder the pictures go to (default: here).
+The window is shown without taking the keyboard focus.
 """
 import os
 import sys
@@ -49,9 +54,11 @@ def frame(seed: int):
 def main() -> int:
     m = load_finder()
     from pathlib import Path
-    from PySide6.QtWidgets import QApplication, QScrollArea
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent
+    app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setStyle("Fusion")
 
     wall = m._DayWall()
@@ -74,6 +81,9 @@ def main() -> int:
     sc.setWidget(wall)
     wall._scroll_host = sc
     sc.resize(PANE_W, PANE_H)
+    # Seen, but never handed the keyboard focus.
+    sc.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+    sc.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
     sc.show()
     app.processEvents()
     wall._relayout()
@@ -90,10 +100,10 @@ def main() -> int:
     print("sideways bar:", sc.horizontalScrollBar().maximum() > 0)
     print("vertical bar:", sc.verticalScrollBar().maximum() > 0)
     for hr, txt in wall._row_heads:
-        print("  banner:", txt)
+        print("  name:", txt)
     print("  caption:", wall._caption(wall.cells()[0]))
 
-    out = Path(__file__).with_name("day_wall.png")
+    out = out_dir / "day_wall.png"
     sc.grab().save(str(out))
     print("written:", out)
 
@@ -101,9 +111,21 @@ def main() -> int:
     vb = sc.verticalScrollBar()
     vb.setValue(vb.maximum())
     app.processEvents()
-    out2 = Path(__file__).with_name("day_wall_bottom.png")
+    out2 = out_dir / "day_wall_bottom.png"
     sc.grab().save(str(out2))
     print("written:", out2)
+
+    # Label size up, scrolled part of a column sideways: the name grows with the
+    # captions and rides at the pane's left edge.
+    vb.setValue(0)
+    wall._shared.cap_pt = 17.5
+    wall.refresh_captions()
+    app.processEvents()
+    sc.horizontalScrollBar().setValue(int(wall.row_col_width() * 0.6))
+    app.processEvents()
+    out3 = out_dir / "day_wall_big.png"
+    sc.grab().save(str(out3))
+    print("written:", out3)
     return 0
 
 

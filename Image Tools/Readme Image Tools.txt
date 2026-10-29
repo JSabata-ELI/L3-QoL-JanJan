@@ -64,14 +64,37 @@ THE FOUR TABS
     itself. There is also a "Detailed view" tab at the end of the row
     of tabs — it shows the marked pictures one at a time, and the
     arrows under it (or the left and right arrow keys) step through
-    them. Mark nothing and it steps through the whole wall.
+    them. Mark nothing and it steps through the whole wall. The arrows
+    stay on ONE camera: four cameras over ten days count 1 / 10. The
+    camera name and the time are above the picture; click the camera
+    name to pick another camera from a list — it opens that camera's
+    picture of the same day, and the arrows then step through its
+    days.
 
-    "Day by day" gives each camera a line of its own: that camera's
-    days side by side, the next camera on the next line. Four days
-    fill the window and the rest is to the right — scroll sideways for
-    them, and down for more cameras. The grey strip over each line
-    names the camera; the day and the time are written under each
-    picture.
+    "Day by day" has two layouts, chosen with "Day by day layout:
+    Horizontal / Vertical" right above the pictures, shown while the
+    Day by day tab is open (the choice is remembered). At least three
+    days always fit the window; the picture under the mouse is drawn
+    at full sharpness once the mouse rests on it.
+    VERTICAL: one column per camera, the newest day at the top and the
+    older days below it — scroll down for them. Up to six cameras fill
+    the window; more are reached by scrolling sideways. The camera
+    names stay at the top while you scroll, and a grey band names each
+    day.
+    HORIZONTAL: each camera has a line of its own, its days side by
+    side. Four days fill the window and the rest is to the right. With
+    one or two cameras the lines sit in the middle of the window.
+    "Picture size" makes the pictures bigger or smaller (the same as
+    Ctrl + mouse wheel); "Fit" puts them back.
+    "Label size" sets how big the text under each picture is (time,
+    day, camera), and the camera names and day bands of the Day by day
+    view with it. The program remembers it. The text sits directly
+    under its picture. In Day by day (Horizontal) the camera's name is
+    at the left end of that same line and stays there when you scroll
+    sideways.
+
+    Marking a picture does not switch anything off: the mouse-over
+    details and double-click still work on marked pictures.
 
     Every click ADDS to what is marked, so you can click picture after
     picture and all of them stay marked. Click a marked one again to
@@ -136,7 +159,12 @@ THE FOUR TABS
     Or say it as a number: "the first moment SBW4 was above 13 J"
     gives you that one moment on all the cameras at once, and it
     checks the cameras were actually recording something before it
-    answers.
+    answers. It finds the FIRST such moment on EACH picked day, so
+    twelve days give up to twelve pictures per camera; days where it
+    never happened are listed. It only looks inside the time you set:
+    inside the regions you marked on the graph, or, with none marked,
+    inside each day's Time window (07:00 to 21:00 unless you changed
+    it).
 
     The cameras do not have to be picked first — press Search and it
     asks for them, then goes.
@@ -149,13 +177,19 @@ THE FOUR TABS
     written rather than about a second later. Every camera in the
     grid does, including the ones whose file happens to land while
     the selected camera's own picture is still being read.
+    Any move back in time (slider, mouse wheel, arrow keys, frame
+    arrows, a saved timestamp) turns live mode off, and the view stays
+    where you put it while the older pictures are read back in.
 
     LAYOUT TABS
     The row of small tabs at the top of the Image Slider holds several
     set-ups at once — "Ghost tile" in one, "Laser running" in another —
     each with its own cameras, arrangement, time window and live mode.
     "+" adds a tab (named Panel 1, Panel 2, …), × closes one,
-    double-click a tab's name to rename it.
+    double-click a tab's name to rename it. Right-click a tab for
+    more: Duplicate (a copy with the same cameras and time window),
+    Rename, Move left / right, Close, Close other tabs. The tab you
+    are on is light blue with a thick blue rim.
 
     Only the tab you are looking at does any work. The others sleep:
     nothing is read from the share, nothing is drawn, no machine values
@@ -185,19 +219,30 @@ THE FOUR TABS
     all of them if none is selected. Picking a camera afterwards
     never copies anything onto it.
 
-    A panel of machine values sits beside the picture and always
-    shows the values belonging to the frame you are looking at,
-    waiting for the archive if it has to rather than showing the
-    previous shot's numbers. While it is waiting it keeps asking at
-    a steady pace instead of backing off, so the numbers land with
-    the picture rather than a beat after it.
+    A panel of machine values sits beside the picture. When you look
+    back into the archive it shows the values belonging to the frame
+    you are looking at, matched to that frame exactly.
+
+    IN LIVE MODE THE VALUES ARE NOT MATCHED TO THE PICTURE. Following
+    the newest frame, the panel shows the newest value the archive
+    holds, refreshed about once a second — it may belong to a shot a
+    second or two earlier or later than the picture on screen. (The
+    camera stores about three frames a second and the archive answers
+    in one to several seconds, so frame-by-frame matching could never
+    keep up.) Step back a frame, move the slider or turn Live mode off,
+    and every value is matched to its own frame exactly again. A
+    picture saved with its values always gets that frame's own values.
+    In live mode a value has no dot; a grey dot means the archive has
+    not answered for 20 s (hover it to see since when).
 
     A coloured dot next to a value says what state it is in — on the
     panel over the picture, in the PV table and in a saved picture:
     red = not loaded yet (it fills itself in), grey = no value
     (nothing archived near this frame, or it could not be read),
     orange = the number belongs to an earlier shot than the picture.
-    No dot = this frame's own reading. Hover the value in the PV
+    No dot = this frame's own reading. The archive writes a value only
+    when it CHANGES, so a frame with nothing written near it reads the
+    last value written before it, with no dot — that is its value. Hover the value in the PV
     table for the details (how much earlier, and why).
 
     LIMITS AND TRIPS — LIVE MODE ONLY
@@ -254,7 +299,9 @@ THE FOUR TABS
     mode, and the panel over the picture shows it too. Each shot counts
     once, when the camera on screen, another open camera at the same
     rate, or a laser energy reading saw it — so a picture missing from
-    the archive does not make it skip a shot. Changing the camera keeps
+    the archive does not make it skip a shot. In low power, when the
+    energy meters show no pulse, the open cameras' pictures are counted
+    instead. Changing the camera keeps
     the number; it only goes up with a new shot. After X seconds
     without a shot the count starts again from zero — the old number
     stays on screen until the next shot, which reads 1. Double-click
@@ -264,6 +311,14 @@ THE FOUR TABS
     (F11) and watcher view (Ctrl+F11). In focus view every camera
     window is cut to its picture, so no grey band is left around it;
     the picture keeps its size.
+
+    Double-click one camera to see just that camera over the whole
+    monitor (black around it, still live). Esc or another double-click
+    puts it back.
+
+    The eye at the top of the PV table's eye column hides every PV on
+    the picture with one click; the next click brings back the ones
+    that were shown. Double-click it to show them all.
 
     With several cameras open, the program sizes their windows so
     that even the smallest picture comes out as large as the screen
@@ -320,20 +375,27 @@ THE FOUR TABS
 
     A picked mark has a round knob with a turning arrow above it:
     drag the knob to turn the mark (hold Shift for steps of 15°).
-    "Overlay settings" turns them by number too — pick one mark or
-    "All …" from the list under each shape, or turn every mark at
-    once with "All marks angle". Each shape can also have an
+    "Overlay settings" has a section for crosses, circles and squares.
+    "Apply to" at the top of each says what the settings below are
+    for: all of them on all cameras, the selected cameras only, or
+    one mark by its number ("Cross 2") — colour, thickness, size,
+    width and height (in picture pixels) and angle. There are no upper
+    limits. "All marks angle" turns every mark at once. Each shape can also have an
     outline: a thin rim (black unless you choose otherwise) along
     both sides of the line, so it stays visible on a bright beam
     and on a dark background alike. The look is remembered.
 
-    PCW3_NF shows the permanent reference square that is set on the
-    camera itself. The camera screen draws it, but it is not part of
-    the stored picture, so the program draws it back on. Right-click
-    the picture to switch it off or to nudge its edges. The diodes
-    have their measuring grid behind the same right click; on every
-    other camera a right click opens nothing, and right-click-drag
-    still zooms everywhere. A MIDDLE click puts the camera you
+    Reference frames: the camera program draws white frames on its
+    screen that are not part of the stored picture, so the program
+    draws them back on. Right-click a camera's picture to open
+    "Reference frames": tick which frames to show, "Add by hand", or
+    "Read from camera window" to copy the frame from the camera
+    program open on THIS computer (if it is not open here, you are
+    told so and nothing is added). Every new frame is added as a new
+    row — nothing is overwritten; rename and delete are there too.
+    PCW3_NF keeps its measured square as "Measured by hand". The
+    diodes have their measuring grid behind the same right click, and
+    right-click-drag still zooms everywhere. A MIDDLE click puts the camera you
     clicked back to the whole frame, that one camera only. The marks
     belong to the picture, not to the screen: zoom in and they stay
     on the same spot of the beam, growing with it, and keep their
@@ -421,9 +483,17 @@ THE FOUR TABS
     Under "PVs" one button, "Configure PVs", opens the same picker
     the Image Slider uses, so a PV you add or rename in one tab is
     the same PV in the other. Every PV whose eye is open gets a row
-    under the button: tick the row to search by it, and type the
-    value and the tolerance beside it; leave it unticked to only
-    see its value in the results.
+    under the button: tick the row to search by it, pick in the box
+    beside the name how the band is given, and type its numbers on
+    the line below; leave it unticked to only see its value in the
+    results. The box offers:
+      ± value     a target and a tolerance around it
+      ± %         a target and a percentage of it
+      from – to   a range, both ends included
+      above       this value or more
+      below       this value or less
+    A box turns amber when its band lets almost everything through,
+    or when "from" is above "to".
 
     Then two buttons: "Load data" reads only the numbers and says
     how many shots fall inside the band - no pictures, so it is
@@ -439,7 +509,17 @@ THE FOUR TABS
     of the whole search, and the table had already said there was
     nothing there. The row stays in the list, yellow, and says
     "image not searched" instead of pretending a picture was
-    looked for and not found. Widen the tolerance to search them.
+    looked for and not found. Widen the band to search them.
+
+    The "Folder" column shows the whole path of the picture's
+    folder on one line. When the window is too narrow for it, the
+    table scrolls sideways instead of cutting the path.
+
+    Every column fits its text on its own. Drag the edge of a
+    column in the heading to make it narrower or wider; it then
+    keeps that width, and text that no longer fits is shortened
+    with "…". Double-click the edge to let it fit its text again.
+    The same works in the list of shots of one day.
 
     Double-click a day in the results and a window opens with every
     matching shot of that day, and a graph beside it showing the

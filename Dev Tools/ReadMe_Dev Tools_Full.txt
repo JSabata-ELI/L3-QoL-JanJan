@@ -2,11 +2,13 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05
-  (dev_tools.py 117 lines, b_t.py 2045, cm_t.py 2721)
+Verified against source: 2026-10-16 (PySide6 version)
+  (dev_tools.py 167 lines, dt_core.py 2033, dt_common.py 582,
+   dt_builder.py 698, dt_copy.py 602; 4082 lines in all)
+  Program folder: 304 kB in 14 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe Dev Tools.txt  ("ReadMe" button)
-Code map:      STRUCTURE.md  (and dev_tools_structure.md, older)
+Code map:      STRUCTURE.md  (and dev_tools_structure.md, a function map)
 -----------------------------------------------------------------
 
 
@@ -28,8 +30,11 @@ They are separate on purpose: building is slow and local, publishing
 is fast and touches what everybody else uses. You will often build
 several times and publish once.
 
-The window opens maximised, so the long project lists and the log
-below them are visible at once.
+The window opens at its normal size (1280 x 860, not maximised),
+which fits the project lists and the log below them. It looks like Image Tools: each part
+of a tab is a section with a coloured title bar — Root folder (blue),
+the program list (green), Selected program (purple), Destinations
+(red), Log (teal).
 
 
 =================================================================
@@ -41,6 +46,11 @@ below them are visible at once.
   Scratch        publishing destination one; also holds the shared
                  version list
   SharePoint     publishing destination two
+
+Diagnostic and Diagnostic Webex listener run on one PC only and are
+never copied to Scratch — copy, ReadMe copy and Deploy Libraries all
+skip Scratch for them, even when it is ticked. They go to SharePoint
+only.
 
 Set them with "Set paths" in either tab. They are stored per user.
 
@@ -72,10 +82,14 @@ settings are the fallback that makes the built copy work.
     remembered. The point is that the list is long and most of it is
     not what you are working on today.
 
-    Each row shows the version the project was last built as, taken
-    from the build output folder, and the next version, which is the
-    last number stepped up by one. Type over it when a change
-    deserves a bigger step.
+    Each row shows the next version, which is the last number stepped
+    up by one. Click a row and the "Selected program" panel on the
+    right shows the version it was last built as (from the shared
+    version list, else from the build output folder) and the next one,
+    which you can type over when a change deserves a bigger step. The
+    same panel sets the Group and has "Open ReadMe", which opens the
+    program's short document (and offers to create it when there is
+    none).
 
     Changing a group, or switching "Show ignored", moves the rows in
     place — the list is not redrawn and does not flicker.
@@ -140,17 +154,40 @@ settings are the fallback that makes the built copy work.
       - Test files are never bundled. They are development-only and
         nothing imports them at run time.
 
-      - If the sources import numpy, scipy, scikit-learn, OpenCV,
-        matplotlib or pandas, the whole of that package is collected
-        automatically. Those packages carry compiled parts that the
-        automatic detection misses, and a bundle without them fails
-        at run time with a missing-module error that names something
-        you have never heard of.
+      - Big libraries (numpy, scipy, matplotlib, pandas and the like)
+        are NOT collected whole any more. Until October 2026 they
+        were, whenever a program imported them; that made the build
+        tool examine every part of every one of them and made each
+        build several times longer. The build tool's own knowledge of
+        these libraries brings in what they need. If a built program
+        stops with a missing-module error, name that module in the
+        program's settings file (see 3.5) — only as a last resort the
+        whole package.
 
-      - Collecting a whole package also drags in that package's own
-        test suite, which is large and useless. Those are excluded
-        again — and only the test suites, never the similarly named
-        parts that some libraries genuinely use at run time.
+      - A package collected whole (because its settings file asks for
+        it) also drags in its own test suite, which is large and
+        useless. Those are excluded again — and only the test suites,
+        never the similarly named parts that some libraries genuinely
+        use at run time.
+
+      - Several programs ticked at once are built side by side — up
+        to three at a time, fewer on a machine with few processor
+        cores or little free memory. While they run together, each
+        line in the log starts with the program's name in brackets.
+        With "Copy after build", each program is copied as soon as
+        its own build is done, but only one copy runs at a time. The
+        final report lists the programs in the order they were
+        ticked, whichever finished first.
+
+      - Every build's time is split into four parts and shown in the
+        log ("Built: ... (95s: analysis 70s, package 15s, collect 8s,
+        finish 2s)"): analysis is the build tool finding every module
+        the program uses, package is packing them into the program
+        file, collect is copying the libraries into the support
+        folder, finish is the work after that (sources, pictures,
+        ReadMes). Each build also adds one line to build_times.log
+        next to Dev Tools, with the date, the four parts and the copy
+        time, so it can be seen later what made a build slow.
 
       - The version folder is deleted before the build. OneDrive
         marks synced files read-only and the build tool refuses to
@@ -194,12 +231,13 @@ settings are the fallback that makes the built copy work.
 
     In the project list, a project with helpers gets a small arrow.
     Open it and each helper is a line of its own, with everything a
-    project's line has: a tick box, its own next version, and its own
-    ReadMe and Details buttons. Details shows the helper in the panel
-    on the right — its name, the script it is built from, its last and
-    its next version — so the version you build it with is set there,
-    separately from its parent's. Group stays empty and locked: a
-    helper is not sorted into the sections, it follows its parent.
+    project's line has: a tick box and its own next version. Click it
+    and the panel on the right shows the helper — its name, the script
+    it is built from, its last and its next version — so the version
+    you build it with is set there, separately from its parent's, and
+    "Open ReadMe" opens the helper's own document. Group stays empty
+    and locked: a helper is not sorted into the sections, it follows
+    its parent.
 
     A helper's documentation is named after the HELPER, not after the
     folder it lives in — ReadMe_<helper name>.txt and
@@ -209,9 +247,10 @@ settings are the fallback that makes the built copy work.
     be found under it. The build copies both into the helper's version
     folder, and says so in the log when one of them is missing.
 
-    The helpers open on any click on the project: on its line, on its
-    tick box, or on Details. Only the arrow in front of the name
-    closes them again. The point is that the helpers are usually the
+    The helpers open on any click on the project: on its line or on
+    its tick box. Only the arrow in front of the name closes them
+    again. Nothing else opens them — changing a group, for instance,
+    leaves every project folded or unfolded as it was. The point is that the helpers are usually the
     reason for the click — they do not have to be hunted for behind a
     two-character arrow.
 
@@ -303,10 +342,12 @@ settings are the fallback that makes the built copy work.
 4.1 THE LIST
 
     Every program in the build output, with its available versions
-    and the version last published from this computer. Programs with
-    something newer than what was published are highlighted, and
-    "Select new" ticks exactly those (when there are none, the log
-    says so).
+    and the version last published. The Status column says NEW in
+    green when the newest build is newer than what was published, UTD
+    in red when the published version is up to date, and a grey NEW
+    for a program that has never been built. "Select new" ticks
+    exactly the green ones and sets them to their newest version
+    (when there are none, the log says so).
 
     After a copy, and after a build, the rows update in place: a new
     version appears in its Version list and the status and "last
@@ -399,7 +440,7 @@ settings are the fallback that makes the built copy work.
 
 4.5 THE OTHER BUTTONS
 
-    ReadMe only
+    Copy ReadMe only
         Publishes just the documentation files — both the short one
         and the detailed one. For fixing a typo without a rebuild and
         without touching the program itself. This is also the button
@@ -409,13 +450,12 @@ settings are the fallback that makes the built copy work.
     Fix
         Repairs old archive folders — section 5.
 
-    Build internal
-        Builds the shared support folder (the Internal Builder
-        project).
-
-    Deploy internal
-        Pushes that folder into the selected programs on the
-        destinations. This is a large upload and every program
+    Deploy Libraries
+        Pushes the shared support folder — built by the Internal
+        Builder project in the Builder tab — into the ticked programs
+        on Scratch. Files that did not change are left alone; files
+        that are no longer part of it are removed. A progress bar runs
+        under the buttons. This is a large upload and every program
         depends on it, so it is a separate, deliberate action rather
         than part of a normal publish.
 
@@ -536,7 +576,7 @@ Launcher card still opens nothing. Name it after the folder.
   The Launcher shows no "Details" button at all
       Three things have to be true, and all three are easy to miss:
       the detailed file has to exist in the repository, it has to
-      have been published (Copy, or "ReadMe only" — writing it in
+      have been published (Copy, or "Copy ReadMe only" — writing it in
       the repository does nothing to the share on its own), and the
       LAUNCHER ITSELF has to be a build new enough to know about the
       button. An old Launcher exe on the share has no Details button

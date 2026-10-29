@@ -48,13 +48,14 @@ That is deliberate. Inventing a verdict out of the limits of a hall nobody is
 shooting into would put a red cross on screen that means nothing, and after a
 week of those nobody looks at the crosses at all.
 
-There is ONE exception, and it is `halls_in_force`. SGV502 to SGV505 do not
-publish yet, so on today's machine the experimental halls can never say they are
-being shot into and NOTHING would ever be judged — the program would be a wall
-of grey dashes. While not one of those four valves can be read, Int's limits are
-in force whatever Int's own valve says, and Int's square goes WHITE rather than
-green: we are watching Int, we are not claiming the beam is in it. The rule
-switches itself off the day the first of those four valves publishes.
+There is ONE exception, and it is `halls_in_force`. When SGV502 to SGV505
+cannot be read at all (until 15.10.2026 that was every day; now it means the
+L3BT archive is down and the L3BT MSS window is not open), the experimental
+halls can never say they are being shot into and NOTHING would ever be judged —
+the program would be a wall of grey dashes. While not one of those four valves
+can be read, Int's limits are in force whatever Int's own valve says, and Int's
+square goes WHITE rather than green: we are watching Int, we are not claiming
+the beam is in it. The rule switches itself off as soon as one of them answers.
 
 WHAT A MISSING READING IS NOT
 -----------------------------
@@ -107,12 +108,27 @@ DEFAULT_SHOOT_WHEN = {"Int": CLOSED, "E2": OPEN, "E3": OPEN,
 # only while the open switch cannot be read, and it is deliberately not
 # editable: a wrong name there would be found once a year, on the one day the
 # open switch was down.
+#
+# SGV501 publishes on the CPVA archiver as L3-PSS:…. SGV502 to SGV505 never
+# have there; they publish in the L3BT archive (read through the L3BT proxy, see
+# `ls_cpva`) as L3BT-MSS:SGV50x_OPEN_IN / _CLOSED_IN — the same switches the
+# L3BT MSS window draws. Checked 15.10.2026: those are live, while the E3/E4/E5-
+# PSS-SGV50x:VALVE_IN_*_POSITION and L3BT-MSS:SGV50x_CLOSED names hold nothing
+# but "Disconnected" rows since 13.8.2026.
 _SGV = {"Int": 501, "E2": 502, "E3": 503, "E4": 504, "E5": 505}
 DEFAULT_GATES = {
-    hall: {"open": f"L3-PSS:SGV{n}_IN_OPEN_POSITION",
-           "closed": f"L3-PSS:SGV{n}_IN_CLOSED_POSITION"}
+    hall: ({"open": f"L3-PSS:SGV{n}_IN_OPEN_POSITION",
+            "closed": f"L3-PSS:SGV{n}_IN_CLOSED_POSITION"} if n == 501 else
+           {"open": f"L3BT-MSS:SGV{n}_OPEN_IN",
+            "closed": f"L3BT-MSS:SGV{n}_CLOSED_IN"})
     for hall, n in _SGV.items()
 }
+
+# The old default names of SGV502 to SGV505, which never published. A settings
+# file still holding one of them is moved onto the new default when it is read;
+# any other name the operator typed is left alone.
+_DEAD_GATE_NAMES = {f"L3-PSS:SGV{n}_IN_OPEN_POSITION": hall
+                    for hall, n in _SGV.items() if n != 501}
 
 
 def switch_made(value):
@@ -310,12 +326,13 @@ def hall_state(shooting, hall, readings, last_ok, now_s, screen=None):
                     + "\n".join(lines))
 
     word = "open" if position == OPEN else "closed"
+    shown = hall_shown(hall)
     if position == shoot_when(hall):
         return (STATE_SHOOTING,
-                f"The gate valve is {word}, so the beam is going into {hall}."
+                f"The gate valve is {word}, so the beam is going into {shown}."
                 f"\n{used}{only}")
     return (STATE_IDLE,
-            f"The gate valve is {word}, so the beam is not going into {hall}."
+            f"The gate valve is {word}, so the beam is not going into {shown}."
             f"\n{used}{only}")
 
 
@@ -393,8 +410,10 @@ def single_hall(shooting, readings, last_ok, now_s, screen=None):
 # "waiting for hall". With SGV501 open and a hall's valve open, that hall's
 # square lights up and L3 is plain idle.
 #
-# Only the name ON THE SQUARES changes. The hall is still "Int" in the file,
-# on the Limits tab's hall buttons and in every sentence about limits.
+# Only the name ON SCREEN changes. Since 14.10.2026 that is everywhere — the
+# squares, the Limits tab's hall buttons and every sentence a person reads
+# ("v limits nastavení pro Int, které se má jmenovat L3"). The hall is still
+# "Int" in the file and in saved sets, so nothing saved needs converting.
 HALL_SHOWN = {"Int": "L3"}
 STATE_WAITING = "waiting"
 
@@ -455,6 +474,33 @@ FIRING_MIN_J = 0.1
 # "at least 0.1 J" — and green — all night.
 FIRING_HOLD_S = 15.0
 
+# ── a trigger is not low power ──────────────────────────────────────────────
+# Reported on 15.10.2026: "když střílíme HP a pak najednou přijde tzv. trigger
+# shot …, tak začne program blikat, protože jakoby si myslí, že jedeme low
+# power". A trigger is one or two shots with no energy, far apart; low power
+# shooting is a STREAM of them ("v LP ty shoty chodí rychle za sebou bez
+# energie", about 3.3 Hz). Read off SBW4's archive, 5.–15.10.2026:
+#
+#   high power             0.1–0.2 samples a second, all over 0.05 J
+#   a trigger in it        1–3 samples of 0.016–0.021 J between the HP ones
+#   low power shooting     about 1.1–1.25 samples a second, 0.016–0.021 J,
+#                          for hours (the archiver drops repeats, so not 3.3)
+#
+# So low power is LP_STREAM_N samples at or under DM_SPLIT_J within
+# LP_STREAM_S of the newest one — five in ten seconds is four seconds of a
+# real stream, and at HP's pace even a trigger between every pair of shots
+# makes two. A lone low sample decides nothing: it neither says low power nor
+# cancels the high power shot before it, and the hall stays SHOOTING.
+#
+# The SAST1 shutter on its own says low power (`dm_judge`) only once no HP shot
+# has come for HP_HOLD_S: the shutter stays open between the shots of a high
+# power sequence, and the gap after a single shot can be long. After that, a
+# low power stream still says so at once — the switch to low power took 20–30 s
+# or more (15.10.2026).
+LP_STREAM_N = 5
+LP_STREAM_S = 10.0
+HP_HOLD_S = 120.0
+
 
 def _newest_energy(readings, last_ok, now_s):
     """(newest_ns, pv, value) of the newer readable SBW4 name, or None."""
@@ -487,68 +533,137 @@ def firing(readings, last_ok, now_s):
                 f"{'' if on else 'not '}firing.\n{pv}")
 
 
-class FiringWatch:
-    """Is the laser firing NOW: a shot's energy, and that it arrived lately.
+def _samples_of(readings, pv):
+    """[(t_ns, J)] of one SBW4 name's last samples, oldest first: the recent
+    ones when the reading carries them, else just the newest."""
+    reading = readings[pv]
+    stamps = tuple(getattr(reading, "recent_ns", ()) or ())
+    values = tuple(getattr(reading, "recent_v", ()) or ())
+    out = []
+    for t, v in zip(stamps, values):
+        try:
+            out.append((int(t), float(v)))
+        except (TypeError, ValueError):
+            continue
+    newest = getattr(reading, "newest_ns", None) or 0
+    if not out or out[-1][0] < newest:
+        out.append((int(newest), float(reading.value)))
+    return out
 
-    A new sample is noticed by its archiver timestamp changing, and WHEN it was
-    noticed is taken off this PC's monotonic clock — never by comparing the
-    sample's own stamp with `time.time()`: this PC runs about 25 s ahead of the
+
+class FiringWatch:
+    """Is the laser firing NOW, and at which power: SBW4's samples, and when
+    they arrived.
+
+    A new sample is noticed by its archiver timestamp, and WHEN it was noticed
+    is taken off this PC's monotonic clock — never by comparing the sample's
+    own stamp with `time.time()`: this PC runs about 25 s ahead of the
     archiver, so every shot would look too old.
 
-    The sample already in the archive when the program starts does not count.
-    Nobody knows when it was fired, and the square waits for the next one.
+    The samples already in the archive when the program starts do not count.
+    Nobody knows when they were fired, and the square waits for the next one.
+
+    Every new sample is looked at, not just the newest: a trigger landing in
+    the same pass as a high power shot must not hide it (`LP_STREAM_N`).
     """
 
     def __init__(self, hold_s=FIRING_HOLD_S):
         self.hold_s = float(hold_s)
-        self._key = None            # (pv, newest_ns) of the sample last seen
-        self._seen_at = None        # monotonic time it was first seen
-        self._value = None          # its energy, J
+        self._last_ns = None        # newest stamp already looked at
+        self._fire = None           # (monotonic seen, J) of the last >= 0.1 J
+        self._high = None           # (monotonic seen, J) of the last HP shot
+        self._stream = None         # (monotonic seen, J, count) of LP
 
-    def update(self, readings, last_ok, now_s, mono_s):
-        """(True / False / None, sentence), the way `firing` answers."""
-        on, why = firing(readings, last_ok, now_s)
+    def _look(self, readings, last_ok, now_s, mono_s):
         best = _newest_energy(readings, last_ok, now_s)
         if best is None:
+            return
+        samples = _samples_of(readings, best[1])
+        top = samples[-1][0]
+        if self._last_ns is None:
+            self._last_ns = top             # history, not a shot
+            return
+        new = [(t, v) for t, v in samples if t > self._last_ns]
+        if not new:
+            return
+        self._last_ns = top
+        mono = float(mono_s)
+        for _t, v in new:
+            if v >= FIRING_MIN_J:
+                self._fire = (mono, v)
+            if v > DM_SPLIT_J:
+                self._high = (mono, v)
+        # A stream of low shots: LP_STREAM_N of them within LP_STREAM_S of
+        # the newest, which has to be one of them and has to be new.
+        if samples[-1][1] <= DM_SPLIT_J:
+            cut = top - int(LP_STREAM_S * 1e9)
+            lows = sum(1 for t, v in samples if t >= cut and v <= DM_SPLIT_J)
+            if lows >= LP_STREAM_N:
+                self._stream = (mono, samples[-1][1], lows)
+
+    def _age(self, held, mono_s, hold_s=None):
+        if held is None:
+            return None
+        age = float(mono_s) - held[0]
+        return age if age < (self.hold_s if hold_s is None else hold_s) \
+            else None
+
+    def update(self, readings, last_ok, now_s, mono_s):
+        """(True / False / None, sentence): a shot of at least FIRING_MIN_J
+        noticed less than `hold_s` ago. A trigger after it changes nothing."""
+        on, why = firing(readings, last_ok, now_s)
+        self._look(readings, last_ok, now_s, mono_s)
+        if on is None:
             return on, why
-        key = (best[1], best[0])
-        self._value = best[2]
-        if key != self._key:
-            # The first sample ever seen is the one that was already there.
-            self._seen_at = None if self._key is None else float(mono_s)
-            self._key = key
+        age = self._age(self._fire, mono_s)
+        if age is not None:
+            if on:
+                return True, f"{why}\nLast shot {age:.0f} s ago."
+            return True, (f"SBW4 {self._fire[1]:.3f} J {age:.0f} s ago — "
+                          f"the laser is firing. The newer sample under "
+                          f"{FIRING_MIN_J:g} J is a lone trigger, which does "
+                          f"not stop it.\n{why}")
         if not on:
             return on, why
-        if self._seen_at is None:
+        if self._fire is None:
             return False, (f"{why}\nThat shot was already there when the "
                            "program started — waiting for the next one.")
-        age = float(mono_s) - self._seen_at
-        if age >= self.hold_s:
-            return False, (f"{why}\nLast shot {age:.0f} s ago — idle after "
-                           f"{self.hold_s:g} s without a new one.")
-        return True, f"{why}\nLast shot {age:.0f} s ago."
+        age = float(mono_s) - self._fire[0]
+        return False, (f"{why}\nLast shot {age:.0f} s ago — idle after "
+                       f"{self.hold_s:g} s without a new one.")
 
     def fresh_energy(self, mono_s):
-        """(value in J, seconds ago) of the newest SBW4 sample when it arrived
-        less than `hold_s` ago, else None. Call after `update` on the same
-        pass. The sample already there at start-up is never fresh."""
-        if self._key is None or self._seen_at is None:
-            return None
-        age = float(mono_s) - self._seen_at
-        if age >= self.hold_s:
-            return None
-        return self._value, age
+        """(value in J, seconds ago) of what is being shot, else None. Call
+        after `update` on the same pass.
+
+        A high power shot noticed less than `hold_s` ago wins; else a low
+        power stream (`LP_STREAM_N`) whose newest sample is that fresh. A lone
+        low sample — a trigger — is never fresh energy. Nor is anything
+        already there at start-up."""
+        age = self._age(self._high, mono_s)
+        if age is not None:
+            return self._high[1], age
+        age = self._age(self._stream, mono_s)
+        if age is not None:
+            return self._stream[1], age
+        return None
+
+    def high_age(self, mono_s, hold_s=HP_HOLD_S):
+        """Seconds since the last high power shot when under `hold_s`, else
+        None — what keeps an open shutter from meaning low power."""
+        return self._age(self._high, mono_s, hold_s)
 
 
 # ── the deformable mirror's set-up, judged by SBW4's energy ──────────────────
 # Asked for on 8.10.2026: a "DM settings" line on the Overview list, there only
 # while its Show is ticked on the Limits tab, saying which saved set-up the
-# mirror's Set-up grid is. Low power cannot be on while we shoot at high power,
+# mirror's Applied voltages grid is. Low power cannot be on while we shoot at high power,
 # and the other way round; low power shooting cannot be seen any other way, so
 # SBW4's energy decides:
 #
 #   a fresh SBW4 shot over DM_SPLIT_J      the set-up must be ticked High power
-#   a fresh SBW4 shot at or under it       the set-up must be ticked Low power
+#   a fresh STREAM of shots at or under    the set-up must be ticked Low power
+#   it (a lone one is a trigger, 15.10.2026 — see LP_STREAM_N)
 #
 # Which set-ups count as which is ticked on the DM settings tab (9.10.2026:
 # "když jich budu mít víc zaškrtnutých, tak pokud jedno z nich tam bude, tak to
@@ -590,17 +705,20 @@ def shutter_open(readings, last_ok, now_s):
         return None
 
 
-def dm_judge(tag, energy, name="the set-up", shutter=None):
+def dm_judge(tag, energy, name="the set-up", shutter=None, high_age=None):
     """(state, sentence) for the mirror's set-up against what is being shot.
 
     `tag` is DM_TAG_HIGH / DM_TAG_LOW for a set-up ticked as such, "" for a
     grid read fine but ticked for neither, None when the mirror is not known.
-    `energy` is `FiringWatch.fresh_energy`: (J, seconds ago) or None.
-    `shutter` is `shutter_open`: True, False or None (not known).
+    `energy` is `FiringWatch.fresh_energy`: (J, seconds ago) or None — a lone
+    trigger is never in it. `shutter` is `shutter_open`: True, False or None
+    (not known). `high_age` is `FiringWatch.high_age`: seconds since the last
+    high power shot while under HP_HOLD_S, else None.
 
         a fresh SBW4 shot over DM_SPLIT_J        high power is being shot
-        else the shutter open                    low power is being shot
-        else a fresh shot at or under it         low power is being shot
+        else a fresh low power stream            low power is being shot
+        else the shutter open, and no high
+             power shot for HP_HOLD_S            low power is being shot
         else                                     nothing is being shot
     """
     if tag is None:
@@ -610,19 +728,26 @@ def dm_judge(tag, energy, name="the set-up", shutter=None):
         value, age = energy
         want, words = DM_TAG_HIGH, "High power"
         shot = f"SBW4 {value:.3f} J {age:.0f} s ago — over {DM_SPLIT_J:g} J"
-    elif shutter:
-        want, words = DM_TAG_LOW, "Low power"
-        shot = (f"the {DM_SHUTTER_NAME} shutter is open and no SBW4 shot over "
-                f"{DM_SPLIT_J:g} J came in the last {FIRING_HOLD_S:g} s")
     elif energy is not None:
         value, age = energy
         want, words = DM_TAG_LOW, "Low power"
-        shot = (f"SBW4 {value:.3f} J {age:.0f} s ago — at or under "
-                f"{DM_SPLIT_J:g} J")
+        shot = (f"SBW4 shots at or under {DM_SPLIT_J:g} J keep coming, "
+                f"{LP_STREAM_N} or more in {LP_STREAM_S:g} s (the last "
+                f"{value:.3f} J, {age:.0f} s ago)")
+    elif shutter and high_age is None:
+        want, words = DM_TAG_LOW, "Low power"
+        shot = (f"the {DM_SHUTTER_NAME} shutter is open and no SBW4 shot over "
+                f"{DM_SPLIT_J:g} J came in the last {HP_HOLD_S:g} s")
     else:
         if tag not in (DM_TAG_HIGH, DM_TAG_LOW):
             return STATE_UNKNOWN, (f"{name} is ticked for neither High power "
                                    f"nor Low power — nothing is being shot")
+        if shutter and high_age is not None:
+            return STATE_OK, (f"{name} — the {DM_SHUTTER_NAME} shutter is "
+                              f"open, but the last high power shot was "
+                              f"{high_age:.0f} s ago: still a high power "
+                              f"sequence, not low power, until "
+                              f"{HP_HOLD_S:g} s without one")
         closed = (f"the {DM_SHUTTER_NAME} shutter is "
                   f"{'closed' if shutter is False else 'not readable'}")
         return STATE_OK, (f"{name} — no fresh SBW4 shot and {closed}, "
@@ -1545,7 +1670,8 @@ def _worst_verdict(row, value, halls_active, scanning=False):
         state, text = judge(value, *limits_in_force(row, hall, scanning))
         if scan:
             text = f"scan: {text}"
-        wording = f"{hall}: {text}" if len(halls_active) > 1 else text
+        wording = (f"{hall_shown(hall)}: {text}" if len(halls_active) > 1
+                   else text)
         if state == STATE_BAD:
             return STATE_BAD, wording
         if state == STATE_UNKNOWN and worst == STATE_OK:
@@ -1600,7 +1726,7 @@ def status_line(rows, shooting, readings, last_ok, now_s=None, screen=None,
     values = row_values(rows, readings, last_ok, now)
     bad = sum(len(hall_faults(rows, values, h, scanning)) for h in active)
     verdict = f", {bad} out of range" if bad else ", all in range"
-    where = ", ".join(active)
+    where = ", ".join(hall_shown(h) for h in active)
     if not fallback:
         return f"Shooting into {where} — {how_many} watched{verdict}"
     # Why Int's limits are the ones in force. It is the normal state of the
@@ -1633,34 +1759,52 @@ def search_channels(names, query, limit=400):
     * the query is split into WORDS, and every word has to appear somewhere in
       the name. Nothing has to be at the start, and nothing has to be adjacent
       — "chl temp" finds `L3-UTIL-CHL03-001:Temp`;
-    * the ORDER is honoured: a name carrying the words in the order they were
-      typed ranks above one carrying them jumbled;
+    * the ORDER of the words does not matter: "temp chl" gives exactly what
+      "chl temp" gives, in the same ranking;
+    * commas, semicolons and `*` separate words just like spaces;
     * a fragment that fits several channels returns THOSE channels. It is a
       filter, never an error and never the whole list back.
 
     `total` is how many matched before `limit` cut the list, so the caller can
     say "showing 400 of 1620" rather than silently showing part of an answer.
     """
-    words = [w for w in (query or "").lower().split() if w]
+    words = [w for w in re.split(r"[\s,;*]+", (query or "").lower()) if w]
     if not words:
         return [], 0
     scored = []
     for name in names:
-        low = name.lower()
-        if any(w not in low for w in words):
-            continue
-        pos, in_order, at = 0, True, []
-        for w in words:
-            found = low.find(w, pos)
-            if found < 0:
-                in_order = False
-                found = low.find(w)
-            at.append(found)
-            pos = max(pos, found + len(w))
-        score = (0 if in_order else 1, min(at), len(name), name)
-        scored.append((score, name))
+        s = _rank_channel(name, words)
+        if s is not None:
+            scored.append(((s, len(name), name), name))
     scored.sort()
     return [n for _s, n in scored[:limit]], len(scored)
+
+
+def _rank_channel(name, words):
+    """Sort weight of one channel (lower = better), or None when a word is
+    missing. Each word is graded on its own — exact name 0, exact field (the
+    part after the last ':') 1, a prefix 2, inside the field 3, anywhere 4 —
+    the weakest word sets the tier and the sum breaks ties. Nothing here looks
+    at the order the words were typed in."""
+    low = name.lower()
+    field = low.rsplit(":", 1)[-1]
+    worst = total = 0
+    for w in words:
+        if w == low:
+            s = 0
+        elif w == field:
+            s = 1
+        elif low.startswith(w) or field.startswith(w):
+            s = 2
+        elif w in field:
+            s = 3
+        elif w in low:
+            s = 4
+        else:
+            return None
+        worst = max(worst, s)
+        total += s
+    return worst * 10 + min(total, 9)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1850,13 +1994,18 @@ HALLS_DEFAULTS = {"auto": True, "band_px": 150, "show_word": True,
 # "pro halu user vidí jen jeden čtvereček a jeho popis se bude automaticky
 # měnit v závislosti na tom, kam střílíme". In this mode `band_px` is the
 # square's SIDE, so the same box and the same fit/manual machinery serve both.
-#
-# The share of the tab's width the one square may take at most; the list gets
-# the rest. The height usually decides first.
-SINGLE_SQUARE_FRAC = 0.35
 
 # Between the one square and the list beside it, in pixels.
 SINGLE_GAP_PX = 24
+
+# The smallest text the fit lets the squares squeeze the list down to. The
+# squares are as big as they can be while the list beside or under them still
+# fits at this size; only when the window is too small for even that does the
+# text go smaller, and only below `LOOK_LIMITS`' floor does anything run past
+# the window's edge (user, 12.10.2026: "co největší tak, aby se tam vlezl i
+# text.. pokud se už text nevleze, tak až teprve tehdy se bude moct text
+# přepisovat přes hranu"). The program's own starting text size.
+FIT_TEXT_MIN_PX = 19
 
 # The band is the strip the squares live in. Wide bounds, for the reason
 # `LOOK_LIMITS` has them: the window may be a wall-sized display or a corner of
@@ -2111,6 +2260,15 @@ def _largest(low, high, fits):
     return best
 
 
+def _text_floor(low, fits):
+    """The text size the squares must leave room for: `FIT_TEXT_MIN_PX` when
+    the rows fit at it with no square at all, else the largest size that does,
+    else `low`."""
+    if fits(FIT_TEXT_MIN_PX):
+        return FIT_TEXT_MIN_PX
+    return _largest(low, FIT_TEXT_MIN_PX, fits)
+
+
 def fit_sizes(band_w, list_w, avail, n_rows, row_h, row_w,
               auto=True, band_frac=None):
     """The four numbers that fill a window. No Qt in here.
@@ -2165,8 +2323,11 @@ def fit_sizes(band_w, list_w, avail, n_rows, row_h, row_w,
         size = mark = None
     else:
         # The squares take as much as they may — but never so much that the
-        # list cannot show its rows at the smallest readable text.
-        band = min(cap, max(0.0, avail - n * row_h(low)))
+        # list cannot show its rows at `FIT_TEXT_MIN_PX`, or at the floor when
+        # the window is too small even for that.
+        floor = _text_floor(low, lambda t: (n * row_h(t) <= avail
+                                            and row_w(t) <= list_w))
+        band = min(cap, max(0.0, avail - n * row_h(floor)))
         size = _largest(low, high, lambda t: (n * row_h(t) <= avail - band
                                               and row_w(t) <= list_w))
         # The text hit the width, or its own ceiling, before it used up the
@@ -2196,15 +2357,13 @@ def fit_single(width, square_h, list_h, list_spare, n_rows, row_h, row_w):
         n_rows      how many rows the list is showing
         row_h(t), row_w(t)   one row's height and width at text size `t`
 
-    THE TEXT FIRST, THEN THE SQUARE. The square used to take its full size
-    first (the height, up to `SINGLE_SQUARE_FRAC` of the width) and the text
-    got what was left — which on a wide, low window left the list small with
-    the window half empty, "nevyužívá potenciál daného místa", 1.10.2026.
-
-    Now the square only has to be as tall as the list it stands beside (never
-    less than half its full size, never more than all of it), the text grows
-    as far as that allows, and whatever width the text did not need goes back
-    to the square, up to its full size.
+    THE SQUARE FIRST, AS BIG AS THE TEXT LETS IT (12.10.2026). The square is
+    as tall as the height allows, and only as narrow as it must be for the
+    list to fit beside it at `FIT_TEXT_MIN_PX` (or, on a window too small for
+    that, at the largest size that fits at all). Then the text grows into
+    whatever room is left beside it. Before, the text came first and the square
+    got at most 35 % of the width and usually half of that — "the big square is
+    too small".
 
     Returns `(size_px, mark_px, side_px, word_px)`; `size_px` and `mark_px` are
     `None` when there is no row to measure.
@@ -2214,28 +2373,20 @@ def fit_single(width, square_h, list_h, list_spare, n_rows, row_h, row_w):
     width = max(1, int(width))
     square_h = max(1, int(square_h))
     list_h = max(0, int(list_h))
-    full = max(1.0, min(float(square_h), width * SINGLE_SQUARE_FRAC))
-
-    def side_for(t):
-        # As tall as the rows, inside [half, full].
-        return max(full * 0.5, min(full, float(n * row_h(t))))
+    beside = width - SINGLE_GAP_PX - list_spare     # square + one row
 
     def room(s):
-        return width - s - SINGLE_GAP_PX - list_spare
+        return beside - s
 
     if n == 0:
-        side = full
+        side = float(min(square_h, width))
         size = mark = None
     else:
+        floor = _text_floor(low, lambda t: (n * row_h(t) <= list_h
+                                            and row_w(t) <= beside - 1))
+        side = max(1.0, min(float(square_h), beside - row_w(floor)))
         size = _largest(low, high, lambda t: (n * row_h(t) <= list_h
-                                              and row_w(t) <= room(side_for(t))))
-        # The width the text did not take goes to the square.
-        side = max(side_for(size),
-                   min(full, width - SINGLE_GAP_PX - list_spare - row_w(size)))
-        if row_w(size) > room(side):
-            # Even the smallest text does not fit beside half a square: the
-            # list must stay readable, the square gives way.
-            side = max(1.0, width - SINGLE_GAP_PX - list_spare - row_w(size))
+                                              and row_w(t) <= room(side)))
         mark_lo, mark_hi = LOOK_LIMITS["mark_px"]
         mark = max(mark_lo, min(mark_hi, int(round(size * FIT_MARK_RATIO))))
 
@@ -2466,7 +2617,10 @@ def normalise(cfg):
             if isinstance(raw, str):
                 # The shape before the valve had two channels: one name, which
                 # was the open switch.
-                out["shooting"][hall] = {"open": raw.strip()}
+                name = raw.strip()
+                if _DEAD_GATE_NAMES.get(name) == hall:
+                    name = DEFAULT_GATES[hall]["open"]
+                out["shooting"][hall] = {"open": name}
                 continue
             if not isinstance(raw, dict):
                 continue
@@ -2477,8 +2631,10 @@ def normalise(cfg):
             # A saved EMPTY name is a name the operator cleared, and it must
             # stay cleared — a default put back here would keep resurrecting a
             # channel they deliberately took out.
-            out["shooting"][hall]["open"] = (
-                str(name).strip() if isinstance(name, str) else "")
+            name = str(name).strip() if isinstance(name, str) else ""
+            if _DEAD_GATE_NAMES.get(name) == hall:
+                name = DEFAULT_GATES[hall]["open"]
+            out["shooting"][hall]["open"] = name
     rows = []
     seen_ids = set()
     old_scan_ticked = False
@@ -2643,3 +2799,173 @@ def save_config(cfg, path=None):
         except Exception:
             pass
         return f"Settings could not be saved: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Saved settings: named sets on the share, one per operator
+# ─────────────────────────────────────────────────────────────────────────────
+# Asked for on 12.10.2026: "abych měl možnost nahrát více nastavení podle
+# toho, jaký user to bude ovládat.. dropdown menu těch nastavení, ze kterých si
+# vyberu, klik na import a voala.. všechny nastavení se změnili". The sets
+# live in `settings_sets.json` beside `dm_setups.json` on the share, so every PC
+# sees the same list; the Settings tab reads and writes it on a thread.
+#
+# A set holds PARTS of the settings document, the operator ticks which ones
+# are saved and which are loaded. The DM writer switch (`dm.write`) is never
+# in a set: it says which PC reads the mirror, and loading somebody's set on
+# a second PC must not make two writers. The saved DM set-ups and their
+# High / Low ticks are on the share already and need no copy.
+
+SETS_NAME = "settings_sets.json"
+
+# (key, caption, top-level keys of the settings document). "dm" is handled on
+# its own, see `_DM_SET_KEYS`.
+SET_PARTS = (
+    ("channels", "Channels and limits",
+     ("rows", "shooting", "scanning", "active_hall")),
+    ("look", "Look (text, squares)", ("look", "halls")),
+    ("shots", "Shot counter", ("shots",)),
+    ("dm", "DM reading", ()),
+    ("window", "Window size and place", ("window_max", "window_geometry")),
+)
+SET_PART_KEYS = tuple(p[0] for p in SET_PARTS)
+SET_PART_CAPTIONS = {p[0]: p[1] for p in SET_PARTS}
+# Ticked when the tab opens: everything but where the window sits, which is a
+# matter of the PC's screen rather than of who is operating.
+SET_PARTS_DEFAULT = ("channels", "look", "shots", "dm")
+_DM_SET_KEYS = ("title", "every_s")
+
+
+def settings_parts(cfg, parts):
+    """The chosen parts of a settings document, deep-copied, for a set."""
+    import copy
+    out = {}
+    for key, _caption, doc_keys in SET_PARTS:
+        if key not in parts:
+            continue
+        if key == "dm":
+            dm = dm_of(copy.deepcopy(cfg))
+            out["dm"] = {k: dm[k] for k in _DM_SET_KEYS}
+            continue
+        for doc_key in doc_keys:
+            if doc_key in cfg:
+                out[doc_key] = copy.deepcopy(cfg[doc_key])
+    return out
+
+
+def parts_in(settings):
+    """Which parts a saved set holds, in `SET_PARTS` order."""
+    if not isinstance(settings, dict):
+        return []
+    held = []
+    for key, _caption, doc_keys in SET_PARTS:
+        if key == "dm":
+            if isinstance(settings.get("dm"), dict):
+                held.append(key)
+        elif any(k in settings for k in doc_keys):
+            held.append(key)
+    return held
+
+
+def apply_settings_parts(cfg, settings, parts):
+    """A NEW settings document: `cfg` with the chosen parts of a saved set
+    laid over it, repaired by `normalise`. `cfg` itself is not touched.
+    A part the set does not hold leaves that part as it was."""
+    import copy
+    out = copy.deepcopy(cfg)
+    if not isinstance(settings, dict):
+        return normalise(out)
+    for key, _caption, doc_keys in SET_PARTS:
+        if key not in parts:
+            continue
+        if key == "dm":
+            saved = settings.get("dm")
+            if isinstance(saved, dict):
+                dm = dm_of(out)
+                for k in _DM_SET_KEYS:
+                    if k in saved:
+                        dm[k] = saved[k]
+            continue
+        for doc_key in doc_keys:
+            if doc_key in settings:
+                out[doc_key] = copy.deepcopy(settings[doc_key])
+    return normalise(out)
+
+
+def clean_sets(raw):
+    """{name: {"settings", "saved", "by"}} out of a file, bad entries dropped."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    items = raw.get("sets") if isinstance(raw.get("sets"), dict) else {}
+    for name, entry in items.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(entry, dict) \
+                or not isinstance(entry.get("settings"), dict):
+            continue
+        out[name.strip()] = {"settings": entry["settings"],
+                             "saved": str(entry.get("saved") or ""),
+                             "by": str(entry.get("by") or "")}
+    return out
+
+
+def sets_document(sets):
+    return {"version": 1, "sets": sets}
+
+
+def _set_entry(settings, now_s=None):
+    import datetime
+    now = time.time() if now_s is None else now_s
+    return {"settings": settings,
+            "saved": datetime.datetime.fromtimestamp(now).isoformat(
+                timespec="seconds"),
+            "by": socket.gethostname()}
+
+
+def add_set(sets, name, settings, now_s=None):
+    """A copy of `sets` with a new one, or (None, why not)."""
+    name = (name or "").strip()
+    if not name:
+        return None, "Type a name for the settings first."
+    if name in sets:
+        return None, (f"Settings called \"{name}\" already exist. Pick them "
+                      f"and press Save to overwrite them, or type another "
+                      f"name.")
+    if not settings:
+        return None, "Tick at least one part to save."
+    out = dict(sets)
+    out[name] = _set_entry(settings, now_s)
+    return out, None
+
+
+def overwrite_set(sets, name, settings, now_s=None):
+    """A copy of `sets` with `name` saved again, or (None, why not)."""
+    if name not in sets:
+        return None, f"\"{name}\" is not on the list any more."
+    if not settings:
+        return None, "Tick at least one part to save."
+    out = dict(sets)
+    out[name] = _set_entry(settings, now_s)
+    return out, None
+
+
+def rename_set(sets, old, new):
+    """A copy of `sets` with `old` called `new`, order kept, or (None, why)."""
+    new = (new or "").strip()
+    if old not in sets:
+        return None, f"\"{old}\" is not on the list any more."
+    if not new:
+        return None, "Type the new name first."
+    if new == old:
+        return None, None
+    if new in sets:
+        return None, f"Settings called \"{new}\" already exist."
+    return {(new if n == old else n): e for n, e in sets.items()}, None
+
+
+def delete_set(sets, name):
+    """A copy of `sets` without `name`, or (None, why not)."""
+    if name not in sets:
+        return None, f"\"{name}\" is not on the list any more."
+    return {n: e for n, e in sets.items() if n != name}, None

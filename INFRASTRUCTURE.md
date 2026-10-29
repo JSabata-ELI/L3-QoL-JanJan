@@ -16,7 +16,7 @@ about what crosses folder boundaries.
 | Folder | What it is | Launcher group | Toolkit | Built? |
 |--------|-----------|----------------|---------|--------|
 | `Image Tools` | Camera images: Finder, Slider, Shot Finder, Workshop | Scripts | PySide6 | yes |
-| `Screenshots` | Camera frames + monitor shots into one folder | Scripts | tkinter | yes |
+| `Screenshots` | Camera frames + monitor shots into one folder | Scripts | PySide6 | yes |
 | `Time Converter` | Rename archive files to readable timestamps | Scripts | tkinter | yes |
 | `Announcer` | Screen-region watch + PV badges | Scripts | tkinter | yes |
 | `CSS Logger` | Archive explorer / logger (**Spectra** is its second tab, `sp_t.py`) | Scripts | PySide6 | yes |
@@ -27,8 +27,8 @@ about what crosses folder boundaries.
 | `Shift planner` | Fill your availability into the shift spreadsheet | External¹ | tkinter | yes |
 | `Calibrations` | Energy-detector calibration | In progress | PySide6 | yes |
 | `Laser settings` | Is the machine set right for the hall being shot into? | In progress ³ | PySide6 | not yet |
-| `Launcher` | Starts everything else | Parts | tkinter | yes |
-| `Dev Tools` | Builder + Copy Manager (build and publish) | Personal | tkinter | yes |
+| `Launcher` | Starts everything else | Parts | PySide6 | yes |
+| `Dev Tools` | Builder + Copy Manager (build and publish) | Personal | PySide6 | yes |
 | `Internal Builder` | Builds the shared support folder | Personal | — | yes (by-product) |
 | `Extractor` | Manual fallback for distributing the support folder | External¹ | console | no, on purpose |
 | `Git Work` | Everyday git from one window | Personal | PySide6 | yes |
@@ -46,7 +46,7 @@ permanent fix is to add the folder name to the right set.
 ² **Deliberately invisible.** `SPFE Values` is not built, so the Launcher — which lists
 a folder only when it holds an exe (`l.py:487`) — never sees it. It does appear in
 Dev Tools ▸ Builder's project list, which takes any folder containing a `.py`
-(`b_t.py:314`); it is simply never built. It is written as one QWidget and is meant to
+(`dt_core.py::find_projects`); it is simply never built. It is written as one QWidget and is meant to
 become an **SPFE values** tab of CSS Logger rather than ship on its own.
 
 ³ **Finished, but watching nothing yet.** `Laser settings` is listed in
@@ -62,8 +62,8 @@ Chiller Log will appear under Scripts as soon as it is built.
 
 | | has `icon.ico` | has `build_config.json` |
 |---|---|---|
-| Announcer, CSS Logger, Diagnostic, Image Tools, Internal Builder, Laser settings | yes | yes |
-| Calibrations, Chiller Log, Dev Tools, Git Work, Launcher, Screenshots, Shift planner, Time Converter | yes | no (none needed) |
+| Announcer, CSS Logger, Dev Tools, Diagnostic, Image Tools, Internal Builder, Laser settings | yes | yes |
+| Calibrations, Chiller Log, Git Work, Launcher, Screenshots, Shift planner, Time Converter | yes | no (none needed) |
 | Pulser Monitor | **no** | yes |
 | SPFE Values | **no** | no (not built yet) |
 | Extractor | no | no (not built on its own) |
@@ -299,7 +299,7 @@ Deliberate overlaps, so nobody merges them by mistake:
   the hall. Diagnostic alerts on one set of thresholds regardless of where the shot
   is going. Nothing in Laser settings writes, sounds or sends anything.
 - **Screenshots vs Image Tools.** Screenshots collects; Image Tools inspects.
-- **Extractor vs Dev Tools ▸ Deploy internal.** Same job; Extractor is the manual
+- **Extractor vs Dev Tools ▸ Copy Manager ▸ Deploy Libraries.** Same job; Extractor is the manual
   fallback and its folder list is out of date.
 
 ---
@@ -326,7 +326,7 @@ filename it looks for out of the **folder name** (`_norm("readme_" + folder)`), 
 Dev Tools' deploy is more forgiving (it falls back to `README.txt`), so **a publish
 can succeed while the Launcher still shows nothing**. That mismatch is easy to miss.
 
-`cm_t.py::find_readme_full_or_none` mirrors the Launcher's matcher exactly, and both
+`dt_core.py::find_readme_full_or_none` mirrors the Launcher's matcher exactly, and both
 the Builder and the Copy Manager carry **both** documents — the build puts them in the
 version folder, `Copy` and `ReadMe only` publish them. If those two matchers ever
 diverge, a publish lands a file the Launcher will not open, and nothing says so until
@@ -385,6 +385,7 @@ What is duplicated deliberately:
 |---------|-----------|------|
 | `set_app_icon(win, ico, app_id)` | every tkinter program | tkinter's `iconbitmap` only sets the title bar; the Windows 11 taskbar reads the small-icon slots and the window-class icon. Must be **frozen-aware** — in a build `__file__` does not point next to the exe. |
 | `_icon_app_id(prefix, ico)` | all 16 programs | **A new taskbar identity on every launch** (`prefix` + a random suffix), set before the first window exists. Windows caches the taskbar picture per identity and never re-reads it, so every *stable* form went blank sooner or later — a fixed string, a hash of the icon, a hash tagged with the build's file name — and setting no identity at all only moved the stale cache to the exe path (Diagnostic v1.3.1, 17.09.2026: window icon, exe icon resource and the shell's own file icon all correct, the button blank). An identity Windows has never seen has nothing cached, so the button takes the **window** icon — measured on a frozen PyInstaller build. Returns None when the program has no `icon.ico` (Pulser Monitor, SPFE Values), and nothing here needs a stable identity: no program registers a shortcut or sends Windows toasts. The one cost: pinning a *running* button pins that run's identity and would not start the program again — pin the exe. Because the picture now comes from the window icon, the Builder also puts `icon.ico` **inside** the bundle (`--add-data`), so a failed read next to the exe cannot cost the picture. |
+| `_nudge_taskbar_icon(hwnd)` | all 17 programs with a window (Tk: called from `set_app_icon`) | **Makes Explorer read the button's picture again** at about 2, 10, 30 and 60 s after start: takes the window's own icon away and gives it back (WM_SETICON), on a daemon thread. Explorer reads a button's picture once, when it creates the button; when that read misses, the button stays blank for the whole run even with a fresh identity and a correct window icon (Diagnostic v1.3.4, 15.10.2026, started from `C:`). Re-sending the same icon did nothing; away-and-back made the running window draw its magnifier at once. Tk's `set_app_icon` also falls back to the bundled `icon.ico` (`sys._MEIPASS`) and sets the slots on the outer window (`wm frame`) once Tk has mapped it. |
 | `get_app_dir()` / `_app_dir()` | every program | exe folder when frozen, source folder otherwise. Every path resolves through it. |
 | Hour-chunked archiver fetch | Chiller Log, CSS Logger, Image Tools, SPFE Values | the one-hour limit from §2 |
 | `cpva_core.py`'s fetch layer | CSS Logger (owner), SPFE Values (`spfe_core.py`) | function names kept identical on purpose. SPFE Values is written to become a CSS Logger tab; `spfe_t.py` and `spfe_record.py` import through a `try: from cpva_core … except ImportError: from spfe_core …` adapter, so `spfe_core.py` is simply **not copied** when the widget moves and this row disappears. |
@@ -403,18 +404,20 @@ What is duplicated deliberately:
 
 ## 8. Testing
 
-No shared test runner. Each program keeps its own offline checks next to it, and they
-are all headless and network-free unless stated:
+No shared test runner. Each program keeps its own offline checks in its own
+`testing/` folder — never in the program folder itself — and they are all headless
+and network-free unless stated. Run them from the program folder as
+`python testing/<name>.py`. Some examples:
 
 ```
 Image Tools/testing/     test_day_split.py, test_pv_resilience.py,
                          test_scale_invariance.py (needs the lab),
                          bench_*.py — the viewer, the live path, the PV panel
-Pulser Monitor/          test_pulser.py, test_gui.py, test_real.py, test_gate.py
-                         (run all four before changing the analyser)
-Diagnostic/              test_alerting.py, test_monitor_frozen.py,
+Pulser Monitor/testing/  test_pulser.py, test_gui.py, test_real.py, test_gate.py,
+                         test_blinks.py (run all before changing the analyser)
+Diagnostic/testing/      test_alerting.py, test_monitor_frozen.py,
                          test_bot_commands.py
-CSS Logger/              test_smoke.py, test_live_pacing.py,
+CSS Logger/testing/      test_smoke.py, test_live_pacing.py,
                          test_count_param.py (needs the archiver)
 ```
 

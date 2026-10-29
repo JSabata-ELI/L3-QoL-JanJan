@@ -1,19 +1,43 @@
 # dev_tools.py
-# Thin connector — imports BuilderUI from b_t.py and DeployGUI from cm_t.py.
+"""Dev Tools — one window, two tabs (Builder, Copy Manager) and one shared log.
 
+PySide6, in the Image Tools look. All logic lives in dt_core.py; dt_builder.py
+and dt_copy.py are the two tabs, dt_common.py the shared look, log and dialogs.
+"""
+from __future__ import annotations
+
+import os
+import re
 import sys
-import tkinter as tk
-from tkinter import ttk
 from pathlib import Path
 
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget
 
-def _app_dir() -> Path:
-    if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+import dt_core as core
+from dt_builder import BuilderTab
+from dt_common import MAIN_TABS_QSS, LogHub, apply_app_style, init_ui_thread
+from dt_copy import CopyTab
+
+_APP_ID_PREFIX = "ELI.DevToolsPractice" if core.PRACTICE else "ELI.DevTools"
 
 
-def _icon_app_id(prefix, ico_path):
+def _icon_file():
+    """icon.ico: next to the exe, then inside the bundle, then the source folder."""
+    return core.icon_file()
+
+
+def _app_version() -> str:
+    """Version of the running build, e.g. "v2.0.0", or "" when run from source.
+    The builder names every exe "<Program> vX.Y.Z.exe", so the exe's own file
+    name is the one place that always tells the truth."""
+    if not getattr(sys, "frozen", False):
+        return ""
+    m = re.search(r"\s(v\d+(?:\.\d+)*)$", Path(sys.executable).stem)
+    return m.group(1) if m else ""
+
+
+def _icon_app_id() -> str | None:
     """A taskbar identity that is new on every launch.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
@@ -37,120 +61,120 @@ def _icon_app_id(prefix, ico_path):
     Returns None when there is no icon at all; the caller then sets no id and
     the button keeps taking the exe's own picture.
     """
-    import os.path
-    if not ico_path or not os.path.exists(str(ico_path)):
+    if _icon_file() is None:
         return None
     import uuid
-    return f"{prefix}.{uuid.uuid4().hex[:12]}"
+    return f"{_APP_ID_PREFIX}.{uuid.uuid4().hex[:12]}"
 
 
-def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
-    """Give the window (title bar) AND the Windows taskbar button our icon.
+def _nudge_taskbar_icon(hwnd) -> None:
+    """Make the taskbar re-read this window's icon a few times after start.
 
-    tkinter's iconbitmap only fixes the title bar / WM_BIG icon; the Windows 11
-    taskbar reads the *small* icon slots (ICON_SMALL/SMALL2) and the window-class
-    icon (GCLP_HICONSM), which Tk otherwise leaves as its default feather logo.
-    We force every slot from icon.ico via Win32 before the window is first shown.
+    Explorer reads a taskbar button's picture once, when it creates the
+    button, and does not ask again by itself. When that one read misses, the
+    button keeps the blank window placeholder for the whole run although the
+    window holds the right icon -- measured on Diagnostic v1.3.4, 15.10.2026:
+    started from C:, a fresh per-launch id, WM_GETICON answering with the
+    magnifier, the button blank. Re-sending the same icon changed nothing;
+    taking the icon away and giving it back made Explorer re-read it, and the
+    same running window drew the magnifier at once. So that is done here a few
+    times while the button may still be appearing (a slow start, a busy
+    Explorer after logon). Runs on a daemon thread; the window's own icon
+    handles are put back, so nothing is created or leaked.
     """
-    import ctypes
-    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
-    if _aumid:
+    if not hwnd:
+        return
+    import threading
+
+    def run():
+        import ctypes
+        import ctypes.wintypes as wt
+        import time
+        user32 = ctypes.windll.user32
+        send = user32.SendMessageTimeoutW
+        send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT,
+                         wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send.restype = ctypes.c_size_t
+        res = ctypes.c_size_t()
+        for delay in (2, 8, 20, 30):          # at about 2, 10, 30 and 60 s
+            time.sleep(delay)
+            try:
+                if not user32.IsWindow(wt.HWND(hwnd)):
+                    return
+                held = {}
+                for which in (1, 0):          # ICON_BIG, ICON_SMALL
+                    res.value = 0
+                    # SMTO_ABORTIFHUNG: a frozen window just skips this round
+                    if send(hwnd, 0x007F, which, 0, 0x0002, 2000,
+                            ctypes.byref(res)) and res.value:
+                        held[which] = res.value
+                for which in held:
+                    send(hwnd, 0x0080, which, 0, 0x0002, 2000, ctypes.byref(res))
+                for which, h in held.items():
+                    send(hwnd, 0x0080, which, h, 0x0002, 2000, ctypes.byref(res))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="taskbar-icon").start()
+
+
+# Note: no WM_SETICON / SetClassLongPtr "force taskbar icon" helper here (the Tk
+# version needed one). Measured on Win11: the taskbar draws the *window* icon,
+# so Qt's setWindowIcon is enough. _nudge_taskbar_icon above sets no new
+# picture; it only takes the window's own icon away and back.
+
+
+class DevToolsWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        ver = _app_version()
+        title = f"Dev Tools {ver}" if ver else "Dev Tools (source)"
+        if core.PRACTICE:
+            title += "  —  practice folders"
+        self.setWindowTitle(title)
+        icon = core.icon_file()
+        if icon is not None:
+            self.setWindowIcon(QIcon(str(icon)))
+        self.resize(1280, 860)
+        self.setMinimumSize(1060, 620)
+        self.setStyleSheet("QMainWindow { background: #f3f3f3; }")
+
+        self.hub = LogHub(self)
+        # Practice mode only: its folders and config must exist before the tabs
+        # read them. Does nothing in normal use.
+        core.ensure_practice_setup(self.hub.write)
+
+        self.tabs = QTabWidget()
+        self.tabs.tabBar().setStyleSheet(MAIN_TABS_QSS)
+        self.builder = BuilderTab(self.hub)
+        self.copy = CopyTab(self.hub)
+        self.builder.copy_tab = self.copy
+        self.copy.builder = self.builder
+        self.tabs.addTab(self.builder, "Builder")
+        self.tabs.addTab(self.copy, "Copy Manager")
+        self.setCentralWidget(self.tabs)
+
+
+def main() -> int:
+    app_id = _icon_app_id() if os.name == "nt" else None
+    if app_id:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
         except Exception:
             pass
-    try:
-        win.iconbitmap(default=ico_path)
-    except Exception:
-        pass
-    try:
-        u = ctypes.windll.user32
-        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
-        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)  # LR_LOADFROMFILE|LR_DEFAULTSIZE
-        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)       # LR_LOADFROMFILE
-        for which, h in ((1, big), (0, sm), (2, sm)):            # ICON_BIG, ICON_SMALL, ICON_SMALL2
-            if h:
-                u.SendMessageW(hwnd, 0x0080, which, h)           # WM_SETICON
-        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
-        if big:
-            set_cls(hwnd, -14, big)   # GCLP_HICON
-        if sm:
-            set_cls(hwnd, -34, sm)    # GCLP_HICONSM
-    except Exception:
-        pass
 
-
-def _combo_wheel(event):
-    """Mouse wheel over a combobox.
-
-    ttk's own class binding steps the value on every wheel turn, and it runs
-    before the list's scroll handler. Scrolling the Copy Manager list over the
-    Version column therefore silently changed which version would be copied,
-    and a turn over Builder's Group moved the project to another group. The
-    value now changes only in the box the user clicked into (it has the
-    keyboard focus); anywhere else the turn scrolls the list underneath.
-    """
-    w = event.widget
-    try:
-        focused = w.focus_get() is w
-    except Exception:
-        focused = False
-    step = -1 if event.delta > 0 else 1
-    if focused and "disabled" not in w.state():
-        try:
-            w.tk.call("ttk::combobox::Scroll", str(w), step)
-        except tk.TclError:
-            pass
-        return "break"
-    parent = w.master
-    while parent is not None and not isinstance(parent, tk.Canvas):
-        parent = parent.master
-    if parent is not None:
-        try:
-            parent.yview_scroll(step, "units")
-        except tk.TclError:
-            pass
-    return "break"
-
-
-def install_combo_wheel_guard(root):
-    root.bind_class("TCombobox", "<MouseWheel>", _combo_wheel)
-
-
-def main():
-    from b_t import BuilderUI
-    from cm_t import DeployGUI
-
-    root = tk.Tk()
-    install_combo_wheel_guard(root)
-    root.title("Dev Tools")
-    set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.DevTools")
-    root.geometry("1180x820")
-    root.minsize(1060, 620)
-    try:
-        root.state("zoomed")          # start maximized
-    except Exception:
-        root.attributes("-zoomed", True)
-
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True, side="top")
-
-    # Sdílený log widget — fyzicky žije v CM tabu, Builder do něj píše přes log_widget
-    cm_tab = DeployGUI(nb)
-
-    def _on_build_done(built_projects, build_summary=None, build_info=None):
-        nb.select(cm_tab)
-        cm_tab.auto_deploy(built_projects, build_summary=build_summary, build_info=build_info)
-
-    builder_tab = BuilderUI(nb, on_build_done=_on_build_done, log_widget=cm_tab.log)
-    builder_tab._cm_ref = cm_tab
-    cm_tab._builder_ref = builder_tab
-
-    nb.add(builder_tab, text="  Builder  ")
-    nb.add(cm_tab,      text="  Copy Manager  ")
-
-    root.mainloop()
+    app = QApplication(sys.argv)
+    apply_app_style(app)
+    icon = core.icon_file()
+    if icon is not None:
+        app.setWindowIcon(QIcon(str(icon)))
+    init_ui_thread()
+    win = DevToolsWindow()
+    win.show()  # normal 1280 x 860 window, not maximized
+    _nudge_taskbar_icon(int(win.winId()))
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

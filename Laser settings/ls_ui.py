@@ -363,19 +363,23 @@ def install_app_look(app=None):
 def install_wheel_guard(app=None):
     """A value must never change just because the pointer crossed its control.
 
-    Number boxes, drop-downs and sliders answer the wheel only once they have
-    been CLICKED. Until then the notch goes to the panel behind them, so a
-    settings panel still scrolls when the pointer happens to pass over a field
-    on the way down. The focus a freshly opened window HANDS its first field does
-    not count, or the top field of a panel would answer the wheel before it had
-    ever been touched.
+    Number boxes, drop-downs and sliders answer the wheel only after they were
+    CLICKED (or reached with Tab), and only while the pointer is over them --
+    Qt delivers a wheel notch to the control under the pointer, so a selected
+    field elsewhere on the page is never touched. Moving the pointer away keeps
+    the field selected (the keyboard still edits it); the wheel works on it
+    again when the pointer comes back. Selecting another control ends it. An
+    unselected field passes the notch to the panel behind it, so a settings
+    panel still scrolls when the pointer happens to pass over a field. The
+    focus a freshly opened window HANDS its first field does not count.
     """
-    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtCore import QEvent, QObject, Qt
     from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
-                                   QAbstractSpinBox, QComboBox, QScrollBar)
+                                   QAbstractSpinBox, QApplication, QComboBox,
+                                   QScrollBar)
 
     app = app or QApplication.instance()
-    if app is None or getattr(app, "_ls_wheel_guard", None) is not None:
+    if app is None or getattr(app, "_wheel_guard", None) is not None:
         return
 
     class _WheelGuard(QObject):
@@ -383,8 +387,10 @@ def install_wheel_guard(app=None):
         _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
                    Qt.FocusReason.BacktabFocusReason,
                    Qt.FocusReason.ShortcutFocusReason)
-        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
-                  Qt.FocusReason.OtherFocusReason)
+        # Focus that leaves only for a moment and comes back to the same field:
+        # another window was activated, or the drop-down's own list opened.
+        _KEEP = (Qt.FocusReason.ActiveWindowFocusReason,
+                 Qt.FocusReason.PopupFocusReason)
 
         def eventFilter(self, obj, ev):
             """EVERY event in the program passes through here, so it may not
@@ -425,10 +431,26 @@ def install_wheel_guard(app=None):
                 if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
                     obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 return False
+            if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+                # A click is what selects the field -- also the field that
+                # already HAD the focus (the first one of a window is handed
+                # it), where no FocusIn follows the click. The press lands on
+                # the spin box's own text line, so look one or two levels up.
+                w = obj
+                for _ in range(3):
+                    if isinstance(w, self._GUARDED):
+                        w.setProperty("wheelReady", True)
+                        break
+                    w = w.parentWidget() if hasattr(w, "parentWidget") else None
+                    if w is None:
+                        break
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
                 if ev.reason() in self._EARNED:
                     obj.setProperty("wheelReady", True)
-                elif ev.reason() in self._GIVEN:
+                return False
+            if t == QEvent.Type.FocusOut and isinstance(obj, self._GUARDED):
+                if ev.reason() not in self._KEEP:
                     obj.setProperty("wheelReady", False)
                 return False
             if t != QEvent.Type.Wheel:
@@ -447,7 +469,7 @@ def install_wheel_guard(app=None):
 
     guard = _WheelGuard(app)
     app.installEventFilter(guard)
-    app._ls_wheel_guard = guard
+    app._wheel_guard = guard
 
 
 def paint_dialog(dlg, white=False):
@@ -1084,6 +1106,24 @@ def paint_check_box(painter, rect, checked):
             QPointF(x + w * 0.80, y + h * 0.26)]))
     finally:
         painter.restore()
+
+
+class AlignedEditDelegate(QStyledItemDelegate):
+    """The box you type in sits where the cell's text sits.
+
+    Qt's own editor is a line edit aligned LEFT whatever the cell asks for —
+    measured on this Qt: a centred "12.5" jumped to the left edge the moment
+    it was double-clicked, and back to the middle on Enter (14.10.2026, "zarovnej
+    číselné hodnoty v tabulce na střed"). The editor takes the cell's own
+    alignment here, so a centred number stays in the middle while it is typed.
+    """
+
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        align = index.data(Qt.ItemDataRole.TextAlignmentRole)
+        if align is not None and hasattr(editor, "setAlignment"):
+            editor.setAlignment(Qt.AlignmentFlag(int(align)))
+        return editor
 
 
 class CenteredCheckDelegate(QStyledItemDelegate):

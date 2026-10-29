@@ -2,8 +2,10 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05
-  (_internal_builder.py 177 lines, _internal_builder.spec 102 lines)
+Verified against source: 2026-10-15
+  (_internal_builder.py 178 lines,
+   _internal_builder.spec 102; 280 lines in all)
+  Program folder: 116 kB in 7 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: Readme Internal Builder.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

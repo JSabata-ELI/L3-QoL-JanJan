@@ -9,6 +9,14 @@ limit — the limits are the Limits tab.
     the word in them    SHOOTING / idle / not read, on or off, and how big
     the list            the typeface, the size, bold, and the verdict square
     the window          what size the Maximise button makes it
+    saved settings      named sets of all the above and more, on the share
+
+SAVED SETTINGS (12.10.2026): one set per operator, on the scratch share so
+every PC sees the same list (`ls_core.SET_PARTS`, `settings_sets.json`). Pick
+one in the drop-down and press Load: the ticked parts of it replace this PC's.
+The share is read and written on a thread of its own (a missing share costs
+seconds), and polled from here; the file is read again before every change, so
+a set another PC saved meanwhile is never lost.
 
 THE FIT WRITES ITS ANSWER INTO THE BOXES. `ov_t.OverviewTab._fit_to_window`
 works the four numbers out and puts them in the settings document; `park()`
@@ -46,15 +54,27 @@ like every other setting in this program.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QRectF, QSize, Qt, Signal
+import threading
+
+from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QCheckBox, QFontComboBox, QFrame, QGridLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QScrollArea,
-                               QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFontComboBox, QFrame,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QScrollArea, QSpinBox, QVBoxLayout,
+                               QWidget)
 
 import ls_core as C
+import ls_dm as D
 import ls_ui as U
 from ov_t import _Row
+
+# Delete takes two clicks within this time, as on the DM settings tab — no
+# modal "are you sure", which would freeze every other window.
+_ARM_MS = 4000
+
+# The saved-settings drop-down and the name box: wide enough for a name, no
+# wider, so the buttons sit right beside them.
+_SET_FIELD_W = 220
 
 # A number box holds two or three digits and " px"; it does not need the width
 # of a font name. A grid cell stretches whatever is put in it, so both are also
@@ -586,6 +606,20 @@ class FontTab(QWidget):
         self._win = win
         self._loading = False
         self._rows = []
+        # The saved sets: what the share held at the last look, the job on
+        # the thread (a plain dict it fills in), and its poll.
+        self._sets = {}
+        self._sets_share = D.Share()
+        self._sets_reply = None
+        self._sets_listed = False
+        self._sets_timer = QTimer(self)
+        self._sets_timer.setInterval(100)
+        self._sets_timer.timeout.connect(self._sets_poll)
+        self._armed = None
+        self._arm_timer = QTimer(self)
+        self._arm_timer.setSingleShot(True)
+        self._arm_timer.setInterval(_ARM_MS)
+        self._arm_timer.timeout.connect(self._disarm)
         self._build()
         self.reload()
 
@@ -615,16 +649,309 @@ class FontTab(QWidget):
 
         # No shot counter box: its settings sit in its own row on the Limits
         # tab since 5.10.2026 (`st_t.SettingsTab._shot_settings_cell`).
+        root.addWidget(self._build_sets_box())
         root.addWidget(self._build_window_box())
         root.addWidget(self._build_halls_box())
         root.addWidget(self._build_list_box())
         root.addStretch(1)
 
+    # ── saved settings ─────────────────────────────────────────────────────
+    def _build_sets_box(self):
+        """Named sets of settings on the share: pick, Load, Save, Rename,
+        Delete, and which parts take part. See `ls_core.SET_PARTS`."""
+        box = QGroupBox("Saved settings")
+        box.setToolTip(
+            "Settings saved under a name — one set per operator, say — on the "
+            "scratch share, so every PC sees the same list.\nPick one and press "
+            "Load: the ticked parts of it replace this PC's settings.\nThe DM "
+            "writer switch is never saved or loaded: it belongs to the PC.")
+        lay = QVBoxLayout(box)
+        lay.setSpacing(6)
+
+        pick = QHBoxLayout()
+        pick.setSpacing(6)
+        pick.addWidget(QLabel("Settings"))
+        self._set_combo = QComboBox()
+        self._set_combo.currentIndexChanged.connect(self._set_picked)
+        # Short, with the buttons right beside it — stretched across the
+        # page, it pushed them off the right edge (13.10.2026).
+        self._set_combo.setFixedWidth(_SET_FIELD_W)
+        pick.addWidget(self._set_combo)
+        self._set_load = U.button(
+            "Load", icon_name="check", primary=True,
+            tip="Replace this PC's settings by the ticked parts of the picked "
+                "set.")
+        self._set_load.clicked.connect(self._set_load_clicked)
+        pick.addWidget(self._set_load)
+        self._set_save = U.button(
+            "Save", icon_name="save",
+            tip="Save this PC's settings (the ticked parts) into the picked "
+                "set, over what it held.")
+        self._set_save.clicked.connect(self._set_save_clicked)
+        pick.addWidget(self._set_save)
+        self._set_delete = U.button(
+            "Delete", icon_name="trash", danger=True,
+            tip="Take the picked set off the list, for every PC. Click twice.")
+        self._set_delete.clicked.connect(self._set_delete_clicked)
+        pick.addWidget(self._set_delete)
+        pick.addStretch(1)
+        lay.addLayout(pick)
+
+        name = QHBoxLayout()
+        name.setSpacing(6)
+        name.addWidget(QLabel("Name"))
+        self._set_name = QLineEdit()
+        self._set_name.setPlaceholderText("new name")
+        self._set_name.setToolTip("A name for a new set (Save as new), or the "
+                                  "new name of the picked one (Rename).")
+        self._set_name.setFixedWidth(_SET_FIELD_W)
+        name.addWidget(self._set_name)
+        self._set_new = U.button(
+            "Save as new", icon_name="plus",
+            tip="Save this PC's settings (the ticked parts) as a new set under "
+                "the name typed beside it.")
+        self._set_new.clicked.connect(self._set_new_clicked)
+        name.addWidget(self._set_new)
+        self._set_rename = U.button(
+            "Rename", icon_name="pencil",
+            tip="Give the picked set the name typed beside it.")
+        self._set_rename.clicked.connect(self._set_rename_clicked)
+        name.addWidget(self._set_rename)
+        name.addStretch(1)
+        lay.addLayout(name)
+
+        parts = QHBoxLayout()
+        parts.setSpacing(12)
+        parts.addWidget(QLabel("Parts"))
+        self._set_parts = {}
+        for key in C.SET_PART_KEYS:
+            check = QCheckBox(C.SET_PART_CAPTIONS[key])
+            check.setStyleSheet(U.chk_qss())
+            check.setChecked(key in C.SET_PARTS_DEFAULT)
+            check.setToolTip("Saved with Save / Save as new, and replaced by "
+                             "Load, only while ticked.")
+            check.toggled.connect(self._sync_set_buttons)
+            parts.addWidget(check)
+            self._set_parts[key] = check
+        parts.addStretch(1)
+        lay.addLayout(parts)
+
+        self._set_note = QLabel("")
+        self._set_note.setWordWrap(True)
+        self._set_note.setStyleSheet(f"color: {U.QUIET};")
+        self._set_note.hide()
+        lay.addWidget(self._set_note)
+        self._sync_set_buttons()
+        return box
+
+    def _say(self, text):
+        """The line under the box: what the last action did. Hidden when it
+        has nothing to say, so it is not an empty strip."""
+        self._set_note.setText(text or "")
+        self._set_note.setVisible(bool(text))
+
+    def _ticked_parts(self):
+        return [k for k, c in self._set_parts.items() if c.isChecked()]
+
+    def _picked_set(self):
+        name = self._set_combo.currentData()
+        return name if name in self._sets else None
+
+    def _sync_set_buttons(self, *_a):
+        busy = self._sets_reply is not None
+        picked = self._picked_set() is not None
+        parts = bool(self._ticked_parts())
+        self._set_load.setEnabled(not busy and picked and parts)
+        self._set_save.setEnabled(not busy and picked and parts)
+        self._set_delete.setEnabled(not busy and picked)
+        self._set_rename.setEnabled(not busy and picked)
+        self._set_new.setEnabled(not busy and parts)
+
+    def _fill_set_combo(self, select=None):
+        keep = select if select is not None else self._set_combo.currentData()
+        self._set_combo.blockSignals(True)
+        try:
+            self._set_combo.clear()
+            for name, entry in self._sets.items():
+                self._set_combo.addItem(name, name)
+                held = ", ".join(C.SET_PART_CAPTIONS[k]
+                                 for k in C.parts_in(entry["settings"]))
+                when = entry["saved"].replace("T", " ")
+                tip = (f"Saved {when} on {entry['by'] or 'an unknown PC'}.\n"
+                       f"Holds: {held or 'nothing'}.")
+                self._set_combo.setItemData(self._set_combo.count() - 1, tip,
+                                            Qt.ItemDataRole.ToolTipRole)
+            if not self._sets:
+                self._set_combo.addItem("(nothing saved yet)", None)
+            at = self._set_combo.findData(keep) if keep else -1
+            self._set_combo.setCurrentIndex(max(0, at))
+        finally:
+            self._set_combo.blockSignals(False)
+        self._set_picked()
+
+    def _set_picked(self, *_a):
+        self._disarm()
+        name = self._picked_set()
+        tip = (self._set_combo.itemData(self._set_combo.currentIndex(),
+                                        Qt.ItemDataRole.ToolTipRole)
+               if name else "")
+        self._set_combo.setToolTip(tip or "")
+        self._sync_set_buttons()
+
+    def _set_load_clicked(self):
+        name = self._picked_set()
+        parts = self._ticked_parts()
+        if name is None or not parts:
+            return
+
+        def then(sets):
+            entry = sets.get(name)
+            if entry is None:
+                return f"\"{name}\" is not on the list any more."
+            held = [p for p in parts if p in C.parts_in(entry["settings"])]
+            if not held:
+                return f"\"{name}\" holds none of the ticked parts."
+            self._win.apply_settings(entry["settings"], held)
+            return (f"Loaded \"{name}\": "
+                    + ", ".join(C.SET_PART_CAPTIONS[p] for p in held) + ".")
+
+        self._say(f"Loading \"{name}\"…")
+        self._sets_run(None, "", then=then, select=name)
+
+    def _set_save_clicked(self):
+        name = self._picked_set()
+        if name is None:
+            return
+        settings = C.settings_parts(self._win.settings_document(),
+                                    self._ticked_parts())
+        self._say(f"Saving \"{name}\"…")
+        self._sets_run(lambda sets: C.overwrite_set(sets, name, settings),
+                       f"Saved \"{name}\".", select=name)
+
+    def _set_new_clicked(self):
+        name = self._set_name.text().strip()
+        settings = C.settings_parts(self._win.settings_document(),
+                                    self._ticked_parts())
+        self._say(f"Saving \"{name}\"…")
+        self._sets_run(lambda sets: C.add_set(sets, name, settings),
+                       f"Saved \"{name}\".", select=name)
+
+    def _set_rename_clicked(self):
+        old = self._picked_set()
+        new = self._set_name.text().strip()
+        if old is None:
+            return
+        self._say(f"Renaming \"{old}\"…")
+        self._sets_run(lambda sets: C.rename_set(sets, old, new),
+                       f"\"{old}\" is now \"{new}\".", select=new)
+
+    def _set_delete_clicked(self):
+        name = self._picked_set()
+        if name is None:
+            return
+        if self._armed != name:
+            self._armed = name
+            self._set_delete.setText("Click again to delete")
+            self._arm_timer.start()
+            return
+        self._disarm()
+        self._say(f"Deleting \"{name}\"…")
+        self._sets_run(lambda sets: C.delete_set(sets, name),
+                       f"Deleted \"{name}\".")
+
+    def _disarm(self):
+        self._armed = None
+        self._arm_timer.stop()
+        if hasattr(self, "_set_delete"):
+            self._set_delete.setText("Delete")
+
+    def _sets_run(self, edit, done, then=None, select=None):
+        """Read the sets file on a thread, apply `edit` (sets → (new sets or
+        None, why not)) and write it back when there is something new. The
+        reply is a plain dict polled by `_sets_poll`; no Qt object crosses
+        threads. `then(sets)` runs on the GUI thread afterwards and returns
+        the sentence to show."""
+        if self._sets_reply is not None:
+            return
+        reply = {"done": False}
+        self._sets_reply = (reply, done, then, select)
+        share = self._sets_share
+
+        def work():
+            try:
+                folder = share.folder()
+                if folder is None:
+                    reply["error"] = ("The scratch share cannot be reached — "
+                                      "the saved settings are not available.")
+                    return
+                path = folder / C.SETS_NAME
+                try:
+                    raw = D.read_json(path)
+                except Exception as exc:
+                    reply["error"] = (f"{C.SETS_NAME} on the share could not "
+                                      f"be read ({exc}) — nothing was "
+                                      f"changed.")
+                    return
+                sets = C.clean_sets(raw) if raw is not None else {}
+                why = None
+                if edit is not None:
+                    new, why = edit(sets)
+                    if new is not None:
+                        D.write_json_atomic(path, C.sets_document(new))
+                        sets = new
+                    reply["changed"] = new is not None
+                reply["sets"] = sets
+                reply["why"] = why
+            except Exception as exc:
+                share.lost()
+                reply["error"] = f"The scratch share failed: {exc}"
+            finally:
+                reply["done"] = True
+
+        threading.Thread(target=work, daemon=True,
+                         name="settings-sets").start()
+        self._sync_set_buttons()
+        self._sets_timer.start()
+
+    def _sets_poll(self):
+        if self._sets_reply is None:
+            self._sets_timer.stop()
+            return
+        reply, done, then, select = self._sets_reply
+        if not reply.get("done"):
+            return
+        self._sets_timer.stop()
+        self._sets_reply = None
+        if "error" in reply:
+            self._say(reply["error"])
+            self._sync_set_buttons()
+            return
+        self._sets = reply["sets"]
+        changed = reply.get("changed", True)
+        self._fill_set_combo(select if changed else None)
+        if reply.get("why"):
+            text = reply["why"]
+        elif then is not None:
+            try:
+                text = then(self._sets)
+            except Exception as exc:
+                text = f"Could not load: {exc}"
+        else:
+            text = done
+            if changed and select is not None:
+                self._set_name.clear()
+        self._say(text or "")
+
     def _build_window_box(self):
         """What the Maximise button does. See `ls_core.WINDOW_MAX_DEFAULTS`."""
         box = QGroupBox("The window")
-        lay = QHBoxLayout(box)
+        # Two lines, not one: on one line the box was wider than a normal
+        # window and the page scrolled sideways (13.10.2026).
+        rows = QVBoxLayout(box)
+        rows.setSpacing(6)
+        lay = QHBoxLayout()
         lay.setSpacing(8)
+        rows.addLayout(lay)
 
         self._max_on = QCheckBox("Maximise to this size")
         self._max_on.setStyleSheet(U.chk_qss())
@@ -651,6 +978,10 @@ class FontTab(QWidget):
         self._max_h.setFixedWidth(_BOX_W)
         self._max_h.valueChanged.connect(self._max_typed)
         lay.addWidget(self._max_h)
+        lay.addStretch(1)
+        lay = QHBoxLayout()
+        lay.setSpacing(8)
+        rows.addLayout(lay)
 
         # Where. Counted from the top left corner of the screen's free area
         # (the screen minus the taskbar) — see `ls_core.WINDOW_MAX_DEFAULTS`.
@@ -1066,6 +1397,11 @@ class FontTab(QWidget):
         super().showEvent(ev)
         self._board.set_band_px(self._band_shape())
         self._board.update()
+        # The saved sets are looked up the first time the tab is opened, not
+        # at start: a PC off the share would wait for nothing.
+        if not self._sets_listed:
+            self._sets_listed = True
+            self._sets_run(None, "")
 
     def _board_changed(self):
         """A square was dragged. The board has already written the rectangles.

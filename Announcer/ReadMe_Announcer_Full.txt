@@ -2,6 +2,13 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
+Verified against source: 2026-10-15
+  (main.py 772 lines, ann_alarm.py 1166, ann_core.py 1150,
+   ann_ui.py 1115, ar_t.py 1006, vl_t.py 864, ann_screen.py 816,
+   ann_cpva.py 780, ann_watch.py 656, al_t.py 613, wa_t.py 519,
+   ann_presets.py 387, ann_sound.py 302,
+   ann_log.py 170; 10316 lines in all)
+  Program folder: 799 kB in 26 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe Announcer.txt  ("ReadMe" button)
 -----------------------------------------------------------------
@@ -164,8 +171,10 @@ Short version: ReadMe Announcer.txt  ("ReadMe" button)
 
     Name and the sentence you want to read when it fires
     Channel        type it, or press Find
-    Find           searches the archiver's own list of every channel
-                   it holds — nearly ten thousand names. Type a few
+    Find           searches every channel the archives hold — the CPVA
+                   archiver's list plus the L3 beam transport (L3BT)
+                   and facility (FCT) archives, about 21 000 names. A
+                   channel only those two have is read from them. Type a few
                    words from the name in any order; each word has to
                    appear somewhere, nothing has to be at the start
                    and nothing has to touch. "chl temp" finds
@@ -394,8 +403,12 @@ Short version: ReadMe Announcer.txt  ("ReadMe" button)
 
   A RED EXCLAMATION MARK, next to the circle, no background and no
   words: the readings have not been arriving for over five minutes.
-  The archiver is down, the network is gone, or the channel itself is
-  dead. It is the only thing said about that on screen; which channel
+  The archiver and its backup are both down, the network is gone, or
+  the channel itself is dead. (When only the archiver is down, the
+  readings come from its backup, the L3 proxy on 10.78.0.64 / .65,
+  which holds the same data, and nothing changes on screen; the log
+  line counts it as "backup=".) It is the only thing said about that
+  on screen; which channel
   and what the archiver answered is in the message log on the Watch
   tab. It goes away by itself the moment a reading comes back.
 

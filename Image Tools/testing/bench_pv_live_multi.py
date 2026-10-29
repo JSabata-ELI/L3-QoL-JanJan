@@ -142,8 +142,10 @@ def main():
         check("this shot's own value arrives without a SECOND shot", got,
               f"values={v._pv_values} src={pv_src_ts()} want={ts1} "
               f"awaiting={v._pv_awaiting}")
-        check("the numbers describe the frame on screen", pv_src_ts() == ts1,
-              f"src={pv_src_ts()} want={ts1}")
+        # 13.10.2026: in live mode the panel is a FEED (newest archived value, not
+        # matched to a frame — PV_LIVE_POLL_MS); the value check above is the test.
+        check("live feed: the shown value is the newest archived one",
+              v._pv_live_feed_on() and v._pv_values.get("PTM1", "").startswith("31"))
         check("and they are shown unflagged",
               v._pv_display_text("PTM1").strip() == "31.000 J",
               f"showed {v._pv_display_text('PTM1')!r}")
@@ -154,8 +156,6 @@ def main():
             lambda: v._pv_values.get("PTM1", "").startswith("32"), 15.0)
         check("the next shot updates too", got,
               f"values={v._pv_values} src={pv_src_ts()} want={ts2}")
-        check("still describing the frame on screen", pv_src_ts() == ts2,
-              f"src={pv_src_ts()} want={ts2}")
 
         # ── 3. A sample published BEFORE the app even sees the frame. Nothing may
         #       be left waiting on a value that is already there. ─────────────────
@@ -241,10 +241,10 @@ def main():
             published.append((t + 25_000_000, vv))
         published.sort()
         republish()
-        got = B.wait_for(lambda: pv_src_ts() == last_ts, 25.0)
-        check("the panel settles on the LAST frame's own value", got,
-              f"src={pv_src_ts()} want={last_ts} values={v._pv_values} "
-              f"awaiting={v._pv_awaiting}")
+        got = B.wait_for(lambda: v._pv_values.get("PTM1", "").startswith(
+            f"{last_val:.0f}"), 25.0)
+        check("the panel settles on the LAST shot's value (live feed)", got,
+              f"values={v._pv_values} awaiting={v._pv_awaiting}")
         check("that value is the last shot's", v._pv_values.get("PTM1", "").startswith(f"{last_val:.0f}"),
               f"values={v._pv_values} want {last_val}")
         check("and it is shown unflagged — no offset label",

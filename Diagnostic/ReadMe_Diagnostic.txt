@@ -76,6 +76,8 @@ DIFFERENT LIMITS FOR DIFFERENT OPERATION
                         could physically produce. Shown differently
                         from missing data, because it means the
                         sensor is wrong rather than absent.
+                        The limits are in Settings: one for
+                        pressures, one for everything else.
     not updating        the archive answers, but has no newer
                         reading to give — the number on screen is
                         hours old. This one is worth understanding —
@@ -184,6 +186,16 @@ THE WEBEX BOT
   OR ALARM LIMIT - so a chiller sitting a tenth of a degree outside
   its band overnight no longer means walking to the PC.
 
+  Everything about who gets told what can be run from the chat:
+  add, remove and rename values, edit their rules, mute one value
+  for a while (/snooze), say "I know" so the reminders stop (/ack),
+  mute one channel (/channels email off 4h), set regular quiet
+  hours (/quiet), change how often reminders come (/pacing), send a
+  test message (/test), and read back what was sent, what was held
+  back and who changed what (/history). /settings shows all of it
+  in one message, and /undo takes back any change made from the
+  chat, one step at a time.
+
   ONE THING NOBODY GUESSES: in a room with more than two people,
   Webex shows a bot only the messages that @mention it. A command
   typed without the tag never reaches the program at all — which from
@@ -200,8 +212,9 @@ THE WEBEX BOT
 
   for one command in full - examples, and what to watch out for.
   There is such a page for status, alarms, list, plot, time, change,
-  undo, graph, stop, enable, cancel, window, yaxis, datawatchdog,
-  run, food and mention.
+  undo, add, remove, rename, rule, snooze, ack, history, test,
+  channels, quiet, pacing, settings, graph, stop, enable, cancel,
+  window, yaxis, datawatchdog, run, food and mention.
 
   The list itself is deliberately one line per command - what it
   takes, and the one thing that catches people out. Everything
@@ -226,6 +239,26 @@ THE WEBEX BOT
   /change 6 15 is the form that always gets through. The program
   refuses a number that would cross another limit - which the window
   on the PC does not - and /undo puts the last change back.
+
+  ADDING A VALUE: /add with any part of its archive name. One match
+  is added at once; several come back numbered, and the answer is
+  the number. A new value is read and drawn straight away, but sends
+  nothing until it has limits (/change) and is switched on (/enable).
+  /remove asks first - answer "ano" - and /undo brings the value back
+  with its limits and rules.
+
+  KEEPING QUIET:
+      @Diagnostics /snooze DA1; 2h        nothing about DA1 for 2 h
+      @Diagnostics /ack                   I know - stop the reminders
+      @Diagnostics /channels email off 4h no alert e-mails for 4 h
+      @Diagnostics /quiet add email; mon-fri; 22:00-06:00; warnings
+  A snooze that runs out while the value is still bad sends one
+  alert then, so nothing hides behind it. An acknowledgement lasts
+  only while the state stays the same: getting worse, or recovering,
+  is announced as usual. The quiet rule above means weeknights
+  without warning e-mails, while an alarm still goes out; the same
+  rules are in Settings, under Notification channels, with a switch
+  that suspends them all. Replies to commands are never held back.
 
   A GRAPH OVER MONTHS is drawn as the average of each point on the
   picture with a shaded band from the lowest to the highest reading

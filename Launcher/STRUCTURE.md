@@ -1,6 +1,7 @@
 # Launcher — STRUCTURE
 
-> Verified against source: 2026-08-19 · `l.py` 1586 L
+> Verified against source: 2026-10-16 · `l.py` 2310 L (PySide6; the Tk version
+> was replaced the same day — backup in `C:\Dev\backup\launcher_tk_2026-10-16\`)
 
 User-facing documentation: `Readme Launcher.txt` (short, the Launcher's **ReadMe**
 button) and `ReadMe_Launcher_Full.txt` (detailed, the Launcher's **Details** button).
@@ -11,12 +12,15 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 
 | File | Description |
 |------|-------------|
-| `l.py` | Single file. The whole launcher (tkinter/ttk). |
-| `icon.ico` | Window / taskbar icon (see `set_app_icon`). |
+| `l.py` | Single file. The whole launcher (PySide6). |
+| `icon.ico` | Window / taskbar icon (`_icon_file`, `main`). |
 | `%APPDATA%\Launcher\config.json` | Persisted settings — not in the repo. |
 | `%APPDATA%\Launcher\old_version_run.log` | Output of the last archived-version run (`OLD_RUN_LOG`) — not in the repo. |
 | `testing/test_archive_versions.py` | What the version menu offers for each shape of `archive/` folder. |
 | `testing/test_old_version_launch.py` | Each route: an in-folder exe is started without moving anything, an archived exe is swapped in **with its sources**, a sources-only folder runs its own code, a one-file exe runs in place. |
+| `testing/test_inplace_updates.py` | The window changes in place (update flag, acknowledge, move to group, open/close a group), the version list is read on opening, no dialog after a scan, names fit their buttons. Runs on `minimal:enable_fonts` — nothing on screen. |
+| `testing/render_window.py <out> [source]` | Renders the window, all groups open and the group menu to PNGs, without putting anything on screen. |
+| `testing/test_cleanup_strays.py` | The Clean button's file moves and deletions. |
 
 ---
 
@@ -121,7 +125,8 @@ user move a program to another group (or reset it) and the choice is persisted.
    versioned `.py` files and would otherwise become a bogus entry.
 
 ### Update indicator
-- `_schedule_version_poll()` → `self.after(10000, ...)` — 10 s poll
+- `_schedule_version_poll()` → `self.after(10000, ...)` — 10 s poll (`after` is
+  the window's own thread-safe stand-in for Tk's, see UI below)
 - `_poll_versions()` / `_scan_program_versions()` — background rescan, all programs
   in parallel (`ThreadPoolExecutor`, 16), same dist folders as the first scan
   (`_dist_candidates`)
@@ -130,8 +135,8 @@ user move a program to another group (or reset it) and the choice is persisted.
   poll that started before another source was loaded (`gen != _scan_gen`) is
   dropped. Only buttons whose highlight flipped are restyled
   (`_set_update_style`); a card that gained its first older version is rebuilt
-  alone (`_replace_card`) so it gets a 🔽.
-- `_acknowledge_update(name)` — ✓ button or a successful launch; writes the config;
+  alone (`_replace_card`) so it gets its clock button.
+- `_acknowledge_update(name)` — right-click *Acknowledge update* or a successful launch; writes the config;
   restyles that one button
 - On startup `_apply_programs()` re-flags anything whose version no longer matches
   the acknowledged one
@@ -185,57 +190,67 @@ Routes, in order:
    console, so an import failure would otherwise be completely silent.
 
 If `_temp_latest` already exists routes 2 and 3 are refused (a previous swap did
-not finish); the broom button offers to restore it (every scan marks the button).
+not finish); the Clean button offers to restore it (every scan marks the button).
 
 ### Maintenance helpers
 | Function | Description |
 |----------|-------------|
-| `find_misplaced_timestamped_exes(programs)` | Timestamped exes left in a program folder → `(src, archive dst)` |
-| `prompt_move_misplaced(parent, list)` | Summary dialog, Move / Skip |
+| `find_misplaced_version_files(programs)` | Versioned files not where their version lives → `(src, dst)`; `dst=None` = identical twin, delete |
+| `apply_misplaced_cleanup(list)` | Does the moves / deletions; a different build of the same name is kept as ` (2)` |
+| `prompt_move_misplaced(parent, list)` | Summary dialog, Tidy up / Skip (`_ask`) |
 | `find_programs_in_swap_state(programs)` | Programs with a leftover `archive/_temp_latest/` |
 | `prompt_restore_swap_state(parent, stuck)` | Offers to move the latest files back |
-| `_run_cleanup()` | 🧹 Clean button — runs both checks, opens the dialogs, then re-marks the button with what is left |
-| `_mark_clean_button(count)` | `🧹 Clean (n)` in `Alert.TButton` (amber; the vista theme draws it as an orange frame), or plain |
+| `_run_cleanup()` | Clean button — runs both checks, opens the dialogs, then re-marks the button with what is left |
+| `_mark_clean_button(count)` | `Clean (n)` with the `alert` property (orange, dark text), or plain `Clean` |
 
 Both checks run in the scan's worker thread (`refresh` → `_apply_programs(..., tidy)`)
-and **never open a dialog by themselves** — a modal with `grab_set()` after every
-scan took the keyboard from whatever the user was typing into. The result only
-marks the Clean button and is named in the status line (which wraps instead of
-being cut). A failed scan is reported in the status line, not a message box.
+and **never open a dialog by themselves** — a modal after every scan took the
+keyboard from whatever the user was typing into. The result only marks the
+Clean button and is named in the status line (which wraps instead of being
+cut). A failed scan is reported in the status line, not a message box.
 
-### UI (tkinter)
-- `Launcher(tk.Tk)` — main window; source radio buttons, 📋 Notes, ⚙ Set paths,
-  🧹 Clean, scrollable body, status bar
-- `ScrollableFrame(ttk.Frame)` — canvas-based scroll area used for the card grid
-- Collapsible group sections (`_rebuild_buttons`, `_build_group_content`,
-  `_toggle_group`); always `GROUP_COLS` = 2 columns
-- **Only a new scan rebuilds the window** (`_rebuild_buttons`). Everything else
-  changes the widgets in place:
-  - a header + grid exist for every group in `GROUP_ORDER`; `_pack_groups()`
-    shows the non-empty ones in order, `_update_group_header()` sets arrow + count
-  - cards: `_build_card()` makes one (unplaced), `_regrid(gkey)` places a group's
-    cards in name order; `_prog_cells` / `_prog_buttons` map name → card / button
+### UI (PySide6)
+- `Launcher(QMainWindow)` — source radio buttons in a *Data source* group box,
+  Notes / Set paths / Clean, a `QScrollArea` body (`_inner`, `_body`), a
+  wrapping status label. `main()` sets the app id, `apply_app_style(app)`
+  (Fusion + `light_palette()` + `APP_STYLESHEET`, every colour stated — this PC
+  runs Windows in dark mode), the window icon on the app and the window, and
+  `_nudge_taskbar_icon`.
+- **Threads.** Workers never touch a widget. `after(ms, fn, *args)` emits to
+  `_Invoker`, a queued signal that runs `QTimer.singleShot(ms, fn)` on the
+  window's thread — the copied launch / scan / poll code calls it exactly as it
+  called Tk's `after`. `_set_status(text)` replaces `status.configure(text=…)`.
+- `messagebox` — a two-method shim (`showerror`, `showinfo`) over `QMessageBox`,
+  kept under the tkinter name so the launch code and its test stub still match.
+- **Only a new scan rebuilds the window** (`_rebuild_buttons` → `_clear_body`).
+  Everything else changes the widgets in place:
+  - a header (`QToolButton#groupHeader`) + a grid widget exist for every group
+    in `GROUP_ORDER`; `_show_groups()` shows the non-empty ones and the open
+    grids, `_update_group_header()` sets the drawn triangle + count
+  - cards: `_build_card()` makes one, `_regrid(gkey)` places a group's cards in
+    name order, two to a row; `_prog_cells` / `_prog_buttons` map name → card /
+    button; `_group_built` says which groups have their cards
   - move to group: `_drop_card` + `_regrid(old)`, `_add_card` + `_regrid(new)`
     (a never-opened group builds its cards lazily when opened)
-  - button width follows the longest name in the open groups;
-    `_apply_btn_width()` re-sizes existing buttons instead of rebuilding
-  - 🔽 menu is filled by `postcommand` (`_fill_version_menu`) when it opens
-  - no `<Configure>` binding on the root (it fires for every child widget)
-- Mouse wheel: `ScrollableFrame._on_mousewheel` scrolls only for events from the
-  main window; `_guard_wheel_on_value_widgets()` prefixes the class bindings of
-  `TCombobox`/`TSpinbox`/`Spinbox`/`Scale`/`TScale` with
-  `if {[focus] ne "%W"} continue`, so a value changes only in the focused field
-  and over any other field the list scrolls
-- ⚙ Set paths: the hint for each path is in the dialog itself (no separate info
-  box); a chosen folder is selected and loaded straight away
-- Tests: `testing/test_inplace_updates.py` (hidden via `testing/hidden_tk.py`);
-  `testing/bench_render.py <out.png>` renders the window without taking focus
-- Card = program button (name + version, amber + ↑ when an update is pending),
-  ReadMe, Details, ✓ acknowledge, 📂 folder, 🔽 archived-version dropdown,
-  right-click group menu
-- Office sources are disabled on lab machines (`_rebuild_radiobuttons`)
-- `set_app_icon(win, ico_path, app_id)` — icon + AppUserModelID so the taskbar
-  shows the program icon instead of the Python feather
+  - update flag: the `update` dynamic property + `_repolish()`
+  - the version menu is filled on `aboutToShow` (`_fill_version_menu`)
+- **Widths.** `_calc_prog_btn_px()` = the longest label in the OPEN groups,
+  measured with `_ui_font(9)` (a stylesheet font never reaches `font()`), plus
+  icon and padding — names are never cut. `_apply_btn_width()` resizes in place.
+  `_doc_btn_px()` is the minimum of both small-button columns, so a card without
+  Details or without older versions keeps the same size. `_fit_width()` sets the
+  window's minimum width from the body's `minimumSizeHint` + scroll bar + margins
+  and widens the window once if needed; never narrows it. No horizontal scroll
+  bar.
+- **Drawn icons.** `drawn_icon(name)` paints notes, gear, broom, folder, history
+  (clock), open/closed triangles and tick with QPainter on a 20 × 20 grid, at
+  six sizes and in every QIcon mode — no emoji or symbol glyphs.
+- Right-click on a program button: `_show_group_menu` — *Acknowledge update*
+  (only while orange), *Move to group* (current one ticked), *Reset to default*.
+- Set paths: the hint for each path is in the dialog itself; a chosen folder is
+  selected and loaded straight away (`QFileDialog.getExistingDirectory`).
+- Office sources are disabled on lab machines (`_root_enabled`,
+  `_rebuild_radiobuttons`). No value widgets, so no wheel guard is needed.
 
 
 ---
@@ -255,37 +270,16 @@ file's stem *and* full name, so the extension is irrelevant. `.txt` is used
 throughout so `os.startfile` always has a handler; `STRUCTURE.md` stays `.md`
 because it is for developers reading the repo, not for the Launcher.
 
-Row 0 of the card's sub-frame holds the doc buttons: **ReadMe** spans both columns
-when there is no Details file, otherwise the two share the row. A program with a
-Details file but no ReadMe (should not happen) shows Details spanning both.
+Row 0 of the card's small-button grid holds the doc buttons: **ReadMe** spans both
+columns when there is no Details file, otherwise the two share the row. A program
+with a Details file but no ReadMe (should not happen) shows Details spanning both.
+Row 1 holds the folder button and, when there are older versions, the clock.
+Both columns have `_doc_btn_px()` as their minimum and both rows 24 px, so every
+card has the same size whatever buttons it has.
 `open_readme()` / `open_readme_full()` both `os.startfile` and report a missing
 file in a message box rather than failing silently.
 
-### Making two buttons fit — measured, not guessed
-
-Adding Details as a second text button took a card from **250 px to 336 px**, and
-`_group_min_cell_px = 260` with `max(2, …)` then laid three of them into ~860 px of
-canvas: the third card was clipped at the window edge and a horizontal scrollbar
-appeared. Measured on this machine (vista theme, Segoe UI):
-
-| | |
-|---|---|
-| program button at `width=18` | 160 px, while `"Internal Builder"` needs only 132 px — **28 px of slack** |
-| a doc button with no explicit `width` | 69–80 px, and that is the **theme minimum**: `"ReadMe"` is 42 px of text, `"Details"` 35 px |
-
-So the width was never spent on the labels. Three changes, and the card ends at
-**268 px** — 18 px more than the original single-button card:
-
-| Change | Why |
-|--------|-----|
-| `_prog_btn_chars()` sizes the program button to the **longest label actually shown** (clamped 10…22, matching `clamp_label`), one width for every group so the cards still line up | reclaims the slack; verified no label clips — the widest needs 80 px in 108 px of inner space |
-| the doc buttons get `width=7` and their own `Doc.TButton` style with padding `(3, 2)` | an explicit width is the **only** way under the theme minimum. 56 px each, holding 42 px and 35 px of text. The font stays at 8 — legibility first |
-| `_calc_group_cols()` uses `_measured_cell_px` (the first card's real `winfo_reqwidth() + 12`) and allows **one** column | a hard-coded estimate goes stale the moment a card gains a button, and forcing two columns drew a card into space that did not exist |
-
-`_build_group_content` measures the first cell it builds, and re-flows once (guarded
-by `_cell_remeasure_done`, cleared in `_rebuild_buttons`) if the column count that
-measurement implies differs from the one already used — so a card that changes shape
-re-flows the grid by itself instead of silently overflowing.
-
-Verified by driving the real window: 2 columns at 700 px, 3 at 918 px, 4 at 1200 px,
-content within the canvas every time.
+The Tk version's card-width history (theme minimums, a measured cell width that
+bounced between two values and rebuilt the window forever) does not apply any
+more: Qt's layouts give each card its real minimum size, the column count is a
+constant, and `_fit_width()` only sets the window's minimum width.

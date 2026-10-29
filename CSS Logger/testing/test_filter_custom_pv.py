@@ -38,6 +38,7 @@ except Exception:
 
 app = QApplication.instance() or QApplication(sys.argv)
 sp_t.SpectraWidget._save_shot_filter = lambda self: None     # keep the user's file
+sp_t._cpva_load_all_channels = lambda: []                    # no archiver asked
 
 failures = []
 

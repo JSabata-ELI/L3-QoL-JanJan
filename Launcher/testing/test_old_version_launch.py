@@ -43,6 +43,9 @@ class _FakeApp:
     """Just enough of the launcher window for _launch_exe."""
     status = type("S", (), {"configure": lambda self, *a, **k: None})()
 
+    def _set_status(self, text):
+        pass
+
     def after(self, delay, fn, *args):
         if getattr(fn, "__name__", "") in ("showerror", "showinfo"):
             shown.append(args)

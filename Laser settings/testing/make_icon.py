@@ -17,11 +17,12 @@ Three things make it sharp rather than soft, and all three are needed:
   * the rim is 6 % of the frame and the drawing is scaled so its farthest ink
     sits at `FIT` of the inner radius, so the white gap between the drawing and
     the rim is the same at every size;
-  * below `SMALL_BELOW` the drawing is SIMPLER, not smaller. Five halls at
-    24 px merge into one grey band; one lit hall with a tick still says "this
-    hall is set right", which is what the program is about. The taskbar and the
-    title bar are both under that line, so the simple one is the one that is
-    actually seen.
+  * the drawing is ONE lit hall with a white tick, at every size. Until
+    14.10.2026 the frames from 64 px up drew five halls with the beam dropping
+    into the middle one, and only the small frames had the single square. The
+    taskbar and the title bar show the small frames, so the single square is
+    the icon everybody knows — and the big five-hall drawing on the title slide
+    of the guide read as "the wrong icon". One drawing everywhere since.
 """
 
 from __future__ import annotations
@@ -52,17 +53,10 @@ GREEN_EDGE = "#1d6b29"
 
 RIM_FRAC = 0.06             # the rim's width, as a fraction of the frame
 
-# The farthest ink, as a fraction of the inner radius. Two numbers, because the
-# two drawings put their ink in different places: the wide one's farthest ink is
-# the bottom corners of the end halls, with the top corners of its box empty, so
-# it can be pushed out further. The simple one IS a square and its four corners
-# are all ink, so it needs the lower value to keep a white ring showing at 16 px.
-FIT_FULL = 0.95
+# The farthest ink, as a fraction of the inner radius. The square's four corners
+# are all ink, so this keeps a white ring showing between them and the rim at
+# 16 px.
 FIT_SMALL = 0.86
-
-# Below this the five halls cannot be told apart. Measured by blowing every
-# frame up: at 24 px each hall would be three pixels wide.
-SMALL_BELOW = 64
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,62 +94,10 @@ def _fit(inner, unit_w, unit_h, fit):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The two drawings
+# The drawing
 # ─────────────────────────────────────────────────────────────────────────────
-# The full picture, in its own units: the beam along the top, an arrow dropping
-# into the middle hall, and the five halls in a row underneath.
-_CELL, _GAP = 1.0, 0.26
-_ROW_W = 5 * _CELL + 4 * _GAP           # 6.04
-_HALL_Y = 2.30                          # the top of the row of halls
-_FULL_W, _FULL_H = _ROW_W, _HALL_Y + _CELL
-
-
-def _draw_full(p, px, inner):
-    """Five halls, the middle one lit, with the beam coming down into it."""
-    s = _fit(inner, _FULL_W, _FULL_H, FIT_FULL)
-    x0 = px / 2.0 - _FULL_W * s / 2.0
-    y0 = px / 2.0 - _FULL_H * s / 2.0
-
-    def ux(u):
-        return x0 + u * s
-
-    def uy(u):
-        return y0 + u * s
-
-    mid = _ROW_W / 2.0                  # 3.02 — the middle hall's centre line
-
-    # The beam along the top, and the arrow dropping out of it.
-    beam = QPen(QColor(INK))
-    # In `OVER` units: this is drawn at `OVER` times the frame.
-    beam.setWidthF(max(OVER * 1.2, 0.22 * s))
-    beam.setCapStyle(Qt.PenCapStyle.RoundCap)
-    p.setPen(beam)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    p.drawLine(QPointF(ux(0.30), uy(0.13)), QPointF(ux(_ROW_W - 0.30),
-                                                    uy(0.13)))
-    p.drawLine(QPointF(ux(mid), uy(0.13)), QPointF(ux(mid), uy(1.46)))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(INK))
-    p.drawPolygon(QPolygonF([QPointF(ux(mid), uy(2.10)),
-                             QPointF(ux(mid - 0.42), uy(1.40)),
-                             QPointF(ux(mid + 0.42), uy(1.40))]))
-
-    # The five halls. The middle one is lit, and only it carries a tick.
-    for i in range(5):
-        lit = (i == 2)
-        left = i * (_CELL + _GAP)
-        rect = QRectF(ux(left), uy(_HALL_Y), _CELL * s, _CELL * s)
-        pen = QPen(QColor(GREEN_EDGE if lit else INK))
-        pen.setWidthF(max(OVER * 1.0, (0.17 if lit else 0.15) * s))
-        p.setPen(pen)
-        p.setBrush(QColor(GREEN) if lit else QColor(DISC))
-        p.drawRoundedRect(rect, 0.18 * s, 0.18 * s)
-        if lit:
-            _tick(p, rect, DISC, max(OVER * 1.2, 0.20 * s))
-
-
 def _draw_small(p, px, inner):
-    """One lit hall with a tick: the same idea with the detail taken out."""
+    """One lit hall with a white tick — the hall is set right."""
     s = _fit(inner, 1.0, 1.0, FIT_SMALL)
     side = 1.0 * s
     rect = QRectF(px / 2.0 - side / 2.0, px / 2.0 - side / 2.0, side, side)
@@ -203,10 +145,7 @@ def draw(px):
     try:
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         inner = _disc(p, big)
-        if px < SMALL_BELOW:
-            _draw_small(p, big, inner)
-        else:
-            _draw_full(p, big, inner)
+        _draw_small(p, big, inner)
     finally:
         p.end()
     return _down(img, px)

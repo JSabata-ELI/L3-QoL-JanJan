@@ -1,4 +1,4 @@
-"""The broom button tidies up version files that sit in the wrong place.
+"""The Clean button tidies up version files that sit in the wrong place.
 
 Run from the Launcher folder:  python testing/test_cleanup_strays.py
 

@@ -43,9 +43,9 @@ THINGS TO KNOW BEFORE YOU USE IT
     still names folders that no longer exist and it does not know
     about the newer programs at all, so those simply do not get
     updated. Nothing breaks — missing folders are skipped.
-  - Dev Tools does the same job better: its Copy Manager tab has
-    "Build internal" and "Deploy internal", which always work from
-    the current list of programs. Use those unless you have a
+  - Dev Tools does the same job better: its Builder tab builds
+    "Internal Builder" and its Copy Manager tab has "Deploy
+    Libraries", which always work from the current list of programs. Use those unless you have a
     reason not to. This script is the manual fallback.
   - The computer you run it from must be able to reach Z:.
 

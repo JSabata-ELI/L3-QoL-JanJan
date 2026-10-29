@@ -13,8 +13,8 @@ Pinned here:
   * a row is a CAMERA and a column is a DAY
   * up to four columns tile the pane edge to edge — no empty quarter for three
   * more than four ask for a wider widget, which is what raises the sideways bar
-  * the row banner names the CAMERA and spans the WHOLE width, not just the
-    visible part
+  * the row is named by its CAMERA, on a plate in the caption strip no wider
+    than one column
   * the row height still fits about three rows, so the vertical bar steps cameras
   * the layout is measured against the PANE, never against the widget's own size
     (which is bigger on purpose once it scrolls — measuring itself would grow it
@@ -150,16 +150,18 @@ def main() -> int:
     check("which is what raises the sideways bar",
           wall.minimumWidth() > PANE_W, f"{wall.minimumWidth()} vs {PANE_W}")
 
-    print("\n=== the camera banner spans the whole width ===")
+    print("\n=== the camera name sits in the caption strip ===")
+    # No band over the row any more (27.10.2026): the name is a plate at the left
+    # end of the row's caption strip — see test_wall_row_name_in_caption.py.
     heads = wall._row_heads
-    check("one banner per camera", len(heads) == 4, f"{len(heads)} banner(s)")
-    check("each spans every column, not just the visible part",
-          all(r.width() >= wall.minimumWidth() for r, _t in heads),
+    check("one name per camera", len(heads) == 4, f"{len(heads)} name(s)")
+    check("each no wider than one column",
+          all(r.width() <= wall.row_col_width() for r, _t in heads),
           repr([r.width() for r, _t in heads]))
-    check("the banner names the camera", heads[0][1].startswith("CAM00"),
+    check("the name is the camera's", heads[0][1].startswith("CAM00"),
           repr(heads[0][1]))
-    check("and says how many days its line reaches across",
-          "12 days" in heads[0][1], repr(heads[0][1]))
+    check("without the day count (each caption names its day)",
+          "days" not in heads[0][1], repr(heads[0][1]))
 
     print("\n=== the rows step cameras ===")
     check("about three rows fit the pane",

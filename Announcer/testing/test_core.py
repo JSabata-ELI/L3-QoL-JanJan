@@ -276,7 +276,7 @@ def test_channel_search_is_a_filter_not_an_error():
     got, total = C.search_channels(names, "chl temp")
     assert total == 3 and len(got) == 3
     assert got[0] == "L3-UTIL-CHL03-001:Temp", \
-        "the shortest in-order match comes first"
+        "the best, shortest match comes first"
     # Words may be anywhere and need not touch.
     assert C.search_channels(names, "energy")[1] == 2
     # A word that fits nothing gives nothing — not everything.
@@ -286,12 +286,14 @@ def test_channel_search_is_a_filter_not_an_error():
     assert C.search_channels(names, "   ") == ([], 0)
 
 
-def test_channel_search_honours_the_order_typed():
-    names = ["A:TempSetpoint", "A:SetpointTemp"]
-    got, _ = C.search_channels(names, "set temp")
-    assert got[0] == "A:SetpointTemp"
-    got, _ = C.search_channels(names, "temp set")
-    assert got[0] == "A:TempSetpoint"
+def test_channel_search_ignores_the_order_typed():
+    names = ["A:TempSetpoint", "A:SetpointTemp", "L3-UTIL-CHL03-001:Temp"]
+    assert C.search_channels(names, "set temp") \
+        == C.search_channels(names, "temp set") \
+        == C.search_channels(names, "temp,set")
+    assert C.search_channels(names, "chl temp") \
+        == C.search_channels(names, "temp chl") \
+        == (["L3-UTIL-CHL03-001:Temp"], 1)
 
 
 def test_channel_search_says_how_many_it_is_showing():

@@ -21,9 +21,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 from PIL import Image, PngImagePlugin  # noqa: E402
-import s  # noqa: E402
+import ssq_core as s  # noqa: E402
 
-PW = s.PreviewWindow
+PW = s.Tone   # the preview's rendering, without the window
 FAILED = []
 IS_T = Path(__file__).resolve().parents[2] / "Image Tools" / "is_t.py"
 

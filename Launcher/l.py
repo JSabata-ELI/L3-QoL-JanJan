@@ -1,4 +1,10 @@
 # l.py
+"""The Launcher (PySide6): one window that starts every program in the collection.
+
+It scans a folder of programs, sorts them into groups and shows one card per
+program: start, ReadMe, Details, its folder and its older versions. A newer
+version on disk turns the card orange until it is started or acknowledged.
+"""
 import os
 import re
 import shutil
@@ -7,10 +13,19 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
-from PIL import Image, ImageTk
+
+from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPalette, QPen,
+    QPixmap, QPolygonF,
+)
+from PySide6.QtWidgets import (
+    QApplication, QButtonGroup, QDialog, QFileDialog, QFrame, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QRadioButton, QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+)
+from shiboken6 import isValid
 
 # ---------------- CONFIG ----------------
 def _onedrive_root() -> Path:
@@ -144,15 +159,9 @@ def _apply_config_to_root_options(cfg: dict) -> list:
 IGNORE_DIR_NAMES = {"archive", "dist"}  # program\archive is ignored
 
 # Two cards to a row, always: never one, never three. The window is kept wide
-# enough for two of the widest cards instead (see _fit_two_columns).
+# enough for two of the widest cards instead (see _fit_width).
 GROUP_COLS = 2
 MIN_WINDOW_H = 430
-# The cards get less than the canvas is wide: the grid is packed with padx=8
-# inside a frame packed with padx=6, on both sides. Measuring this live reads
-# the previous size while a resize is still on its way and then the second
-# column lands past the right edge, so it is taken from the two pack() calls in
-# _rebuild_buttons_inner — change it there and change it here.
-GRID_PAD_PX = 2 * (8 + 6)
 
 NOTES_LAB    = Path(r"\\hapls-share.lcs.local\scratch\Software\notes.txt")
 NOTES_OFFICE = Path(r"\\hapls-share.cs.eli-beams.eu\scratch\Software\notes.txt")
@@ -653,73 +662,6 @@ def _launch_no_zone_check(path: Path) -> bool:
     return bool(ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)))
 
 
-# ---------------- UI HELPERS ----------------
-class ScrollableFrame(ttk.Frame):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.canvas = tk.Canvas(self, highlightthickness=0)
-        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.inner = ttk.Frame(self.canvas)
-
-        self.window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.vsb.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.vsb.pack(side="right", fill="y")
-
-        self.inner.bind("<Configure>", self._on_inner_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-
-        # mouse wheel only when needed (we also guard in handler)
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _on_inner_configure(self, event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self._update_scroll_enabled()
-
-    def _on_canvas_configure(self, event):
-        # Šířku inner okna nastavujeme jen pokud je obsah užší než canvas
-        bbox = self.canvas.bbox("all")
-        content_w = (bbox[2] - bbox[0]) if bbox else 0
-        if content_w < event.width:
-            self.canvas.itemconfigure(self.window, width=event.width)
-        self._update_scroll_enabled()
-
-    def _content_overflows(self) -> bool:
-        bbox = self.canvas.bbox("all")
-        if not bbox:
-            return False
-        content_h = bbox[3] - bbox[1]
-        canvas_h = self.canvas.winfo_height()
-        return content_h > canvas_h + 2
-
-    def _update_scroll_enabled(self):
-        overflow = self._content_overflows()
-
-        # hide/show scrollbar
-        if overflow:
-            if not self.vsb.winfo_ismapped():
-                self.vsb.pack(side="right", fill="y")
-        else:
-            if self.vsb.winfo_ismapped():
-                self.vsb.pack_forget()
-
-        # if no overflow, force top
-        if not overflow:
-            self.canvas.yview_moveto(0)
-
-    def _on_mousewheel(self, event):
-        # bind_all hears the wheel over every window of the program; only the
-        # main window's list may scroll — not from inside a dialog on top of it.
-        try:
-            if event.widget.winfo_toplevel() is not self.winfo_toplevel():
-                return
-        except Exception:
-            return      # a menu or a widget already gone
-        if not self._content_overflows():
-            return  # LOCK scroll when everything fits
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
 # A stray in archive\ carries a version but no timestamp — the loose twin of a
 # file that belongs inside archive\vX.Y.Z\. Timestamped names are left alone:
 # those are the old flat archive, which the launcher still lists as versions.
@@ -795,59 +737,6 @@ def apply_misplaced_cleanup(misplaced: list[tuple[Path, Path | None]]) -> list[s
     return errors
 
 
-def prompt_move_misplaced(parent: tk.Tk, misplaced: list[tuple[Path, Path | None]]):
-    """Zobrazí souhrnnou hlášku a nabídne přesun."""
-    rows = []
-    for src, dst in misplaced:
-        where = src.parent.name
-        if dst is None:
-            rows.append(f"  {where}\\{src.name}\n"
-                        f"      the same file is already filed away — delete this copy")
-        else:
-            rows.append(f"  {where}\\{src.name}\n"
-                        f"      move to  {dst.parent.name}\\")
-    msg = (
-        "The following versioned files are not where their version lives:\n\n"
-        + "\n".join(rows)
-        + "\n\nTidy them up?"
-    )
-
-    confirmed = tk.BooleanVar(value=False)
-
-    dlg = tk.Toplevel(parent)
-    dlg.title("Misplaced files found")
-    dlg.resizable(False, False)
-    dlg.grab_set()
-    dlg.focus_set()
-
-    ttk.Label(dlg, text=msg, justify="left", padding=(16, 12)).pack()
-
-    btn_row = ttk.Frame(dlg)
-    btn_row.pack(pady=(0, 12))
-
-    def on_yes():
-        confirmed.set(True)
-        dlg.destroy()
-
-    def on_no():
-        dlg.destroy()
-
-    ttk.Button(btn_row, text="Tidy up", width=10, command=on_yes).pack(side="left", padx=8)
-    ttk.Button(btn_row, text="Skip", width=10, command=on_no).pack(side="left", padx=8)
-
-    parent.wait_window(dlg)
-
-    if not confirmed.get():
-        return
-
-    errors = apply_misplaced_cleanup(misplaced)
-    if errors:
-        messagebox.showerror(
-            "Cleanup failed",
-            "Some files could not be tidied up:\n\n" + "\n".join(errors),
-            parent=parent,
-        )
-
 
 def find_programs_in_swap_state(programs: dict[str, dict]) -> list[tuple[str, Path, Path]]:
     """Return (program_name, program_dir, temp_dir) for programs stuck mid old-version swap."""
@@ -861,62 +750,6 @@ def find_programs_in_swap_state(programs: dict[str, dict]) -> list[tuple[str, Pa
             stuck.append((name, program_dir, temp_dir))
     return stuck
 
-
-def prompt_restore_swap_state(parent: tk.Tk, stuck: list[tuple[str, Path, Path]]):
-    """Dialog that offers to restore programs stuck in an incomplete old-version launch."""
-    lines = "\n".join(f"  {name}" for name, _, _ in stuck)
-    msg = (
-        f"The following programs have an incomplete old-version launch.\n"
-        f"Their latest files are stored in a temporary folder:\n\n"
-        f"{lines}\n\n"
-        f"Restore the latest versions now?"
-    )
-
-    confirmed = tk.BooleanVar(value=False)
-
-    dlg = tk.Toplevel(parent)
-    dlg.title("Incomplete old-version launch detected")
-    dlg.resizable(False, False)
-    dlg.grab_set()
-    dlg.focus_set()
-
-    ttk.Label(dlg, text=msg, justify="left", padding=(16, 12)).pack()
-
-    btn_row = ttk.Frame(dlg)
-    btn_row.pack(pady=(0, 12))
-
-    def on_yes():
-        confirmed.set(True)
-        dlg.destroy()
-
-    def on_no():
-        dlg.destroy()
-
-    ttk.Button(btn_row, text="Restore", width=10, command=on_yes).pack(side="left", padx=8)
-    ttk.Button(btn_row, text="Skip", width=10, command=on_no).pack(side="left", padx=8)
-
-    parent.wait_window(dlg)
-
-    if not confirmed.get():
-        return
-
-    errors = []
-    for name, program_dir, temp_dir in stuck:
-        try:
-            for f in list(temp_dir.iterdir()):
-                shutil.move(str(f), str(program_dir / f.name))
-            try:
-                temp_dir.rmdir()
-            except Exception:
-                pass
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-    if errors:
-        messagebox.showerror(
-            "Restore failed",
-            "Some programs could not be restored:\n\n" + "\n".join(errors),
-            parent=parent,
-        )
 
 # ---------------- APP ----------------
 def _icon_app_id(prefix, ico_path):
@@ -950,44 +783,417 @@ def _icon_app_id(prefix, ico_path):
     return f"{prefix}.{uuid.uuid4().hex[:12]}"
 
 
-def set_app_icon(win, ico_path, app_id=None):
-    """Apply icon.ico to the title bar AND the Windows taskbar button.
+def _nudge_taskbar_icon(hwnd) -> None:
+    """Make the taskbar re-read this window's icon a few times after start.
 
-    tkinter's iconbitmap only sets the title bar icon; the Windows 11 taskbar
-    reads the small icon slots + window-class icon, which Tk leaves as its
-    default feather. We force every slot from icon.ico via Win32.
+    Explorer reads a taskbar button's picture once, when it creates the
+    button, and does not ask again by itself. When that one read misses, the
+    button keeps the blank window placeholder for the whole run although the
+    window holds the right icon -- measured on Diagnostic v1.3.4, 15.10.2026:
+    started from C:, a fresh per-launch id, WM_GETICON answering with the
+    magnifier, the button blank. Re-sending the same icon changed nothing;
+    taking the icon away and giving it back made Explorer re-read it, and the
+    same running window drew the magnifier at once. So that is done here a few
+    times while the button may still be appearing (a slow start, a busy
+    Explorer after logon). Runs on a daemon thread; the window's own icon
+    handles are put back, so nothing is created or leaked.
     """
-    import ctypes
-    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
-    if _aumid:
+    if not hwnd:
+        return
+    import threading
+
+    def run():
+        import ctypes
+        import ctypes.wintypes as wt
+        import time
+        user32 = ctypes.windll.user32
+        send = user32.SendMessageTimeoutW
+        send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT,
+                         wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send.restype = ctypes.c_size_t
+        res = ctypes.c_size_t()
+        for delay in (2, 8, 20, 30):          # at about 2, 10, 30 and 60 s
+            time.sleep(delay)
+            try:
+                if not user32.IsWindow(wt.HWND(hwnd)):
+                    return
+                held = {}
+                for which in (1, 0):          # ICON_BIG, ICON_SMALL
+                    res.value = 0
+                    # SMTO_ABORTIFHUNG: a frozen window just skips this round
+                    if send(hwnd, 0x007F, which, 0, 0x0002, 2000,
+                            ctypes.byref(res)) and res.value:
+                        held[which] = res.value
+                for which in held:
+                    send(hwnd, 0x0080, which, 0, 0x0002, 2000, ctypes.byref(res))
+                for which, h in held.items():
+                    send(hwnd, 0x0080, which, h, 0x0002, 2000, ctypes.byref(res))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="taskbar-icon").start()
+
+
+# ---------------- QT LOOK ----------------
+APP_ID_PREFIX = "ELI.Launcher"
+UI_FONT = "Segoe UI"
+INK = "#111111"
+AMBER = "#ffa500"
+
+# Every colour stated: Windows here runs in dark mode, and anything left to the
+# theme comes out black on black. Each rule that sets `color:` has its disabled
+# twin, because the plain rule paints the disabled state too.
+APP_STYLESHEET = f"""
+QWidget {{ background: #f3f3f3; color: {INK}; font-family: "{UI_FONT}"; font-size: 9pt; }}
+QLabel {{ background: transparent; }}
+QLabel#hint {{ color: #404040; }}
+QGroupBox {{ border: 1px solid #c4c4c4; border-radius: 4px; margin-top: 14px;
+             padding-top: 6px; background: #f3f3f3; font-weight: bold; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 8px; padding: 0 4px; color: {INK}; }}
+QRadioButton {{ background: transparent; font-weight: normal; }}
+QRadioButton:disabled {{ color: #9a9a9a; }}
+QRadioButton::indicator {{ width: 12px; height: 12px; border: 1px solid #555555;
+                           border-radius: 7px; background: #ffffff; }}
+QRadioButton::indicator:hover {{ border-color: #2f6fb5; }}
+QRadioButton::indicator:checked {{ background: qradialgradient(cx:0.5, cy:0.5,
+    radius:0.5, fx:0.5, fy:0.5, stop:0 {INK}, stop:0.5 {INK}, stop:0.62 #ffffff,
+    stop:1 #ffffff); }}
+QRadioButton::indicator:disabled {{ background: #eeeeee; border-color: #b0b0b0; }}
+QPushButton {{ background: #e8e8e8; color: {INK}; border: 1px solid #a8a8a8;
+               border-radius: 3px; padding: 4px 10px; font-weight: normal; }}
+QPushButton:hover {{ background: #d9e8ff; }}
+QPushButton:pressed {{ background: #c4d8f5; }}
+QPushButton:disabled {{ background: #eeeeee; color: #9a9a9a; border-color: #cccccc; }}
+QPushButton[alert="true"] {{ background: {AMBER}; color: {INK}; border-color: #c77d00; }}
+QPushButton[alert="true"]:hover {{ background: #ffb733; }}
+QPushButton[alert="true"]:pressed {{ background: #e09000; }}
+QPushButton#prog {{ text-align: left; padding: 4px 8px; }}
+QPushButton#prog[update="true"] {{ background: {AMBER}; color: {INK}; border-color: #c77d00; }}
+QPushButton#prog[update="true"]:hover {{ background: #ffb733; }}
+QPushButton#prog[update="true"]:pressed {{ background: #e09000; }}
+QPushButton#doc {{ padding: 2px 3px; font-size: 8pt; }}
+QToolButton#small {{ background: #e8e8e8; color: {INK}; border: 1px solid #a8a8a8;
+                     border-radius: 3px; padding: 2px; }}
+QToolButton#small:hover {{ background: #d9e8ff; }}
+QToolButton#small:pressed {{ background: #c4d8f5; }}
+QToolButton#small::menu-indicator {{ image: none; width: 0px; }}
+QToolButton#groupHeader {{ background: transparent; color: {INK}; border: none;
+                           border-radius: 3px; padding: 3px 6px 3px 2px;
+                           font-size: 10pt; font-weight: bold; }}
+QToolButton#groupHeader:hover {{ background: #e2e2e2; }}
+QScrollArea {{ border: 1px solid #c4c4c4; background: #f3f3f3; }}
+QWidget#body {{ background: #f3f3f3; }}
+QScrollBar:vertical {{ background: #e6e6e6; width: 14px; margin: 0; border: none; }}
+QScrollBar::handle:vertical {{ background: #b4b4b4; min-height: 28px;
+                               border-radius: 4px; margin: 2px; }}
+QScrollBar::handle:vertical:hover {{ background: #9a9a9a; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+QMenu {{ background: #ffffff; color: {INK}; border: 1px solid #a8a8a8; padding: 3px 0; }}
+QMenu::item {{ padding: 4px 22px 4px 8px; background: transparent; }}
+QMenu::item:selected {{ background: #2f6fb5; color: #ffffff; }}
+QMenu::item:disabled {{ color: #555555; }}
+QMenu::separator {{ height: 1px; background: #d0d0d0; margin: 3px 6px; }}
+QToolTip {{ background: #ffffcc; color: {INK}; border: 1px solid #aaa; padding: 4px; }}
+QMessageBox, QDialog {{ background: #f3f3f3; }}
+"""
+
+
+def light_palette() -> QPalette:
+    """The same colours for what a stylesheet cannot reach (pop-ups, the
+    native folder picker's frame, message boxes)."""
+    pal = QPalette()
+    for role, colour in ((QPalette.Window, "#f3f3f3"), (QPalette.WindowText, INK),
+                         (QPalette.Base, "#ffffff"), (QPalette.AlternateBase, "#f7f7f7"),
+                         (QPalette.Text, INK), (QPalette.Button, "#e8e8e8"),
+                         (QPalette.ButtonText, INK), (QPalette.ToolTipBase, "#ffffcc"),
+                         (QPalette.ToolTipText, INK), (QPalette.Highlight, "#2f6fb5"),
+                         (QPalette.HighlightedText, "#ffffff"),
+                         (QPalette.PlaceholderText, "#777777")):
+        pal.setColor(role, QColor(colour))
+    return pal
+
+
+def apply_app_style(app) -> None:
+    app.setStyle("Fusion")
+    app.setPalette(light_palette())
+    app.setStyleSheet(APP_STYLESHEET)
+
+
+def _ui_font(pt: float, bold: bool = False) -> QFont:
+    """The font the stylesheet paints with, for measuring. A stylesheet font
+    never reaches widget.font(), so measuring that would use the wrong one."""
+    f = QFont(UI_FONT)
+    f.setPointSizeF(pt)
+    f.setBold(bold)
+    return f
+
+
+def _repolish(w) -> None:
+    """Re-read the stylesheet after a dynamic property changed."""
+    w.style().unpolish(w)
+    w.style().polish(w)
+    w.update()
+
+
+# ---------------- DRAWN ICONS ----------------
+# Drawn, never typed: an emoji resolves to a colour font that ignores the
+# stylesheet, and a symbol glyph comes out as a hairline or not at all.
+
+def _pen(ink: str, width: float = 1.6) -> QPen:
+    pen = QPen(QColor(ink), width)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    return pen
+
+
+def _paint_symbol(p: QPainter, name: str, ink: str, fill: str | None) -> None:
+    """One symbol on a 20 x 20 grid."""
+    c = QColor(ink)
+    if name == "notes":
+        p.setPen(_pen(ink))
+        p.setBrush(QColor(fill) if fill else Qt.NoBrush)
+        p.drawRoundedRect(QRectF(4, 2.5, 12, 15), 1.5, 1.5)
+        p.setPen(_pen(ink, 1.3))
+        for y in (7, 10, 13):
+            p.drawLine(QPointF(7, y), QPointF(13, y))
+    elif name == "gear":
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        for i in range(8):
+            p.save()
+            p.translate(10, 10)
+            p.rotate(i * 45)
+            p.drawRoundedRect(QRectF(-1.7, -8.8, 3.4, 4.2), 0.6, 0.6)
+            p.restore()
+        ring = QPainterPath()
+        ring.addEllipse(QPointF(10, 10), 6.2, 6.2)
+        hole = QPainterPath()
+        hole.addEllipse(QPointF(10, 10), 2.6, 2.6)
+        p.drawPath(ring.subtracted(hole))
+    elif name == "broom":
+        p.setPen(_pen(ink, 2.0))
+        p.drawLine(QPointF(16.5, 2.5), QPointF(10.5, 9.5))
+        p.setPen(_pen(ink, 1.2))
+        p.setBrush(QColor(fill) if fill else c)
+        p.drawPolygon(QPolygonF([QPointF(8.2, 7.8), QPointF(13, 11.6),
+                                 QPointF(9.6, 17.8), QPointF(2.4, 13.4)]))
+        p.setPen(_pen(ink, 1.0))
+        for a, b in (((7.2, 11.2), (4.4, 15.0)), ((9.4, 12.6), (7.2, 16.6))):
+            p.drawLine(QPointF(*a), QPointF(*b))
+    elif name == "folder":
+        p.setPen(_pen(ink, 1.4))
+        p.setBrush(QColor(fill) if fill else Qt.NoBrush)
+        path = QPainterPath()
+        path.moveTo(2.5, 4.5)
+        path.lineTo(8, 4.5)
+        path.lineTo(9.8, 6.5)
+        path.lineTo(17.5, 6.5)
+        path.lineTo(17.5, 15.8)
+        path.lineTo(2.5, 15.8)
+        path.closeSubpath()
+        p.drawPath(path)
+        p.drawLine(QPointF(2.5, 8.6), QPointF(17.5, 8.6))
+    elif name == "history":
+        p.setPen(_pen(ink, 1.7))
+        p.setBrush(QColor(fill) if fill else Qt.NoBrush)
+        p.drawEllipse(QPointF(10, 10), 7, 7)
+        p.drawLine(QPointF(10, 10), QPointF(10, 5.6))
+        p.drawLine(QPointF(10, 10), QPointF(13.2, 12))
+    elif name == "closed":
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QPolygonF([QPointF(7, 4.5), QPointF(14.5, 10), QPointF(7, 15.5)]))
+    elif name == "open":
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QPolygonF([QPointF(4.5, 7), QPointF(15.5, 7), QPointF(10, 14.5)]))
+    elif name == "tick":
+        p.setPen(_pen(ink, 2.3))
+        p.setBrush(Qt.NoBrush)
+        p.drawPolyline(QPolygonF([QPointF(4, 10.5), QPointF(8.5, 15), QPointF(16, 5.5)]))
+
+
+_FILLS = {"notes": "#ffffff", "folder": "#f2c14e", "broom": "#d9a441", "history": "#ffffff"}
+_ICON_CACHE: dict = {}
+
+
+def drawn_icon(name: str) -> QIcon:
+    """A symbol in every QIcon mode, at several sizes so it stays sharp at any
+    display scaling. Needs a running QApplication."""
+    icon = _ICON_CACHE.get(name)
+    if icon is not None:
+        return icon
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 40, 48):
+        for mode, ink, fill in ((QIcon.Normal, INK, _FILLS.get(name)),
+                                (QIcon.Active, INK, _FILLS.get(name)),
+                                (QIcon.Selected, "#ffffff", None),
+                                (QIcon.Disabled, "#9a9a9a", None)):
+            pm = QPixmap(size, size)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.scale(size / 20, size / 20)
+            _paint_symbol(p, name, ink, fill)
+            p.end()
+            icon.addPixmap(pm, mode, QIcon.Off)
+    _ICON_CACHE[name] = icon
+    return icon
+
+
+# ---------------- DIALOGS ----------------
+_MAIN = None   # the launcher window, parent of every message box
+
+
+def _message(kind, title: str, text: str, parent=None) -> None:
+    box = QMessageBox(parent if parent is not None else _MAIN)
+    box.setIcon(kind)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.exec()
+
+
+class messagebox:
+    """The two message boxes the launch code calls, under their tkinter names,
+    so that code stays exactly as it is in the Tk Launcher."""
+
+    @staticmethod
+    def showerror(title, text, parent=None):
+        _message(QMessageBox.Icon.Critical, title, text, parent)
+
+    @staticmethod
+    def showinfo(title, text, parent=None):
+        _message(QMessageBox.Icon.Information, title, text, parent)
+
+
+def _ask(parent, title: str, text: str, yes: str, no: str) -> bool:
+    """A question with two named buttons; True for the first one."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    v = QVBoxLayout(dlg)
+    v.setContentsMargins(16, 12, 16, 12)
+    v.setSpacing(12)
+    v.addWidget(QLabel(text, dlg))
+    row = QHBoxLayout()
+    row.addStretch(1)
+    for label, slot in ((yes, dlg.accept), (no, dlg.reject)):
+        b = QPushButton(label, dlg)
+        b.setMinimumWidth(90)
+        b.clicked.connect(slot)
+        row.addWidget(b)
+    row.addStretch(1)
+    v.addLayout(row)
+    return dlg.exec() == QDialog.Accepted
+
+
+def prompt_move_misplaced(parent, misplaced: list[tuple[Path, Path | None]]):
+    """Zobrazí souhrnnou hlášku a nabídne přesun."""
+    rows = []
+    for src, dst in misplaced:
+        where = src.parent.name
+        if dst is None:
+            rows.append(f"  {where}\\{src.name}\n"
+                        f"      the same file is already filed away — delete this copy")
+        else:
+            rows.append(f"  {where}\\{src.name}\n"
+                        f"      move to  {dst.parent.name}\\")
+    msg = (
+        "The following versioned files are not where their version lives:\n\n"
+        + "\n".join(rows)
+        + "\n\nTidy them up?"
+    )
+    if not _ask(parent, "Misplaced files found", msg, "Tidy up", "Skip"):
+        return
+
+    errors = apply_misplaced_cleanup(misplaced)
+    if errors:
+        messagebox.showerror(
+            "Cleanup failed",
+            "Some files could not be tidied up:\n\n" + "\n".join(errors),
+            parent=parent,
+        )
+
+
+def prompt_restore_swap_state(parent, stuck: list[tuple[str, Path, Path]]):
+    """Dialog that offers to restore programs stuck in an incomplete old-version launch."""
+    lines = "\n".join(f"  {name}" for name, _, _ in stuck)
+    msg = (
+        f"The following programs have an incomplete old-version launch.\n"
+        f"Their latest files are stored in a temporary folder:\n\n"
+        f"{lines}\n\n"
+        f"Restore the latest versions now?"
+    )
+    if not _ask(parent, "Incomplete old-version launch detected", msg, "Restore", "Skip"):
+        return
+
+    errors = []
+    for name, program_dir, temp_dir in stuck:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
-        except Exception:
-            pass
-    try:
-        win.iconbitmap(default=ico_path)
-    except Exception:
-        pass
-    try:
-        u = ctypes.windll.user32
-        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
-        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
-        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
-        for which, h in ((1, big), (0, sm), (2, sm)):
-            if h:
-                u.SendMessageW(hwnd, 0x0080, which, h)
-        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
-        if big:
-            set_cls(hwnd, -14, big)
-        if sm:
-            set_cls(hwnd, -34, sm)
-    except Exception:
-        pass
+            for f in list(temp_dir.iterdir()):
+                shutil.move(str(f), str(program_dir / f.name))
+            try:
+                temp_dir.rmdir()
+            except Exception:
+                pass
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    if errors:
+        messagebox.showerror(
+            "Restore failed",
+            "Some programs could not be restored:\n\n" + "\n".join(errors),
+            parent=parent,
+        )
 
 
-class Launcher(tk.Tk):
+# ---------------- APP ----------------
+def _icon_file() -> Path | None:
+    """icon.ico next to the exe, then the copy bundled inside it (the builder
+    adds it with --add-data), then next to this file."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+    cands.append(Path(__file__).resolve().parent / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
+def _app_version() -> str:
+    """Version of the running build, e.g. "v2.0.0", or "" when run from source.
+    The builder names every exe "<Program> vX.Y.Z.exe", so the exe's own file
+    name is the one place that always tells the truth."""
+    if not getattr(sys, "frozen", False):
+        return ""
+    m = re.search(r"\s(v\d+(?:\.\d+)*)$", Path(sys.executable).stem)
+    return m.group(1) if m else ""
+
+
+class _Invoker(QObject):
+    """Hands a call to the window's thread; the worker threads use it."""
+    call = Signal(object)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.call.connect(self._run, Qt.ConnectionType.QueuedConnection)
+
+    @staticmethod
+    def _run(job):
+        ms, fn, args = job
+        QTimer.singleShot(ms, lambda: fn(*args))
+
+
+class Launcher(QMainWindow):
     def __init__(self):
         super().__init__()
+        global _MAIN
+        _MAIN = self
+        self._invoker = _Invoker(self)
         self._scan_gen = 0
         self._config = _load_config()
         self._root_options = _apply_config_to_root_options(self._config)
@@ -996,136 +1202,167 @@ class Launcher(tk.Tk):
         except Exception:
             _hn = ""
         self._is_lab_machine = any(kw in _hn for kw in ("OPR", "VIS"))
-        self.style = ttk.Style(self)
 
-        # Modern Windows theme (nejlíp vypadá na Win10/11)
-        for t in ("vista", "xpnative"):
-            if t in self.style.theme_names():
-                self.style.theme_use(t)
-                break
-
-        # Jednotná typografie
-        self.option_add("*Font", "SegoeUI 10")
-        self._guard_wheel_on_value_widgets()
-        # --- two columns, window sized to the cards ---
-        self._group_cols = GROUP_COLS
-        # How wide the widest card on screen really is. Nothing is guessed: a
-        # guess goes stale the moment a card gains a button, and a stale guess is
-        # what let two columns be drawn into the space for one.
-        self._measured_cell_px = None
-        # A card is not the same width in every group (the ReadMe+Details pair
-        # makes it narrower than the archive dropdown does), so one measured
-        # width re-taken per group used to bounce between two values and each
-        # bounce booked another rebuild — the window flickered between one and
-        # two columns for ever. Now the width is taken from the widest card on
-        # screen and may only GROW inside one relayout chain, and the chain is
-        # capped, so it always settles.
-        self._relayouts = 0
-        self._btn_chars_used: int | None = None
-        self._chrome_px: int | None = None   # window width that is not card space
-        self._doc_btn_px = None
-
-        # Jemnější buttony
-        # Program button style (hover effect)
-        self.style.configure(
-            "Prog.TButton",
-            padding=(8, 6),
-            font=("Segoe UI", 9),
-            anchor="w"
-        )
-
-        # Hover + pressed states
-        self.style.map(
-            "Prog.TButton",
-            background=[
-                ("active", "#e6f2ff"),      # hover
-                ("pressed", "#cce4ff")
-            ]
-        )
-
-        # Update-available variant: amber background
-        self.style.configure(
-            "Update.Prog.TButton",
-            padding=(8, 6),
-            font=("Segoe UI", 9),
-            anchor="w",
-            background="#ffa500",
-            foreground="#000000",
-        )
-        self.style.map(
-            "Update.Prog.TButton",
-            background=[
-                ("active", "#ffb733"),
-                ("pressed", "#e09000"),
-            ]
-        )
-
-        # The Clean button when there is something to tidy: same amber as the
-        # update highlight, dark text.
-        self.style.configure("Alert.TButton", background="#ffa500", foreground="#000000")
-        self.style.map("Alert.TButton",
-                       background=[("active", "#ffb733"), ("pressed", "#e09000")])
-
-        self.style.configure("Info.TButton", padding=(5, 2), font=("Segoe UI", 8))
-        # The two doc buttons sit side by side, so they get tighter padding than
-        # the other small buttons. The font stays at 8 — legibility first; the
-        # width is bought back from the program button instead.
-        self.style.configure("Doc.TButton", padding=(3, 2), font=("Segoe UI", 8))
-        self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        self.style.configure("TLabel", font=("Segoe UI", 10))
-        self.title("Launcher")
-        if getattr(sys, "frozen", False):
-            _base = Path(sys.executable).resolve().parent
-        else:
-            _base = Path(__file__).resolve().parent
-        set_app_icon(self, str(_base / "icon.ico"), "ELI.Launcher")
-        self.geometry("600x510")
-        self.minsize(550, 430)
+        ver = _app_version()
+        self.setWindowTitle(f"Launcher {ver}" if ver else "Launcher (source)")
+        icon = _icon_file()
+        if icon is not None:
+            self.setWindowIcon(QIcon(str(icon)))
+        self.resize(600, 510)
+        self.setMinimumSize(550, MIN_WINDOW_H)
 
         self.programs: dict[str, dict] = {}
         self.current_root_label: str | None = None
         self.current_root_path: Path | None = None
-        self._icon_cache: dict[str, tk.PhotoImage] = {}
-        self._known_versions: dict[str, tuple] = {}   # program_name → (major, minor, patch)
+        self._root_idx = -1                            # no source picked yet
+        self._icon_cache: dict[str, QIcon | None] = {}
         self._update_available: set[str] = set()       # programs with newer version on disk
         self._pending_updates: dict[str, Path] = {}    # name → newer exe path (not yet acknowledged)
-        self._prog_buttons: dict[str, ttk.Button] = {} # current button widget per program
-        self._prog_cells: dict[str, ttk.Frame] = {}    # the whole card per program
+        self._prog_buttons: dict[str, QPushButton] = {}  # current button widget per program
+        self._prog_cells: dict[str, QWidget] = {}        # the whole card per program
         # Acknowledged versions: {program_name: version_str} — persisted in config
-        # Once a user launches or clicks ✓, the version is acknowledged and highlight clears.
+        # Once a user launches or acknowledges, the version is acknowledged and highlight clears.
         self._acknowledged: dict[str, str] = self._config.get("acknowledged_versions", {})
         # Custom group overrides: {program_name: gkey} — persisted in config
         self._custom_groups: dict[str, str] = self._config.get("custom_groups", {})
-
-        # no default selection
-        self.root_choice = tk.IntVar(value=-1)  # bude obsahovat label z ROOT_OPTIONS
+        # Persistent collapse state: gkey → bool (True = expanded)
+        self._group_expanded: dict[str, bool] = {}
+        self._group_items: dict[str, list] = {}
+        self._group_toggle_btns: dict[str, QToolButton] = {}
+        self._group_grids: dict[str, QWidget] = {}
+        self._group_layouts: dict[str, QGridLayout] = {}
+        self._group_built: set[str] = set()            # groups whose cards exist
+        self._prog_btn_w = 0                           # one width for every program button
+        self._doc_btn_w: int | None = None
 
         self._build_ui()
         self._set_idle_state()
         self._auto_select_root()
         self._schedule_version_poll()
 
-    # Widgets whose value the mouse wheel changes.
-    _WHEEL_VALUE_CLASSES = ("TCombobox", "TSpinbox", "Spinbox", "Scale", "TScale")
+    # -------- the Tk `after`, safe from any thread --------
 
-    def _guard_wheel_on_value_widgets(self):
-        """The wheel changes a value only in the field the user clicked into.
+    def after(self, ms: int, fn, *args):
+        """Run fn(*args) on the window's thread in `ms` milliseconds.
 
-        Tk's own class binding turns the value of whatever box is under the
-        pointer, so scrolling the list past one would change it. Each class
-        binding is prefixed with a focus check; `continue` ends just that
-        binding, so over an unpicked box the wheel still scrolls the list.
+        Callable from the worker threads, which may never touch a widget
+        themselves; the call is queued to the window's thread first.
         """
-        for cls in self._WHEEL_VALUE_CLASSES:
-            for seq in ("<MouseWheel>", "<Shift-MouseWheel>"):
-                try:
-                    script = self.bind_class(cls, seq)
-                except tk.TclError:
-                    continue
-                if not script or "focus] ne" in script:
-                    continue
-                self.tk.call("bind", cls, seq,
-                             'if {[focus] ne "%W"} continue\n' + script)
+        self._invoker.call.emit((ms, fn, args))
+
+    def _set_status(self, text: str):
+        self.status.setText(text)
+
+    # -------- window --------
+
+    def _root_enabled(self, label: str, path) -> bool:
+        return path is not None and not (self._is_lab_machine
+                                         and label.lower().startswith("office"))
+
+    def _build_ui(self):
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        # Root selector (radio buttons)
+        box = QGroupBox("Data source", central)
+        outer.addWidget(box)
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(8, 8, 8, 8)
+        bl.setSpacing(6)
+
+        rb_row = QHBoxLayout()
+        rb_row.setSpacing(12)
+        bl.addLayout(rb_row)
+        self._rb_group = QButtonGroup(self)
+        self._rb_widgets: list[QRadioButton] = []
+        for i, (label, path, _configurable) in enumerate(self._root_options):
+            rb = QRadioButton(label, box)
+            rb.setEnabled(self._root_enabled(label, path))
+            self._rb_group.addButton(rb, i)
+            rb_row.addWidget(rb)
+            self._rb_widgets.append(rb)
+        rb_row.addStretch(1)
+        self._rb_group.idClicked.connect(self._on_root_clicked)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        bl.addLayout(btn_row)
+        for text, icon, slot in (("Notes", "notes", self.open_notes),
+                                 ("Set paths", "gear", self.open_set_paths)):
+            b = QPushButton(text, box)
+            b.setIcon(drawn_icon(icon))
+            b.setIconSize(QSize(16, 16))
+            b.clicked.connect(slot)
+            btn_row.addWidget(b)
+        self._clean_btn = QPushButton("Clean", box)
+        self._clean_btn.setIcon(drawn_icon("broom"))
+        self._clean_btn.setIconSize(QSize(16, 16))
+        self._clean_btn.clicked.connect(self._run_cleanup)
+        btn_row.addWidget(self._clean_btn)
+        btn_row.addStretch(1)
+
+        # Program cards. Never a horizontal scroll bar: the window is kept wide
+        # enough for two of the widest cards instead (_fit_width).
+        self.scroll = QScrollArea(central)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._inner = QWidget()
+        self._inner.setObjectName("body")
+        self._inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._body = QVBoxLayout(self._inner)
+        self._body.setContentsMargins(6, 4, 6, 6)
+        self._body.setSpacing(2)
+        self.scroll.setWidget(self._inner)
+        outer.addWidget(self.scroll, 1)
+
+        # Status. A long source path plus the tidy-up note does not fit one
+        # line; it wraps instead of being cut off at the window edge.
+        self.status = QLabel("", central)
+        self.status.setWordWrap(True)
+        outer.addWidget(self.status)
+
+    def _clear_body(self):
+        while self._body.count():
+            item = self._body.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+        self._prog_buttons = {}
+        self._prog_cells = {}
+        self._group_toggle_btns = {}
+        self._group_grids = {}
+        self._group_layouts = {}
+        self._group_built = set()
+
+    def _body_note(self, text: str):
+        lbl = QLabel(text, self._inner)
+        lbl.setContentsMargins(8, 8, 8, 8)
+        self._body.addWidget(lbl)
+        self._body.addStretch(1)
+
+    def _set_idle_state(self):
+        self._clear_body()
+        self._body_note("Select a data source above.")
+        self.status.setText("No source selected.")
+
+    def _set_root_idx(self, idx: int):
+        self._root_idx = idx
+        if idx >= 0:
+            self._rb_widgets[idx].setChecked(True)
+            return
+        # An exclusive group refuses to have nothing checked.
+        self._rb_group.setExclusive(False)
+        for rb in self._rb_widgets:
+            rb.setChecked(False)
+        self._rb_group.setExclusive(True)
+
+    def _on_root_clicked(self, idx: int):
+        self._root_idx = idx
+        self.refresh()
 
     def _auto_select_root(self):
         try:
@@ -1141,79 +1378,11 @@ class Launcher(tk.Tk):
         idx = preferred if preferred < len(opts) and opts[preferred][1] is not None else \
               next((i for i, (_, p, _) in enumerate(opts) if p is not None), -1)
         if idx >= 0:
-            self.root_choice.set(idx)
+            self._set_root_idx(idx)
             self.refresh()
 
-    def _calc_group_cols(self) -> int:
-        """Always two columns of program buttons.
-
-        The count used to follow the window width, which is what let the layout
-        flip between one and two columns while the cards were being measured.
-        The window is now sized to the cards instead (`_fit_two_columns`), so
-        this is a constant and a resize never re-flows the grid.
-        """
-        return GROUP_COLS
-
-    def _build_ui(self):
-        root = ttk.Frame(self, padding=10)
-        root.pack(fill="both", expand=True)
-
-        # Root selector (radiobuttons)
-        box = ttk.LabelFrame(root, text="Data source")
-        box.pack(fill="x")
-
-        # Řádek 1: radiobuttons
-        rb_row = ttk.Frame(box)
-        rb_row.pack(fill="x", padx=4, pady=(6, 2))
-
-        self._rb_widgets = []
-        for i, (label, path, configurable) in enumerate(self._root_options):
-            rb = ttk.Radiobutton(
-                rb_row,
-                text=label,
-                variable=self.root_choice,
-                value=i,
-                command=self.refresh,
-                state="normal" if (path is not None and not (self._is_lab_machine and label.lower().startswith("office"))) else "disabled",
-            )
-            rb.pack(side="left", padx=6)
-            self._rb_widgets.append(rb)
-
-        # Řádek 2: tlačítka
-        btn_row = ttk.Frame(box)
-        btn_row.pack(fill="x", padx=4, pady=(0, 6))
-
-        ttk.Button(btn_row, text="📋 Notes", command=self.open_notes).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="⚙ Set paths", command=self.open_set_paths).pack(side="left")
-        self._clean_btn = ttk.Button(btn_row, text="🧹 Clean", command=self._run_cleanup)
-        self._clean_btn.pack(side="left", padx=(6, 0))
-
-        # Buttons grid
-        self.sf = ScrollableFrame(root)
-        self.sf.pack(fill="both", expand=True, pady=(10, 0))
-        self.hsb = ttk.Scrollbar(root, orient="horizontal", command=self.sf.canvas.xview)
-        self.hsb.pack(fill="x")
-        self.sf.canvas.configure(xscrollcommand=self.hsb.set)
-        # No <Configure> binding: the column count is fixed (GROUP_COLS), and a
-        # binding on the root window fires for every child widget, so each
-        # rebuild used to queue hundreds of idle jobs that did nothing.
-
-        # Status
-        self.status = ttk.Label(root, text="", anchor="w", justify="left")
-        self.status.pack(fill="x", pady=(8, 0))
-        # A long source path plus the tidy-up note does not fit one line; it
-        # wraps instead of being cut off at the window edge.
-        self.status.bind("<Configure>",
-                         lambda e: self.status.configure(wraplength=max(100, e.width)))
-
-    def _set_idle_state(self):
-        for w in self.sf.inner.winfo_children():
-            w.destroy()
-        ttk.Label(self.sf.inner, text="Select a data source above.").pack(anchor="w", padx=8, pady=8)
-        self.status.configure(text="No source selected.")
-
     def _selected_root(self) -> tuple[str, Path] | None:
-        idx = self.root_choice.get()
+        idx = self._root_idx
         if idx < 0:
             return None
         entry = self._root_options[idx]
@@ -1229,10 +1398,10 @@ class Launcher(tk.Tk):
         self.current_root_label = root_label
         self.current_root_path = selected_root
 
-        self._scan_gen += 1          # ← každý nový scan dostane nové číslo
+        self._scan_gen += 1          # every new scan gets a new number
         gen = self._scan_gen
 
-        self.status.configure(text=f"Scanning: {selected_root} ...")
+        self.status.setText(f"Scanning: {selected_root} ...")
 
         def worker():
             try:
@@ -1244,7 +1413,6 @@ class Launcher(tk.Tk):
                             find_programs_in_swap_state(progs))
                 except Exception:
                     tidy = ([], [])
-                # ← aplikuj pouze pokud jsme stále ve stejném scanu
                 self.after(0, lambda: self._apply_programs(progs, root_label, selected_root, gen, tidy))
             except Exception as e:
                 # Said in the status line, not in a pop-up: this also runs at
@@ -1254,7 +1422,7 @@ class Launcher(tk.Tk):
                 def show_failure():
                     self._apply_programs({}, root_label, selected_root, gen)
                     if gen == self._scan_gen:
-                        self.status.configure(text=msg)
+                        self.status.setText(msg)
                 self.after(0, show_failure)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1268,12 +1436,6 @@ class Launcher(tk.Tk):
         self.current_root_path = selected_root
         self._update_available.clear()
         self._pending_updates.clear()
-        # A new scan can bring different names and different cards, so the card
-        # width is measured again from scratch instead of keeping the widest one
-        # some earlier source happened to have.
-        self._measured_cell_px = None
-        self._btn_chars_used = None
-        self._relayouts = 0
         # Startup check: flag programs whose on-disk version differs from last acknowledged
         for name, info in self.programs.items():
             ack_ver = self._acknowledged.get(name)
@@ -1296,13 +1458,12 @@ class Launcher(tk.Tk):
             if stuck:
                 parts.append(f"{len(stuck)} unfinished old-version launch(es)")
             status += " | To tidy (Clean): " + ", ".join(parts) + "."
-        self.status.configure(text=status)
+        self.status.setText(status)
 
     def _mark_clean_button(self, count: int):
-        if count:
-            self._clean_btn.configure(text=f"🧹 Clean ({count})", style="Alert.TButton")
-        else:
-            self._clean_btn.configure(text="🧹 Clean", style="TButton")
+        self._clean_btn.setText(f"Clean ({count})" if count else "Clean")
+        self._clean_btn.setProperty("alert", bool(count))
+        _repolish(self._clean_btn)
 
     def _run_cleanup(self):
         if not self.programs:
@@ -1327,6 +1488,8 @@ class Launcher(tk.Tk):
             left = 0
         self._mark_clean_button(left)
 
+    # -------- groups and cards --------
+
     def _group_of(self, name: str) -> str:
         g = self._custom_groups.get(name)
         if g not in {k for _t, k in GROUP_ORDER}:
@@ -1334,486 +1497,336 @@ class Launcher(tk.Tk):
         return g
 
     def _rebuild_buttons(self):
-        # Measuring a card runs Tk's pending idle work, and one of those idle
-        # jobs is the column check — which would call this again from inside
-        # itself, on widgets that are being replaced. One rebuild at a time.
-        if getattr(self, "_in_rebuild", False):
-            return
-        self._in_rebuild = True
-        try:
-            self._rebuild_buttons_inner()
-        finally:
-            self._in_rebuild = False
-
-    def _rebuild_buttons_inner(self):
-        # One column count for the whole rebuild: asking again per group is what
-        # let two groups be drawn to two different layouts in the same pass.
-        self._group_cols = self._calc_group_cols()
-        for w in self.sf.inner.winfo_children():
-            w.destroy()
-        self._prog_buttons = {}
-        self._prog_cells = {}
+        """Only a new scan builds the window again; everything else changes
+        the cards in place."""
+        self._clear_body()
 
         items = sorted(self.programs.items(), key=lambda kv: kv[0].lower())
-
         grouped: dict[str, list[tuple[str, dict]]] = {k: [] for _t, k in GROUP_ORDER}
         for name, info in items:
             grouped[self._group_of(name)].append((name, info))
-
-        # Persistent collapse state: gkey → bool (True = expanded)
-        if not hasattr(self, "_group_expanded"):
-            self._group_expanded: dict[str, bool] = {}
-
-        # Store toggle button refs so _toggle_group can update arrows without rebuild
-        self._group_toggle_btns: dict[str, ttk.Button] = {}
-        self._group_frames: dict[str, ttk.Frame] = {}
-        self._group_grids: dict[str, ttk.Frame] = {}    # inner grid widget per group
-        self._group_headers: dict[str, ttk.Frame] = {}  # header widget per group, for pack(after=)
-        self._group_items: dict[str, list] = {}         # items per group for lazy build
-
-        # Fill the item lists for EVERY group first. The button width is taken
-        # from them, and the first group used to be built while the later groups
-        # were still missing — so it got sized to its own longest name only.
-        for _title, _gkey in GROUP_ORDER:
-            if grouped.get(_gkey):
-                self._group_items[_gkey] = grouped[_gkey]
-                # Default: Scripts expanded, everything else collapsed
-                if _gkey not in self._group_expanded:
-                    self._group_expanded[_gkey] = (_gkey == "scripts")
-
-        if not items:
-            ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
-            return
-
-        # A header and an (empty) grid exist for EVERY group, shown or not, so
-        # moving a program into a group that was empty only has to pack it —
-        # nothing else in the window is torn down for that.
-        for title, gkey in GROUP_ORDER:
-            self._group_items.setdefault(gkey, [])
+        self._group_items = grouped
+        for _title, gkey in GROUP_ORDER:
+            # Default: Main scripts open, everything else closed
             self._group_expanded.setdefault(gkey, gkey == "scripts")
 
-            header = ttk.Frame(self.sf.inner)
-            self._group_headers[gkey] = header
+        if not items:
+            self._body_note("No programs to show.")
+            return
 
-            grid_frame = ttk.Frame(self.sf.inner)
-            grid = ttk.Frame(grid_frame)
-            grid.pack(fill="x", padx=8, pady=6)
-            self._group_frames[gkey] = grid_frame
-            self._group_grids[gkey] = grid
+        # The width is taken from every open group BEFORE the first card is
+        # built, so the first group is not sized to its own names only.
+        self._prog_btn_w = self._calc_prog_btn_px()
 
-            toggle_btn = ttk.Button(
-                header,
-                style="Info.TButton",
-                command=lambda k=gkey: self._toggle_group(k),
-            )
-            toggle_btn.pack(side="left")
-            self._group_toggle_btns[gkey] = toggle_btn
+        # A header and an (empty) grid exist for EVERY group, shown or not, so
+        # moving a program into a group that was empty only has to show it.
+        for _title, gkey in GROUP_ORDER:
+            header = QToolButton(self._inner)
+            header.setObjectName("groupHeader")
+            header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            header.setIconSize(QSize(14, 14))
+            header.setCursor(Qt.PointingHandCursor)
+            header.clicked.connect(lambda _=False, k=gkey: self._toggle_group(k))
+            self._body.addWidget(header, 0, Qt.AlignLeft)
+            self._group_toggle_btns[gkey] = header
+
+            grid_w = QWidget(self._inner)
+            grid = QGridLayout(grid_w)
+            grid.setContentsMargins(14, 4, 4, 8)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(10)
+            grid.setColumnStretch(GROUP_COLS, 1)
+            self._body.addWidget(grid_w)
+            self._group_grids[gkey] = grid_w
+            self._group_layouts[gkey] = grid
             self._update_group_header(gkey)
 
             if self._group_expanded[gkey] and self._group_items[gkey]:
                 self._build_group_content(gkey)
+        self._body.addStretch(1)
 
-        self._pack_groups()
-        self._sync_cell_width()
+        self._show_groups()
+        self._fit_width()
 
     def _update_group_header(self, gkey: str):
         btn = self._group_toggle_btns.get(gkey)
         if btn is None:
             return
         title = next(t for t, k in GROUP_ORDER if k == gkey)
-        arrow = "▼" if self._group_expanded.get(gkey) else "▶"
-        btn.configure(text=f"{arrow}  {title}  ({len(self._group_items.get(gkey, []))})")
+        btn.setIcon(drawn_icon("open" if self._group_expanded.get(gkey) else "closed"))
+        btn.setText(f"{title}  ({len(self._group_items.get(gkey, []))})")
 
-    def _pack_groups(self):
-        """Lay the groups out in GROUP_ORDER: the ones with programs get their
-        header, the open ones their cards. Only re-packs existing widgets."""
-        for gkey in self._group_headers:
-            self._group_headers[gkey].pack_forget()
-            self._group_frames[gkey].pack_forget()
+    def _show_groups(self):
+        """Headers for the groups with programs, cards for the open ones."""
         for _title, gkey in GROUP_ORDER:
-            if not self._group_items.get(gkey):
-                continue
-            self._group_headers[gkey].pack(fill="x", padx=6, pady=(6, 0))
-            if self._group_expanded.get(gkey):
-                self._group_frames[gkey].pack(fill="x", padx=6, pady=(2, 0))
-
-    def _drop_card(self, name: str):
-        cell = self._prog_cells.pop(name, None)
-        self._prog_buttons.pop(name, None)
-        if cell is not None and cell.winfo_exists():
-            cell.destroy()
-
-    def _add_card(self, gkey: str, name: str) -> bool:
-        """Build one card into a group's grid — only if that grid has been
-        built; a group never opened builds all its cards when it is opened."""
-        grid = self._group_grids.get(gkey)
-        info = self.programs.get(name)
-        if grid is None or info is None:
-            return False
-        if not grid.winfo_children() and not self._group_expanded.get(gkey):
-            return False
-        self._prog_cells[name] = self._build_card(
-            grid, name, info, self._btn_chars_used or self._prog_btn_chars())
-        return True
-
-    def _replace_card(self, name: str):
-        """Build one program's card again in its place (e.g. it gained a 🔽)."""
-        cell = self._prog_cells.get(name)
-        if cell is None or not cell.winfo_exists():
-            return
-        gkey = self._group_of(name)
-        self._drop_card(name)
-        if self._add_card(gkey, name):
-            self._regrid(gkey)
+            has = bool(self._group_items.get(gkey))
+            if gkey in self._group_toggle_btns:
+                self._group_toggle_btns[gkey].setVisible(has)
+                self._group_grids[gkey].setVisible(has and bool(self._group_expanded.get(gkey)))
 
     def _shown_group_keys(self) -> list:
         """Groups that are open right now — the only ones the sizes come from."""
         return [g for g, items in self._group_items.items()
                 if items and self._group_expanded.get(g)]
 
-    def _prog_btn_chars(self) -> int:
-        """Width of the program buttons, in characters.
+    def _calc_prog_btn_px(self) -> int:
+        """Width of the program buttons, in pixels.
 
-        Sized to the longest name in the groups that are OPEN, so every card on
-        screen gets the same button and they line up column to column. A name
-        hidden in a collapsed group does not stretch them: at a fixed 18 the
-        widest label ("Internal Builder") left 28 px of empty button, and that
-        slack is exactly what the second doc button needs.
+        The longest name in the groups that are OPEN, whole — every card on
+        screen gets the same button so they line up column to column, and a
+        name hidden in a closed group does not stretch them.
         """
+        fm = QFontMetrics(_ui_font(9))
         longest = 0
         shown = self._shown_group_keys()
         for gkey in (shown or list(self._group_items)):
             for _name, info in self._group_items.get(gkey, []):
-                longest = max(longest, len(ui_label(info.get("label", ""))))
-        return max(10, min(longest, 22))
+                longest = max(longest, fm.horizontalAdvance(ui_label(info.get("label", ""))))
+        # icon 24 + gap 6 + padding 2 x 8 + border 2 x 1, and a little air
+        return max(120, longest + 24 + 6 + 16 + 2 + 10)
 
-    def _sync_cell_width(self, allow_shrink: bool = False):
-        """Re-flow the grid if the widest card on screen does not fit the layout.
+    def _doc_btn_px(self) -> int:
+        """Width of one doc button ("ReadMe" / "Details"), measured once.
 
-        The width may only grow while a relayout chain is running, so it cannot
-        bounce between the two card sizes; `allow_shrink` is for the one case
-        where a card really did get narrower — a group was just closed — and it
-        is only ever asked for by a click, never from inside a chain.
+        Both columns of a card's small buttons get it as a minimum, so a card
+        without a Details button keeps the exact geometry of one that has it.
         """
-        widest = 0
-        for gkey in self._shown_group_keys():
-            grid = self._group_grids.get(gkey)
-            if grid is None:
-                continue
-            try:
-                grid.update_idletasks()
-                for cell in grid.winfo_children():
-                    widest = max(widest, cell.winfo_reqwidth() + 12)
-            except Exception:
-                return          # widgets went away under us — nothing to size
-        if widest <= 50:
-            return
+        if self._doc_btn_w is None:
+            fm = QFontMetrics(_ui_font(8))
+            text = max(fm.horizontalAdvance("ReadMe"), fm.horizontalAdvance("Details"))
+            self._doc_btn_w = text + 2 * 3 + 2 + 10
+        return self._doc_btn_w
 
-        if allow_shrink:
-            changed = widest != self._measured_cell_px
-        else:
-            changed = self._measured_cell_px is None or widest > self._measured_cell_px
-        if changed:
-            self._measured_cell_px = widest
-
-        self._fit_two_columns()
-
-        if self._calc_group_cols() != self._group_cols and self._relayouts < 3:
-            self._relayouts += 1
-            self.after(0, self._rebuild_buttons)
-        else:
-            self._relayouts = 0
-
-    def _fit_two_columns(self):
-        """Keep the window wide enough for two of the widest cards side by side.
-
-        Opening a group can bring wider cards, and two of those no longer fit in
-        the window the user left the last group in — the second column would be
-        drawn past the right edge. So the minimum width follows the cards, and a
-        window that is already too narrow is widened once. It is never made
-        narrower again: the size the user chose is theirs to keep.
-        """
-        cell = self._measured_cell_px
-        if not cell:
-            return          # no real card measured yet — nothing to size to
-        try:
-            win_w, win_h = self.winfo_width(), self.winfo_height()
-            canvas_w = self.sf.canvas.winfo_width()
-            # The scrollbar takes its share of the width as soon as the list is
-            # long enough, so count it even while it is hidden. A scrollbar that
-            # was never mapped asks for far more than it takes (69 px measured),
-            # hence the cap — otherwise the window jumps wider than it needs.
-            vsb_w = 0 if self.sf.vsb.winfo_ismapped() else min(self.sf.vsb.winfo_reqwidth(), 24)
-        except Exception:
-            return
-        if win_w <= 1 or canvas_w <= 1:
-            return
-
-        # Everything the window spends on itself: padding, border, scrollbar.
-        # Measured right after a resize the canvas is still the old size, which
-        # makes this look bigger than it is — and it is a property of the window,
-        # not of the moment, so keep the smallest reading rather than the latest.
-        chrome = max(0, win_w - canvas_w) + max(0, vsb_w)
-        if self._chrome_px is None or chrome < self._chrome_px:
-            self._chrome_px = chrome
-        needed = GROUP_COLS * cell + self._chrome_px + GRID_PAD_PX
-        self.minsize(needed, MIN_WINDOW_H)
-        if win_w < needed:
-            self.geometry(f"{needed}x{max(win_h, MIN_WINDOW_H)}")
-
-    def _doc_btn_width_px(self) -> int:
-        """
-        Width of one doc button ("ReadMe" / "Details"), measured once.
-
-        Both halves of a card's button area get this as a minimum, so a card
-        without a "Details" button keeps the exact geometry of one that has it.
-        Without the minimum those two halves shrink to the small icon buttons
-        underneath, the lone "ReadMe" shrinks with them, and the whole card is
-        pulled narrower than its neighbours.
-        """
-        if self._doc_btn_px is None:
-            probe = ttk.Button(self, text="Details", style="Doc.TButton", width=7)
-            try:
-                probe.update_idletasks()
-                self._doc_btn_px = max(40, probe.winfo_reqwidth())
-            except Exception:
-                self._doc_btn_px = 56
-            finally:
-                probe.destroy()
-        return self._doc_btn_px
-
-    def _load_icon(self, icon_path):
-        """A program's 24 px icon, read once and kept for every later card."""
+    def _load_icon(self, icon_path) -> QIcon | None:
+        """A program's icon, read once and kept for every later card."""
         if not icon_path:
             return None
         key = str(icon_path)
         if key not in self._icon_cache:
-            try:
-                pil_img = Image.open(key)
-                if getattr(pil_img, "format", "") == "ICO":
-                    sizes = pil_img.info.get("sizes", [])
-                    if sizes:
-                        candidates = [s for s in sizes if s[0] <= 32]
-                        target = max(candidates) if candidates else min(sizes, key=lambda s: s[0])
-                        pil_img = Image.open(key).resize(target, Image.LANCZOS)
-                pil_img = pil_img.convert("RGBA").resize((24, 24), Image.LANCZOS)
-                self._icon_cache[key] = ImageTk.PhotoImage(pil_img)
-            except Exception:
-                self._icon_cache[key] = None
+            icon = QIcon(key)
+            self._icon_cache[key] = None if icon.isNull() else icon
         return self._icon_cache.get(key)
 
-    def _fill_version_menu(self, menu: tk.Menu, name: str):
-        """Fill the 🔽 list when it opens, from the versions known right now.
+    def _fill_version_menu(self, menu: QMenu, name: str):
+        """Fill the version list when it opens, from the versions known right now.
 
         Built with the card, the list kept whatever the scan had found and
         never showed a version the 10 s poll found later.
         """
-        menu.delete(0, "end")
+        menu.clear()
         info = self.programs.get(name)
         if not info:
             return
         for v in info.get("archive_versions", []):
-            menu.add_command(
-                label=v["label"],
-                command=lambda p=v.get("exe_path"), d=info["program_dir"],
-                               py=v.get("py_path"),
-                               hi=v.get("has_internal", False):
-                    self._launch_exe(p, d, py, hi),
-            )
+            act = menu.addAction(v["label"])
+            act.triggered.connect(
+                lambda _=False, p=v.get("exe_path"), d=info["program_dir"],
+                py=v.get("py_path"), hi=v.get("has_internal", False):
+                    self._launch_exe(p, d, py, hi))
 
     def _build_group_content(self, gkey: str):
-        grid = self._group_grids.get(gkey)
-        group_items = self._group_items.get(gkey, [])
-        if grid is None or not group_items:
+        if not self._group_items.get(gkey) or gkey not in self._group_grids:
             return
-        prog_chars = self._prog_btn_chars()
-        self._btn_chars_used = prog_chars
-        for name, info in group_items:
-            self._prog_cells[name] = self._build_card(grid, name, info, prog_chars)
+        for name, info in self._group_items[gkey]:
+            self._prog_cells[name] = self._build_card(gkey, name, info)
+        self._group_built.add(gkey)
         self._regrid(gkey)
 
     def _regrid(self, gkey: str):
         """Place a group's existing cards in name order, two to a row."""
-        grid = self._group_grids.get(gkey)
-        if grid is None:
+        grid_w = self._group_grids.get(gkey)
+        lay = self._group_layouts.get(gkey)
+        if grid_w is None or lay is None:
             return
-        cols = self._group_cols
+        while lay.count():
+            lay.takeAt(0)
         i = 0
         for name, _info in self._group_items.get(gkey, []):
             cell = self._prog_cells.get(name)
-            if cell is None or not cell.winfo_exists() or cell.master is not grid:
+            if cell is None or not isValid(cell) or cell.parent() is not grid_w:
                 continue
-            cell.grid(row=i // cols, column=i % cols, padx=6, pady=6, sticky="w")
+            lay.addWidget(cell, i // GROUP_COLS, i % GROUP_COLS,
+                          Qt.AlignLeft | Qt.AlignTop)
             i += 1
-        for c in range(cols):
-            grid.grid_columnconfigure(c, weight=0, uniform="grpcols")
 
-    def _build_card(self, grid, name: str, info: dict, prog_chars: int):
+    def _build_card(self, gkey: str, name: str, info: dict) -> QWidget:
         """One program's card (not yet placed — _regrid does that)."""
-        cell = ttk.Frame(grid)
-        cell.grid_columnconfigure(0, weight=0)
-        cell.grid_columnconfigure(1, weight=0)
+        cell = QWidget(self._group_grids[gkey])
+        lay = QHBoxLayout(cell)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
 
+        btn = QPushButton(ui_label(info["label"]), cell)
+        btn.setObjectName("prog")
         img = self._load_icon(info.get("icon_path"))
-
-        btn_style = "Update.Prog.TButton" if name in self._update_available else "Prog.TButton"
-        # The button is as wide as the longest name in the open groups, but
-        # not wider than the cap — a name over the cap ends in "..." instead
-        # of being cut off mid-word at the edge of the button.
-        btn_text = clamp_label(ui_label(info["label"]), prog_chars)
-        btn = ttk.Button(
-            cell,
-            text=btn_text,
-            image=img,
-            compound="left",
-            style=btn_style,
-            width=prog_chars,
-            command=lambda n=name: self.launch(n),
-        )
-        btn.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 6))
-        btn.bind("<Button-3>", lambda e, n=name: self._show_group_menu(e, n))
+        if img is not None:
+            btn.setIcon(img)
+        btn.setIconSize(QSize(24, 24))
+        btn.setProperty("update", name in self._update_available)
+        btn.setFixedWidth(self._prog_btn_w)
+        btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        btn.clicked.connect(lambda _=False, n=name: self.launch(n))
+        btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        btn.customContextMenuRequested.connect(
+            lambda pos, n=name, b=btn: self._show_group_menu(b.mapToGlobal(pos), n))
+        lay.addWidget(btn)
         self._prog_buttons[name] = btn
 
-        sub = ttk.Frame(cell)
-        sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
-        doc_px = self._doc_btn_width_px()
-        # +2 on the left half is the gap the two doc buttons sit apart with.
-        sub.grid_columnconfigure(0, weight=1, minsize=doc_px + 2)
-        sub.grid_columnconfigure(1, weight=1, minsize=doc_px)
-        sub.grid_rowconfigure(0, weight=0)
-        sub.grid_rowconfigure(1, weight=0)
+        sub = QGridLayout()
+        sub.setContentsMargins(0, 0, 0, 0)
+        sub.setHorizontalSpacing(2)
+        sub.setVerticalSpacing(2)
+        doc_w = self._doc_btn_px()
+        sub.setColumnMinimumWidth(0, doc_w)
+        sub.setColumnMinimumWidth(1, doc_w)
+        sub.setRowMinimumHeight(0, 24)
+        sub.setRowMinimumHeight(1, 24)
 
         has_readme = bool(info.get("readme_path"))
         has_full = bool(info.get("readme_full_path"))
-        # width=7 is not the label length — a ttk button with no explicit
-        # width takes the theme's minimum (69-80 px here) however short its
-        # text is, and two of those is what made the card 86 px too wide.
-        # At width=7 with padding (3,2) the button is 56 px and holds
-        # "Details" (35 px) and "ReadMe" (42 px) with room to spare.
-        if has_readme or has_full:
-            if has_readme:
-                info_btn = ttk.Button(
-                    sub, text="ReadMe", style="Doc.TButton", width=7,
-                    command=lambda n=name: self.open_readme(n),
-                )
-                info_btn.grid(
-                    row=0, column=0,
-                    columnspan=1 if has_full else 2,
-                    sticky="ew", pady=(0, 2), padx=(0, 2) if has_full else 0,
-                )
-            if has_full:
-                full_btn = ttk.Button(
-                    sub, text="Details", style="Doc.TButton", width=7,
-                    command=lambda n=name: self.open_readme_full(n),
-                )
-                full_btn.grid(
-                    row=0, column=1 if has_readme else 0,
-                    columnspan=1 if has_readme else 2,
-                    sticky="ew", pady=(0, 2),
-                )
-        else:
-            ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
+        if has_readme:
+            b = QPushButton("ReadMe", cell)
+            b.setObjectName("doc")
+            b.setFixedHeight(24)
+            b.clicked.connect(lambda _=False, n=name: self.open_readme(n))
+            sub.addWidget(b, 0, 0, 1, 1 if has_full else 2)
+        if has_full:
+            b = QPushButton("Details", cell)
+            b.setObjectName("doc")
+            b.setFixedHeight(24)
+            b.clicked.connect(lambda _=False, n=name: self.open_readme_full(n))
+            sub.addWidget(b, 0, 1 if has_readme else 0, 1, 1 if has_readme else 2)
 
-        folder_btn = ttk.Button(
-            sub, text="📂", style="Info.TButton", width=3,
-            command=lambda n=name: self.open_folder(n),
-        )
-        folder_btn.grid(row=1, column=0, sticky="ew", padx=(0, 2))
+        folder = QToolButton(cell)
+        folder.setObjectName("small")
+        folder.setIcon(drawn_icon("folder"))
+        folder.setIconSize(QSize(16, 16))
+        folder.setToolTip("Open the program folder")
+        folder.setFixedHeight(24)
+        folder.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        folder.clicked.connect(lambda _=False, n=name: self.open_folder(n))
+        sub.addWidget(folder, 1, 0)
 
-        versions = info.get("archive_versions", [])
-        if versions:
-            mb = ttk.Menubutton(sub, text="  🔽  ", style="Info.TButton", width=4)
-            menu = tk.Menu(mb, tearoff=0)
-            menu.configure(postcommand=lambda m=menu, n=name: self._fill_version_menu(m, n))
-            mb["menu"] = menu
-            mb.grid(row=1, column=1, sticky="ew")
-        else:
-            ttk.Frame(sub, width=1).grid(row=1, column=1)
+        if info.get("archive_versions"):
+            vb = QToolButton(cell)
+            vb.setObjectName("small")
+            vb.setIcon(drawn_icon("history"))
+            vb.setIconSize(QSize(16, 16))
+            vb.setToolTip("Start an older version")
+            vb.setFixedHeight(24)
+            vb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            menu = QMenu(vb)
+            menu.aboutToShow.connect(lambda m=menu, n=name: self._fill_version_menu(m, n))
+            vb.setMenu(menu)
+            vb.setPopupMode(QToolButton.InstantPopup)
+            sub.addWidget(vb, 1, 1)
+        lay.addLayout(sub)
         return cell
 
+    def _drop_card(self, name: str):
+        cell = self._prog_cells.pop(name, None)
+        self._prog_buttons.pop(name, None)
+        if cell is not None and isValid(cell):
+            for lay in self._group_layouts.values():
+                lay.removeWidget(cell)
+            cell.hide()
+            cell.deleteLater()
+
+    def _add_card(self, gkey: str, name: str) -> bool:
+        """Build one card into a group's grid — only if that group's cards
+        exist or it is open; a group never opened builds them all when opened."""
+        info = self.programs.get(name)
+        if gkey not in self._group_grids or info is None:
+            return False
+        if gkey not in self._group_built and not self._group_expanded.get(gkey):
+            return False
+        self._group_built.add(gkey)
+        self._prog_cells[name] = self._build_card(gkey, name, info)
+        return True
+
+    def _replace_card(self, name: str):
+        """Build one program's card again in its place (e.g. it gained a version list)."""
+        cell = self._prog_cells.get(name)
+        if cell is None or not isValid(cell):
+            return
+        gkey = self._group_of(name)
+        self._drop_card(name)
+        if self._add_card(gkey, name):
+            self._regrid(gkey)
+        self._fit_width()
+
+    def _fit_width(self):
+        """Keep the window wide enough for two of the widest cards side by side.
+
+        The minimum width follows the cards, and a window that is too narrow
+        is widened once. It is never made narrower: the size the user chose is
+        theirs to keep.
+        """
+        self._body.activate()
+        inner = self._inner.minimumSizeHint().width()
+        bar = self.scroll.verticalScrollBar().sizeHint().width()
+        m = self.centralWidget().layout().contentsMargins()
+        need = inner + bar + 2 * self.scroll.frameWidth() + m.left() + m.right()
+        need = max(need, 550, self.centralWidget().minimumSizeHint().width())
+        self.setMinimumWidth(need)
+        if self.width() < need:
+            self.resize(need, max(self.height(), MIN_WINDOW_H))
 
     def _toggle_group(self, gkey: str):
         expanded = not self._group_expanded.get(gkey, False)
         self._group_expanded[gkey] = expanded
-        self._relayouts = 0          # a click starts a fresh relayout chain
 
         # The buttons are as wide as the longest name in the OPEN groups, so a
         # group that brings a longer (or takes away the longest) name resizes
-        # every card. The existing buttons are re-sized in place — the window
-        # used to be torn down and built again for it, which is what flickered.
-        new_chars = self._prog_btn_chars()
-        width_changed = new_chars != self._btn_chars_used
-
-        frame = self._group_frames.get(gkey)
-        if frame:
-            if expanded:
-                # Lazy build: populate grid if it has no children yet
-                grid = self._group_grids.get(gkey)
-                if grid and not grid.winfo_children():
-                    self._build_group_content(gkey)
-                header = self._group_headers.get(gkey)
-                if header:
-                    frame.pack(fill="x", padx=6, pady=(2, 0), after=header)
-                else:
-                    frame.pack(fill="x", padx=6, pady=(2, 0))
-            else:
-                frame.pack_forget()
+        # every card — in place, nothing is built again for it.
+        new_w = self._calc_prog_btn_px()
+        if new_w != self._prog_btn_w:
+            self._apply_btn_width(new_w)
+        if expanded and gkey not in self._group_built:
+            self._build_group_content(gkey)       # lazy: first opening
         self._update_group_header(gkey)
-        if width_changed:
-            self._apply_btn_width(new_chars)
+        self._show_groups()
+        self._fit_width()
 
-        # Opening a group can bring a wider card; closing one can take the
-        # widest away, and then the cards may fit in more columns again. A click
-        # is allowed to make the cards narrower again; a rebuild it starts is
-        # not, so the two card sizes can never take turns.
-        self._sync_cell_width(allow_shrink=True)
-
-    def _apply_btn_width(self, chars: int):
+    def _apply_btn_width(self, px: int):
         """Give every program button on screen the same new width, in place."""
-        self._btn_chars_used = chars
-        for name, btn in self._prog_buttons.items():
-            info = self.programs.get(name)
-            if info is None or not btn.winfo_exists():
-                continue
-            btn.configure(width=chars,
-                          text=clamp_label(ui_label(info["label"]), chars))
+        self._prog_btn_w = px
+        for btn in self._prog_buttons.values():
+            if isValid(btn):
+                btn.setFixedWidth(px)
 
     def _set_update_style(self, name: str):
         """Amber or plain, on the one button — nothing else is redrawn."""
         btn = self._prog_buttons.get(name)
-        if btn is None or not btn.winfo_exists():
+        if btn is None or not isValid(btn):
             return
-        btn.configure(style="Update.Prog.TButton" if name in self._update_available
-                      else "Prog.TButton")
+        btn.setProperty("update", name in self._update_available)
+        _repolish(btn)
 
-    def _show_group_menu(self, event, program_name: str):
+    def _show_group_menu(self, global_pos, program_name: str):
         current_gkey = self._group_of(program_name)
-        menu = tk.Menu(self, tearoff=0)
+        menu = QMenu(self)
         if program_name in self._update_available:
-            menu.add_command(
-                label="✓  Acknowledge update",
-                command=lambda: self._acknowledge_update(program_name),
-            )
-            menu.add_separator()
-        menu.add_command(
-            label="Move to group:",
-            state="disabled",
-            font=("Segoe UI", 9, "bold"),
-        )
-        menu.add_separator()
+            act = menu.addAction("Acknowledge update")
+            act.triggered.connect(lambda _=False: self._acknowledge_update(program_name))
+            menu.addSeparator()
+        head = menu.addAction("Move to group:")
+        head.setEnabled(False)
+        head.setFont(_ui_font(9, bold=True))
+        menu.addSeparator()
+        tick = drawn_icon("tick")
         for title, gkey in GROUP_ORDER:
-            label = f"✓  {title}" if gkey == current_gkey else f"     {title}"
-            menu.add_command(
-                label=label,
-                command=lambda k=gkey: self._move_to_group(program_name, k),
-            )
+            act = menu.addAction(title)
+            if gkey == current_gkey:
+                act.setIcon(tick)
+            act.triggered.connect(
+                lambda _=False, k=gkey: self._move_to_group(program_name, k))
         if program_name in self._custom_groups:
-            menu.add_separator()
-            menu.add_command(
-                label="↺  Reset to default",
-                command=lambda: self._move_to_group(program_name, None),
-            )
-        menu.tk_popup(event.x_root, event.y_root)
+            menu.addSeparator()
+            act = menu.addAction("Reset to default")
+            act.triggered.connect(lambda _=False: self._move_to_group(program_name, None))
+        menu.exec(global_pos)
+        menu.deleteLater()
 
     def _move_to_group(self, program_name: str, gkey: str | None):
         old = self._group_of(program_name)
@@ -1836,22 +1849,20 @@ class Launcher(tk.Tk):
                                         key=lambda kv: kv[0].lower())
         self._drop_card(program_name)
         self._regrid(old)
-        new_chars = self._prog_btn_chars()
-        if new_chars != self._btn_chars_used:
-            self._apply_btn_width(new_chars)
+        new_w = self._calc_prog_btn_px()
+        if new_w != self._prog_btn_w:
+            self._apply_btn_width(new_w)
         if self._add_card(new, program_name):
             self._regrid(new)
         self._update_group_header(old)
         self._update_group_header(new)
-        self._pack_groups()
-        self._relayouts = 0
-        self._sync_cell_width(allow_shrink=True)
+        self._show_groups()
+        self._fit_width()
 
     def _rebuild_radiobuttons(self):
-        for i, (label, path, configurable) in enumerate(self._root_options):
+        for i, (label, path, _configurable) in enumerate(self._root_options):
             if i < len(self._rb_widgets):
-                state = "normal" if (path is not None and not (self._is_lab_machine and label.lower().startswith("office"))) else "disabled"
-                self._rb_widgets[i].configure(state=state)
+                self._rb_widgets[i].setEnabled(self._root_enabled(label, path))
 
     # -------- version update polling --------
 
@@ -1927,7 +1938,7 @@ class Launcher(tk.Tk):
             # about programs that are no longer on screen.
             self._schedule_version_poll()
             return
-        # A card built without any older version has no 🔽 button yet.
+        # A card built without any older version has no version list button yet.
         gained_versions: set[str] = set()
         for name, (best_exe, archive_vers) in refreshed.items():
             if name in self.programs:
@@ -1967,7 +1978,7 @@ class Launcher(tk.Tk):
         self._schedule_version_poll()
 
     def _acknowledge_update(self, program_name: str):
-        """Mark the current update for program_name as seen — clears highlight and blink."""
+        """Mark the current update for program_name as seen — clears the highlight."""
         info = self.programs.get(program_name, {})
         # Advance exe_path to the newer version and forget the pending entry
         pending = self._pending_updates.pop(program_name, None)
@@ -1992,17 +2003,17 @@ class Launcher(tk.Tk):
 
         # Use pending (newer) exe if available, otherwise current
         exe_path: Path = self._pending_updates.get(program_name, info["exe_path"])
-        self.status.configure(text=f"Starting: {program_name} ...")
+        self._set_status(f"Starting: {program_name} ...")
 
         def worker():
             try:
                 if not _launch_no_zone_check(exe_path):
                     os.startfile(str(exe_path))  # fallback
-                self.after(0, self.status.configure, {"text": f"Started: {program_name}"})
+                self.after(0, self._set_status, f"Started: {program_name}")
                 self.after(0, self._acknowledge_update, program_name)
             except Exception as e:
                 self.after(0, messagebox.showerror, "Launch failed", f"{program_name}\n\n{e}")
-                self.after(0, self.status.configure, {"text": "Launch failed."})
+                self.after(0, self._set_status, "Launch failed.")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2011,17 +2022,12 @@ class Launcher(tk.Tk):
         """Start an older version of a program.
 
         The archived .exe IS the whole old program: every build carries its own
-        code inside the exe (34 MB apiece, a different size per version), while
-        the _internal folder beside it holds only the shared Python runtime and
-        the third-party packages, which every version can use. Measured on the
-        published copy: a running build's sys.path holds _internal and its
-        sub-folders and nothing else, so the .py files lying in the program
-        folder are never imported by a running exe.
-
-        So the archived exe is what gets started. All it needs is an _internal
-        beside it, which is why a version out of the archive is put into the
-        program folder for the run. Its .py snapshot rides along, so the folder
-        never shows an old exe with the newest sources next to it.
+        code inside the exe, while the _internal folder beside it holds only the
+        shared Python runtime and the third-party packages, which every version
+        can use. So the archived exe is what gets started. All it needs is an
+        _internal beside it, which is why a version out of the archive is put
+        into the program folder for the run. Its .py snapshot rides along, so
+        the folder never shows an old exe with the newest sources next to it.
         """
         internal_dir = program_dir / "_internal"
         ref = exe_path if exe_path is not None else py_path
@@ -2043,12 +2049,12 @@ class Launcher(tk.Tk):
                 try:
                     if not _launch_no_zone_check(exe_path):
                         subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
-                    self.after(0, self.status.configure, {"text": f"Started: {label}"})
+                    self.after(0, self._set_status, f"Started: {label}")
                 except Exception as e:
                     self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
-                    self.after(0, self.status.configure, {"text": "Launch failed."})
+                    self.after(0, self._set_status, "Launch failed.")
 
-            self.status.configure(text=f"Starting: {label} ...")
+            self._set_status(f"Starting: {label} ...")
             threading.Thread(target=worker, daemon=True).start()
             return
 
@@ -2092,8 +2098,8 @@ class Launcher(tk.Tk):
                 if temp_dir.exists():
                     self.after(0, messagebox.showerror, "Launch blocked",
                                f"A previous old-version launch of this program did not clean up.\n\n"
-                               f"Use the broom button or restart the launcher to restore it first.")
-                    self.after(0, self.status.configure, {"text": "Ready."})
+                               f"Use the Clean button or restart the launcher to restore it first.")
+                    self.after(0, self._set_status, "Ready.")
                     return
                 temp_dir.mkdir(parents=True, exist_ok=True)
                 # Marked before the first move: whatever lands in the temp
@@ -2107,7 +2113,7 @@ class Launcher(tk.Tk):
                     staged.append(dst)
                 env = dict(os.environ)
                 env["PYTHONDONTWRITEBYTECODE"] = "1"
-                self.after(0, self.status.configure, {"text": f"Running: {label}"})
+                self.after(0, self._set_status, f"Running: {label}")
                 if python_exe is None:
                     proc = subprocess.Popen(cmd, cwd=str(program_dir), env=env)
                     proc.wait()
@@ -2133,7 +2139,7 @@ class Launcher(tk.Tk):
                                    f"{label}\n\nIt ended with an error" + detail)
             except Exception as e:
                 self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
-                self.after(0, self.status.configure, {"text": "Launch failed."})
+                self.after(0, self._set_status, "Launch failed.")
             finally:
                 for f in staged:
                     try:
@@ -2147,9 +2153,9 @@ class Launcher(tk.Tk):
                         temp_dir.rmdir()
                     except Exception:
                         pass
-                self.after(0, self.status.configure, {"text": "Ready."})
+                self.after(0, self._set_status, "Ready.")
 
-        self.status.configure(text=f"Starting: {label} ...")
+        self._set_status(f"Starting: {label} ...")
         threading.Thread(target=worker, daemon=True).start()
 
     def open_folder(self, program_name: str):
@@ -2201,60 +2207,62 @@ class Launcher(tk.Tk):
             ),
         }
 
-        # Uživatel si vybere, kterou cestu chce nastavit
+        # The user picks which path to set
         choices = list(key_map.keys())
-        choice_win = tk.Toplevel(self)
-        choice_win.title("Set paths")
-        choice_win.resizable(False, False)
-        choice_win.grab_set()
-
-        ttk.Label(choice_win, text="Which path do you want to set for your personal computer? Do not set the path for PCs in the lab.", padding=(12, 10)).pack()
-
-        chosen_label = tk.StringVar(value=choices[0])
-        for c in choices:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Set paths")
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(4)
+        v.addWidget(QLabel("Which path do you want to set for your personal computer? "
+                           "Do not set the path for PCs in the lab.", dlg))
+        v.addSpacing(6)
+        group = QButtonGroup(dlg)
+        for i, c in enumerate(choices):
             current = self._config.get(key_map[c][0], "(not set)")
-            ttk.Radiobutton(
-                choice_win,
-                text=f"{c}  —  current: {current}",
-                variable=chosen_label,
-                value=c,
-            ).pack(anchor="w", padx=16, pady=(6, 0))
+            rb = QRadioButton(f"{c}  —  current: {current}", dlg)
+            rb.setChecked(i == 0)
+            group.addButton(rb, i)
+            v.addWidget(rb)
             # What to pick is said right here, instead of in a separate message
             # box that popped up before the folder picker.
-            ttk.Label(choice_win, text=key_map[c][1], foreground="#404040",
-                      justify="left").pack(anchor="w", padx=40, pady=(0, 2))
+            hint = QLabel(key_map[c][1], dlg)
+            hint.setObjectName("hint")
+            hint.setContentsMargins(24, 0, 0, 6)
+            v.addWidget(hint)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        ok = QPushButton("Set selected path", dlg)
+        ok.clicked.connect(dlg.accept)
+        row.addWidget(ok)
+        row.addStretch(1)
+        v.addLayout(row)
+        if dlg.exec() != QDialog.Accepted:
+            return
 
-        def on_confirm():
-            label = chosen_label.get()
-            cfg_key, _description = key_map[label]
-            choice_win.destroy()
+        label = choices[max(0, group.checkedId())]
+        cfg_key, _description = key_map[label]
+        current = self._config.get(cfg_key, "")
+        chosen = QFileDialog.getExistingDirectory(
+            self, f"Select folder for {label}", current or str(Path.home()))
+        if not chosen:
+            return
 
-            current = self._config.get(cfg_key, "")
-            chosen = filedialog.askdirectory(
-                parent=self,
-                title=f"Select folder for {label}",
-                initialdir=current or str(Path.home()),
-            )
-            if not chosen:
-                return
+        self._config[cfg_key] = chosen
+        _save_config(self._config)  # the .json is created now, on the first save
 
-            self._config[cfg_key] = chosen
-            _save_config(self._config)  # .json se vytvoří teď, poprvé při uložení
+        self._root_options = _apply_config_to_root_options(self._config)
+        self._rebuild_radiobuttons()
 
-            self._root_options = _apply_config_to_root_options(self._config)
-            self._rebuild_radiobuttons()
-
-            # The new path is used straight away: its option is picked and
-            # loaded, instead of leaving the window empty until it is clicked.
-            idx = next(i for i, (lbl, _p, _c) in enumerate(self._root_options) if lbl == label)
-            if str(self._rb_widgets[idx].cget("state")) != "disabled":
-                self.root_choice.set(idx)
-                self.refresh()
-            elif self.root_choice.get() == idx:
-                self.root_choice.set(-1)
-                self._set_idle_state()
-
-        ttk.Button(choice_win, text="Set selected path", command=on_confirm).pack(pady=(8, 12))
+        # The new path is used straight away: its option is picked and
+        # loaded, instead of leaving the window empty until it is clicked.
+        idx = next(i for i, (lbl, _p, _c) in enumerate(self._root_options) if lbl == label)
+        if self._rb_widgets[idx].isEnabled():
+            self._set_root_idx(idx)
+            self.refresh()
+        elif self._root_idx == idx:
+            self._set_root_idx(-1)
+            self._set_idle_state()
 
     def open_readme(self, program_name: str):
         info = self.programs.get(program_name)
@@ -2289,5 +2297,25 @@ class Launcher(tk.Tk):
             messagebox.showerror("Details open failed", f"{program_name}\n\n{e}")
 
 
+def main() -> int:
+    ico = _icon_file()
+    app_id = _icon_app_id(APP_ID_PREFIX, str(ico) if ico else None) if os.name == "nt" else None
+    if app_id:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+
+    app = QApplication(sys.argv)
+    apply_app_style(app)
+    if ico is not None:
+        app.setWindowIcon(QIcon(str(ico)))
+    win = Launcher()
+    win.show()
+    _nudge_taskbar_icon(int(win.winId()))
+    return app.exec()
+
+
 if __name__ == "__main__":
-    Launcher().mainloop()
+    sys.exit(main())

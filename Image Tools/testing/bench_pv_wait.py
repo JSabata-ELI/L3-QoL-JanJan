@@ -147,13 +147,12 @@ def main():
         B.wait_for(lambda: bool(v._pv_awaiting), 5.0)
         check("panel reports it is waiting", "PTM1" in v._pv_awaiting,
               f"awaiting={v._pv_awaiting} values={v._pv_values}")
-        txt = v._pv_display_text("PTM1")
         # The previous shot's number is 11.0. Showing it unflagged next to this frame is
-        # precisely the reported bug.
+        # precisely the reported bug. Since 05.10.2026 the flag is the dot, not words:
+        # red while this frame's own sample is awaited.
         check("previous shot's number is not presented as this frame's",
-              txt.strip() not in ("11.000 J", "11.000"), f"showed {txt!r}")
-        check("held value says how far back it comes from",
-              "-25 s" in txt or cpva.PV_TEXT_PENDING in txt, f"showed {txt!r}")
+              v._pv_state("PTM1") == m.PV_STATE_LOADING,
+              f"state={v._pv_state('PTM1')!r}")
 
         # ── 2. THE FIX: the value arrives on its own once the archiver publishes ──
         print("\n[2] the archiver publishes it — no user interaction from here on")
@@ -214,9 +213,11 @@ def main():
               f"want={fast_ts[-3]} awaiting={v._pv_awaiting}")
         check("shows that shot's real value",
               v._pv_values.get("PTM1") == "23.000", f"values={v._pv_values}")
-        txt = v._pv_display_text("PTM1")
-        check("labelled with the sub-second gap, not passed off as this frame's",
-              txt.strip() == "23.000 J (-0.6 s)", f"showed {txt!r}")
+        # 13.10.2026: the archiver writes only on CHANGE, so a number read for an
+        # earlier frame is flagged only once a NEWER sample is known to exist —
+        # here none is published yet, so it is shown plainly (and snaps below).
+        check("no flag while no newer sample is known",
+              v._pv_state("PTM1") == "", f"state={v._pv_state('PTM1')!r}")
         check("no 'wait' left — the number IS a real reading", not v._pv_awaiting,
               f"awaiting={v._pv_awaiting}")
         check("'refresh behind' badge stays off (the offset is deliberate)",

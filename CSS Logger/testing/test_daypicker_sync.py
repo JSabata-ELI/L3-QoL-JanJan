@@ -2,7 +2,7 @@
 
 `Image Tools/daypicker.py` owns how a day and a time window are picked for the
 whole suite. This folder keeps a verbatim copy of it, because the builder only
-bundles .py files that sit in the program's own folder (Dev Tools/b_t.py passes
+bundles .py files that sit in the program's own folder (Dev Tools/dt_core.py passes
 that folder as PyInstaller's only --paths).
 
 Two copies means they can drift, and a drifted calendar is invisible until an
@@ -127,7 +127,7 @@ def main() -> int:
 
     # A built copy cannot rely on the file being next to sp_t.py. That folder is
     # _internal, and the deploy REPLACES _internal with one shared runtime
-    # library (Dev Tools/cm_t.py, "Deploy Libraries") that carries no
+    # library (Dev Tools/dt_core.py, "Deploy Libraries") that carries no
     # daypicker.py — which is exactly how the network copy lost it. Two things
     # keep it alive: the module is compiled into the exe, and the loader knows
     # more than one place to look.

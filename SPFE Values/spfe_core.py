@@ -14,6 +14,8 @@ No GUI toolkit is imported here, so it is safe to use from headless tests.
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +50,20 @@ CPVA_BASE_URL         = "https://10.78.0.57:8443/api/1.0/cpva"
 CPVA_SAMPLES_ENDPOINT = "/samples"
 CPVA_HTTP_TIMEOUT     = 10.0
 
+# The backup. The CPVA archiver is only a front end: the L3 proxy on .64 (twin
+# .65) serves the very same L3 Cassandra -- measured 15.10.2026, an identical
+# channel list, identical rows, the same speed. When the CPVA service cannot be
+# reached at all (connection refused or reset, HTTP 502/503/504) the same
+# question goes there instead, and for the next CPVA_DOWN_S seconds every
+# question goes straight to it. Never on a read timeout (same slow database
+# behind both) and never on any other HTTP error (that is an answer).
+L3_PROXY_BASE_URLS = (
+    "http://10.78.0.64:8080/l3proxy/archive-access/api/1.0/archive/1",
+    "http://10.78.0.65:8080/l3proxy/archive-access/api/1.0/archive/1",
+)
+CPVA_DOWN_S = 60.0
+_UNREACHABLE_HTTP = (502, 503, 504)
+
 # The archiver only returns reliable data when the query window <= 1 h.
 CHUNK_SIZE_NS = int(3600 * 1e9)
 
@@ -72,6 +88,60 @@ def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT):
     return orjson.loads(resp.content)
 
 
+def _cannot_reach(exc) -> bool:
+    """The service is not there at all -- as opposed to slow, or answering."""
+    if isinstance(exc, requests.ConnectionError):   # refused, reset, SSL, connect timeout
+        return True
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    return code in _UNREACHABLE_HTTP
+
+
+_cpva_down_until = 0.0
+_DOWN_LOCK = threading.Lock()
+
+
+def _cpva_is_down() -> bool:
+    with _DOWN_LOCK:
+        return time.monotonic() < _cpva_down_until
+
+
+def _mark_cpva_down() -> None:
+    global _cpva_down_until
+    with _DOWN_LOCK:
+        _cpva_down_until = time.monotonic() + CPVA_DOWN_S
+
+
+def _get_json_or_backup(cpva_url: str, proxy_path: str,
+                        timeout: float = CPVA_HTTP_TIMEOUT):
+    """The CPVA archiver, or the L3 proxy when the archiver cannot be reached.
+
+    `proxy_path` is the same question in the proxy's URL shape. An error from
+    the proxy is raised as it is; only when neither can be reached is it one
+    ConnectionError naming both.
+    """
+    first = None
+    if not _cpva_is_down():
+        try:
+            return _http_get_json(cpva_url, timeout=timeout)
+        except Exception as exc:
+            if not _cannot_reach(exc):
+                raise
+            _mark_cpva_down()
+            first = exc
+    last = None
+    for base in L3_PROXY_BASE_URLS:
+        try:
+            return _http_get_json(base + proxy_path, timeout=timeout)
+        except Exception as exc:
+            if not isinstance(exc, requests.ConnectionError):
+                raise                   # an answer, or a slow one: not the twin's job
+            last = exc
+    if first is None:
+        raise last
+    raise requests.ConnectionError(
+        f"archiver unreachable ({first}); backup L3 proxy: {last}") from last
+
+
 def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
                        timeout: float = CPVA_HTTP_TIMEOUT) -> list[dict]:
     """Every archived sample of one channel in [start_ns, end_ns]."""
@@ -81,7 +151,11 @@ def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
         "end":   str(end_ns),
     })
     url = f"{CPVA_BASE_URL}{CPVA_SAMPLES_ENDPOINT}?{params}"
-    data = _http_get_json(url, timeout=timeout)
+    proxy_params = urllib.parse.urlencode({"start": str(start_ns),
+                                           "end":   str(end_ns)})
+    proxy_path = (f"/samples/{urllib.parse.quote(channel, safe='')}"
+                  f"?{proxy_params}")
+    data = _get_json_or_backup(url, proxy_path, timeout=timeout)
     if not isinstance(data, list):
         raise ValueError(f"Unexpected response shape: {type(data).__name__}")
     return data

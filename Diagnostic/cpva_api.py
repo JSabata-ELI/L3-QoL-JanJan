@@ -10,11 +10,11 @@ archiver session only. (The notifier clients in alerting.py keep TLS ON.)
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import re
 import sys
 import threading
+import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -49,6 +49,34 @@ CPVA_BASE_URL          = "https://10.78.0.57:8443/api/1.0/cpva"
 CPVA_SAMPLES_ENDPOINT  = "/samples"
 CPVA_CHANNELS_ENDPOINT = "/channels"
 CPVA_HTTP_TIMEOUT      = 10.0
+
+# The backup. The CPVA archiver is only a front end: the L3 proxy on .64 (twin
+# .65) serves the very same L3 Cassandra - measured 15.10.2026, an identical
+# channel list, identical rows, the same speed. So when the CPVA service cannot
+# be reached at all (connection refused or reset, HTTP 502/503/504) the same
+# question goes there instead, and for the next CPVA_DOWN_S seconds every
+# question goes straight to it. Never on a read timeout (same slow database
+# behind both) and never on HTTP 500 (the archiver's "too big", which the
+# splitter answers). Copied from CSS Logger/cpva_core.py.
+L3_PROXY_BASE_URLS = (
+    "http://10.78.0.64:8080/l3proxy/archive-access/api/1.0/archive/1",
+    "http://10.78.0.65:8080/l3proxy/archive-access/api/1.0/archive/1",
+)
+CPVA_DOWN_S = 60.0
+_UNREACHABLE_HTTP = (502, 503, 504)
+
+# The archives the CPVA archiver does not have. Same hosts, same URL shape.
+# L3BT: beam transport and the experimental halls' safety channels (4336 names
+# on 15.10.2026, 196 also on CPVA). FCT: facility channels - cooling, power,
+# PSI, leak detection (7636 names, 48 also on CPVA). A channel is read from one
+# of these only when it lists it and the CPVA archiver does not; the shared
+# names stay where they always were. Looked up in this order.
+EXTRA_ARCHIVES = {
+    "l3bt": ("http://10.78.0.64:8080/l3btproxy/archive-access/api/1.0/archive/1",
+             "http://10.78.0.65:8080/l3btproxy/archive-access/api/1.0/archive/1"),
+    "fct":  ("http://10.78.0.64:8080/fctproxy/archive-access/api/1.0/archive/1",
+             "http://10.78.0.65:8080/fctproxy/archive-access/api/1.0/archive/1"),
+}
 
 # The default query window. It is NOT a hard limit of the archiver: what the
 # archiver refuses is a response that carries too many samples (measured: fine
@@ -161,6 +189,152 @@ def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT,
     return json.loads(buf)
 
 
+class ArchiveUnreachable(requests.RequestException):
+    """Neither the archiver nor its backup could be reached.
+
+    Deliberately not a ConnectionError: those are split into smaller windows,
+    and halving a range never brings a server back.
+    """
+
+
+def _cannot_reach(exc) -> bool:
+    """The service is not there at all - as opposed to slow, or answering."""
+    if isinstance(exc, requests.ConnectionError):   # refused, reset, SSL, connect timeout
+        return True
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    return code in _UNREACHABLE_HTTP
+
+
+_cpva_down_until = 0.0
+_DOWN_LOCK = threading.Lock()
+BACKUP_STATS = {"backup": 0}
+
+
+def _cpva_is_down() -> bool:
+    with _DOWN_LOCK:
+        return time.monotonic() < _cpva_down_until
+
+
+def _mark_cpva_down() -> None:
+    global _cpva_down_until
+    with _DOWN_LOCK:
+        _cpva_down_until = time.monotonic() + CPVA_DOWN_S
+
+
+def _get_json_or_backup(cpva_url: str, proxy_path: str,
+                        timeout: float = CPVA_HTTP_TIMEOUT):
+    """The CPVA archiver, or the L3 proxy when the archiver cannot be reached.
+
+    `proxy_path` is the same question in the proxy's URL shape. The backup gets
+    the caller's whole timeout and the same size ceiling. An error from the
+    proxy is raised as it is (its HTTP 500 still means "split"); only when
+    neither can be reached is it one ArchiveUnreachable naming both.
+    """
+    first = None
+    if not _cpva_is_down():
+        try:
+            return _http_get_json(cpva_url, timeout=timeout)
+        except Exception as exc:
+            if not _cannot_reach(exc):
+                raise
+            _mark_cpva_down()
+            first = exc
+    with _DOWN_LOCK:
+        BACKUP_STATS["backup"] += 1
+    try:
+        return _proxy_get_json(L3_PROXY_BASE_URLS, proxy_path, timeout)
+    except requests.ConnectionError as last:
+        if first is None:
+            raise
+        raise ArchiveUnreachable(
+            f"archiver unreachable ({first}); backup L3 proxy: {last}") from last
+
+
+def _proxy_get_json(base_urls, path: str, timeout: float,
+                    max_bytes: int = MAX_RESPONSE_BYTES):
+    """GET on a proxy: the first host, and the twin only when the first one
+    cannot be reached. Any other error is an answer and is raised as it is."""
+    last = None
+    for base in base_urls:
+        try:
+            return _http_get_json(base + path, timeout=timeout, max_bytes=max_bytes)
+        except Exception as exc:
+            if not isinstance(exc, requests.ConnectionError):
+                raise                   # an answer, or a slow one: not the twin's job
+            last = exc
+    raise last
+
+
+# ---------------------------------------------------------------------------
+# Which archive holds a channel
+# ---------------------------------------------------------------------------
+# The channel lists are cheap (0.02 s each) and held for the session; every
+# cpva_fetch_channels (a picker opening) refreshes them.
+_ALL_CHANNELS_PATH = "/channels-by-pattern/" + urllib.parse.quote("*", safe="")
+_cpva_names: "set[str] | None" = None
+_proxy_names: dict = {}                 # extra archive key -> its names
+_lists_tried_at = 0.0
+_ROUTE_LOCK = threading.Lock()
+# Held for the whole load, so the first polls WAIT for the lists instead of all
+# going to the CPVA archiver while the first one is fetching.
+_LOAD_LOCK = threading.Lock()
+_LIST_RETRY_S = 30.0
+
+
+def _names_of(raw) -> "set[str]":
+    return {str(x) for x in raw if isinstance(x, str)} \
+        if isinstance(raw, list) else set()
+
+
+def _load_lists(timeout: float = 6.0) -> None:
+    """Fill the name lists that are not held yet. Never raises."""
+    global _cpva_names, _lists_tried_at
+    with _LOAD_LOCK:
+        with _ROUTE_LOCK:
+            if (_cpva_names is not None
+                    and all(k in _proxy_names for k in EXTRA_ARCHIVES)):
+                return
+            if _lists_tried_at \
+                    and time.monotonic() - _lists_tried_at < _LIST_RETRY_S:
+                return
+            _lists_tried_at = time.monotonic()
+        if _cpva_names is None:
+            try:
+                names = _names_of(_get_json_or_backup(
+                    f"{CPVA_BASE_URL}{CPVA_CHANNELS_ENDPOINT}",
+                    _ALL_CHANNELS_PATH, timeout=timeout))
+                with _ROUTE_LOCK:
+                    _cpva_names = names
+            except Exception:
+                pass
+        for key, urls in EXTRA_ARCHIVES.items():
+            if key in _proxy_names:
+                continue
+            try:
+                names = _names_of(_proxy_get_json(urls, _ALL_CHANNELS_PATH, timeout,
+                                                  MAX_CHANNELS_RESPONSE_BYTES))
+                with _ROUTE_LOCK:
+                    _proxy_names[key] = names
+            except Exception:
+                pass
+
+
+def archive_of(channel: str):
+    """The extra archive ("l3bt" / "fct") this channel is read from, or None
+    for the CPVA archiver (and its backup)."""
+    _load_lists()
+    with _ROUTE_LOCK:
+        lists, cpva = dict(_proxy_names), _cpva_names
+    # Without the CPVA list nobody can say the name is ALSO there; the proxies
+    # answer the shared names with identical samples, so it is safe.
+    if cpva is not None and channel in cpva:
+        return None
+    for key in EXTRA_ARCHIVES:
+        if channel in lists.get(key, ()):
+            return key
+    return None
+
+
 def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
                        timeout: float = CPVA_HTTP_TIMEOUT) -> list[dict]:
     params = urllib.parse.urlencode({
@@ -169,7 +343,15 @@ def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
         "end":   str(end_ns),
     })
     url  = f"{CPVA_BASE_URL}{CPVA_SAMPLES_ENDPOINT}?{params}"
-    data = _http_get_json(url, timeout=timeout)
+    proxy_params = urllib.parse.urlencode({"start": str(start_ns),
+                                           "end":   str(end_ns)})
+    proxy_path = (f"/samples/{urllib.parse.quote(channel, safe='')}"
+                  f"?{proxy_params}")
+    extra = archive_of(channel)
+    if extra is not None:
+        data = _proxy_get_json(EXTRA_ARCHIVES[extra], proxy_path, timeout)
+    else:
+        data = _get_json_or_backup(url, proxy_path, timeout=timeout)
     if not isinstance(data, list):
         raise ValueError(f"Unexpected response shape: {type(data).__name__}")
     return data
@@ -505,10 +687,28 @@ def cpva_decode_units(sample: dict) -> str:
 
 def cpva_fetch_channels(timeout: float = CPVA_HTTP_TIMEOUT) -> list[str]:
     url  = f"{CPVA_BASE_URL}{CPVA_CHANNELS_ENDPOINT}"
-    data = _http_get_json(url, timeout=timeout)
+    data = _get_json_or_backup(url, "/channels-by-pattern/" +
+                               urllib.parse.quote("*", safe=""), timeout=timeout)
     if not isinstance(data, list):
         raise ValueError(f"Unexpected response from /channels: {type(data).__name__}")
-    return [str(x) for x in data]
+    global _cpva_names
+    out = [str(x) for x in data]
+    seen = set(out)
+    with _ROUTE_LOCK:
+        _cpva_names = set(seen)
+    # The L3BT and FCT proxies' names too, so their channels can be picked; the
+    # same lists route the reads. A proxy that does not answer adds nothing.
+    for key, urls in EXTRA_ARCHIVES.items():
+        try:
+            extra = _names_of(_proxy_get_json(urls, _ALL_CHANNELS_PATH, timeout,
+                                              MAX_CHANNELS_RESPONSE_BYTES))
+        except Exception:
+            continue
+        with _ROUTE_LOCK:
+            _proxy_names[key] = set(extra)
+        out.extend(sorted(extra - seen))
+        seen |= extra
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -568,18 +768,3 @@ def shorten_pv_name(full_name: str) -> str:
     if device and field:
         return f"{device} - {field}"
     return device or field or full_name
-
-
-# ---------------------------------------------------------------------------
-# Wildcard filter
-# ---------------------------------------------------------------------------
-
-def _matches_wildcard(text: str, pattern: str) -> bool:
-    pattern = pattern.strip()
-    if not pattern:
-        return True
-    tl = text.lower()
-    pl = pattern.lower()
-    if "*" in pl:
-        return fnmatch.fnmatch(tl, pl)
-    return all(t in tl for t in pl.split())

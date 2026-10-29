@@ -38,7 +38,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox,
                                QListWidgetItem, QMenu, QMessageBox, QPushButton,
                                QScrollArea, QSizePolicy, QSplitter, QStyle,
                                QStyledItemDelegate, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QTableWidgetItem, QTabWidget, QVBoxLayout,
+                               QWidget)
 
 PICTURE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff",
                     ".webp"}
@@ -192,6 +193,15 @@ _MENU_QSS = (
 )
 _MSGBOX_QSS = ("QMessageBox { background: #f3f3f3; color: #111; }"
                "QLabel { color: #111; }" + _BTN_QSS)
+_TABS_QSS = (
+    "QTabWidget::pane { border: 1px solid #c8ccd2; background: #f3f3f3;"
+    " top: -1px; }"
+    "QTabBar::tab { background: #e2e5e9; color: #16202c; border: 1px solid #c8ccd2;"
+    " border-bottom: 0px; padding: 5px 16px; margin-right: 2px;"
+    " border-top-left-radius: 3px; border-top-right-radius: 3px; }"
+    "QTabBar::tab:selected { background: #f3f3f3; font-weight: 700; }"
+    "QTabBar::tab:hover:!selected { background: #d9e8ff; }"
+)
 
 _CHECK_PX = 15
 _CHECK_QSS_CACHE = ""
@@ -1231,10 +1241,14 @@ class _ThumbList(QListWidget):
         a_rename = menu.addAction("Rename")
         a_mark = menu.addAction("Put the file back" if item.deleted
                                 else "Mark the file for deletion")
+        menu.addSeparator()
+        a_table = menu.addAction("Add to table")
         chosen = menu.exec(e.globalPos())
         if chosen is None:
             return
-        if chosen is a_open:
+        if chosen is a_table:
+            self._owner.add_selection_to_table(row)
+        elif chosen is a_open:
             self._owner.open_picture(row)
         elif chosen is a_show:
             self._owner.show_in_explorer(row)
@@ -1896,6 +1910,7 @@ class PhotoRenamerWidget(QWidget):
         self._relayout_depth = 0
         self._split_needs_default = True
         self._min_locked = False
+        self._table = None          # the Table tab, made in _build
 
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(max(2, min(8, (os.cpu_count() or 4))))
@@ -1917,7 +1932,19 @@ class PhotoRenamerWidget(QWidget):
 
     # ---- building -----------------------------------------------------------
     def _build(self) -> None:
-        outer = QVBoxLayout(self)
+        # Two tabs: everything below is the Photos tab; the Table tab lays the
+        # pictures out in a comparison table and saves it as one picture.
+        top = QVBoxLayout(self)
+        top.setContentsMargins(4, 4, 4, 4)
+        top.setSpacing(0)
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(_TABS_QSS)
+        self._tabs.setDocumentMode(False)
+        top.addWidget(self._tabs)
+        photos = QWidget()
+        self._tabs.addTab(photos, action_icon("picture"), "Photos")
+
+        outer = QVBoxLayout(photos)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(8)
 
@@ -2057,6 +2084,11 @@ class PhotoRenamerWidget(QWidget):
             self._split_needs_default = False
         self._split = split
         outer.addWidget(split, 1)
+
+        # Imported here, not at the top: tb_t builds on this module.
+        from tb_t import TableTab
+        self._table = TableTab(self)
+        self._tabs.addTab(self._table, action_icon("table"), "Table")
 
         self._refresh_buttons()
 
@@ -2337,6 +2369,8 @@ class PhotoRenamerWidget(QWidget):
             self._thumbs.clear()
         self._thumbs[(key, max_side)] = pm
         self._list.viewport().update()
+        if self._table is not None:
+            self._table.owner_thumb_arrived()
 
     # ---- the preview panel --------------------------------------------------
     def _on_item_entered(self, li: QListWidgetItem) -> None:
@@ -2599,6 +2633,8 @@ class PhotoRenamerWidget(QWidget):
         for row in range(len(self._items)):
             self._set_tooltip(row)
         self._refresh_buttons()
+        if self._table is not None:
+            self._table.owner_changed()
 
     def _refresh_buttons(self) -> None:
         n_all = len(self._items)
@@ -2693,7 +2729,15 @@ class PhotoRenamerWidget(QWidget):
 
         results = self._apply(renames, deletes, edits)
         fails = [(cells, err) for cells, err in results if err]
+        # The Table tab holds pictures by path: point it at the new names.
+        moved = {}
+        for it in renames:
+            new = it.path.parent / it.new_name
+            if new.exists() and not it.path.exists():
+                moved[str(it.path)] = str(new)
         self._scan()
+        if self._table is not None:
+            self._table.after_save(moved)
         # Nothing is said when it all worked; only a failure is worth a window.
         if fails:
             self._report_failures(fails, len(results))
@@ -2837,4 +2881,43 @@ class PhotoRenamerWidget(QWidget):
         state["split_sizes"] = list(self._split.sizes())
         state["save_without_asking"] = bool(self._chk_quick.isChecked())
         save_ui_state(state)
+        if self._table is not None:
+            self._table.shutdown()
         self._stop_loading()
+
+    # ---- what the Table tab asks for ----------------------------------------
+    def table_items(self) -> list[Item]:
+        """The pictures the Table tab lists: everything not crossed out."""
+        return [it for it in self._items if not it.deleted]
+
+    def root_folder(self) -> Path | None:
+        return self._root
+
+    def edits_for_path(self, path: str) -> tuple[list, int]:
+        """(pending edit steps, edit revision) of a picture; ([], 0) for one
+        that is not in the open folder."""
+        for it in self._items:
+            if str(it.path) == path:
+                return (it.edits if not it.deleted else []), it.edit_rev
+        return [], 0
+
+    def selected_paths(self) -> list[str]:
+        rows = sorted({i.row() for i in self._list.selectedIndexes()})
+        return [str(self._items[r].path) for r in rows
+                if 0 <= r < len(self._items) and not self._items[r].deleted]
+
+    def add_selection_to_table(self, row: int) -> None:
+        """The tile menu's "Add to table": the selected pictures, or the one
+        clicked, into the table's next empty cells."""
+        paths = self.selected_paths()
+        it = self.item_at(row)
+        if not paths and it is not None and not it.deleted:
+            paths = [str(it.path)]
+        if self._table is not None and paths:
+            n = self._table.add_paths(paths)
+            self._flash_status(f"{n} added to the table")
+
+    def _flash_status(self, text: str) -> None:
+        self._st_count.setText(text)
+        self._st_count.setVisible(True)
+        QTimer.singleShot(3000, self._refresh_buttons)

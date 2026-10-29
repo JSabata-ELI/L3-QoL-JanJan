@@ -76,6 +76,7 @@ class PollEngine(QObject):
         self._get_channels = get_channels
         self._readings = {}             # channel -> Reading
         self._last_ok = {}              # channel -> time.time() of last value
+        self._failing = set()           # channels whose last read failed
         self._closing = False
 
         # The L3BT MSS window, looked at once a pass while `want_screen` says
@@ -230,9 +231,26 @@ class PollEngine(QObject):
         self._inflight = False
         now = time.time()
         for name, reading in out.items():
+            prev = self._readings.get(name)
+            seen = self._last_ok.get(name)
+            if (reading.error and prev is not None and prev.has_value
+                    and seen is not None and now - seen <= C.STALE_AFTER_S):
+                # One read that failed or was not answered in time (from the
+                # office the archiver often takes longer than a pass allows)
+                # does not throw away a good value a few seconds old: it is
+                # kept until it is `STALE_AFTER_S` old, and then the row says
+                # "not read for N s" as before (13.10.2026 — GDD, TOD and SBW4
+                # flickered to a dash in the office).
+                if name not in self._failing:
+                    self._failing.add(name)
+                    self.logged.emit(f"{name}: a read failed ({reading.error})"
+                                     f" — the last value is kept for up to "
+                                     f"{int(C.STALE_AFTER_S)} s", None)
+                continue
             self._readings[name] = reading
             if reading.has_value:
                 self._last_ok[name] = now
+                self._failing.discard(name)
         self.updated.emit()
 
     def _look_at_screen(self):

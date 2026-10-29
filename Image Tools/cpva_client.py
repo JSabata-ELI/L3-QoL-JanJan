@@ -10,6 +10,15 @@ Replaces the three divergent per-file copies of the HTTP client:
 
 Stdlib only. NO Qt imports — this module runs on arbitrary worker threads and is
 shared between the re-exec'd module copies of the tools.
+
+The backup: the CPVA archiver is only a front end, and the L3 proxy on
+10.78.0.64 (twin .65) serves the very same L3 Cassandra — measured 15.10.2026,
+an identical channel list, identical rows, the same speed. When the CPVA service
+cannot be reached at all (connection refused or reset, HTTP 502/503/504) the same
+question goes there instead, and for the next CPVA_DOWN_S seconds every question
+goes straight to it. Never on a timeout (same slow database behind both) and never
+on HTTP 500 (the archiver's "window too big", which fetch_samples_split answers by
+splitting).
 """
 
 from __future__ import annotations
@@ -127,6 +136,37 @@ for _ in range(_POOL_SIZE):
     _pool.put(None)          # slots start empty; connections are created lazily
 del _
 
+# ── the L3 proxy: the backup for the archiver ────────────────────────────────
+# Plain HTTP. Two hosts serving the same archive; the first is asked first.
+PROXY_HOSTS        = ("10.78.0.64:8080", "10.78.0.65:8080")
+L3_PROXY_BASE_PATH = "/l3proxy/archive-access/api/1.0/archive/1"
+# ── the archives the CPVA archiver does not have ─────────────────────────────
+# Same hosts, same URL shape. L3BT: beam transport and the experimental halls'
+# safety channels (4336 names on 15.10.2026, 196 also on CPVA). FCT: facility
+# channels — cooling, power, PSI, leak detection (7636 names, 48 also on CPVA).
+# A channel is read from one of these only when it lists it and the CPVA
+# archiver does not; the shared names stay where they always were.
+L3BT_PROXY_BASE_PATH = "/l3btproxy/archive-access/api/1.0/archive/1"
+FCT_PROXY_BASE_PATH  = "/fctproxy/archive-access/api/1.0/archive/1"
+EXTRA_ARCHIVES = (L3BT_PROXY_BASE_PATH, FCT_PROXY_BASE_PATH)
+# How long a failed channel listing is left alone before it is asked again.
+_LIST_RETRY_S = 30.0
+# How long the archiver is left alone after it could not be reached.
+CPVA_DOWN_S = 60.0
+# The answers that mean "the service is not there", not "your question was bad".
+_UNREACHABLE_HTTP = (502, 503, 504)
+
+# One pool per proxy and host, the archiver's size: the L3 proxy stands in for
+# the archiver, and an L3BT/FCT channel is read through the same paths (day
+# warm-ups, PV panel) as any other.
+_proxy_pools: "dict[tuple[str, str], queue.LifoQueue]" = {}
+for _base in (L3_PROXY_BASE_PATH,) + EXTRA_ARCHIVES:
+    for _host in PROXY_HOSTS:
+        _proxy_pools[(_base, _host)] = queue.LifoQueue(maxsize=_POOL_SIZE)
+        for _ in range(_POOL_SIZE):
+            _proxy_pools[(_base, _host)].put(None)
+del _base, _host, _
+
 
 # ── diagnostics ───────────────────────────────────────────────────────────────
 # Process-wide counters. The user's report is "SOMETIMES the PV is not read", and
@@ -146,7 +186,15 @@ STATS: "dict[str, float]" = {
     "range_splits": 0,      # oversize ranges re-fetched in halves (fetch_samples_split)
     "alias_hits": 0,        # empty days answered by the channel's other name (SBW4)
     "samples_after_window": 0,  # carry-over values stamped after the asked window
+    # How long the archiver itself takes. Measured 13.10.2026: a one-minute window
+    # holding ONE sample took anywhere from 0.00 to 5.5 s, with the network at
+    # 63 ms — so "the PV panel is slow" can be the server, and the log must say so.
+    "req_time_max_s": 0.0,  # slowest single request since start
+    "req_slow": 0,          # requests that took longer than _REQ_SLOW_S
+    "narrow_hits": 0,       # lookups answered from the window, day read behind
+    "backup": 0,            # requests answered (or tried) on the L3 proxy instead
 }
+_REQ_SLOW_S = 2.0
 _stats_lock = threading.Lock()
 
 
@@ -172,7 +220,43 @@ def stats_line() -> str:
             f"poolWaitMax={s['pool_wait_max_s']:.1f}s "
             f"drop={int(s['samples_dropped'])} warmFail={int(s['warm_failures'])} "
             f"take={int(s['takeovers'])} split={int(s.get('range_splits', 0))} "
-            f"days={n_days}")
+            f"reqMax={s.get('req_time_max_s', 0.0):.1f}s "
+            f"slow={int(s.get('req_slow', 0))} narrow={int(s.get('narrow_hits', 0))} "
+            f"backup={int(s.get('backup', 0))} days={n_days}")
+
+
+# ── the archiver's own clock ─────────────────────────────────────────────────
+# This workstation runs ~25 s ahead of the archiver, so "has the archiver had time
+# to write a sample for this moment?" cannot be asked of time.time(). Every reply
+# carries the server's HTTP Date header; the offset is kept from the recent ones.
+# The header is truncated to whole seconds, so each reading is at most 1 s LOW and
+# the max over the recent ones is the best estimate — and an estimate that errs low
+# only makes a caller wait a little longer, never answer too early.
+_server_offsets: "list[float]" = []
+_SERVER_OFFSETS_KEEP = 64
+_server_clock_lock = threading.Lock()
+
+
+def _note_server_date(date_hdr: "str | None", local_s: float) -> None:
+    if not date_hdr:
+        return
+    try:
+        from email.utils import parsedate_to_datetime
+        srv = parsedate_to_datetime(date_hdr).timestamp()
+    except Exception:
+        return
+    with _server_clock_lock:
+        _server_offsets.append(srv - local_s)
+        del _server_offsets[:-_SERVER_OFFSETS_KEEP]
+
+
+def archiver_now_ns() -> "int | None":
+    """The archiver's current time, in ns, or None before its first reply."""
+    with _server_clock_lock:
+        if not _server_offsets:
+            return None
+        off = max(_server_offsets)
+    return int((time.time() + off) * 1e9)
 
 
 def _request_json(path_qs: str, timeout: float):
@@ -195,6 +279,7 @@ def _request_json(path_qs: str, timeout: float):
         raise CpvaBusyError(f"connection pool exhausted waiting for {path_qs}")
     _stat_max("pool_wait_max_s", time.monotonic() - _t_wait)
     _stat_bump("requests")
+    _t_req = time.monotonic()
     try:
         last_exc: Exception | None = None
         for attempt in range(2):
@@ -205,9 +290,11 @@ def _request_json(path_qs: str, timeout: float):
             try:
                 conn.request("GET", full_path, headers={"Accept": "application/json"})
                 resp = conn.getresponse()
+                _note_server_date(resp.getheader("Date"), time.time())
                 body = resp.read()
                 if resp.status >= 500:
                     last_exc = CpvaError(f"HTTP {resp.status} for {path_qs}")
+                    last_exc.unreachable = resp.status in _UNREACHABLE_HTTP
                     if attempt == 0:
                         time.sleep(0.3)
                         continue
@@ -224,21 +311,32 @@ def _request_json(path_qs: str, timeout: float):
                 raise
             except socket.timeout as exc:
                 # A retry would double an already-long stall; the day-cache
-                # layer degrades gracefully instead.
+                # layer degrades gracefully instead. A connection that never
+                # opened is a host that is not there — that one goes to the backup;
+                # a slow answer on an open one is the database, shared with it.
+                never_opened = conn.sock is None
                 _close_quiet(conn)
                 conn = None
                 _stat_bump("timeouts")
-                raise CpvaError(f"timeout after {timeout}s for {path_qs}") from exc
+                err = CpvaError(f"timeout after {timeout}s for {path_qs}")
+                err.unreachable = never_opened
+                raise err from exc
             except Exception as exc:
                 # RemoteDisconnected / BadStatusLine / SSLError / OSError …
                 _close_quiet(conn)
                 conn = None
                 last_exc = exc
                 if attempt == 1:
-                    raise CpvaError(f"transport error for {path_qs}: {exc}") from exc
+                    err = CpvaError(f"transport error for {path_qs}: {exc}")
+                    err.unreachable = True
+                    raise err from exc
         raise CpvaError(f"unreachable retry state: {last_exc}")
     finally:
         _pool.put(conn)
+        _dt = time.monotonic() - _t_req
+        _stat_max("req_time_max_s", _dt)
+        if _dt > _REQ_SLOW_S:
+            _stat_bump("req_slow")
 
 
 def _close_quiet(conn) -> None:
@@ -247,6 +345,194 @@ def _close_quiet(conn) -> None:
             conn.close()
         except Exception:
             pass
+
+
+def _proxy_get_one(host: str, path: str, timeout: float,
+                   base: str = L3_PROXY_BASE_PATH):
+    """One GET on one L3 proxy host. Raises CpvaError with the same message
+    prefixes as the archiver side ("HTTP 5…", "timeout after"), so splitting and
+    the alias fallback read it the same way; `transport` is set on it when the
+    host itself could not be reached, which is what sends us to the twin."""
+    pool = _proxy_pools[(base, host)]
+    try:
+        conn = pool.get(timeout=_POOL_WAIT_S)
+    except queue.Empty:
+        _stat_bump("busy")
+        raise CpvaBusyError(f"proxy connection pool exhausted waiting for {path}")
+    _stat_bump("requests")
+    _t_req = time.monotonic()
+    try:
+        for attempt in range(2):
+            if conn is None:
+                conn = http.client.HTTPConnection(host, timeout=timeout)
+            else:
+                conn.timeout = timeout
+            try:
+                conn.request("GET", base + path,
+                             headers={"Accept": "application/json"})
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status >= 400:
+                    _stat_bump("http_errors")
+                    raise CpvaError(f"HTTP {resp.status} for {path} on {host}")
+                try:
+                    return json.loads(body.decode("utf-8"))
+                except ValueError as exc:
+                    raise CpvaError(f"bad JSON from {host}: {exc}") from exc
+            except CpvaError:
+                raise
+            except socket.timeout as exc:
+                _close_quiet(conn)
+                conn = None
+                _stat_bump("timeouts")
+                err = CpvaError(f"timeout after {timeout}s for {path} on {host}")
+                err.transport = True
+                raise err from exc
+            except Exception as exc:
+                _close_quiet(conn)
+                conn = None
+                if attempt == 1:
+                    err = CpvaError(f"transport error for {path} on {host}: {exc}")
+                    err.transport = True
+                    raise err from exc
+        raise CpvaError("unreachable retry state")
+    finally:
+        pool.put(conn)
+        _stat_max("req_time_max_s", time.monotonic() - _t_req)
+
+
+def _proxy_request_json(path: str, timeout: float, base: str = L3_PROXY_BASE_PATH):
+    """GET on a proxy: the first host, and the twin only when the first one
+    cannot be reached. An HTTP error is an answer, so it is not asked twice."""
+    last: "Exception | None" = None
+    for host in PROXY_HOSTS:
+        try:
+            return _proxy_get_one(host, path, timeout, base)
+        except CpvaBusyError as exc:
+            last = exc
+        except CpvaError as exc:
+            if not getattr(exc, "transport", False):
+                raise
+            last = exc
+    raise last if last is not None else CpvaError("no proxy host")
+
+
+_cpva_down_until = 0.0
+_down_lock = threading.Lock()
+
+
+def _cpva_is_down() -> bool:
+    with _down_lock:
+        return time.monotonic() < _cpva_down_until
+
+
+def _mark_cpva_down() -> None:
+    global _cpva_down_until
+    with _down_lock:
+        _cpva_down_until = time.monotonic() + CPVA_DOWN_S
+
+
+def _cpva_or_backup(path_qs: str, backup_path: str, timeout: float):
+    """The CPVA archiver, or the L3 proxy when the archiver cannot be reached.
+
+    `backup_path` is the same question in the proxy's URL shape. The backup gets
+    the caller's whole timeout: it reads the same database, just as slowly."""
+    first: "CpvaError | None" = None
+    if not _cpva_is_down():
+        try:
+            return _request_json(path_qs, timeout)
+        except CpvaBusyError:
+            raise
+        except CpvaError as exc:
+            if not getattr(exc, "unreachable", False):
+                raise
+            _mark_cpva_down()
+            first = exc
+    _stat_bump("backup")
+    try:
+        return _proxy_request_json(backup_path, timeout)
+    except CpvaError as exc:
+        # An HTTP error from the proxy is the archive's own answer ("HTTP 500" =
+        # too big, so the caller splits): raised as it is. Only "the proxy is
+        # not there either" is worth naming both in one message.
+        if first is None or not getattr(exc, "transport", False):
+            raise
+        raise CpvaError(f"archiver unreachable ({first}); "
+                        f"backup L3 proxy: {exc}") from exc
+
+
+# ── which archive holds a channel ─────────────────────────────────────────────
+# The full channel lists are cheap (0.02 s each) and held for the session; a
+# "**" listing (every picker opening) refreshes them.
+_cpva_names: "set[str] | None" = None
+_proxy_names: "dict[str, set[str]]" = {}     # extra proxy base path → its names
+_lists_tried_at = 0.0
+_route_lock = threading.Lock()
+# Held for the whole load, so the first reads WAIT for the lists instead of all
+# going to the CPVA archiver while the first one is fetching.
+_load_lock = threading.Lock()
+_ALL_CHANNELS_PATH = "/channels-by-pattern/" + urllib.parse.quote("*", safe="")
+
+
+def _names_of(raw) -> "set[str]":
+    out: "set[str]" = set()
+    if isinstance(raw, list):
+        for d in raw:
+            if isinstance(d, str):
+                out.add(d)
+            elif isinstance(d, dict):
+                name = d.get("channelName") or d.get("name") or d.get("channel")
+                if name:
+                    out.add(str(name))
+    return out
+
+
+def _load_lists(timeout: float = 6.0) -> None:
+    """Fill the name lists that are not held yet. Never raises."""
+    global _cpva_names, _lists_tried_at
+    with _load_lock:
+        with _route_lock:
+            if (_cpva_names is not None
+                    and all(b in _proxy_names for b in EXTRA_ARCHIVES)):
+                return
+            if _lists_tried_at and time.monotonic() - _lists_tried_at < _LIST_RETRY_S:
+                return
+            _lists_tried_at = time.monotonic()
+        if _cpva_names is None:
+            try:
+                qs = urllib.parse.urlencode({"pattern": "**"})
+                names = _names_of(_cpva_or_backup(f"/channels-by-pattern?{qs}",
+                                                  _ALL_CHANNELS_PATH, timeout))
+                with _route_lock:
+                    _cpva_names = names
+            except Exception:
+                pass
+        for base in EXTRA_ARCHIVES:
+            if base in _proxy_names:
+                continue
+            try:
+                names = _names_of(_proxy_request_json(_ALL_CHANNELS_PATH, timeout,
+                                                      base))
+                with _route_lock:
+                    _proxy_names[base] = names
+            except Exception:
+                pass
+
+
+def archive_of(channel: str) -> "str | None":
+    """The proxy base path this channel is read from, or None for the CPVA
+    archiver (and its backup)."""
+    _load_lists()
+    with _route_lock:
+        lists, cpva = dict(_proxy_names), _cpva_names
+    # Without the CPVA list nobody can say the name is ALSO there; the proxies
+    # answer the shared names with identical samples, so it is safe.
+    if cpva is not None and channel in cpva:
+        return None
+    for base in EXTRA_ARCHIVES:
+        if channel in lists.get(base, ()):
+            return base
+    return None
 
 
 # ── low-level fetches ─────────────────────────────────────────────────────────
@@ -259,7 +545,14 @@ def fetch_samples(channel: str, start_ns: int, end_ns: int,
         "start": str(int(start_ns)),
         "end":   str(int(end_ns)),
     })
-    data = _request_json(f"/samples?{qs}", timeout)
+    proxy_qs = urllib.parse.urlencode({"start": str(int(start_ns)),
+                                       "end":   str(int(end_ns))})
+    proxy_path = f"/samples/{urllib.parse.quote(channel, safe='')}?{proxy_qs}"
+    base = archive_of(channel)
+    if base is not None:
+        data = _proxy_request_json(proxy_path, timeout, base)
+    else:
+        data = _cpva_or_backup(f"/samples?{qs}", proxy_path, timeout)
     return data if isinstance(data, list) else []
 
 
@@ -379,6 +672,45 @@ def fetch_values_ex(channel: str, start_ns: int, end_ns: int,
         return result, channel
 
 
+def _fetch_values_pieced(channel: str, start_ns: int, end_ns: int,
+                         piece_ns: int, *, timeout: float = DEFAULT_TIMEOUT
+                         ) -> "tuple[list[tuple[int, float]], str]":
+    """`fetch_values_ex` over [start_ns, end_ns], read in pieces of `piece_ns`.
+
+    The same samples, in the same order — but no single answer is a whole day.
+    `json.loads` of one big answer is a single C call that holds Python's global
+    lock for its whole length, so a window thread waiting for that lock froze for
+    as long as a day of a per-shot PV took to parse (27.10.2026: Image Finder could
+    not be clicked while PTM1 and SBW4 loaded). Between pieces the lock is handed
+    back. Pieces run one after another: the pool is shared, and this is about
+    short holds, not speed.
+
+    The ".value" probe runs on the FIRST piece only (once per piece would double
+    the requests for every quiet hour); the remaining pieces are read under the
+    name that answered it."""
+    piece_ns = max(int(piece_ns), 1)
+    out: list[tuple[int, float]] = []
+    src = channel
+    probing = True
+    lo = int(start_ns)
+    while lo <= end_ns:
+        hi = min(lo + piece_ns - 1, int(end_ns))
+        got, got_src = fetch_values_ex(src, lo, hi, timeout=timeout,
+                                       try_value_suffix=probing)
+        if got:
+            src = got_src
+        probing = False
+        # A piece's carry-over sample can be stamped after the piece (see
+        # _drop_after); left in, it would push out the next piece's real samples.
+        got = _drop_after(got, hi)
+        if out and got and got[0][0] <= out[-1][0]:
+            got = [s for s in got if s[0] > out[-1][0]]
+        out.extend(got)
+        lo = hi + 1
+        time.sleep(0)          # hand the lock over before the next piece
+    return out, src
+
+
 def fetch_values(channel: str, start_ns: int, end_ns: int,
                  *, timeout: float = DEFAULT_TIMEOUT,
                  try_value_suffix: bool = True) -> list[tuple[int, float]]:
@@ -405,8 +737,12 @@ def fetch_channels(pattern: str = "**", *, timeout: float = DEFAULT_TIMEOUT) -> 
     Entries may come back as bare strings or as dicts; when a dict carries an
     engineering unit it is kept in CHANNEL_UNITS as a side effect, since this is the
     only listing the app ever asks for."""
+    global _cpva_names
     qs = urllib.parse.urlencode({"pattern": pattern})
-    data = _request_json(f"/channels-by-pattern?{qs}", timeout)
+    # The proxy takes the pattern as a path segment, not a query.
+    data = _cpva_or_backup(f"/channels-by-pattern?{qs}",
+                           "/channels-by-pattern/" + urllib.parse.quote(pattern, safe=""),
+                           timeout)
     out: list[str] = []
     if isinstance(data, list):
         for d in data:
@@ -421,31 +757,70 @@ def fetch_channels(pattern: str = "**", *, timeout: float = DEFAULT_TIMEOUT) -> 
                         if isinstance(u, str) and u.strip():
                             CHANNEL_UNITS[str(name)] = u.strip()
                             break
+    # The L3BT and FCT proxies' names matching the same pattern, so their
+    # channels can be picked too. A proxy that does not answer adds nothing.
+    seen = set(out)
+    proxy_pattern = "/channels-by-pattern/" + urllib.parse.quote(pattern, safe="")
+    for base in EXTRA_ARCHIVES:
+        try:
+            extra = _names_of(_proxy_request_json(proxy_pattern, timeout, base))
+        except Exception:
+            continue
+        if pattern in ("*", "**"):
+            # A full listing doubles as the routing list: fresher than the one
+            # loaded at the first read, and channels added since become readable.
+            with _route_lock:
+                _proxy_names[base] = set(extra)
+        out.extend(sorted(extra - seen))
+        seen |= extra
+    if pattern in ("*", "**"):
+        with _route_lock:
+            _cpva_names = _names_of(data)
     return out
 
 
-_channels_cache: dict[str, list[str]] = {}
+_channels_cache: dict[str, tuple[float, list[str]]] = {}
 _channels_lock = threading.Lock()
+
+# How long a listing is reused before the next caller downloads it again.
+# Channels are added to the archiver while the program stays open (SPIDER GDD,
+# TPD and FOG appeared mid-session on 2026-10-13 and no picker offered them
+# until a restart). Measured 2026-10-13: the whole "**" listing, 9747 names,
+# comes back in 0.02-0.06 s, so a fresh one per picker opening costs nothing.
+CHANNELS_MAX_AGE_S = 30.0
 
 
 def fetch_channels_cached(pattern: str = "**", *,
                           timeout: float = DEFAULT_TIMEOUT) -> list[str]:
-    """fetch_channels() with a process-wide cache and single-flight.
+    """fetch_channels() with a short process-wide cache and single-flight.
 
-    The "**" listing is ~9700 names (~MBs of JSON) and every PV picker in the
-    suite wants exactly that same list, so downloading it per tab is pure waste.
+    Every PV picker in the suite wants exactly the same list, so pickers opened
+    together share one download. The cache only lives CHANNELS_MAX_AGE_S: a
+    picker opened later asks again and sees channels added since. When that
+    later download fails, the older listing is served rather than nothing.
     An empty/failed listing is never cached — the next caller retries.
     """
-    hit = _channels_cache.get(pattern)
-    if hit is not None:
-        return list(hit)
-    with _channels_lock:
+    def fresh():
         hit = _channels_cache.get(pattern)
-        if hit is not None:
-            return list(hit)
-        out = fetch_channels(pattern, timeout=timeout)
+        if hit is not None and time.monotonic() - hit[0] < CHANNELS_MAX_AGE_S:
+            return list(hit[1])
+        return None
+    out = fresh()
+    if out is not None:
+        return out
+    with _channels_lock:
+        out = fresh()
+        if out is not None:
+            return out
+        try:
+            out = fetch_channels(pattern, timeout=timeout)
+        except Exception:
+            old = _channels_cache.get(pattern)
+            if old is not None:
+                return list(old[1])
+            raise
         if out:
-            _channels_cache[pattern] = list(out)
+            _channels_cache[pattern] = (time.monotonic(), list(out))
         return list(out)
 
 
@@ -463,25 +838,13 @@ def split_query(text: str) -> list[str]:
     return [t for t in re.split(r"[\s,;*]+", (text or "").strip().lower()) if t]
 
 
-def tokens_in_order(hay: str, tokens: "list[str]") -> bool:
-    """True when every token occurs in `hay` in the order typed."""
-    pos = 0
-    for t in tokens:
-        i = hay.find(t, pos)
-        if i < 0:
-            return False
-        pos = i + len(t)
-    return True
-
-
 def rank_pv_match(disp: str, key: str, q) -> "int | None":
     """Sort weight of one suggestion against query `q` (lower = better), or None
     when it doesn't match at all. `q` may be raw text or a token list.
 
     Multi-token queries are AND-matched: "hapls sbw4" keeps only names holding
-    both "hapls" and "sbw4" anywhere, i.e. what "*hapls*sbw4*" would mean —
-    without having to type the stars. Tokens found in the typed order rank above
-    the same tokens scrambled, so nothing is hidden by guessing the order wrong.
+    both "hapls" and "sbw4" anywhere. The order of the words does not matter at
+    all — "sbw4 hapls" gives the same hits in the same ranking.
 
     Ranking exists because taking the first N raw substring hits out of ~9700
     channels returned nothing but cameras for queries like "pcm" — the PV the
@@ -512,9 +875,6 @@ def rank_pv_match(disp: str, key: str, q) -> "int | None":
     # Weakest token decides the tier; the sum only breaks ties, so a name that
     # matches every token well beats one that barely matches any.
     score = worst * 10 + min(total, 9)
-    if len(tokens) > 1 and not (tokens_in_order(k, tokens)
-                                or tokens_in_order(d, tokens)):
-        score += 5
     if CAM_CHANNEL_RE.match(key):
         # Relative order is preserved when EVERY hit is a camera, so an
         # explicitly camera-targeted query is unaffected.
@@ -802,7 +1162,8 @@ def _merge_tail(old: "list[tuple[int, float]]", old_ts: "list[int]",
 def get_day(channel: str, date_key: str, *,
             today_ttl: float = 3.0,
             timeout: float = DEFAULT_TIMEOUT,
-            span_ns: "tuple[int, int] | None" = None) -> DayResult:
+            span_ns: "tuple[int, int] | None" = None,
+            piece_ns: "int | None" = None) -> DayResult:
     """Samples for one Prague day, cached.
 
     Status semantics:
@@ -824,6 +1185,10 @@ def get_day(channel: str, date_key: str, *,
     limit and costs it a split. The slice is remembered with the samples
     (`_Entry.span`), and a caller asking for more than a cached entry holds
     refetches rather than being told the night was empty.
+
+    `piece_ns` reads a fresh fetch in pieces of that length (`_fetch_values_pieced`)
+    so no single answer holds Python's global lock for long — for a caller whose
+    window thread must stay clickable while it waits. None: one request, as before.
     """
     key = (channel, date_key)
     is_today = (date_key == today_key())
@@ -924,9 +1289,14 @@ def get_day(channel: str, date_key: str, *,
             samples, src = [], channel
             for _i, name in enumerate(names):
                 try:
-                    got, got_src = fetch_values_ex(
-                        name, win_start, win_end,
-                        timeout=max(timeout, FULL_DAY_TIMEOUT))
+                    if piece_ns:
+                        got, got_src = _fetch_values_pieced(
+                            name, win_start, win_end, piece_ns,
+                            timeout=max(timeout, FULL_DAY_TIMEOUT))
+                    else:
+                        got, got_src = fetch_values_ex(
+                            name, win_start, win_end,
+                            timeout=max(timeout, FULL_DAY_TIMEOUT))
                 except CpvaBusyError:
                     raise              # our own pool — says nothing about the name
                 except CpvaError as exc:
@@ -1240,6 +1610,8 @@ class LookupResult(NamedTuple):
     value: "float | None"
     ts_ns: "int | None"      # timestamp of the sample actually used
     status: str              # "ok" | "not_found" | "pending" | "stale" | "error"
+                             # | "held" (a quiet channel's last sample, see
+                             # _head_is_quiet; only with pending_if_uncovered)
     # False when the raw archiver sample had to be SNAPPED onto the channel's value
     # grid (see QUANTIZED_CHANNELS) — i.e. the motor was caught mid-move, so the
     # returned position is the nearest legal one rather than one it reported holding.
@@ -1744,6 +2116,98 @@ def value_at_or_before(channel: str, ts_ns: int, *,
     return LookupResult(val, back.ts_ns, st, exact)
 
 
+# ── narrow first ──────────────────────────────────────────────────────────────
+# A lookup whose day is not cached used to read the WHOLE day before answering —
+# measured 13.10.2026: 47 557 SBW4 samples, 20.7 s, while the same archiver answered
+# a one-minute window in 0.02–0.9 s. So the PV panel's first value after a start, a
+# jump to another day or midnight waited twenty seconds for 23 hours nobody asked
+# about. Now such a lookup asks for the window around the frame first and answers
+# from that; the whole day is read in the background, so the NEXT frames bisect the
+# cache exactly as before. A narrow answer that finds nothing falls back to the old
+# whole-day path, which is where every subtle case (step channels, the pending
+# head, carry-over values) is decided — the shortcut only ever adds a fast "yes".
+NARROW_MAX_WINDOW_NS = 10 * 60 * 1_000_000_000      # wider windows: whole day as before
+_NARROW_BG_MAX = 2                                  # whole-day reads behind the panel
+_narrow_bg: "set[tuple[str, str]]" = set()
+_narrow_bg_lock = threading.Lock()
+_narrow_bg_sem = threading.BoundedSemaphore(_NARROW_BG_MAX)
+
+
+def _warm_day_behind(channel: str, date_key: str, today_ttl: float,
+                     timeout: float) -> None:
+    """Read (channel, day) into the cache on a background thread, once at a time."""
+    key = (channel, date_key)
+    with _narrow_bg_lock:
+        if key in _narrow_bg:
+            return
+        _narrow_bg.add(key)
+
+    def _run():
+        try:
+            with _narrow_bg_sem:
+                get_day(channel, date_key, today_ttl=today_ttl, timeout=timeout)
+        except Exception:
+            _stat_bump("warm_failures")
+        finally:
+            with _narrow_bg_lock:
+                _narrow_bg.discard(key)
+
+    threading.Thread(target=_run, daemon=True, name="cpva-narrow-warm").start()
+
+
+def _lookup_narrow(channel: str, ts_ns: int, date_key: str, window_ns: int,
+                   prefer: str, pending_if_uncovered: bool, today_ttl: float,
+                   timeout: float) -> "LookupResult | None":
+    """The fast first answer of lookup_near, or None to take the whole-day path."""
+    if window_ns > NARROW_MAX_WINDOW_NS:
+        return None
+    key = (channel, date_key)
+    if peek_day(channel, date_key) is not None:
+        return None                         # cached: the normal path is instant
+    with _narrow_bg_lock:
+        ours = key in _narrow_bg
+    with _day_cache_lock:
+        theirs = key in _inflight and not ours
+    if theirs:
+        # Somebody else (a save-range or Shot Finder warm-up) is already reading
+        # this day: wait for it like before rather than add a request per frame.
+        return None
+    start, end = ts_ns - window_ns, ts_ns + window_ns
+    got: "list[tuple[int, float]]" = []
+    try:
+        for name in read_order(channel):
+            ans = _drop_after(fetch_values(name, start, end, timeout=timeout,
+                                           try_value_suffix=False), end)
+            if _has_inside(ans, start):
+                got = ans
+                break
+            if ans and not got:
+                got = ans                   # carry-over only — keep looking
+    except CpvaError:
+        return None                         # let the normal path report it
+    _warm_day_behind(channel, date_key, today_ttl, timeout)
+    inside = [s for s in got if s[0] >= start]
+    head = got[-1][0] if got else None
+    cand = nearest_sample_ex(inside, ts_ns, window_ns=window_ns, prefer=prefer)
+    if cand is not None:
+        _stat_bump("narrow_hits")
+        val, exact = quantize(channel, cand[1])
+        return LookupResult(val, cand[0], "ok", exact, head)
+    # Nothing inside. "Not published yet" is safe to say from here only for a
+    # channel KNOWN to be a per-shot measurement — anything else may be a setting
+    # whose held value only the whole-day path can find.
+    # The head here is the archiver's carry-over sample: a quiet channel's is far
+    # behind, and that case belongs to the whole-day path (see _head_is_quiet).
+    if (pending_if_uncovered and date_key == today_key()
+            and _cached_step_verdict(channel) is False
+            and (head is None or head < ts_ns + window_ns)
+            and may_still_publish(ts_ns, window_ns)
+            and not (head is not None
+                     and ts_ns - head > QUIET_HEAD_MIN_S * 1e9)):
+        return LookupResult(None, None, "pending", True, head)
+    return None
+
+
 def lookup_near(channel: str, ts_ns: int, *,
                 window_ns: int = 30 * 1_000_000_000,
                 prefer: "str | None" = None,
@@ -1796,6 +2260,11 @@ def lookup_near(channel: str, ts_ns: int, *,
         prefer = "nearest"
     date_key = date_key_for_ns(ts_ns)
     day_start, day_end = day_bounds_ns(date_key)
+    if day_start <= ts_ns - window_ns and ts_ns + window_ns <= day_end:
+        quick = _lookup_narrow(channel, ts_ns, date_key, window_ns, prefer,
+                               pending_if_uncovered, today_ttl, timeout)
+        if quick is not None:
+            return quick
     date_keys = [date_key]
     if ts_ns - day_start < window_ns:
         date_keys.insert(0, prev_date_key(date_key))
@@ -1837,6 +2306,7 @@ def lookup_near(channel: str, ts_ns: int, *,
     # only when it changes has no sample near any frame, and its value at this
     # moment is simply the last one written (see classify_step_channel). That is
     # not a stale reading — it is the setting the machine is running with.
+    back_error = False
     if primary_status != "error" and classify_step_channel(
             channel, ts_ns, primary=primary_samples,
             today_ttl=today_ttl, timeout=timeout):
@@ -1844,11 +2314,79 @@ def lookup_near(channel: str, ts_ns: int, *,
                                   timeout=timeout)
         if back.value is not None:
             return back._replace(head_ts_ns=primary_head)
-    if primary_status == "error":
+        back_error = back.status == "error"
+    if primary_status == "error" or back_error:
+        # A failed READ is an error, never "not published yet" (13.10.2026: a
+        # look-back that timed out on the office link turned into a red "waiting"
+        # dot that never went away).
         return LookupResult(None, None, "error", True, primary_head)
     # Nothing matched. Is that "no such sample" or "not published yet"? Only the
     # head can tell, and only for today — a finished day will never grow again.
     if (pending_if_uncovered and date_key == today_key()
-            and (primary_head is None or primary_head < ts_ns + window_ns)):
+            and (primary_head is None or primary_head < ts_ns + window_ns)
+            and may_still_publish(ts_ns, window_ns)):
+        if _head_is_quiet(primary_head, primary_samples, ts_ns, day_start):
+            held = _held_from_quiet(channel, ts_ns, primary_head, today_ttl,
+                                    timeout)
+            if held is not None:
+                return held
         return LookupResult(None, None, "pending", True, primary_head)
     return LookupResult(None, None, "not_found", True, primary_head)
+
+
+# ── a quiet channel is not "about to publish" ────────────────────────────────
+# "Pending" means: the archiver's newest sample is just before the frame, so the
+# frame's own sample is on its way (~1 s). That is only true when the channel is
+# actually writing. A channel whose newest sample is far behind the frame — far
+# for ITS OWN cadence — is not about to publish anything: it is a setting nobody
+# has changed, or a detector that has stopped. Calling that "pending" painted a
+# red "waiting" dot that never cleared (13.10.2026, GDD / TOD in the office,
+# whenever the setting classification above could not finish over a slow link).
+# Such a channel now answers with its last sample, status "held": the caller
+# shows it with its age, never as this frame's own reading.
+QUIET_HEAD_MIN_S = 60.0
+
+# The archiver writes a sample only when the value CHANGES (13.10.2026: SBW4 with the
+# laser off flips between two noise levels at irregular 0.3–20 s gaps; GDD last wrote
+# at 07:26). So once the archiver's own clock is past the frame's window by this much
+# and still nothing is in the window, nothing is coming: the value did not change, and
+# the last sample before the frame IS the frame's value. Publication lag measured ≈ 0
+# (17.09.2026), worst seen 3.7 s on 06.10.; archiver_now_ns errs low by up to 1 s,
+# which adds to this.
+PUBLISH_MARGIN_S = 1.0
+
+
+def may_still_publish(ts_ns: int, window_ns: int) -> bool:
+    """True while a sample stamped inside ts_ns ± window_ns could still appear.
+    Unknown archiver clock (no reply seen yet) answers True — the old behaviour."""
+    now = archiver_now_ns()
+    if now is None:
+        return True
+    return now < ts_ns + window_ns + int(PUBLISH_MARGIN_S * 1e9)
+
+
+def _head_is_quiet(head: "int | None",
+                   samples: "list[tuple[int, float]] | None",
+                   ts_ns: int, day_start_ns: int) -> bool:
+    """True when the newest sample is too far behind ts_ns to be "on its way":
+    more than QUIET_HEAD_MIN_S, and more than STEP_LONG_GAP_RATIO × the channel's
+    median gap today — so a slow but steady shot cadence still pends."""
+    if head is None:
+        # Nothing written today at all: quiet once the frame is a while into it.
+        return ts_ns - day_start_ns > QUIET_HEAD_MIN_S * 1e9
+    behind = ts_ns - head
+    tail = sorted(t for t, _v in (samples or [])[-50:])
+    gap = _gap_quantile_s(tail, 0.5) or 0.0
+    return behind > max(QUIET_HEAD_MIN_S, gap * STEP_LONG_GAP_RATIO) * 1e9
+
+
+def _held_from_quiet(channel: str, ts_ns: int, head: "int | None",
+                     today_ttl: float, timeout: float) -> "LookupResult | None":
+    back = value_at_or_before(channel, ts_ns, today_ttl=today_ttl,
+                              timeout=timeout)
+    if back.value is None:
+        if back.status == "error":
+            return LookupResult(None, None, "error", True, head)
+        return None
+    _stat_bump("quiet_held")
+    return back._replace(status="held", head_ts_ns=head)

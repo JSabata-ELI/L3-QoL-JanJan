@@ -1,255 +1,170 @@
 ---
 name: Dev Tools structure map
-description: Line-by-line map of dev_tools.py, b_t.py, cm_t.py — Builder + Copy Manager/Deploy tool. Read before editing.
+description: Function map of dev_tools.py, dt_core.py, dt_common.py, dt_builder.py, dt_copy.py — Builder + Copy Manager. Read before editing.
 ---
 
-Dev Tools — tkinter two-tab app: Builder (`b_t.py`) + Copy Manager / Deploy (`cm_t.py`)
-Files (verified 2026-08-19): `dev_tools.py` (86 L) | `b_t.py` (1215 L) | `cm_t.py` (2128 L)
+Dev Tools — PySide6, two tabs: Builder (`dt_builder.py`) + Copy Manager (`dt_copy.py`),
+all logic in `dt_core.py`, shared look/log/dialogs in `dt_common.py`.
+Verified 2026-10-16. Why things are the way they are: `STRUCTURE.md`.
 
-Line numbers are anchors — they drift. Re-grep the symbol if an offset looks wrong.
-
----
-
-## dev_tools.py
-
-Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
-
-| Line | Name | Note |
-|------|------|------|
-| L10 | `_app_dir()` | frozen exe parent or `__file__` parent |
-| L17 | `set_app_icon(win, ico, app_id)` | title bar + **taskbar** icon: `iconbitmap` only fixes WM_BIG, so ICON_SMALL/SMALL2 and the window-class icons are forced via Win32 (otherwise Windows shows the Tk feather) |
-| L51 | `main()` | root window, icon, 950×780, `ttk.Notebook`, `DeployGUI` first (it owns the shared log), then `BuilderUI(log_widget=cm_tab.log)`, cross refs `_cm_ref` / `_builder_ref` |
-
-**Build-done wiring:** Builder calls `on_build_done(built_projects, build_summary)`
-→ selects the CM tab → `cm_tab.auto_deploy(built_projects, build_summary)`.
+No line numbers here — they drift. Grep the name.
 
 ---
 
-## b_t.py — Builder tab
+## dev_tools.py — window
 
-### Module-level constants
-
-| Line | Name | Value |
-|------|------|-------|
-| L16-18 | `APP_DIR`, `SETTINGS_PATH`, `USAGE_LOG` | `builder_settings.json`, `build_usage.json` |
-| L21 | `_CONFIG_PATH` | `%APPDATA%\DevTools\config.json` |
-| L73-80 | `BUILDER_DIR`, `PROGRAMY_DIR`, `PROGRAMY_DIST_DIR`, `COPY_MANAGER_SRC_DIR`, `COPY_MANAGER_DIST_DIR` | source + dist roots |
-| L82-83 | `RE_VER`, `RE_VDIR` | `X.Y.Z` / `vX.Y.Z` |
-| L85 | `ALWAYS_IGNORE` | dist, Matlab, Icons, .vscode, .venv, .git |
-
-### Module-level helpers
-
-| Line | Name | What it does |
-|------|------|-------------|
-| L23/31 | `_load_devtools_config` / `_save_devtools_config` | `%APPDATA%\DevTools\config.json` |
-| L38/45/59 | `_versions_txt_path` / `read_versions_txt` / `write_version_to_txt` | `<scratch>/Versions.txt`, flat `Name = vX.Y.Z` |
-| L89/96/100 | `parse_version_tuple` / `version_tuple_to_str` / `bump_patch` | version math |
-| L107 | `run(cmd, cwd)` | `subprocess.run` |
-| L111/120 | `load_json` / `save_json` | JSON with fallback |
-
-### Class: BuilderUI (ttk.Frame, L123)
-
-| Line | Method | Note |
-|------|--------|------|
-| L124 | `__init__` | loads settings + usage, discovers projects, builds UI |
-| L172 | `_log(msg)` | local log + shared CM log |
-| L198-211 | `_on_local_log_scroll` / `_on_local_log_scrollbar_release` / `_check_local_log_position` / `_clear_local_log` | autoscroll only while pinned to the bottom |
-
-**Key instance attrs:** `root_folder`, `dist_root`, `selected_project`,
-`projects_all` / `projects_sorted`, `project_checks` `{name: BooleanVar}`,
-`project_rows`, `project_next_override`, `project_next_labels`, `project_groups`
-(`Main`/`Side`/`Ignored project`).
-
-#### Discovery & version logic
-
-| Line | Method | Note |
-|------|--------|------|
-| L219 | `guess_main_py(project_dir)` | `<name>.py` → `main.py` → `app.py` → single `.py` |
-| L246 | `find_projects(root)` | dirs with a `.py`, skipping `_`-prefixed + `ALWAYS_IGNORE` |
-| L262 | `last_version_from_dist(name)` | newest `vX.Y.Z` in dist |
-| L294/299/302 | `default_next_version_for_project` / `effective_next_version_for_project` / `reset_next_version_overrides` | auto-bump vs manual override |
-| L308 | `sort_projects` | display order |
-
-#### UI
-
-| Line | Method | Note |
-|------|--------|------|
-| L312 | `_build_ui()` | root selector, scrollable project list, detail panel, action buttons, local log |
-| L418 | `_render_project_buttons()` | builds every row (Ignored too) + per-row version labels, once per project-set change |
-| — | `_layout_project_rows()` | re-grids the existing rows into Main / Side / Ignored (Group, Show ignored) — no rebuild |
-| L481/494 | `_update_focus_styles` / `_refresh_project_list_version_labels` | |
-| L500/527/602 | `_change_root` / `_open_set_paths` / `_reload_projects` | roots (config-backed when frozen) + rescan |
-| L622/646/660/663/672 | `_select_project` / `_on_group_changed` / `_on_project_check_clicked` / `_bind_next_version_trace` / `_on_next_version_edited` | selection, grouping, version override tracking |
-| L690/694/698 | `_select_all_projects` / `_clear_all_projects` / `_get_checked_projects` | |
-
-#### Build
-
-| Line | Method | Note |
-|------|--------|------|
-| L707 | `_build_internal_builder_sync(live_log)` | builds `_internal_builder` when it is missing |
-| **L735** | `_build_one_project(p, ver, live_log)` | **core build** (steps below) |
-| L990 | `_set_build_buttons_enabled(enabled)` | busy state |
-| L994 | `_on_build_finished(...)` | reload + summary + optional auto-deploy |
-| L1040 | `_build_selected()` | validate versions, launch the build thread |
-| L1097/1101/1131 | `_open_dist` / `_open_readme` / `_run_copy_manager` | |
-
-**`_build_one_project()` steps**
-1. entry `.py`; output `dist/<project>/v<version>/`
-2. delete an existing version folder first (PyInstaller `--noconfirm` trips over the
-   read-only flags OneDrive leaves behind — `_on_rm_error` clears them)
-3. extra `.py` files from the project root, **excluding `test_*.py`** (dev-only)
-4. `build_config.json` → `collect_all`, `collect_binaries`, `hidden_imports`,
-   `copy_metadata`, `exclude_modules`, `extra_files`
-5. **auto `--collect-all`** (L806 `_AUTO_COLLECT`) when the sources import numpy /
-   scipy / sklearn / cv2 / matplotlib / pandas — their native libs otherwise go missing
-6. **auto `--exclude-module`** (L826 `_TEST_SUBMODULES`) for those packages' own
-   `.tests` submodules that `--collect-all` drags in. Only `.tests`, never
-   `.testing` / `._testing` (public runtime helpers)
-7. `py -m PyInstaller --onedir --windowed --noconfirm` + icon + `--add-data` per extra `.py`
-8. move the built app one level up into the version folder (`_internal` stays)
-9. rename exe → `<Name> v<version>.exe`, copy `icon.ico` next to it
-10. copy the main `.py`, the extra sources, and `extra_files` (folders too —
-    recursively, minus `__pycache__` / `Thumbs.db`)
-11. **auto asset folders**: `images` / `sounds` / `assets` / `icons` are copied
-    whenever the project has them, config or not. They are read from next to the
-    exe at runtime, so a build without them breaks only once it is deployed
-    (Announcer's alarm image is `images/scorpion_orig.png`)
-12. copy the project's ReadMe into the version folder — `cm_t.py` looks for it
-    there first and otherwise keeps the copy already on the destination, so
-    skipping this leaves the published ReadMe frozen forever
-13. remove the TEMP work dir only
-14. `write_version_to_txt(name, ver)` + append to `build_usage.json`, then log the
-    resulting folder listing
+| Name | Note |
+|------|------|
+| `_icon_file()` | → `dt_core.icon_file()` (exe folder → `sys._MEIPASS` → source folder) |
+| `_icon_app_id()` | fresh taskbar id per launch (`ELI.DevTools.<random>`) |
+| `_nudge_taskbar_icon(hwnd)` | takes the window icon away and back at ~2/10/30/60 s so Explorer re-reads it |
+| `DevToolsWindow` | title, icon, `LogHub`, the blue program tabs, `BuilderTab` + `CopyTab`, cross refs `builder.copy_tab` / `copy.builder` |
+| `main()` | app id → QApplication → `apply_app_style` → `init_ui_thread` → window shown at 1280 × 860 (not maximized) → nudge |
 
 ---
 
-## cm_t.py — Copy Manager / Deploy tab
+## dt_core.py — logic, no UI
 
-### Module-level constants & path resolution
+### Paths, config, state
+| Name | Note |
+|------|------|
+| `PRACTICE`, `APP_KEY`, `PRACTICE_ROOT`, `CONFIG_PATH` | practice mode switch (off) and the config file `%APPDATA%\DevTools\config.json` |
+| `app_dir()`, `icon_file()`, `state_dir()` | frozen-aware folders |
+| `settings_path()`, `usage_log_path()`, `cm_state_path()` | `builder_settings.json`, `build_usage.json`, `copy_manager_state.ini` |
+| `load_json`, `save_json`, `load_config`, `save_config` | |
+| `ensure_practice_setup(log)` | practice mode only: folders + one-time seed from the real setup |
+| `programs_root()`, `dist_root()`, `scratch_root()`, `destination_roots()` | |
+| `internal_builder_dist()`, `internal_builder_distpath()` | where the Internal Builder's `_internal` is read from / built to |
 
-| Line | Name | Value |
-|------|------|-------|
-| L22 | `_CONFIG_PATH` | `%APPDATA%\DevTools\config.json` |
-| L24/32 | `_load_devtools_config` / `_save_devtools_config` | |
-| L39 | `_get_destination_roots()` | `[("Scratch", …), ("Sharepoint", …)]` **from the config** — no hardcoded paths |
-| L50/59/66/73 | `_src_root` / `_dist_root` / `_internal_builder_dist` / `_programs_root` | config override → fallback; internal builder prefers local `C:\Dev\dist\_internal_builder` |
-| L97/102/106/120 | `_get_scratch_root` / `_versions_txt_path` / `read_versions_txt` / `write_version_to_txt` | `Versions.txt` |
-| L134-140 | `VERSION_RE`, `_VERSION_LOOSE_RE`, `TIMESTAMPED_EXE_RE`, `_exe_version` | |
-| L144-148 | `README_PREFIX`, `README_NAME`, `STATE_FILE_NAME`, `STATE_SECTION` | |
+### Versions
+| Name | Note |
+|------|------|
+| `read_versions_txt(force)`, `write_version_to_txt`, `invalidate_versions_cache` | `<scratch>/Versions.txt`, 15 s cache |
+| `RE_VER`, `RE_VDIR`, `VERSION_RE`, `TIMESTAMPED_EXE_RE` | |
+| `parse_version_tuple`, `bump_patch`, `parse_version`, `is_newer_version` | |
+| `list_versions(dist_dir)` | `vX.Y.Z` folders, newest first |
+| `last_version_in_dist`, `last_built_version(name, dist)` | Versions.txt first, then dist |
+| `fmt_elapsed` | "4.5s" / "2m 38s" |
 
-### Module-level helpers
+### Discovery (Builder)
+| Name | Note |
+|------|------|
+| `ALWAYS_IGNORE`, `NO_WINDOW` | |
+| `guess_main_py(dir)` | `<name>.py` → slug → `main.py` → `app.py` → first `.py` |
+| `find_projects(root)` | folders with a `.py`, not `_`-prefixed, sorted |
+| `find_helpers(projects, cache)` | `extra_exes` per project, cached on the config's mtime |
+| `module_homes(root)`, `check_module_homes(p, py_files, root, log)` | build stops on a module outside the folder or with a second copy |
 
-| Line | Name | What it does |
-|------|------|-------------|
-| L152/158 | `_app_dir` / `set_app_icon` | frozen-aware dir, taskbar icon |
-| L192/196/216 | `_state_path` / `load_state` / `save_state` | `copy_manager_state.ini` `[deployed]` |
-| L229/233 | `_is_locked_winerror32` / `_try_move` | locked-file aware move |
-| L250/255/259 | `parse_version` / `version_tuple_to_str` / `list_versions` | `vX.Y.Z` folders, desc |
-| L273 | `find_exe_in_folder` | exact → regex → name → first |
-| L302 | `unique_path` | ` (2)`, ` (3)`, … |
-| L314/322 | `_load_ico_as_photoimage` / `show_icon_compare_dialog` | modal old-vs-new icon compare → replace? |
-| **L386** | `_fix_archive_dir` | flat files in `archive/` → `vX.Y.Z/` folders; per version keeps only the latest timestamped build |
-| **L493** | `_reunite_unknown_helpers` | moves helper `.py` copies out of `archive/unknown/` back into their version folder under the ORIGINAL importable name, matching Nth copy ↔ Nth timestamp via the two `archive_log.txt` files |
-| L597-617 | `_DUP_SUFFIX_RE`, `_TS_SUFFIX_RE`, `_canonical_stem`, `_dup_index` | strip `__YYYYMMDD_HHMMSS` and ` (N)` |
-| **L622** | `_normalize_version_folder_names` | per version folder: group by canonical name, keep the base copy, rename to the canonical name, delete duplicates — so every folder is a clean runnable snapshot the Launcher can read |
-| L677 | `move_existing_exes_to_archive` | on deploy, archive every other exe; a locked exe is skipped, not fatal |
-| L711/715/737 | `_normalize_name` / `find_readme_or_raise` / `copy_readme_with_overwrite_notice` | ReadMe handling |
-| L745 | `is_newer_version(latest, deployed)` | drives the "new" highlight |
-| L756 | `ScrollableFrame` | mousewheel-aware program list container |
-| L780 | `_build_summary(jobs, roots)` | confirmation text |
+### Build
+| Name | Note |
+|------|------|
+| `ASSET_DIR_NAMES`, `SHARED_DATA_DIR_NAMES` | asset folders (shipped by build, protected by deploy); shared data (never touched) |
+| `_TEST_SUBMODULES` | `.tests` excluded for a `collect_all` package (collect-all only from `build_config.json`) |
+| `new_workdir(name)` | private PyInstaller work folder, day-old ones swept |
+| `as_out_dir(msg)`, `exe_icon_count(exe)`, `_rmtree_readonly`, `_run_logged(…, on_line)`, `_rm_norm` | |
+| `PhaseClock` | build time split: analysis / package / collect / finish, from PyInstaller's lines |
+| `parallel_builds(n)`, `_free_ram_gb()` | builds at once: ≤ 3, one per 4 cores and per 2 GB free |
+| `_SHARED_FILE_LOCK` | Versions.txt, `build_usage.json`, `build_times.log` written one at a time |
+| `record_build_usage(name)` | `build_usage.json`, last 500 |
+| `record_build_times(name, ver, total, phases, copy_s)`, `build_times_path()` | `build_times.log`, one tab-separated line per build |
+| `build_one_project(p, ver, dist, root, log, clock)` | → `(ok, version folder or error)` |
+| `build_one_helper(h, ver, dist, log, clock)` | `--onefile`, own dist entry |
+| `build_internal_builder(root, log, clock)` | `.spec` if present |
+| `build_summary(...)` | the BUILD DONE report |
 
-### Class: DeployGUI (ttk.Frame, L789)
+### Copy Manager list, state
+| Name | Note |
+|------|------|
+| `CM_IGNORE`, `list_program_dirs(root)` | |
+| `find_helper_programs(dirs)` | helper names per program |
+| `helper_parents(refresh)`, `dest_dir_for(dst, name)`, `helper_dir_names(name)` | a helper goes inside its program's folder |
+| `load_state`, `save_state`, `last_deployed(name, versions_map, state)` | |
 
-| Line | Method | Note |
-|------|--------|------|
-| L790 | `__init__` | loads state, builds UI, loads programs |
-| L813-857 | `_update_programs_root_wraplength`, `_split_path_to_lines`, `_reflow_dest_paths`, `_on_dest_configure`, `_build_dest_rows` | long UNC paths wrap instead of stretching the window |
-| L890/940 | `_open_set_paths` / `_change_root` | config-backed roots |
-| L961 | `_build_ui()` | left program list, right destinations, action buttons, progress, log |
-| L1073/1081 | `_refresh` / `auto_deploy(built_projects, build_summary)` | Builder hand-off |
-| L1116-1152 | `_log`, `_clear_log`, `_on_log_scroll`, `_on_log_scrollbar_release`, `_check_log_position`, `_compute_program_col_px` | log + layout |
-| L1159 | `_load_programs()` | source folders → dist versions → one row per program **plus an indented row per helper exe** (`find_helper_programs`, read from each folder's `build_config.json` → `extra_exes`, the Builder's source too). `Versions.txt` is read once for the whole list. Helper rows are `grid_remove()`d while folded (`expanded_programs`, `helper_rows`, `expander_buttons`, arrow in column 0) |
-| — | `_build_program_row(...)` / `_configure_row_columns(frame)` | the row itself and the shared column layout: arrow, tick box, program, version, status, last deployed |
-| — | `_on_program_check_clicked(key)` | ticking a program pushes the tick onto its helpers and opens the list — one-way push, unticking a helper sticks. Helpers share `program_vars`, so Select all / new / Clear / `auto_deploy` need no special case. This is what fixed a built helper being reported `NOT copied — not selected in Copy Manager` |
-| L1252/1256/1270 | `_select_all_programs` / `_select_new_programs` / `_clear_programs` | |
-| **L1274** | `_on_fix()` | runs `_fix_archive_dir` + `_reunite_unknown_helpers` + `_normalize_version_folder_names` over the selected programs' archives |
-| L1365 | `_collect_icon_conflicts(...)` | = `_scan_icon_conflicts` (share stat, thread-safe) + `_resolve_icon_conflicts` (one compare dialog per conflict, UI thread) |
-| — | `_update_rows_in_place()` | after a copy / build: versions, status, last deployed per row; ticks stay |
-| L1431/1434/1439 | `_get_selected_programs` / `_get_selected_destination_roots` / `_set_busy` | |
-| L1443-1455 | `_progress_show` / `_progress_update` / `_progress_hide` | |
-| **L1460** | `_deploy_one_program(program_dir, version_name, destination_roots, live_log, icon_decisions)` | **core deploy** |
-| L1738/1796/1845 | `_on_copy_readme_only` / `_on_build_internal` / `_on_deploy_internal` | ReadMe-only copy; build `_internal_builder`; zip + extract `_internal/` into the selected programs |
-| **L2021** | `_on_copy(build_summary)` | main workflow: collect conflicts → deploy each → update state + `Versions.txt` → log stats |
+### Files, archive
+| Name | Note |
+|------|------|
+| `merge_dir(src, dst)` | copy over, never delete first |
+| `_move_legacy_toplevel_folder` | old top-level helper folder → inside the program |
+| `exe_version`, `find_exe_in_folder`, `unique_path`, `_try_move` | `_try_move` reports a locked file instead of failing |
+| `find_readme_or_raise`, `find_readme_full_or_none`, `_find_docs` | the two user documents; `_full` mirrors the Launcher |
+| `fix_archive_dir`, `reunite_unknown_helpers`, `canonical_stem`, `normalize_version_folder_names` | archive maintenance |
+| `_archive_file`, `move_existing_exes_to_archive` | |
+| `fix_destinations(roots, log)` | the **Fix** button |
 
-**`_deploy_one_program()` steps**
-1. exe in the version folder, ReadMe, `.py` files, icon, extras — **files and
-   folders**, `_internal` excluded
-2. per destination root: create `<dst>/<program>/`, archive the old exe/py into
-   `archive/vX.Y.Z/`, copy the new exe as `<program> <version>.exe`, copy the `.py`
-   files, the extras, the ReadMe, and the icon (a stale PNG is dropped when an ICO
-   is copied; conflicts follow `icon_decisions`)
-3. remove leftover folders on the destination — except `_internal`, `archive`, and
-   the names in `incoming_dirs`
-
-**ReadMe lookup order** (L1493) — version folder → **source folder in the repo**
-→ `dist/<program>/` → for a helper exe the parent's source folder
-(`helper_parent_dir[name]`, where `ReadMe_<helper name>` lives — a helper has no
-source folder of its own) → `<destination>/<program>/` → warn and skip. Step 2 was added
-because builds predating the Builder's ReadMe copy have none in the version folder,
-and the deploy then shipped no ReadMe at all. `_on_copy_readme_only` (L1767) uses
-the same order.
-
-**`incoming_dirs`** (L1530-1548) — the folder names the new version brings. The
-stale-folder cleanup at L1581 must skip them, or an app's runtime assets
-(`Announcer/images`, `Announcer/sounds`) are deleted and nothing re-creates them.
+### Deploy
+| Name | Note |
+|------|------|
+| `_find_icon`, `scan_icon_conflicts(jobs, roots)` | file part of the icon check (thread) |
+| `icon_decisions_for(name, exists, replace)` | |
+| `ERROR_KEYS` | what counts as an error in the reports |
+| `deploy_one_program(program_dir, version, roots, helper_parent_dir, log, icon_decisions)` | → `(stats, file_log)` |
+| `copy_readme_only(names, roots, helper_parent_dir, log)` | |
+| `latest_internal_folder()`, `deploy_libraries(names, internal, scratch, log, progress)` | **Deploy Libraries** |
+| `copy_summary(...)`, `overall_summary(...)` | COPY DONE / ALL DONE reports |
 
 ---
 
-## Data structures & flows
+## dt_common.py — look, log, threads, dialogs
 
-### Project discovery
-- A dir under `PROGRAMY_DIR` with at least one `.py`
-- Entry point `<name>.py` > `main.py` > `app.py`
-- Optional `build_config.json` for PyInstaller extras
+| Name | Note |
+|------|------|
+| `ACCENT`, `SELECT_BG`, `SEC_*` | Image Tools colours and section accents |
+| `_IT_APP_QSS`, `BTN_QSS`, `COMBO_QSS`, `CHECKBOX_QSS`, `TREE_QSS`, `OTHER_QSS`, `MAIN_TABS_QSS` | stylesheets copied from Image Tools |
+| `_tick_image_url()` | white tick picture in `%TEMP%` |
+| `app_stylesheet()`, `apply_app_style(app)`, `light_palette()` | |
+| `_shade(hex, f)`, `Section(title, accent)` | coloured panel; content goes into `.body_layout` |
+| `_Invoker`, `init_ui_thread()`, `on_ui(fn, …)`, `ask_on_ui(fn, …)` | thread → UI thread hand-over |
+| `LogHub` | `new_view()`, `write(text, force_scroll)`, `clear()`; flushes every 40 ms |
+| `log_box(hub)` | the Log section with **Clear** |
+| `WheelGuard`, `guard_wheel(combo)` | no wheel edits on an unfocused drop-down |
+| `wrap_path`, `path_row` | long paths wrap at separators |
+| `message`, `ask_yes_no`, `ask_dist_missing` | |
+| `icon_compare_dialog(...)` | **Icon conflict** — True = replace |
+| `set_paths_dialog(parent)` | **Set paths** — True when saved |
 
-### Build output layout
-```
-dist/<project_name>/
-  v<version>/
-    <project_name> v<version>.exe
-    <project_name> v<version>.py   ← copy of the entry point
-    *.py                            ← extra sources (no test_*.py)
-    _internal/                      ← PyInstaller libs
-    icon.ico / extra_files
-    images/ sounds/ assets/ icons/  ← auto-detected asset folders
-    ReadMe_*.txt                    ← copied so the deploy can publish it
-```
+---
 
-### Deploy output layout
-```
-<dst_root>/<program_name>/
-  <program_name> <version>.exe
-  *.py
-  ReadMe_*.txt
-  icon.ico
-  images/ sounds/ assets/ icons/   ← whatever the build brought
-  archive/
-    vX.Y.Z/
-      <program_name> vX.Y.Z.exe
-      if_t.py, is_t.py …            ← importable names → runnable snapshot
-      archive_log.txt
-```
+## dt_builder.py — `BuilderTab`
 
-### Configuration files
-| File | Location | Purpose |
-|------|----------|---------|
-| `builder_settings.json` | `APP_DIR` | `root_folder`, `project_groups` |
-| `build_config.json` | per project dir | collect_all, collect_binaries, hidden_imports, copy_metadata, exclude_modules, extra_files |
-| `build_usage.json` | `APP_DIR` | build history |
-| `copy_manager_state.ini` | `APP_DIR` | deployed versions `[deployed] name = vX.Y.Z` |
-| `config.json` | `%APPDATA%\DevTools\` | `src_root`, `dist_root`, `scratch`, `sharepoint` |
-| `Versions.txt` | `<scratch>` | `Name = vX.Y.Z` per program, written after each build/deploy |
-| `icon.ico` | per project dir | app icon; bundled into the exe + copied to dist |
+| Group | Methods |
+|-------|---------|
+| UI | `_build_ui`, `_log`, `_save_settings`, `_save_replace_icons` |
+| Versions | `last_version`, `default_next`, `effective_next`, `invalidate_version_cache`, `helpers_of` |
+| List | `reload_projects`, `_make_item`, `_render` (all rows, once), `_group_of`, `_layout_rows` (re-place only, signals blocked), `_paint_order`, `_refresh_version_labels` |
+| Ticks | `_on_item_changed` (push to helpers), `_set_tick`, `_visible_names`, `_select_all`, `_clear_all`, `build_queue` |
+| Panel | `_on_current_changed` (ignored while `_updating`), `_focused_name`, `_show_focus`, `_on_next_edited`, `_on_group_changed`, `_open_focused_readme`, `_open_readme` |
+| Paths | `_change_root`, `_open_set_paths`, `apply_paths`, `_open_dist` |
+| Build | `_ensure_dist_root`, `_build_selected` (worker), `_on_build_finished` |
 
-To add a deployment destination, set it in **Set paths** (it lands in
-`%APPDATA%\DevTools\config.json`) — `_get_destination_roots()` reads it from there.
+State: `ticked`, `tick_order`, `items` (name → row), `section_items`, `expanded`,
+`next_override`, `focused` (`("project", Path)` / `("helper", dict)`), `project_groups`.
+
+---
+
+## dt_copy.py — `CopyTab`
+
+| Group | Methods |
+|-------|---------|
+| UI | `_build_ui`, `_log`, `_build_dest_rows`, `selected_destination_roots`, `set_busy`, `_progress`, `_progress_hide` |
+| Paths | `_change_root`, `_open_set_paths`, `apply_paths`, `refresh` |
+| List | `load_programs`, `_fit_name_column`, `_make_row`, `_attach_combo`, `_fill_row`, `update_rows_in_place` |
+| Ticks | `_on_item_changed` (push to helpers), `_set_checked`, `_select_all`, `_select_new`, `_clear`, `selected_programs` |
+| Icons | `resolve_icon_conflicts` (UI thread) |
+| Copy | `_record_deployed`, `copy_one_after_build` (called from the Builder's worker), `copy_after_build_report`, `_write_reports`, `_on_copy` |
+| Other | `_on_copy_readme_only`, `_on_fix`, `_on_deploy_libraries` |
+
+State: `rows` (name → item, combo, key, is_new, latest), `helper_names_by_parent`,
+`helper_parent_dir`, `expanded`, `dest_checks`, `state_deployed`.
+
+`_status_of(has_versions, is_new, deployed)` — NEW green / UTD red / grey.
+
+---
+
+## Configuration files
+| File | Where | Content |
+|------|-------|---------|
+| `config.json` | `%APPDATA%\DevTools\` | `root_folder`, `dist_root`, `scratch`, `sharepoint` (also read by the Launcher) |
+| `builder_settings.json` | beside the app | `root_folder` fallback, `project_groups`, `replace_icons_without_asking` |
+| `build_usage.json` | beside the app | build history |
+| `copy_manager_state.ini` | beside the app | `[deployed] name = vX.Y.Z` |
+| `Versions.txt` | `<scratch>` | `Name = vX.Y.Z`, shared with every PC |

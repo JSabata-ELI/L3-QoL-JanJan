@@ -1,5 +1,5 @@
 {
-  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe; hidden_imports are forced into the bundle; extra_exes are helper scripts built as their own self-contained .exe next to the app.",
+  "_comment": "Read by Dev Tools (dt_core.py) at build time. extra_files are copied next to the exe; hidden_imports are forced into the bundle; extra_exes are helper scripts built as their own self-contained .exe next to the app.",
   "extra_files": [
     "notify_provision.dat"
   ],

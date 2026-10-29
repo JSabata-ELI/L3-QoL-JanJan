@@ -2,6 +2,12 @@ SPFE Values — Detailed information
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
+Verified against source: 2026-10-15
+  (main.py 264 lines, spfe_t.py 3283, spfe_store.py 2571,
+   daypicker.py 1078, spfe_core.py 355, spfe_limits.py 217,
+   spfe_record.py 159, spfe_stats.py 144,
+   spfe_sections.py 119; 8190 lines in all)
+  Program folder: 490 kB in 15 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_SPFE Values.txt
 -----------------------------------------------------------------
@@ -54,7 +60,9 @@ is what the two buttons under "Earlier days" are for:
 They ask the archiver exactly the same question as the catch-up, at the same two
 times of day, and skip anything that is already in the log. How far back they
 can reach is up to the archiver: a PV that was not being archived yet answers
-with nothing, and the Log window says so.
+with nothing, and the Log window says so. If the archiver cannot be reached at
+all, the same question goes to its backup, the L3 proxy on 10.78.0.64 (twin
+.65), which holds the same data; the archiver is tried again a minute later.
 
 Weekends are skipped by the catch-up, because the value of "Saturday morning" on
 a machine nobody was running is noise. The two step buttons, < Previous and

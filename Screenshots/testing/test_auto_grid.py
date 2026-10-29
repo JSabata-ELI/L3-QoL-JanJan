@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import s  # noqa: E402
+import ssq_core as s  # noqa: E402
 
 SEC = 1_000_000_000
 FAILED = []

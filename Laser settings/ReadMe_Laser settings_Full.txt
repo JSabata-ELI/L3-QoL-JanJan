@@ -2,10 +2,12 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05
-  (main.py 592 lines, ls_core.py 2271, ls_ui.py 1542, ov_t.py 1329,
-   st_t.py 1030, ft_t.py 1124, in_t.py 159, ls_cpva.py 456,
-   ls_screen.py 411, ls_engine.py 248, ls_log.py 174; 9336 lines)
+Verified against source: 2026-10-15
+  (main.py 754 lines, ls_core.py 2865, ov_t.py 1724, ls_ui.py 1608,
+   st_t.py 1472, ft_t.py 1467, ls_dm.py 1392, ls_cpva.py 764,
+   dm_t.py 564, ls_screen.py 470, ls_engine.py 361, dw_t.py 229,
+   ls_log.py 174, in_t.py 168; 14012 lines in all)
+  Program folder: 804 kB in 19 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe Laser settings.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -25,20 +27,35 @@ are described in section 12.
 
 1.1 WHICH HALL IS BEING SHOT INTO
 
-    Int, E2, E3, E4 and E5 — in that order, left to right, until
-    somebody arranges them otherwise on the Settings tab.
+    L3, E2, E3, E4 and E5 — in that order, left to right, until
+    somebody arranges them otherwise on the Settings tab. (L3 is
+    stored as "Int" in the settings file; see 1.4.)
 
     Whether a hall is being shot into is read off its safety gate
     valve. The valve reports its position on two channels, but ONE
     of them is read:
 
-      L3-PSS:SGV50n_IN_OPEN_POSITION     1 = open,   0 = not open
-                                         READ
-      L3-PSS:SGV50n_IN_CLOSED_POSITION   1 = closed, 0 = not closed
-                                         fallback
+      L3 (SGV501), from the CPVA archiver (10.78.0.57):
+        L3-PSS:SGV501_IN_OPEN_POSITION     1 = open,   0 = not open
+                                           READ
+        L3-PSS:SGV501_IN_CLOSED_POSITION   1 = closed, 0 = not closed
+                                           fallback
 
-      Int  SGV501     E2  SGV502     E3  SGV503
+      E2 to E5 (SGV502 to SGV505), from the L3BT archive
+      (10.78.0.64, or its twin 10.78.0.65 when .64 is down):
+        L3BT-MSS:SGV50n_OPEN_IN            1 = open,   0 = not open
+                                           READ
+        L3BT-MSS:SGV50n_CLOSED_IN          1 = closed, 0 = not closed
+                                           fallback
+
+      L3   SGV501     E2  SGV502     E3  SGV503
       E4   SGV504     E5  SGV505
+
+    Which archive a channel is read from is decided by the program:
+    a name only the L3BT archive lists is read there, everything
+    else from the CPVA archiver. The channel picker on the Limits
+    tab lists the names of both. A channel whose newest archived
+    sample is "Disconnected" is "not read", never its last value.
 
     The open switch is a complete answer on its own: "not open"
     means closed, because a gate valve that is not open is shut.
@@ -58,17 +75,22 @@ are described in section 12.
     switch archived as a float has been seen to publish 0.9999.
 
     WHICH POSITION MEANS SHOOTING is a fact about the machine, not
-    a setting, so nobody is asked: Int is internal shooting, so the
+    a setting, so nobody is asked: L3 is internal shooting, so the
     beam goes there while the gate valve is CLOSED, and for the
     experimental halls the valve is open when the beam goes in.
     Whenever one valve is open the others are shut.
 
-    ONLY SGV501 IS LIVE. The other four valves do not publish yet.
-    All five are read all the same; nothing has to be switched on
-    for them when they come up. Until then the four are read off
-    the L3BT MSS window instead — see 1.2.
+    ALL FIVE ARE LIVE since 15.10.2026. Until then SGV502 to SGV505
+    were set to L3-PSS:SGV50n_IN_*_POSITION names on the CPVA
+    archiver, which never published; a settings file still holding
+    one of those old open names is moved onto the new one when it is
+    read. Names that LOOK right but hold only "Disconnected" since
+    13.8.2026, so do not use them: E3/E4/E5-PSS-SGV50n:VALVE_IN_*_
+    POSITION, E3-PSS-SGV501:IN_*_POSITION, L3BT-MSS:SGV50n_CLOSED and
+    L3BT-MSS:SGV50n_OPEN_FOR_BEAM. If the L3BT archive cannot be
+    reached, the four are read off the L3BT MSS window — see 1.2.
 
-1.2 THE L3BT MSS WINDOW — THE STOPGAP
+1.2 THE L3BT MSS WINDOW — THE LAST RESORT
 
     On L3-OPR03 the L3BT MSS window shows each valve's position in
     a small box under its name. While a valve's channels cannot be
@@ -101,9 +123,8 @@ are described in section 12.
     minute is not believed either.
 
     Order of trust, per hall: the open channel, then the closed
-    channel, then the window. The day a valve publishes, its
-    channel answers and the window is not asked about it again;
-    once all four publish, the window is not looked at at all.
+    channel, then the window. While all four channels answer, the
+    window is not looked at at all.
 
 1.3 THE SQUARE
 
@@ -152,12 +173,15 @@ are described in section 12.
     blink on one shared beat of 450 ms, so they can never drift out
     of step with each other.
 
-1.4 INT'S SQUARE IS CALLED L3
+1.4 INT IS CALLED L3
 
-    Since 2.10.2026 — it is the laser itself, shooting internally
-    while SGV501 is shut. Only the name on the squares changed: the
-    Limits tab's hall button, the settings file and every sentence
-    about limits still say Int. What the L3 square shows:
+    Since 2.10.2026 on the squares — it is the laser itself,
+    shooting internally while SGV501 is shut — and since 14.10.2026
+    everywhere on screen: the Limits tab's hall button, the gate
+    valve box and every tooltip and sentence say L3. Only the
+    settings file and the saved settings sets still store it as
+    "Int", so nothing saved by an older version needs converting.
+    What the L3 square shows:
 
       SGV501 closed                      SHOOTING or idle, by
                                          SBW4's energy, exactly as
@@ -188,7 +212,7 @@ are described in section 12.
     single square on the left and the list beside it. Its name
     changes by itself to the hall the beam is going into. The beam
     never goes into two halls at once, and when it goes into none
-    of E2 to E5 it is going into Int (SGV501 shut) — so the square
+    of E2 to E5 it is going into L3 (SGV501 shut) — so the square
     names the hall whose limits are in force, and L3 whenever there
     is none. Its colour, its word and its blink are that hall's,
     exactly as on the five. In this mode "Height of the band" is
@@ -216,7 +240,7 @@ are described in section 12.
     There is ONE list of channels, shared by all five halls. What
     differs per hall is the limits, and ONLY the limits. Show is
     one switch for the whole program: untick it in E2 and the value
-    stops being watched in Int and E5 too, and the row leaves the
+    stops being watched in L3 and E5 too, and the row leaves the
     first tab there and then.
 
     A value is in range when
@@ -396,17 +420,17 @@ If two halls are being shot into at once, every row is judged
 against both and the worse verdict wins; the row's tooltip then
 names the hall it came from.
 
-4.1 WHILE ONLY INT CAN ANSWER
+4.1 WHILE ONLY L3 CAN ANSWER
 
     There is one exception to all of the above, and it is the state
     the machine is actually in today. SGV502 to SGV505 publish
-    nothing. Int shoots while its valve is SHUT, so with that valve
+    nothing. L3 shoots while its valve is SHUT, so with that valve
     open no hall could ever say it was being shot into and the
     whole list sat grey for ever.
 
     So: while not one of those four valves can be read — not from
-    its channels and not off the L3BT MSS window — Int's limits are
-    in force whatever Int's own valve says. Int's square goes WHITE
+    its channels and not off the L3BT MSS window — L3's limits are
+    in force whatever L3's own valve says. L3's square goes WHITE
     with a darker edge and the word WATCHING — not green, because
     nobody is shooting into it and the square must not claim
     otherwise — and the rows are judged. If something is out of
@@ -466,7 +490,11 @@ it.
 
 5.2 THE TABLE
 
-    Click a cell and type. Its columns: Show, Alarm, Letter,
+    Double-click a cell to change it, press F2, or pick it and just
+    start typing. A centred number stays centred while it is typed
+    (14.10.2026 — Qt's own editor jumped to the left edge). Every
+    number in every table of the program is centred; only names and
+    channels read from the left. Its columns: Show, Alarm, Letter,
     Channel or formula, Name on the first tab, Unit, Min, Max,
     Scan min, Scan max, Reading now.
 
@@ -519,7 +547,17 @@ it.
     every formula is rewritten so it keeps meaning the same rows. A
     row dropped under the "Not shown" line has its Show unticked; one
     dragged back above it is ticked again. The shot counter has a
-    table of its own and is not dragged.
+    table of its own and is not dragged. A blue line shows where the
+    rows will land, and Esc cancels. Pick several with Ctrl / Shift
+    first, then drag one of them; a plain drag no longer picks a
+    range of rows (it used to, and that was all a drag ever did —
+    fixed 12.10.2026).
+
+    THE TABLE TAKES THE WINDOW'S HEIGHT (12.10.2026). It used to be
+    fixed to the height of its rows, so on a big window it stayed
+    small with empty paper under it. Now it fills the page above the
+    shot counter's table and scrolls inside itself; it is never
+    shorter than six rows, and below that the page scrolls.
 
     A comma is accepted as the decimal point. Anything that is not
     a number empties the box rather than sitting there looking like
@@ -764,6 +802,22 @@ a limit.
     honest consequence of "čtverečky zůstanou čtverce, pás se
     zkrátí".
 
+    THE SQUARES FIRST, THE TEXT ALWAYS INSIDE (12.10.2026). The
+    squares are as big as they can be while the list still fits
+    beside them (one square) or under them (five) at 19 px of text.
+    Only on a window too small for even that does the text go
+    smaller, and only at 8 px can anything run past the edge — "co
+    největší tak, aby se tam vlezl i text.. pokud se už text
+    nevleze, tak až teprve tehdy se bude moct text přepisovat přes
+    hranu". In the one-square mode the text used to come first and
+    the square was held to a third of the width; on a 1920 x 1080
+    window it now takes the whole height.
+
+    WITH THE FIT OFF, your numbers apply, but a text too big for the
+    window is DRAWN smaller (the verdict square keeps its proportion
+    to it), so the list never runs past the window's edge. The
+    numbers in the boxes and in the file stay as you typed them.
+
 8.2 THE BOARD
 
     The white rectangle is a scale model of the band the squares
@@ -908,6 +962,58 @@ a limit.
     even row. It is not possible to make the first tab unreadable
     and then have no way of putting it right.
 
+8.6 SAVED SETTINGS (12.10.2026)
+
+    At the top of the tab. Settings saved under a name — one set per
+    operator, say — so that whoever is at the controls picks theirs
+    and everything changes at once: "dropdown menu těch nastavení,
+    ze kterých si vyberu, klik na import a voala.. všechny nastavení
+    se změnili".
+
+    The sets are one file on the scratch share, settings_sets.json
+    beside dm_setups.json, so every PC sees the same list. It is read
+    and written in the background; with the share out of reach the
+    box says so and nothing else is affected.
+
+      Load          the ticked parts of the picked set replace this
+                    PC's settings, and every tab shows them at once
+      Save          this PC's settings (the ticked parts) over the
+                    picked set
+      Save as new   the same, as a new set under the name typed in
+                    the Name box; a name already taken is refused
+      Rename        the picked set gets the typed name
+      Delete        click twice within four seconds; gone for every
+                    PC
+
+    The parts, each a tick box:
+
+      Channels and limits     the list of rows (formulas, Show,
+                              Alarm, names, units, every hall's Min /
+                              Max, scan limits, the order), the gate
+                              valve channels, Scanning, the hall the
+                              Limits tab shows
+      Look (text, squares)    "look" and "halls" — typeface, sizes,
+                              bold, one square or five, their
+                              arrangement, the fit
+      Shot counter            its reset time, size and bold
+      DM reading              the Remote Desktop title and Look every
+      Window size and place   the Maximise size and place, and where
+                              the window is (unticked to begin with:
+                              that is a matter of the PC's screen)
+
+    A set saved with some parts unticked holds only the others; the
+    drop-down's tooltip says what each set holds. Loading a part a
+    set does not hold leaves that part as it is.
+
+    NEVER IN A SET: the DM writer switch. It says which PC reads the
+    mirror, and loading somebody's set on a second PC must not make
+    two of them. The saved DM set-ups and their High / Low power
+    ticks are on the share already and are the same on every PC.
+
+    The file is read again before every change and only the one set
+    is changed, so a set another PC saved a moment ago is never lost;
+    a file that cannot be read is never overwritten.
+
 
 =================================================================
 9. WHAT IT READS, AND HOW OFTEN
@@ -917,6 +1023,19 @@ The archiver, the same one Announcer, Image Tools and CSS Logger
 read:
 
   https://10.78.0.57:8443/api/1.0/cpva
+
+Channels that archiver does not have are read from the archives that
+do: the L3 beam transport (L3BT) and the facility (FCT) archives on
+10.78.0.64 (twin .65). The search in the Limits tab finds their
+channels too.
+
+If that archiver cannot be reached at all, the same readings are
+taken from its backup, the L3 proxy on 10.78.0.64 (or its twin
+.65), which serves the same archive. The program then stays on the
+backup for a minute before trying the archiver again. Nothing on
+screen changes; the log line counts it as "backup=". A slow archiver
+is not a reason to switch: the backup reads the same data just as
+slowly.
 
 One pass a second reads one channel per gate valve — five — and
 every watched channel, side by side over eight keep-alive
@@ -1031,14 +1150,14 @@ itself that leave no Python traceback.
       Check whose limits are in force. Hovering the row lists all
       five halls' limits with that one marked. It may not be the
       hall you were thinking of: while SGV502 to SGV505 are silent,
-      Int's are the ones in force.
+      L3's are the ones in force.
 
   "DM settings says Unknown"
       The line under it says why. Most often the Remote Desktop
       window on OPR1 is minimised: restore it (it may stay behind
       other windows). Otherwise it is not open, or Mirror Control
-      Window's Set-up grid is covered by another window inside the
-      remote desktop.
+      Window's Applied voltages grid (the left one) is covered by
+      another window inside the remote desktop.
 
   "DM settings says No fresh reading"
       OPR1 has stopped writing: Laser settings is not running there,
@@ -1057,8 +1176,18 @@ only way to it is the Remote Desktop window that OPR1 keeps open
 
 12.1 WHAT IS READ
 
-Mirror Control Window shows two 6 x 6 grids. The right-hand one,
-Set-up, is the one read. The numbers 0 to 35 in it are only the
+Mirror Control Window shows two 6 x 6 grids. The LEFT-hand one,
+Applied voltages, is the one read: it is what is really on the
+mirror. The right-hand one, Set-up, is only what the operator is
+about to apply, and is never judged. (Until 12.10.2026 it was the
+other way round — "se musí kontrolovat to nastavení vlevo!! ne
+vpravo".) Since 14.10.2026 the Set-up grid is read as well, but
+ONLY so a set-up can be saved from it before it is applied ("Save
+the Set-up grid", 12.3); OPR1 writes it into the state file beside
+the Applied grid. When it is covered nothing else changes. The two
+grids of one set-up differ by about 5 levels, well inside the
+tolerance below, so a set-up saved from the right grid is
+recognised on the left one once applied. The numbers 0 to 35 in it are only the
 electrode numbers and are the same in every set-up; each
 electrode's voltage is shown only as the colour of its cell — blue
 -150 V, white 0, red +150 V. No voltage is worked out from it. The
@@ -1069,18 +1198,20 @@ Two set-ups count as the same when no electrode's colour differs by
 more than a hair (15 levels out of 255 in any of red, green and
 blue — about 9 V). Remote Desktop sends the picture slightly lossy:
 on OPR1 the Low power grid came through up to 7 levels off. The
-low- and high-power set-ups of 8.10.2026 differ by up to 51 levels,
-in 18 of the 36 electrodes by more than 15.
+low- and high-power set-ups of 8.10.2026 differ by up to 49 levels,
+in 17 of the 36 electrodes by more than 15.
 
 The grid is found wherever it is: the Remote Desktop window can be
 any size, Mirror Control Window can be anywhere on the remote
 screen, and other windows (SID4) may cover parts of it. Only the
-Set-up grid itself has to be visible.
+Applied voltages grid itself has to be visible. Its colour scale is
+on its LEFT; the Set-up grid's is on its right, so the two are never
+confused.
 
 12.2 DM WRITER — ON OPR1 ONLY
 
-Tick "Read the Set-up grid from the Remote Desktop window and write
-it to the scratch share" on OPR1, and on no other PC. The setting is
+Tick "Read the Applied voltages grid from the Remote Desktop window
+and write it to the scratch share" on OPR1, and on no other PC. The setting is
 kept per PC. Every few seconds — "Look every", 1 to 10 s, 5 s at
 first — the window is copied into memory; every other PC then reads
 the state file just as often. It
@@ -1129,24 +1260,60 @@ The list of saved set-ups is one file on the share, so every PC sees
 the same names.
 
     Save the grid on the mirror now   saves the current colours
-                    under the name typed beside it. Refused when the
-                    name is taken, or when these colours are already
-                    saved under another name.
+                    under the name typed beside it. A name already on
+                    the list (capitals and spaces do not count)
+                    REPLACES that set-up's grid after a second click.
+                    Refused when these colours are already saved
+                    under another name.
+    Save the Set-up grid   the same, from the RIGHT-hand Set-up
+                    grid: a set-up prepared but not yet applied.
+                    Greyed out while OPR1 has not read that grid
+                    (covered, or OPR1 runs a version older than
+                    14.10.2026). The Overview still checks the left
+                    grid only.
+    Replace with the grid on the mirror now   gives the one picked
+                    set-up the grid on the mirror now; click it
+                    twice. Name and High / Low tick stay.
+    Undo replace    gives the picked set-up back the grid it had
+                    before its last replace; click it twice. One step
+                    back is kept.
     Rename          gives the one picked set-up the typed name.
+    Restore built-in   puts the built-in Low power / High power back
+                    on the list after they were deleted or renamed.
     Delete          deletes the picked set-ups; click it twice.
 
-"Low power" and "High power" are BUILT IN: they are always on the
-list (marked "built in"), on every PC, and cannot be deleted. Their
-colours are the Set-up grid of the two screenshots of 8.10.2026
-(High power 7:27, Low power 7:31 — swapped on 9.10.2026, when OPR1
-showed the first guess was the wrong way round).
+A replaced set-up shows "replaced <date time> (<PC>)" in the Saved
+column.
 
-Since 12.10.2026 they CAN be renamed: pick one, type the new name,
-Rename. The shared file then holds the built-in colours under the
-new name, with its High / Low tick, marked "built in, was "Low
-power"" in the list, and the old name leaves the list on every PC.
-Deleting the renamed entry brings the built-in name back. A built-in
-name cannot be given to any other set-up.
+"Low power" and "High power" come BUILT IN, on every PC, marked
+"built in". Their colours are the Applied voltages grid (re-read
+12.10.2026; up to 5 levels off the Set-up grid they were taken from
+before) of the two screenshots of 8.10.2026 (High power 7:27, Low
+power 7:31 — swapped on 9.10.2026, when OPR1 showed the first guess
+was the wrong way round).
+
+Since 21.10.2026 they are set-ups like any other (that day a new
+Low power could not be saved over the old one, and a third set-up
+had to be made):
+    - replaced: the shared file holds the new grid under the
+      built-in name, and every PC uses it;
+    - deleted: the shared file marks the name as removed, and it
+      leaves the list on every PC until Restore built-in;
+    - renamed (since 12.10.2026): the shared file holds the
+      built-in colours under the new name, marked "built in, was
+      "Low power"". A built-in name nobody carries any more can be
+      given to another set-up.
+
+IMPORTANT: a PC running a version older than 21.10.2026 does not
+understand a replaced or deleted built-in set-up: it still shows
+the old built-in grid, and if somebody saves, ticks or deletes
+anything on such a PC, it writes the file back without the
+replacement. Update every PC first.
+
+A yellow line under the list warns when two or more set-ups are
+ticked for the same power: the Overview accepts the mirror on any of
+them, so an old grid left ticked next to its replacement still
+counts as OK.
 
 The list has two tick columns, High power and Low power (added
 9.10.2026). They say which set-ups the Overview accepts:
@@ -1174,18 +1341,32 @@ It says the name of the set-up on the mirror — or Unknown, No fresh
 reading or Not a saved set-up. Its square is judged by SBW4's
 energy, because low-power shooting cannot be seen any other way:
 
-    a new SBW4 shot over 0.05 J        the set-up must be ticked
-                                       High power
-    a new SBW4 shot of 0.05 J or less  the set-up must be ticked
-                                       Low power
+    a new SBW4 shot over 0.05 J        the set-up on the mirror
+                                       must have High power ticked
+    new SBW4 shots of 0.05 J or less,  the set-up on the mirror
+    5 or more within 10 seconds        must have Low power ticked
+
+A TRIGGER IS NOT LOW POWER (15.10.2026). A trigger shot sent in the
+middle of high-power shooting — on request or by mistake — comes
+through SBW4 as one or two shots of about 0.02 J, far apart. Low
+power shooting is a steady stream of them (the laser fires at
+3.3 Hz; the archive keeps about one a second). So one or two shots
+under 0.05 J change nothing: the line stays on High power, the hall
+stays SHOOTING, and nothing blinks. Five or more within 10 seconds
+are low power, recognised within a few seconds of it starting.
+Measured on SBW4's archive of 5.–15.10.2026: replayed through the
+new rule, every trigger inside a high-power sequence is ignored and
+every start of low-power shooting is still caught.
 
 Low-power shooting may leave SBW4 silent instead of under 0.05 J,
 so it is also recognised by the SAST1 shutter (added 9.10.2026,
 channel L3-SHUT_SAST1_Shutter_LT6_SP-MSS:State, 1 = open): a hall's
 valve open, the shutter open, and no SBW4 shot over 0.05 J in the
-last 15 seconds means low power is being shot into that hall, and
-the set-up must be ticked Low power. The shutter is read only while
-the DM settings line is shown.
+last 2 minutes means low power is being shot into that hall, and
+the set-up must be ticked Low power. Within those 2 minutes of a
+high-power shot the open shutter is still taken as the same
+high-power sequence and contradicts neither set-up. The shutter is
+read only while the DM settings line is shown.
 
 A grid that is no saved set-up, or a set-up ticked for neither, is
 a cross for any new shot. With no new shot it is a grey dash.
@@ -1203,10 +1384,10 @@ On the Limits tab the row has no channel, unit or limits to type;
 
 12.5 THE FILES
 
-    <scratch>\Software\LaserSettings\dm_state.json
+    <scratch>\Software\Laser settings\shared\dm_state.json
         what OPR1 saw last: when, which PC, whether it could read
         the grid, the matching set-up and the 36 colours
-    <scratch>\Software\LaserSettings\dm_setups.json
+    <scratch>\Software\Laser settings\shared\dm_setups.json
         the saved set-ups
 
 <scratch> is \\hapls-share.cs.eli-beams.eu\scratch or

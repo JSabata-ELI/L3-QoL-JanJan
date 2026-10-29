@@ -34,7 +34,7 @@ User-facing documentation: `ReadMe_SPFE Values.txt` (short) and
 | `spfe_store.py` | Fields, config, share resolution, the CSV, the workbook. No GUI, no `requests`. |
 | `spfe_stats.py` | The out-of-range rule — "is this unlike the other days?". No GUI, no imports at all beyond the stdlib. |
 | `spfe_limits.py` | The **reference** rule — "is this inside the range somebody set?". Three levels: `""`, `"warn"`, `"bad"`. No GUI, no files, stdlib only. |
-| `spfe_core.py` | Archiver access. A trimmed copy of `CSS Logger/cpva_core.py`'s fetch layer, names kept identical. |
+| `spfe_core.py` | Archiver access. A trimmed copy of `CSS Logger/cpva_core.py`'s fetch layer, names kept identical — including the backup `_get_json_or_backup` (L3 proxy .64/.65 when CPVA cannot be reached; `testing/test_cpva_backup.py`). |
 | `spfe_fields.json` | **The quantities.** Where the PV names, the units, the rounding steps, the prefilled numbers and the Energy link go. Five rows still have no PV. |
 | `spfe_config.json` | Times, share, statistics thresholds, `warn_pct`. |
 | `spfe_references.json` | Not shipped — written beside the log, local and shared. `{"limits": {csv column: {min, max, warn_pct, set_at, by}}}`. |
@@ -48,7 +48,7 @@ to be visible to PyInstaller.
 
 **Visibility.** The Launcher lists a folder only when it holds an `.exe`
 (`Launcher/l.py:487`), so this folder is invisible to it. Dev Tools ▸ Builder
-lists any folder with a `.py` (`Dev Tools/b_t.py:314`), so it *does* appear in
+lists any folder with a `.py` (`Dev Tools/dt_core.py::find_projects`), so it *does* appear in
 the Builder's project list; it is simply never built. Renaming the folder
 `_SPFE Values` would hide it there too.
 

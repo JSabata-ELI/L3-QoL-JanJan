@@ -20,7 +20,7 @@ APP = Path(r"c:\Users\jan.moucka.eli-laser\OneDrive - ELI ERIC\ELI Beamlines\Pyt
 sys.path.insert(0, str(APP))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import pulser_monitor as pm  # noqa: E402
+import main as pm  # noqa: E402
 
 DAY = int(os.environ.get("SCAN_DAY", "13"))
 H0 = int(os.environ.get("SCAN_H0", "5"))     # UTC

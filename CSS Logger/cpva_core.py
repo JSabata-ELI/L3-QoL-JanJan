@@ -62,6 +62,34 @@ CPVA_HTTP_TIMEOUT      = 10.0
 # timeout is derived from its span (see _timeout_for_span), between these two.
 CPVA_HTTP_TIMEOUT_LONG = 120.0
 
+# The backup. The CPVA archiver is only a front end: the L3 proxy on .64 (twin
+# .65) serves the very same L3 Cassandra — measured 15.10.2026, an identical
+# channel list, identical rows, the same `count=` decimation, the same speed. So
+# when the CPVA service cannot be reached at all (connection refused or reset,
+# HTTP 502/503/504) the same question goes there instead, and for the next
+# CPVA_DOWN_S seconds every question goes straight to it. Never on a read timeout
+# (same slow database behind both) and never on HTTP 500 (the archiver's "window
+# too big", which the fetchers answer by splitting).
+L3_PROXY_BASE_URLS = (
+    "http://10.78.0.64:8080/l3proxy/archive-access/api/1.0/archive/1",
+    "http://10.78.0.65:8080/l3proxy/archive-access/api/1.0/archive/1",
+)
+CPVA_DOWN_S = 60.0
+_UNREACHABLE_HTTP = (502, 503, 504)
+
+# The archives the CPVA archiver does not have. Same hosts, same URL shape.
+# L3BT: beam transport and the experimental halls' safety channels (4336 names
+# on 15.10.2026, 196 also on CPVA). FCT: facility channels — cooling, power,
+# PSI, leak detection (7636 names, 48 also on CPVA). A channel is read from one
+# of these only when it lists it and the CPVA archiver does not; the shared
+# names stay where they always were. Looked up in this order.
+EXTRA_ARCHIVES = {
+    "l3bt": ("http://10.78.0.64:8080/l3btproxy/archive-access/api/1.0/archive/1",
+             "http://10.78.0.65:8080/l3btproxy/archive-access/api/1.0/archive/1"),
+    "fct":  ("http://10.78.0.64:8080/fctproxy/archive-access/api/1.0/archive/1",
+             "http://10.78.0.65:8080/fctproxy/archive-access/api/1.0/archive/1"),
+}
+
 # One hour: the span the archiver serves for any channel, however fast it is.
 # It is no longer the fixed request size — cpva_fetch_many_adaptive asks for as
 # much as the server will actually give and halves only what it refuses — but it
@@ -141,7 +169,7 @@ DEFAULT_CONFIG = {
     "http_timeout": 10.0,
     "conditions": [],
     "master_pv": MASTER_RAMP_PV,
-    "master_multiple": "",
+    "master_step": "1000",
     "avg_target_points": 2000,
 }
 
@@ -277,6 +305,144 @@ def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT):
     return orjson.loads(body)
 
 
+def _cannot_reach(exc) -> bool:
+    """The service is not there at all — as opposed to slow, or answering."""
+    if isinstance(exc, requests.ConnectionError):   # refused, reset, SSL, connect timeout
+        return True
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    return code in _UNREACHABLE_HTTP
+
+
+_cpva_down_until = 0.0
+_DOWN_LOCK = threading.Lock()
+BACKUP_STATS = {"backup": 0}
+
+
+def _cpva_is_down() -> bool:
+    with _DOWN_LOCK:
+        return time.monotonic() < _cpva_down_until
+
+
+def _mark_cpva_down() -> None:
+    global _cpva_down_until
+    with _DOWN_LOCK:
+        _cpva_down_until = time.monotonic() + CPVA_DOWN_S
+
+
+def _get_json_or_backup(cpva_url: str, proxy_path: str,
+                        timeout: float = CPVA_HTTP_TIMEOUT):
+    """The CPVA archiver, or the L3 proxy when the archiver cannot be reached.
+
+    `proxy_path` is the same question in the proxy's URL shape. The backup gets
+    the caller's whole timeout: it reads the same database, just as slowly. An
+    error from the proxy is raised as it is (its HTTP 500 still means "split");
+    only when neither can be reached is it one ConnectionError naming both —
+    deliberately not a Timeout, so nobody fans that out into smaller windows.
+    """
+    first = None
+    if not _cpva_is_down():
+        try:
+            return _http_get_json(cpva_url, timeout=timeout)
+        except Exception as exc:
+            if not _cannot_reach(exc):
+                raise
+            _mark_cpva_down()
+            first = exc
+    with _DOWN_LOCK:
+        BACKUP_STATS["backup"] += 1
+    try:
+        return _proxy_get_json(L3_PROXY_BASE_URLS, proxy_path, timeout)
+    except requests.ConnectionError as last:
+        if first is None:
+            raise
+        raise requests.ConnectionError(
+            f"archiver unreachable ({first}); backup L3 proxy: {last}") from last
+
+
+def _proxy_get_json(base_urls, path: str, timeout: float):
+    """GET on a proxy: the first host, and the twin only when the first one
+    cannot be reached. Any other error is an answer and is raised as it is."""
+    last = None
+    for base in base_urls:
+        try:
+            return _http_get_json(base + path, timeout=timeout)
+        except Exception as exc:
+            if not isinstance(exc, requests.ConnectionError):
+                raise                   # an answer, or a slow one: not the twin's job
+            last = exc
+    raise last
+
+
+# ---------------------------------------------------------------------------
+# Which archive holds a channel
+# ---------------------------------------------------------------------------
+# The channel lists are cheap (0.02 s each) and held for the session; every
+# cpva_fetch_channels (a picker opening) refreshes them.
+_ALL_CHANNELS_PATH = "/channels-by-pattern/" + urllib.parse.quote("*", safe="")
+_cpva_names: "set[str] | None" = None
+_proxy_names: dict = {}                 # extra archive key → its names
+_lists_tried_at = 0.0
+_ROUTE_LOCK = threading.Lock()
+# Held for the whole load, so the first reads WAIT for the lists instead of all
+# going to the CPVA archiver while the first one is fetching.
+_LOAD_LOCK = threading.Lock()
+_LIST_RETRY_S = 30.0
+
+
+def _names_of(raw) -> "set[str]":
+    return {str(x) for x in raw if isinstance(x, str)} \
+        if isinstance(raw, list) else set()
+
+
+def _load_lists(timeout: float = 6.0, force: bool = False) -> None:
+    """Fill the name lists that are not held yet. Never raises."""
+    global _cpva_names, _lists_tried_at
+    with _LOAD_LOCK:
+        with _ROUTE_LOCK:
+            complete = (_cpva_names is not None
+                        and all(k in _proxy_names for k in EXTRA_ARCHIVES))
+            if not force and complete:
+                return
+            if not force and _lists_tried_at \
+                    and time.monotonic() - _lists_tried_at < _LIST_RETRY_S:
+                return
+            _lists_tried_at = time.monotonic()
+        if force or _cpva_names is None:
+            try:
+                names = _names_of(_get_json_or_backup(
+                    f"{CPVA_BASE_URL}{CPVA_CHANNELS_ENDPOINT}",
+                    _ALL_CHANNELS_PATH, timeout=timeout))
+                with _ROUTE_LOCK:
+                    _cpva_names = names
+            except Exception:
+                pass
+        for key, urls in EXTRA_ARCHIVES.items():
+            if not force and key in _proxy_names:
+                continue
+            try:
+                names = _names_of(_proxy_get_json(urls, _ALL_CHANNELS_PATH, timeout))
+                with _ROUTE_LOCK:
+                    _proxy_names[key] = names
+            except Exception:
+                pass
+
+
+def archive_of(channel: str):
+    """The extra archive ("l3bt" / "fct") this channel is read from, or None
+    for the CPVA archiver (and its backup)."""
+    _load_lists()
+    with _ROUTE_LOCK:
+        lists, cpva = dict(_proxy_names), _cpva_names
+    # Without the CPVA list nobody can say the name is ALSO there; the proxies
+    # answer the shared names with identical samples, so it is safe.
+    if cpva is not None and channel in cpva:
+        return None
+    for key in EXTRA_ARCHIVES:
+        if channel in lists.get(key, ()):
+            return key
+    return None
+
+
 def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
                        timeout: float = CPVA_HTTP_TIMEOUT,
                        count: int | None = None) -> list[dict]:
@@ -301,7 +467,16 @@ def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
         query["count"] = str(int(count))
     params = urllib.parse.urlencode(query)
     url  = f"{CPVA_BASE_URL}{CPVA_SAMPLES_ENDPOINT}?{params}"
-    data = _http_get_json(url, timeout=timeout)
+    # The proxy names the channel in the path; the rest of the query is the same.
+    proxy_params = urllib.parse.urlencode(
+        {k: v for k, v in query.items() if k != "channelName"})
+    proxy_path = (f"/samples/{urllib.parse.quote(channel, safe='')}"
+                  f"?{proxy_params}")
+    extra = archive_of(channel)
+    if extra is not None:
+        data = _proxy_get_json(EXTRA_ARCHIVES[extra], proxy_path, timeout)
+    else:
+        data = _get_json_or_backup(url, proxy_path, timeout=timeout)
     if not isinstance(data, list):
         raise ValueError(f"Unexpected response shape: {type(data).__name__}")
     return data
@@ -515,6 +690,9 @@ def _empty_report(gaps, boundaries, span_ns) -> FetchReport:
 # and asking costs a request per channel before anything else can start (on a
 # busy archiver, seconds). A probe of the newest hour is remembered this long.
 DENSITY_MEMO_S = 1800.0
+# How long the pre-flight probe is waited for once the day cache has already
+# covered ≥ 90 % of the period (see _preflight_failed).
+PREFLIGHT_CACHED_WAIT_S = 3.0
 _DENSITY_MEMO: dict = {}          # (names, hour asked) -> (samples, monotonic)
 _DENSITY_LOCK = threading.Lock()
 
@@ -672,6 +850,17 @@ def _recheck_decimated(suspects, out, gaps, boundaries, start_ns, end_ns,
 # 112 — the archiver's cost is per request, not per sample.
 MAX_TILES = 16
 
+# A day counts as closed this long after its last midnight (the day cache's
+# own rule); a tile ending later belongs to the open day.
+CLOSED_DAY_NS = int(3600e9)
+# The open day has no thinned level, so it comes back exactly as archived (by
+# mid-afternoon 78 000 samples for one energy). One request for all of it took
+# 4.7–14 s, the same in four-hour pieces read side by side 3.9–4.5 s
+# (measured 12.10.2026, four energies, back to back).
+OPEN_DAY_PIECE_NS = 4 * CHUNK_SIZE_NS
+# How far back the day cache keeps parts of days (cpva_cache.RECENT_DAYS).
+RECENT_DAYS_NS = 3 * 24 * CHUNK_SIZE_NS
+
 
 def _load_tiles(start_ns: int, end_ns: int) -> list:
     """The pieces a load is read in, NEWEST FIRST.
@@ -716,7 +905,8 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                          verify: bool = True,
                          tile_fn=None,
                          cache=None,
-                         aliases: bool = True):
+                         aliases: bool = True,
+                         cached_fn=None):
     """Read several channels over [start_ns, end_ns), whatever its length.
 
     The period is cut into Prague days (:func:`_load_tiles`) and read NEWEST DAY
@@ -758,7 +948,9 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
     moving it (the density check before, the re-reads after).
 
     ``cache`` (a :class:`cpva_cache.DayCache`) serves closed days read before
-    and keeps the closed days read now.
+    and keeps the closed days read now. ``cached_fn(fraction)`` gets the share
+    of (channels × period) served from it so far, each time it grows — a
+    caller can show that at once instead of waiting for the last requests.
 
     ``verify`` (only meaningful with ``count``) checks each thinned series
     against the archive and reads the channel again, as archived, when the
@@ -800,7 +992,7 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
     lock = threading.Lock()
     wake = threading.Event()      # a request finished: the feeder may go on
     state = {"pending": 0, "done": 0, "total": 0, "covered": 0,
-             "requests": 0, "splits": 0, "cached": 0,
+             "requests": 0, "splits": 0, "cached": 0, "from_cache": 0,
              "cancelled": False, "over_budget": False, "decimated": None,
              "noted_span": {}}
     ex: object = None
@@ -824,6 +1016,8 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
     # still out under it, what they read and which pieces failed.
     by_name: dict = {}
     cache_hit_days: set = set()   # (channel, day start) served from the cache
+    recent_hits: set = set()      # (channel, start) served from today's block
+    tile_todo: dict = {}          # (channel, tile) -> the ranges asked for
 
     def _note(text: str) -> None:
         if log_fn:
@@ -998,6 +1192,8 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
         tlo, thi = tiles[tile]
         cnt = _share(tile_cnt.get((ch, tile)), hi - lo, thi - tlo)
         piece = _piece_for(ch, hi - lo)
+        if start_chunk_ns is None and thi > time.time() * 1e9 - CLOSED_DAY_NS:
+            piece = min(piece, OPEN_DAY_PIECE_NS)     # see OPEN_DAY_PIECE_NS
         k = max(1, int(math.ceil((hi - lo) / piece)))
         for i in range(k - 1, -1, -1):
             a = lo + ((hi - lo) * i) // k
@@ -1156,7 +1352,16 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
         """Wait for the pre-flight; a report when the archiver is unreachable."""
         if pre_thread is None:
             return None
-        pre_thread.join()
+        # When the cache already gave most of the period, what is left is a
+        # few requests that time out on their own if the archiver is gone —
+        # waiting up to two full timeouts for the probe first held the bar at
+        # 94 % (12.10.2026). A probe still out after a few seconds counts as
+        # an answer to come.
+        with lock:
+            mostly_cached = whole and state["from_cache"] >= 0.9 * whole
+        pre_thread.join(PREFLIGHT_CACHED_WAIT_S if mostly_cached else None)
+        if pre_thread.is_alive():
+            return None
         dead = dead_box[0]
         if dead is None:
             return None
@@ -1195,17 +1400,18 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
             _note(f"read as archived, not thinned (too few samples to thin): "
                   f"{', '.join(shorten_pv_name(c) for c in sparse)}")
 
-    failed = _preflight_failed()
-    if failed is not None:
-        return failed
-
     # ── the day cache: closed days read before are not asked for again ─────
     cache_on = cache is not None and verify and not _is_cancelled(cancel_fn)
     if cache_on:
         whole_days = [d for lo, hi in tiles for d in _whole_days(lo, hi)]
-        if whole_days:
+        # The recent days too: the share may hold the part of today (or of
+        # the window's first day) another load already read.
+        recent_from = time.time() * 1e9 - RECENT_DAYS_NS
+        part_days = [d for lo, hi in tiles for d in _prague_days(lo, hi)
+                     if d[1] > recent_from and d not in whole_days]
+        if whole_days or part_days:
             try:
-                cache.prefetch(channels, whole_days, TZ_PRAGUE)
+                cache.prefetch(channels, whole_days + part_days, TZ_PRAGUE)
             except Exception as exc:
                 _note(f"day cache unreadable ({exc}) — reading the archiver")
                 cache_on = False
@@ -1232,6 +1438,26 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
             cur = b
         if cur < hi:
             missing.append((cur, hi))
+        # Parts of recent days an earlier load already read (in memory): the
+        # open day, and the part day a "last N hours" window starts in.
+        if missing and hasattr(cache, "recent_get"):
+            density = None if tile_count is None else tile_count / (hi - lo)
+            rest = []
+            for mlo, mhi in missing:
+                for dlo, dhi in _prague_days(mlo, mhi):
+                    got = cache.recent_get(ch, _day_start(dlo), dlo, dhi,
+                                           names_of[ch][0], density)
+                    if got is None:
+                        rest.append((dlo, dhi))
+                        continue
+                    a, b, smp = got
+                    hits.append((a, b, smp))
+                    recent_hits.add((ch, a))
+                    if a > dlo:
+                        rest.append((dlo, a))
+                    if b < dhi:
+                        rest.append((b, dhi))
+            missing = _coalesce_ranges(rest)
         return hits, missing
 
     def _piece_for(ch, span):
@@ -1246,31 +1472,64 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
         # Exactly as archived and dense: start from what is known to work.
         return max(min_chunk_ns, min(span, max(o.good, RAW_START_CHUNK_NS)))
 
-    def _feed_tile(ti):
+    filed: set = set()            # tiles whose cached part is handed over
+
+    def _file_cached(ti):
+        """Hand over what the cache and memory hold of one tile, and note what
+        is left to ask the archiver for (``tile_todo``). Needs no archiver, so
+        it runs for every tile before anything waits on one."""
+        if ti in filed:
+            return
+        filed.add(ti)
         lo, hi = tiles[ti]
         tspan = hi - lo
         for ch in channels:
             tcnt = _share(per_ch_count[ch], tspan, span_total)
             tile_cnt[(ch, ti)] = tcnt
-            todo = [(lo, hi)]
+            tile_todo[(ch, ti)] = [(lo, hi)]
             if cache_on:
                 hits, todo = _from_cache(ch, lo, hi, tcnt)
+                tile_todo[(ch, ti)] = list(todo)
                 if hits:
                     got = [s for _a, _b, smp in hits for s in smp]
                     with lock:
                         if not todo:
                             state["done"] += 1     # the planned slot, all cached
                         state["covered"] += sum(b - a for a, b, _s in hits)
-                        state["cached"] += len(hits)
+                        state["from_cache"] += sum(b - a for a, b, _s in hits)
+                        from_cache = state["from_cache"]
+                        state["cached"] += sum(1 for a, _b, _s in hits
+                                               if (ch, a) not in recent_hits)
                         boundaries[ch].append(hits[0][0])
                         parts[ch].append(got)
                         for a, _b, _s in hits:
                             cache_hit_days.add((ch, a))
+                    # Say how much is read BEFORE handing the samples over:
+                    # the caller's snapshots skip a nearly complete load, and
+                    # with the old order one was drawn of what came from the
+                    # cache, 2.3 s on the window's thread just before the end.
+                    _emit_progress()
                     if chunk_fn and got:
                         try:
                             chunk_fn(ch, got)
                         except Exception:
                             pass
+                    # After the samples are handed over, so a picture made on
+                    # this news already holds them.
+                    if cached_fn and whole:
+                        try:
+                            cached_fn(min(1.0, from_cache / whole))
+                        except Exception:
+                            pass
+
+    def _feed_tile(ti):
+        _file_cached(ti)
+        lo, hi = tiles[ti]
+        tspan = hi - lo
+        open_day = start_chunk_ns is None and hi > time.time() * 1e9 - CLOSED_DAY_NS
+        for ch in channels:
+            tcnt = tile_cnt[(ch, ti)]
+            todo = tile_todo[(ch, ti)]
             planned = True                         # the first request takes the slot
             for rlo, rhi in reversed(todo):        # newest first
                 if len(names_of[ch]) > 1:
@@ -1282,6 +1541,8 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                     continue
                 span = rhi - rlo
                 piece = _piece_for(ch, span)
+                if open_day:
+                    piece = min(piece, OPEN_DAY_PIECE_NS)
                 k = max(1, int(math.ceil(span / piece)))
                 for i in range(k - 1, -1, -1):
                     a = rlo + (span * i) // k
@@ -1303,9 +1564,32 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
         emitted[1] = state["total"]
         progress_fn(0, state["total"])
 
+    # Everything the cache and memory hold goes out first, newest step first —
+    # it needs no archiver, so it must not wait for the pre-flight request
+    # below (measured: on a reload the picture waited 2–4 s for that one
+    # minute of data, the archiver's answer time at that moment).
+    if cache_on:
+        for ti in range(len(tiles)):
+            if _is_cancelled(cancel_fn):
+                break
+            _file_cached(ti)
+
+    failed = _preflight_failed()
+    next_tile = 0
+    if failed is not None:
+        if not state["from_cache"]:
+            return failed
+        # The archiver is not there, but the cache gave part of the period:
+        # keep that, and only the rest is unread.
+        for ch in channels:
+            gaps[ch] = [r for ti in range(len(tiles))
+                        for r in tile_todo.get((ch, ti), [tiles[ti]])]
+            if gaps[ch]:
+                tile_bad.update((ch, ti) for ti in range(len(tiles)))
+        next_tile = len(tiles)
+
     workers = max(1, min(max_workers, len(tiles) * len(channels)))
     ex = ThreadPoolExecutor(max_workers=workers)
-    next_tile = 0
     try:
         while True:
             if _is_cancelled(cancel_fn):
@@ -1432,6 +1716,19 @@ def _fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                     cache.put(ch, a, b, flat, cnt, src, TZ_PRAGUE, now)
                 except Exception:
                     pass
+            # Recent days: what was asked for now joins the blocks in memory.
+            if hasattr(cache, "recent_put"):
+                if tile_src.get((ch, ti), set()) - {names_of[ch][0]}:
+                    continue              # another name answered: not kept
+                density = None if tcnt is None else tcnt / (hi - lo)
+                for rlo, rhi in tile_todo.get((ch, ti), ()):
+                    for dlo, dhi in _prague_days(rlo, rhi):
+                        try:
+                            cache.recent_put(ch, _day_start(dlo), dlo, dhi, flat,
+                                             names_of[ch][0], density, now,
+                                             tz=TZ_PRAGUE)
+                        except Exception:
+                            pass
         cache.flush_async()
 
     for ch, answered in alias_days.items():
@@ -1562,6 +1859,12 @@ def _prague_days(start_ns: int, end_ns: int) -> list:
     return out
 
 
+def _day_start(ns: int) -> int:
+    """The Prague midnight that starts the day ``ns`` falls in."""
+    d = datetime.fromtimestamp(ns / 1e9, TZ_PRAGUE).date()
+    return int(datetime(d.year, d.month, d.day, tzinfo=TZ_PRAGUE).timestamp() * 1e9)
+
+
 def _empty_day_ranges(samples: list, start_ns: int, end_ns: int) -> list:
     """The Prague days of [start, end) holding no sample of ``samples``, with
     neighbouring empty days joined into one range. The archiver's bracket
@@ -1595,7 +1898,8 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                              preflight: bool = True,
                              verify: bool = True,
                              tile_fn=None,
-                             cache=None):
+                             cache=None,
+                             cached_fn=None):
     """The one fetch: :func:`_fetch_many_adaptive`, day by day, newest first.
 
     A channel archived under two names (SBW4) is read under the HAPLS name
@@ -1611,7 +1915,8 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
         log_fn=log_fn, chunk_fn=chunk_fn, coverage_fn=coverage_fn,
         phase_fn=phase_fn, start_chunk_ns=start_chunk_ns,
         min_chunk_ns=min_chunk_ns, max_requests=max_requests,
-        preflight=preflight, verify=verify, tile_fn=tile_fn, cache=cache)
+        preflight=preflight, verify=verify, tile_fn=tile_fn, cache=cache,
+        cached_fn=cached_fn)
 
 
 def cpva_fetch_many_chunked(channels: list[str], start_ns: int, end_ns: int,
@@ -1884,10 +2189,136 @@ def cpva_decode_value(sample: dict):
 
 def cpva_fetch_channels(timeout: float = CPVA_HTTP_TIMEOUT) -> list[str]:
     url  = f"{CPVA_BASE_URL}{CPVA_CHANNELS_ENDPOINT}"
-    data = _http_get_json(url, timeout=timeout)
+    data = _get_json_or_backup(url, "/channels-by-pattern/" +
+                               urllib.parse.quote("*", safe=""), timeout=timeout)
     if not isinstance(data, list):
         raise ValueError(f"Unexpected response from /channels: {type(data).__name__}")
-    return [str(x) for x in data]
+    global _cpva_names
+    out = [str(x) for x in data]
+    with _ROUTE_LOCK:
+        _cpva_names = set(out)
+    return out + extra_channel_names(set(out), timeout=timeout)
+
+
+def extra_channel_names(known=(), timeout: float = CPVA_HTTP_TIMEOUT) -> list[str]:
+    """The L3BT and FCT proxies' names that are not in `known`, sorted, so a
+    picker can offer their channels too. The same lists route the reads, so a
+    channel added since the first read becomes readable. A proxy that does not
+    answer adds nothing."""
+    seen = set(known)
+    out: list[str] = []
+    for key, urls in EXTRA_ARCHIVES.items():
+        try:
+            extra = _names_of(_proxy_get_json(urls, _ALL_CHANNELS_PATH, timeout))
+        except Exception:
+            continue
+        with _ROUTE_LOCK:
+            _proxy_names[key] = set(extra)
+        out.extend(sorted(extra - seen))
+        seen |= extra
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Shots: the moments the laser fired, found from the channels' own writes
+# ---------------------------------------------------------------------------
+# A shot is a moment when MOST of the channels running at the shot rate wrote
+# a value. One channel alone never decides: any channel can skip a shot (it
+# writes only when its value changes, or the archive drops a sample), and a
+# channel running on its own clock (a housekeeping reading every minute, a
+# camera running free at 10 Hz) is not on the shot rate at all and has no vote.
+
+SHOT_RATE_TOL      = 1.25   # own gaps within ×1.25 of each other are one rate
+SHOT_JOIN_FRACTION = 0.4    # writes closer than 0.4 × the shot gap are one moment
+SHOT_MIN_SAMPLES   = 4      # fewer samples than this cannot tell a channel's rate
+
+
+def _median_gap(ts) -> "float | None":
+    ts = np.asarray(ts)
+    if ts.size < SHOT_MIN_SAMPLES:
+        return None
+    d = np.diff(ts)
+    d = d[d > 0]
+    return float(np.median(d)) if d.size else None
+
+
+def shot_rate(ts_by_pv: dict) -> "tuple[float | None, list]":
+    """The shot gap (ns) and the channels that run on it.
+
+    ``ts_by_pv`` maps each real channel to its sorted sample times (ns). The
+    shot gap is the gap most channels repeat at (a tie goes to the slower one:
+    a channel running free is never slower than the shots). Returns
+    ``(None, [])`` when no channel has enough samples to tell."""
+    gaps = {}
+    for pv, ts in ts_by_pv.items():
+        g = _median_gap(ts)
+        if g:
+            gaps[pv] = g
+    if not gaps:
+        return None, []
+    groups: "list[list[float]]" = []
+    for g in sorted(gaps.values()):
+        if groups and g <= groups[-1][0] * SHOT_RATE_TOL:
+            groups[-1].append(g)
+        else:
+            groups.append([g])
+    best = max(groups, key=lambda grp: (len(grp), grp[0]))
+    gap = best[len(best) // 2]
+    members = [pv for pv, g in gaps.items() if best[0] <= g <= best[-1]]
+    return gap, members
+
+
+def shot_moments(ts_by_pv: dict, gap_ns: float, members: list):
+    """(starts, ends) int64 arrays of the shots: the first and the last write
+    of every moment that at least half of ``members`` wrote in.
+
+    Writes closer together than 0.4 × the shot gap belong to one moment, so a
+    channel archived a little after the others still lands on its shot."""
+    empty = np.empty(0, dtype=np.int64)
+    if not gap_ns or not members:
+        return empty, empty
+    parts, who = [], []
+    for i, pv in enumerate(members):
+        ts = np.asarray(ts_by_pv.get(pv, ()), dtype=np.float64)
+        if ts.size:
+            parts.append(ts.astype(np.int64))
+            who.append(np.full(ts.size, i, dtype=np.int64))
+    if not parts:
+        return empty, empty
+    t = np.concatenate(parts)
+    w = np.concatenate(who)
+    order = np.argsort(t, kind="stable")
+    t, w = t[order], w[order]
+    tol = SHOT_JOIN_FRACTION * float(gap_ns)
+    new = np.empty(t.size, dtype=bool)
+    new[0] = True
+    new[1:] = np.diff(t) > tol
+    moment = np.cumsum(new) - 1
+    n_mom = int(moment[-1]) + 1
+    k = len(members)
+    # A channel that wrote twice in one moment still has one vote.
+    voted = np.unique(moment * k + w) // k
+    votes = np.bincount(voted, minlength=n_mom)
+    ok = votes >= max(1, math.ceil(k / 2))
+    starts = t[new][ok]
+    last = np.empty(t.size, dtype=bool)
+    last[:-1] = new[1:]
+    last[-1] = True
+    ends = t[last][ok]
+    return starts, ends
+
+
+def find_shots(ts_by_pv: dict, rate=None):
+    """Every shot in ``ts_by_pv``: ``(starts, ends, gap_ns, members)``.
+
+    ``rate`` is a ``(gap_ns, members)`` found elsewhere — used when these
+    samples are too few to tell the rate themselves (a short selection)."""
+    gap, members = shot_rate(ts_by_pv)
+    if (gap is None or not members) and rate is not None:
+        gap, members = rate
+        members = [pv for pv in members if pv in ts_by_pv]
+    starts, ends = shot_moments(ts_by_pv, gap, members)
+    return starts, ends, gap, members
 
 
 # ---------------------------------------------------------------------------
@@ -2013,10 +2444,10 @@ def shorten_pv_name(full_name: str) -> str:
 def make_pv_query_matcher(query: str):
     """Compile `query` into a predicate that tests one PV name.
 
-    Every whitespace-separated token must occur in the name, in the order given
-    — "023 l3" behaves exactly like "*023*l3*", without having to type the
-    asterisks. Explicit "*" / "?" inside a token still work (and "*" is what
-    lets a token match across a gap in the middle of a word).
+    Every whitespace-separated token must occur somewhere in the name, in ANY
+    order — "023 l3" and "l3 023" find the same channels. Explicit "*" / "?"
+    inside a token still work (and "*" is what lets a token match across a gap
+    in the middle of a word).
 
     Compiled once per query, then called for every channel — the archiver lists
     ~10 000 of them and this runs on each keystroke.
@@ -2024,13 +2455,15 @@ def make_pv_query_matcher(query: str):
     tokens = (query or "").strip().lower().split()
     if not tokens:
         return lambda _text: True
-    parts = []
-    for tok in tokens:
-        parts.append("".join(
-            ".*" if ch == "*" else "." if ch == "?" else re.escape(ch)
-            for ch in tok))
-    rx = re.compile(".*".join(parts))
-    return lambda text: rx.search(text.lower()) is not None
+    rxs = [re.compile("".join(
+               ".*" if ch == "*" else "." if ch == "?" else re.escape(ch)
+               for ch in tok))
+           for tok in tokens]
+
+    def match(text):
+        low = text.lower()
+        return all(rx.search(low) is not None for rx in rxs)
+    return match
 
 
 def _matches_wildcard(text: str, pattern: str) -> bool:

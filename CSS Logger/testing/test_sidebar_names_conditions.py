@@ -2,8 +2,8 @@
 The October 2026 round of CSS Logger fixes, checked without an archiver:
 
   * the mouse wheel never changes a drop-down / number box that was not
-    clicked — not even when Qt gave it focus from the wheel itself — and stops
-    again once the pointer has left it;
+    clicked — not even when Qt gave it focus from the wheel itself; a clicked
+    one keeps working when the pointer leaves and comes back;
   * the sidebar INFO line keeps its width and height whatever it says, and
     ``text()`` still returns exactly what was set;
   * the Custom PV dialog's "What each letter means" table keeps its scroll
@@ -83,8 +83,8 @@ guard.eventFilter(combo, press())
 check("after a click the wheel works on it",
       guard.eventFilter(combo, wheel()) is False)
 guard.eventFilter(combo, QEvent(QEvent.Type.Leave))
-check("once the pointer has left, the wheel stops working on it again",
-      guard.eventFilter(combo, wheel()) is True)
+check("the pointer leaving does not deselect it: back over it, the wheel works",
+      guard.eventFilter(combo, wheel()) is False)
 # A spin box is clicked on its inner line edit: the click still arms the box.
 spin.hasFocus = lambda: True
 guard.eventFilter(spin.lineEdit(), press())

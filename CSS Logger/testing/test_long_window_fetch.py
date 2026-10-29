@@ -470,6 +470,11 @@ class _FakeThinned(_Fake):
 def test_a_long_load_draws_the_spike_and_zoom_reads_it_finer():
     pvs = ["L3-TEST-E:Energy"]
     w = _new_widget(pvs)
+    # The box as the program starts with it: its "1000" switched the zoom
+    # detail off for everyone while the waveplate PV was not even loaded.
+    w._master_multiple_edit.setText(app_main.MASTER_STEP_DEFAULT)
+    # And a condition the spike passes: the detail is judged, not skipped.
+    w._conditions = [{"pv": pvs[0], "min": 0.5, "max": 1000.0}]
     now = datetime.now()
     w._dt_from, w._dt_to = now - timedelta(days=30), now
     fake = _FakeThinned({}).install()

@@ -2,7 +2,7 @@
 
 `Image Tools/daypicker.py` owns how a day is picked for the whole suite. This
 folder keeps a verbatim copy of it, because the builder only bundles .py files
-that sit in the program's own folder (Dev Tools/b_t.py passes that folder as
+that sit in the program's own folder (Dev Tools/dt_core.py passes that folder as
 PyInstaller's only --paths).
 
 Two copies means they can drift, and a drifted calendar is invisible until an

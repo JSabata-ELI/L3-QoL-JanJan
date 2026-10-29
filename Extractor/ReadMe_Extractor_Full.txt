@@ -2,7 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (e.py, 137 lines)
+Verified against source: 2026-10-15  (e.py, 138 lines)
+  Program folder: 53 kB in 5 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_Extractor.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -132,8 +133,8 @@ just quietly does less than you might assume.
 
 Two ways to deal with it:
 
-  - Preferred: use Dev Tools -> Copy Manager -> "Build internal"
-    and "Deploy internal". That path discovers the program folders
+  - Preferred: use Dev Tools -> Builder (tick "Internal Builder")
+    and Copy Manager -> "Deploy Libraries". That path discovers the program folders
     instead of hard-coding them.
   - If you really want to use this script, edit the list at the top
     of e.py first, then run it.
@@ -184,7 +185,7 @@ plain script that you run from a console on purpose.
 =================================================================
 
   Internal Builder   builds the support folder and the zip
-  Dev Tools          Copy Manager tab: build + deploy without the
+  Dev Tools          Builder + Copy Manager tabs: build + deploy without the
                      hard-coded list; this is the maintained path
   Launcher           starts the deployed programs from the share
 

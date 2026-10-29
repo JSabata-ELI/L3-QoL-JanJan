@@ -150,7 +150,18 @@ check("a folder that is not there yet is not an error",
 # ═══ 4. is this arrival a new day? ═══════════════════════════════════════════
 print("\n[4] _live_day_rolled — when the window has to move")
 
-rolled = m.Viewer._live_day_rolled
+_real_rolled = m.Viewer._live_day_rolled
+
+
+def rolled(viewer, ts_ns, today=None):
+    """The checks below are about arrivals that happen NOW, so the clock is pinned to
+    the arrival's own day unless a test says otherwise (only today is a roll target)."""
+    real = m._prague_today
+    m._prague_today = lambda: today or m._dt_from_ns(ts_ns).date()
+    try:
+        return _real_rolled(viewer, ts_ns)
+    finally:
+        m._prague_today = real
 
 
 class Fake:
@@ -190,6 +201,10 @@ check("50 minutes of silence is not yet a night",
 f.ts_list = [ns(2026, 8, 25, 22, 0)]
 check("two and a half hours of silence is",
       rolled(f, ns(2026, 8, 26, 0, 30)) is True)
+
+f.ts_list = [ns(2026, 8, 20, 10, 0)]
+check("a later day that is not today never re-picks the window (27.10.2026)",
+      rolled(f, ns(2026, 8, 26, 8, 0), today=date(2026, 10, 27)) is False)
 
 f.ts_list = []
 check("nothing loaded yet: no day to leave",
@@ -286,8 +301,10 @@ try:
     check("it starts at the new frame's hour",
           (v.last_pick_hour_from, v.last_pick_min_from) == (8, 0),
           f"got={v.last_pick_hour_from}:{v.last_pick_min_from:02d}")
-    check("it runs to the end of that day",
-          (v.last_pick_hour_to, v.last_pick_min_to) == (23, 59),
+    # Just that hour, never "to 23:59" (user rule, 27.10.2026); live mode brings in
+    # the later hours.
+    check("it is just that hour",
+          (v.last_pick_hour_to, v.last_pick_min_to) == (9, 0),
           f"got={v.last_pick_hour_to}:{v.last_pick_min_to}")
     check("yesterday is out of the time filter",
           v._ts_windows[0][0] == ns(2026, 8, 26, 8, 0), f"got={v._ts_windows}")

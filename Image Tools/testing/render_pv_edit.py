@@ -42,6 +42,7 @@ def main() -> int:
             [(t, v) for (t, v) in series if start_ns <= t <= end_ns], "ok", ""))
     # The channel listing, without asking the archiver for its ~9700 names.
     m._PV_CHANNEL_CACHE = list(FAKE_CHANNELS)
+    m.cpva.fetch_channels_cached = lambda *a, **k: list(FAKE_CHANNELS)
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")

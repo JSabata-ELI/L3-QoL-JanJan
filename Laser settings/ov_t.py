@@ -84,7 +84,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel,
                                QLineEdit, QScrollArea, QSizePolicy,
                                QSpacerItem, QVBoxLayout, QWidget)
@@ -764,31 +764,64 @@ class OverviewTab(QWidget):
         box_w = self._scan_box.sizeHint().width()
         box_h = self._scan_box.sizeHint().height()
         self._scan_box.setGeometry(x, y + (h - box_h) // 2, box_w, box_h)
+        if self._shot_row is not None:
+            pad = box_w + self.GAP
+            self._set_shot_px(self._shot_fit_px(w - 2 * pad))
         shot_h = self._shot_h()
         if shot_h:
-            pad = box_w + self.GAP
             self._shot_label.setGeometry(x + pad, y + (h - shot_h) // 2,
                                          max(1, w - 2 * pad), shot_h)
         self._shot_label.setVisible(bool(shot_h))
 
     def _apply_shot_look(self):
         """The line's typeface from the list's look, its size from its own
-        setting. Written as a font AND in the stylesheet — `ls_ui.APP_QSS`
-        sets the family on every widget, and a stylesheet beats `setFont`."""
+        setting. The size is the most it is DRAWN at: `_place_line` makes it
+        smaller when the line has no room for it, and never bigger than the
+        list's own text, so it shrinks with everything else (13.10.2026 — it
+        stayed big and ran under the Scanning box on a small window)."""
         get = getattr(self._win, "shot_settings", None)
         shots = get() if get is not None else {
             "size_px": C.SHOT_SIZE_PX_DEFAULT, "bold": C.SHOT_BOLD_DEFAULT}
-        family = self._win.look()["family"]
-        size, bold = int(shots["size_px"]), bool(shots["bold"])
-        font = self._shot_label.font()
-        font.setFamily(family)
-        font.setPixelSize(size)
-        font.setBold(bold)
-        self._shot_label.setFont(font)
+        self._shot_family = self._win.look()["family"]
+        self._shot_size_set = int(shots["size_px"])
+        self._shot_bold = bool(shots["bold"])
+        self._shot_px = None
+        self._set_shot_px(self._shot_size_set)
+
+    def _shot_font(self, size):
+        font = QFont(self._shot_label.font())
+        font.setFamily(self._shot_family)
+        font.setPixelSize(max(1, int(size)))
+        font.setBold(self._shot_bold)
+        return font
+
+    def _set_shot_px(self, size):
+        """Draw the line at `size` px. Written as a font AND in the stylesheet
+        — `ls_ui.APP_QSS` sets the family on every widget, and a stylesheet
+        beats `setFont`."""
+        if size == getattr(self, "_shot_px", None):
+            return
+        self._shot_px = size
+        self._shot_label.setFont(self._shot_font(size))
         self._shot_label.setStyleSheet(
             f"#shotLine {{ color: {ROW_INK}; background: transparent;"
-            f" font-family: \"{family}\"; font-size: {size}px;"
-            f" font-weight: {700 if bold else 400}; }}")
+            f" font-family: \"{self._shot_family}\"; font-size: {size}px;"
+            f" font-weight: {700 if self._shot_bold else 400}; }}")
+
+    def _shot_fit_px(self, avail_w):
+        """The line's size: its setting, but no bigger than the list's text
+        as drawn and no wider than `avail_w`."""
+        top = self._shot_size_set
+        shown = getattr(self, "_shown_look", None)
+        if shown and self._row_widgets:
+            top = min(top, int(shown["size_px"]))
+        text = self._shot_label.text() or "Shot counter: 000"
+
+        def fits(t):
+            return (QFontMetrics(self._shot_font(t)).horizontalAdvance(text)
+                    + 4 <= avail_w)
+
+        return C._largest(C.LOOK_LIMITS["size_px"][0], max(8, top), fits)
 
     def _place_children(self):
         """The band, the line and the list, by hand. See the note above.
@@ -884,8 +917,11 @@ class OverviewTab(QWidget):
         x_list = x0 + side + C.SINGLE_GAP_PX
         y_list = m + max(0, (h - list_h - line_block) // 2) + line_block
         line_w = list_w
-        if self._shot_h():
-            text_w = QFontMetrics(self._shot_label.font()).horizontalAdvance(
+        if self._shot_row is not None:
+            # At its SET size, not the size it is drawn at now: measured off
+            # the shrunk font, the line would only ever get narrower.
+            text_w = QFontMetrics(
+                self._shot_font(self._shot_size_set)).horizontalAdvance(
                 self._shot_label.text()) + 4
             line_w = max(line_w, text_w + 2 * (
                 self._scan_box.sizeHint().width() + self.GAP))
@@ -1085,11 +1121,61 @@ class OverviewTab(QWidget):
         back — for ever, flickering. Sixteen pixels of width is a cheap price
         for a picture that stands still.
         """
-        bar = self._scroll.verticalScrollBar().sizeHint().width()
         width = self._band_width()
         if self._is_single():
             width -= self._single_side() + C.SINGLE_GAP_PX
-        return max(1, width - 2 * self._scroll.frameWidth() - bar)
+        return max(1, width - self._list_spare())
+
+    def _list_spare(self):
+        """The list's width that is never a row's: its frame and scrollbar."""
+        bar = self._scroll.verticalScrollBar().sizeHint().width()
+        return bar + 2 * self._scroll.frameWidth()
+
+    def _single_list_h(self, n):
+        """In the one-square mode, the height `n` rows share once the frame,
+        the line above them, the margins and every row's padding are off."""
+        lm = self._list.contentsMargins()
+        inner_h = max(1, self.height() - 2 * self.MARGIN)
+        return (inner_h - 2 * self._scroll.frameWidth()
+                - (self._line_h() + self.GAP)
+                - lm.top() - lm.bottom()
+                - n * (4 + self._list.spacing()))
+
+    def _shrunk_to_window(self, look, size, mark, band):
+        """With the fit OFF: the typed text size and verdict square, or less
+        when the rows would not fit the window at them — never past its edge
+        (12.10.2026). Only the floor of `LOOK_LIMITS` may still overflow."""
+        n = len(self._row_widgets)
+        if not n or self.height() <= 40 or self.width() <= 40:
+            return size, mark
+        ratio = mark / max(1, size)
+        m, g = self.MARGIN, self.GAP
+        if self._is_single():
+            inner_w = self._band_width()
+            inner_h = max(1, self.height() - 2 * m)
+            side = max(1, min(int(band), inner_h,
+                              inner_w - C.SINGLE_GAP_PX - self.LIST_MIN))
+            list_w = max(1, inner_w - side - C.SINGLE_GAP_PX
+                         - self._list_spare())
+            avail = self._single_list_h(n)
+        else:
+            w = self._band_width()
+            list_w = max(1, w - self._list_spare())
+            sep_h = max(1, self._sep.sizeHint().height())
+            room = self.height() - 2 * m - 2 * g - sep_h - self.LIST_MIN
+            band_h = max(0, min(int(band), room,
+                                C.band_needed(self._win.halls(), w, band)))
+            avail = self.height() - self._overhead(n) - band_h
+        row_h, row_w = self._row_measures(look, list_w, ratio)
+
+        def fits(t):
+            return n * row_h(t) <= avail and row_w(t) <= list_w
+
+        if fits(size):
+            return size, mark
+        low = C.LOOK_LIMITS["size_px"][0]
+        t = C._largest(low, size, fits)
+        return t, max(C.LOOK_LIMITS["mark_px"][0], int(round(t * ratio)))
 
     def _name_width_for(self, fm, size, list_w, name_text=None):
         """How wide the name column comes out at this text size.
@@ -1155,13 +1241,17 @@ class OverviewTab(QWidget):
         now = len(self._widest()[1])
         return fitted is None or now > fitted or now < fitted - 1
 
-    def _row_measures(self, look, list_w):
+    def _row_measures(self, look, list_w, mark_ratio=None):
         """`(row_h, row_w)` — one row's height and width at a text size.
 
         Handed to `ls_core.fit_sizes`, which cannot measure text itself. The
         metrics are memoised: the bisection asks for the same size more than
         once and building a `QFontMetrics` is the expensive part.
+
+        The verdict square is `FIT_MARK_RATIO` times the text, or `mark_ratio`
+        times it when given — the typed pair's own ratio, with the fit off.
         """
+        ratio = C.FIT_MARK_RATIO if mark_ratio is None else float(mark_ratio)
         cache = {}
         name_text, number_text, units = self._widest()
 
@@ -1174,12 +1264,12 @@ class OverviewTab(QWidget):
             # The verdict square is the taller of the two at this ratio, but
             # measure rather than assume — a typeface with tall ascenders could
             # go either way at the small sizes.
-            mark = int(round(t * C.FIT_MARK_RATIO))
+            mark = int(round(t * ratio))
             return max(metrics(t).height(), mark)
 
         def row_w(t):
             fm = metrics(t)
-            mark = int(round(t * C.FIT_MARK_RATIO))
+            mark = int(round(t * ratio))
             # The same pieces `_Row.block_size` adds up: the space after the
             # colon, the number with its minus slot, the unit column, the gap
             # to the square.
@@ -1216,23 +1306,16 @@ class OverviewTab(QWidget):
         self._fit_value_len = len(self._widest()[1])
         if (halls.get("fit", True) and halls.get("single")
                 and self.height() > 40 and self.width() > 40):
-            # The one square beside the list. The name ceiling is measured
-            # against the room the list has beside the biggest square the
-            # height allows — the square only shrinks when the list needs it.
+            # The one square beside the list. The names are measured in full
+            # (the ceiling is the whole width): `fit_single` makes the square
+            # give way until the whole row fits beside it.
             m = self.MARGIN
             inner_w = self._band_width()
             inner_h = max(1, self.height() - 2 * m)
-            bar = self._scroll.verticalScrollBar().sizeHint().width()
-            spare = bar + 2 * self._scroll.frameWidth()
-            # Half the full square: the least `fit_single` will leave it.
-            side_guess = 0.5 * min(inner_h, inner_w * C.SINGLE_SQUARE_FRAC)
-            list_w = max(1, int(inner_w - side_guess - C.SINGLE_GAP_PX - spare))
+            spare = self._list_spare()
+            list_w = max(1, int(inner_w - C.SINGLE_GAP_PX - spare))
             row_h, row_w = self._row_measures(look, list_w)
-            lm = self._list.contentsMargins()
-            list_h = (inner_h - 2 * self._scroll.frameWidth()
-                      - (self._line_h() + self.GAP)
-                      - lm.top() - lm.bottom()
-                      - n * (4 + self._list.spacing()))
+            list_h = self._single_list_h(n)
             size, mark, band, word = C.fit_single(
                 inner_w, inner_h, list_h, spare, n, row_h, row_w)
             if size is not None:
@@ -1257,6 +1340,12 @@ class OverviewTab(QWidget):
             parked = True
         size, mark = int(look["size_px"]), int(look["mark_px"])
         band, word = int(halls["band_px"]), int(halls["word_px"])
+        if not parked:
+            # The fit is off: the typed sizes stand, but never past the
+            # window's edge (12.10.2026). A text too big for the room is drawn
+            # smaller, the square with it; the typed numbers stay in the file.
+            size, mark = self._shrunk_to_window(look, size, mark, band)
+        shown = dict(look, size_px=size, mark_px=mark)
 
         now = (size, mark, band, word, bool(halls.get("single")))
         if not force and now == getattr(self, "_fitted", None):
@@ -1264,8 +1353,9 @@ class OverviewTab(QWidget):
         self._fitting = True
         try:
             self._fitted = now
+            self._shown_look = shown
             for widget in self._row_widgets:
-                widget.apply_look(look)
+                widget.apply_look(shown)
             # The band first: `_fit_columns` measures the list's width beside
             # the one square, and the square's side is the band's wanted size.
             self._band.set_band(band, word)
@@ -1297,7 +1387,9 @@ class OverviewTab(QWidget):
         if not self._row_widgets:
             return
         self._cols_key = self._columns_key()
-        look = self._win.look()
+        # What the rows are really drawn at — with the fit off that can be
+        # less than the typed size (`_shrunk_to_window`).
+        look = getattr(self, "_shown_look", None) or self._win.look()
         size = int(look["size_px"])
         list_w = self._list_width()
         fm = QFontMetrics(self._base_font(look, size))
@@ -1466,8 +1558,9 @@ class OverviewTab(QWidget):
                     f"{'—' if number is None else number}")
             if text != self._shot_label.text():
                 self._shot_label.setText(text)
-                if self._is_single():
-                    self._place_single()    # its width follows the text there
+                # A longer number may need a smaller size to fit the line;
+                # in the one-square mode the line's width follows the text.
+                self._place_children()
             counter = shot_counter(self._win)
             _set_tip(self._shot_label, counter.sentence() if counter is not None
                      else "Counts the shots.")
@@ -1561,7 +1654,7 @@ class OverviewTab(QWidget):
                                           now)
         shutter = C.shutter_open(engine.readings(), engine.last_ok(), now)
         state, why = C.dm_judge(tag, self._firing.fresh_energy(mono), title,
-                                shutter)
+                                shutter, self._firing.high_age(mono))
         if not active:
             state, why = C.STATE_UNKNOWN, f"no hall is being shot into — {why}"
         elif not C.is_alarmed(row):
@@ -1594,7 +1687,7 @@ class OverviewTab(QWidget):
             entry = C.limits_for(row, hall)
             span = C.range_text(entry.get("min"), entry.get("max"))
             mark = "  ← in force" if hall in active and not scan else ""
-            lines.append(f"{hall}:  {span}{mark}")
+            lines.append(f"{C.hall_shown(hall)}:  {span}{mark}")
         lines += ["", _MARK_LEGEND, "", "Double-click to rename."]
         return "\n".join(lines)
 
@@ -1608,8 +1701,8 @@ class OverviewTab(QWidget):
         # While the fallback is on, the hall is NOT being shot into and the
         # tooltip says so: the limits are in force, the beam is not in there.
         doing = "watching" if fallback else "shooting"
-        # The square's own name (L3 for Int) heads the tooltip; the limits are
-        # still the hall's, which is what the Limits tab calls it.
+        # The square's own name (L3 for Int) heads the tooltip, and it is the
+        # name the Limits tab uses too since 14.10.2026.
         name = C.hall_shown(hall)
         if state == C.STATE_WAITING:
             return f"{name} — waiting for hall.\n\n{why}"
@@ -1623,7 +1716,7 @@ class OverviewTab(QWidget):
             return f"{name} — {doing}, but out of range:\n{names}\n\n{why}"
         if state == "watch":
             return (f"{name} — nobody is shooting into it, but the other "
-                    f"halls' gate valves cannot be read, so {hall}'s limits "
+                    f"halls' gate valves cannot be read, so {name}'s limits "
                     f"are the ones being judged. Everything in range."
                     f"\n\n{why}")
         if state == "shooting":

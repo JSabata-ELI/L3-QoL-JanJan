@@ -25,8 +25,8 @@ folder of every program listed in `TARGET_DIRS`. That zip is the shared PyInstal
 runtime produced by **Internal Builder**, so this is how one set of libraries gets
 pushed to every deployed program at once.
 
-**Largely superseded.** Dev Tools' Copy Manager now has **Build internal** and
-**Deploy internal**, which do the same job from the GUI, against the current program
+**Largely superseded.** Dev Tools' Builder (tick **Internal Builder**) and Copy
+Manager's **Deploy Libraries** do the same job from the GUI, against the current program
 list, and without hard-coded paths. Keep `e.py` as the manual fallback for when the
 Copy Manager cannot be used.
 

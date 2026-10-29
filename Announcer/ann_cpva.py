@@ -34,6 +34,18 @@ change only, so a chiller holding its setpoint perfectly publishes nothing for
 minutes. That is why `peak` falls back to the newest sample of the wider window,
 and why staleness is about the age of our last successful READ, not about the
 age of the value.
+
+THE BACKUP FOR THE ARCHIVER
+---------------------------
+The CPVA archiver is only a front end: the L3 proxy on 10.78.0.64 (twin .65)
+serves the very same L3 Cassandra — measured 15.10.2026, an identical channel
+list, identical rows, and the same speed. So when the CPVA service cannot be
+reached at all (connection refused or reset, HTTP 502/503/504), the same
+question is asked there instead, and for the next `CPVA_DOWN_S` seconds every
+question goes straight to it before the archiver is tried again. It is NOT asked
+on a timeout (the shared database is slow, the twin would be just as slow) nor
+on any other HTTP error (that is an answer). Copied from
+`Laser settings/ls_cpva.py`.
 """
 
 from __future__ import annotations
@@ -80,6 +92,28 @@ for _ in range(_POOL_SIZE):
     _pool.put(None)          # slots start empty; connections are made lazily
 del _
 
+# ── the L3 proxy: the backup for the archiver ────────────────────────────────
+# Plain HTTP. Two hosts serving the same archive; the first is asked first.
+PROXY_HOSTS        = ("10.78.0.64:8080", "10.78.0.65:8080")
+L3_PROXY_BASE_PATH = "/l3proxy/archive-access/api/1.0/archive/1"
+# ── the archives the CPVA archiver does not have ─────────────────────────────
+# Same hosts, same URL shape. L3BT: beam transport and the experimental halls'
+# safety channels (4336 names on 15.10.2026, 196 also on CPVA). FCT: facility
+# channels — cooling, power, PSI, leak detection (7636 names, 48 also on CPVA).
+# A channel is read from one of these only when it lists it and the CPVA
+# archiver does not; the shared names stay where they always were.
+L3BT_PROXY_BASE_PATH = "/l3btproxy/archive-access/api/1.0/archive/1"
+FCT_PROXY_BASE_PATH  = "/fctproxy/archive-access/api/1.0/archive/1"
+EXTRA_ARCHIVES = (L3BT_PROXY_BASE_PATH, FCT_PROXY_BASE_PATH)
+# How long a failed channel listing is left alone before it is asked again.
+_LIST_RETRY_S = 30.0
+# How long the archiver is left alone after it could not be reached.
+CPVA_DOWN_S = 60.0
+# The answers that mean "the service is not there", not "your question was bad".
+_UNREACHABLE_HTTP = (502, 503, 504)
+# A proxy's whole channel list: the pattern is a path segment there, `*` = all.
+_ALL_CHANNELS_PATH = "/channels-by-pattern/" + urllib.parse.quote("*", safe="")
+
 
 class CpvaError(Exception):
     """A failure talking to the archiver. NEVER means "no data"."""
@@ -96,7 +130,8 @@ class CpvaBusyError(CpvaError):
 
 # ── counters, so "sometimes it is not read" becomes a number ─────────────────
 STATS = {"requests": 0, "http_errors": 0, "timeouts": 0, "busy": 0,
-         "dropped": 0, "pool_wait_max_s": 0.0, "passes": 0, "abandoned": 0}
+         "dropped": 0, "pool_wait_max_s": 0.0, "passes": 0, "abandoned": 0,
+         "backup": 0}
 _stats_lock = threading.Lock()
 
 
@@ -118,7 +153,8 @@ def stats_line():
     return (f"archiver passes={int(s['passes'])} req={int(s['requests'])} "
             f"httpErr={int(s['http_errors'])} timeout={int(s['timeouts'])} "
             f"busy={int(s['busy'])} abandoned={int(s['abandoned'])} "
-            f"dropped={int(s['dropped'])} poolWaitMax={s['pool_wait_max_s']:.1f}s")
+            f"dropped={int(s['dropped'])} backup={int(s['backup'])} "
+            f"poolWaitMax={s['pool_wait_max_s']:.1f}s")
 
 
 def _close_quiet(conn):
@@ -162,7 +198,9 @@ def _request_json(path_qs, timeout):
                         time.sleep(0.3)
                         continue
                     _bump("http_errors")
-                    raise CpvaError(f"HTTP {resp.status}")
+                    err = CpvaError(f"HTTP {resp.status}")
+                    err.unreachable = resp.status in _UNREACHABLE_HTTP
+                    raise err
                 if resp.status >= 400:
                     _bump("http_errors")
                     raise CpvaError(f"HTTP {resp.status}")
@@ -173,18 +211,215 @@ def _request_json(path_qs, timeout):
             except CpvaError:
                 raise
             except socket.timeout as exc:
+                # A connection that never opened is a host that is not there; a
+                # slow answer on an open one is the database, and the backup
+                # reads the same database.
+                never_opened = conn.sock is None
                 _close_quiet(conn)
                 conn = None
                 _bump("timeouts")
-                raise CpvaError(f"timeout after {timeout:g} s") from exc
+                err = CpvaError(f"timeout after {timeout:g} s")
+                err.unreachable = never_opened
+                raise err from exc
             except Exception as exc:
                 _close_quiet(conn)
                 conn = None
                 if attempt == 1:
-                    raise CpvaError(f"transport error: {exc}") from exc
+                    err = CpvaError(f"transport error: {exc}")
+                    err.unreachable = True
+                    raise err from exc
         raise CpvaError("unreachable retry state")
     finally:
         _pool.put(conn)
+
+
+# One keep-alive pool per proxy and host. The L3 proxy stands in for the whole
+# archiver, so it gets the archiver's pool size; the other two hold few watched
+# channels.
+_PROXY_POOL_SIZE = {L3_PROXY_BASE_PATH: _POOL_SIZE,
+                    L3BT_PROXY_BASE_PATH: 4, FCT_PROXY_BASE_PATH: 4}
+_proxy_pools = {}
+for _base, _size in _PROXY_POOL_SIZE.items():
+    for _host in PROXY_HOSTS:
+        _proxy_pools[(_base, _host)] = queue.LifoQueue(maxsize=_size)
+        for _ in range(_size):
+            _proxy_pools[(_base, _host)].put(None)
+del _base, _size, _host, _
+
+
+def _proxy_get_one(host, path, timeout, base=L3_PROXY_BASE_PATH):
+    """One GET on one proxy host. Raises CpvaError; `transport` is set on it when
+    the host itself could not be reached, which is what sends us to the twin."""
+    pool = _proxy_pools[(base, host)]
+    try:
+        conn = pool.get(timeout=_POOL_WAIT_S)
+    except queue.Empty:
+        _bump("busy")
+        raise CpvaBusyError("every connection to the proxy was already in use")
+    _bump("requests")
+    try:
+        for attempt in range(2):
+            if conn is None:
+                conn = http.client.HTTPConnection(host, timeout=timeout)
+            else:
+                conn.timeout = timeout
+            try:
+                conn.request("GET", base + path,
+                             headers={"Accept": "application/json"})
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status >= 400:
+                    _bump("http_errors")
+                    raise CpvaError(f"HTTP {resp.status} from {host}")
+                try:
+                    return json.loads(body.decode("utf-8"))
+                except ValueError as exc:
+                    raise CpvaError(f"bad JSON from {host}: {exc}") from exc
+            except CpvaError:
+                raise
+            except socket.timeout as exc:
+                _close_quiet(conn)
+                conn = None
+                _bump("timeouts")
+                err = CpvaError(f"timeout after {timeout:g} s on {host}")
+                err.transport = True
+                raise err from exc
+            except Exception as exc:
+                _close_quiet(conn)
+                conn = None
+                if attempt == 1:
+                    err = CpvaError(f"transport error on {host}: {exc}")
+                    err.transport = True
+                    raise err from exc
+        raise CpvaError("unreachable retry state")
+    finally:
+        pool.put(conn)
+
+
+def _proxy_request_json(path, timeout, base=L3_PROXY_BASE_PATH):
+    """GET on a proxy: the first host, and the twin only when the first one
+    cannot be reached. An HTTP error is an answer, so it is not asked twice."""
+    last = None
+    for host in PROXY_HOSTS:
+        try:
+            return _proxy_get_one(host, path, timeout, base)
+        except CpvaBusyError as exc:
+            last = exc
+        except CpvaError as exc:
+            if not getattr(exc, "transport", False):
+                raise
+            last = exc
+    raise last
+
+
+_cpva_down_until = 0.0
+_down_lock = threading.Lock()
+
+
+def _cpva_is_down():
+    with _down_lock:
+        return time.monotonic() < _cpva_down_until
+
+
+def _mark_cpva_down():
+    global _cpva_down_until
+    with _down_lock:
+        _cpva_down_until = time.monotonic() + CPVA_DOWN_S
+
+
+def _cpva_or_backup(path_qs, backup_path, timeout):
+    """The CPVA archiver, or the L3 proxy when the archiver cannot be reached.
+
+    `backup_path` is the same question in the proxy's URL shape. The backup gets
+    the caller's whole timeout: it reads the same database, just as slowly.
+    """
+    first = None
+    if not _cpva_is_down():
+        try:
+            return _request_json(path_qs, timeout)
+        except CpvaBusyError:
+            raise
+        except CpvaError as exc:
+            if not getattr(exc, "unreachable", False):
+                raise
+            _mark_cpva_down()
+            first = exc
+    _bump("backup")
+    try:
+        return _proxy_request_json(backup_path, timeout)
+    except CpvaError as exc:
+        # An HTTP error from the proxy is the archive's own answer: raised as it
+        # is. Only "the proxy is not there either" names both.
+        if first is None or not getattr(exc, "transport", False):
+            raise
+        raise CpvaError(f"archiver unreachable ({first}); "
+                        f"backup L3 proxy: {exc}") from exc
+
+
+# ── which archive holds a channel ────────────────────────────────────────────
+# The channel lists are cheap (0.02 s each) and held for the session; a picker
+# opening refreshes them (fetch_channels).
+_cpva_names = None
+_proxy_names = {}           # extra proxy base path → its names, once listed
+_lists_tried_at = 0.0
+_route_lock = threading.Lock()
+# Held for the whole load, so the first reads WAIT for the lists instead of
+# all going to the CPVA archiver while the first one is fetching.
+_load_lock = threading.Lock()
+
+
+def _names_of(raw):
+    return {str(n) for n in raw if isinstance(n, str)} \
+        if isinstance(raw, list) else set()
+
+
+def _load_lists(timeout=6.0, force=False):
+    """Fill the name lists that are not held yet. Never raises."""
+    global _cpva_names, _lists_tried_at
+    with _load_lock:
+        with _route_lock:
+            complete = (_cpva_names is not None
+                        and all(b in _proxy_names for b in EXTRA_ARCHIVES))
+            if not force and complete:
+                return
+            if not force and _lists_tried_at \
+                    and time.monotonic() - _lists_tried_at < _LIST_RETRY_S:
+                return
+            _lists_tried_at = time.monotonic()
+        if force or _cpva_names is None:
+            try:
+                names = _names_of(_cpva_or_backup("/channels", _ALL_CHANNELS_PATH,
+                                                  timeout))
+                with _route_lock:
+                    _cpva_names = names
+            except Exception:
+                pass
+        for base in EXTRA_ARCHIVES:
+            if not force and base in _proxy_names:
+                continue
+            try:
+                names = _names_of(_proxy_request_json(_ALL_CHANNELS_PATH, timeout,
+                                                      base=base))
+                with _route_lock:
+                    _proxy_names[base] = names
+            except Exception:
+                pass
+
+
+def archive_of(channel):
+    """The proxy base path this channel is read from, or None for the CPVA
+    archiver (and its backup)."""
+    _load_lists()
+    with _route_lock:
+        lists, cpva = dict(_proxy_names), _cpva_names
+    # Without the CPVA list nobody can say the name is ALSO there; the proxies
+    # answer the shared names with identical samples, so it is safe.
+    if cpva is not None and channel in cpva:
+        return None
+    for base in EXTRA_ARCHIVES:
+        if channel in lists.get(base, ()):
+            return base
+    return None
 
 
 # ── the one fetch ────────────────────────────────────────────────────────────
@@ -198,7 +433,14 @@ def fetch_samples(channel, start_ns, end_ns, *, timeout=DEFAULT_TIMEOUT):
     qs = urllib.parse.urlencode({"channelName": channel,
                                  "start": str(int(start_ns)),
                                  "end": str(int(end_ns))})
-    raw = _request_json(f"/samples?{qs}", timeout)
+    proxy_qs = urllib.parse.urlencode({"start": str(int(start_ns)),
+                                       "end": str(int(end_ns))})
+    proxy_path = f"/samples/{urllib.parse.quote(channel, safe='')}?{proxy_qs}"
+    base = archive_of(channel)
+    if base is not None:
+        raw = _proxy_request_json(proxy_path, timeout, base=base)
+    else:
+        raw = _cpva_or_backup(f"/samples?{qs}", proxy_path, timeout)
     return parse_samples(raw if isinstance(raw, list) else [])
 
 
@@ -236,17 +478,31 @@ _channels_lock = threading.Lock()
 def fetch_channels(*, timeout=10.0, refresh=False):
     """Every channel name the archiver holds. Raises `CpvaError`.
 
-    Measured 2026-09-16: 9744 names in 0.02 s, so it is cheap — but it is held
-    for the session anyway, because a name picker asks for it on every keystroke
-    and the list does not change while the program is open.
+    Measured 2026-09-16: 9744 names in 0.02 s, so it is cheap. It is held so
+    repeated questions are answered from memory, but `refresh=True` asks again:
+    the list DOES change while the program is open (SPIDER GDD, TPD and FOG were
+    added mid-session on 2026-10-13), so a picker refreshes on every opening.
+    A refresh that fails falls back to the list already held.
     """
     global _channels
     with _channels_lock:
         if _channels is not None and not refresh:
             return _channels
-    raw = _request_json("/channels", timeout)
-    names = sorted(str(n) for n in raw if isinstance(n, str)) \
-        if isinstance(raw, list) else []
+    try:
+        raw = _cpva_or_backup("/channels", _ALL_CHANNELS_PATH, timeout)
+    except Exception:
+        with _channels_lock:
+            if _channels is not None:
+                return _channels
+        raise
+    names = _names_of(raw)
+    # The L3BT and FCT proxies' names too, so their channels can be picked. A
+    # proxy that does not answer leaves the list as it is.
+    _load_lists(timeout=timeout, force=True)
+    with _route_lock:
+        for extra in _proxy_names.values():
+            names |= extra
+    names = sorted(names)
     with _channels_lock:
         _channels = names
     return names

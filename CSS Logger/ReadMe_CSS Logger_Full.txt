@@ -2,9 +2,11 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05
-  (main.py 11440 lines, cpva_core.py 1651, sp_t.py 10414,
-   daypicker.py 1078)
+Verified against source: 2026-10-15
+  (main.py 16213 lines, sp_t.py 10480, cpva_core.py 2411,
+   daypicker.py 1078, cpva_cache.py 621,
+   logger_tabs.py 561; 31364 lines in all)
+  Program folder: 2.4 MB in 132 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: Readme CSS logger.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -39,8 +41,9 @@ tab_Full.txt.
 
 SETTING TABS. The CSS Logger itself can be open several times over,
 one tab per setting. Its tabs sit in the same row as "CSS Logger" and
-"Spectra", after a thin line, and show only while the CSS Logger is
-on screen. Each tab is a whole CSS Logger with its own values,
+"Spectra", as small grey chips on a light grey strip, and show only
+while the CSS Logger is on screen. The chip on screen is dark with
+white text. Each tab is a whole CSS Logger with its own values,
 preset, conditions, time window and Live — e.g. the Operation preset
 in one, a hand-picked set of values in another, the Operation preset
 plus the ramping values in a third.
@@ -72,7 +75,16 @@ the presets and the custom PVs.
 
   Archive        the CPVA archiver, over HTTPS on the facility
                  network. Read only; nothing can be changed from
-                 here.
+                 here. Channels it does not have come from the
+                 L3 beam transport (L3BT) and facility (FCT)
+                 archives on 10.78.0.64 (twin .65); the PV
+                 search in both tabs finds them too.
+                 If it cannot be reached at all, both tabs
+                 read the same data from its backup, the L3 proxy
+                 on 10.78.0.64 (twin .65), for a minute at a time
+                 before trying the archiver again. A slow archiver
+                 is not a reason to switch: the backup reads the
+                 same data just as slowly.
   Images         the camera image store on the network, opened when
                  you double-click an image path in the table.
   Local data     a folder of ramping records kept next to the
@@ -136,6 +148,20 @@ shorter period asks for more detail, and then the archive is asked
 again and the finer day replaces the coarser one. When the share is
 not reachable the program simply reads everything from the archive.
 
+TODAY. The archive has no thinned version of the day that is still
+running, so today always comes in full — on a day of shots that is
+tens of thousands of values per signal, the slowest part of a load.
+What the program has read of today (and of the last three days'
+partial days, e.g. yesterday afternoon in a "last 24 hours" window)
+is kept in memory while it runs, so the next load asks the archive
+only for the last few minutes. It is also saved in the day cache on
+the share (at most every half hour per value), so after a restart —
+or at another station — only what came since is read. When nearly
+all of a load comes from there, the graph is drawn at once and the
+last minutes are added when the archive answers. Today is asked for
+in pieces of four hours side by side, which came back faster than
+one big request.
+
 THINNING. For a long window the program can ask the archiver for a
 reduced version of the data rather than every single sample. That is
 what makes a month-long load possible at all.
@@ -175,7 +201,8 @@ read stops at 400 000 samples and it is thinned instead.
 
     "Set time window" is laid out like the one in CS Studio: two panes
     side by side, Start and End, each with two tabs. "Absolute" is a
-    calendar, a clock and the quick times Now / 00:00 / 12:00.
+    calendar, a clock and the quick times Now / 00:00 / 07:00 /
+    13:00 / 17:00.
     "Relative" is a span counted from now — years, months, days,
     hours, minutes, seconds — with "Before now" and a Now button.
     The window always keeps the same size, whichever tab is open.
@@ -234,9 +261,9 @@ read stops at 400 000 samples and it is thinned instead.
     then filtered as you type, so typing is instant.
 
     HOW THE SEARCH WORKS. Type words separated by spaces. Every word
-    has to appear in the name, in the order you typed it, so "023 l3"
-    and "*023*l3*" find the same thing. Asterisk and question mark
-    also work if you want to be explicit.
+    has to appear somewhere in the name, in any order, so "023 l3"
+    and "l3 023" find the same thing. Inside a word an asterisk
+    stands for any run of letters and a question mark for one.
 
     "Custom PV" defines a value calculated from the loaded ones — see
     section 5. It is the only place to do so; the tabs no longer have
@@ -335,14 +362,27 @@ read stops at 400 000 samples and it is thinned instead.
         so the slow one set the pace for both and the whole window
         looked about five seconds behind. Now the graph refreshes as
         fast as the computer manages and the table about once a
-        second. Between graph refreshes the time axis still slides
-        along, which costs almost nothing and is what makes the
-        window glide rather than jump. All three intervals are under
-        Graph settings → Live speed.
+        second. All three intervals are under Graph settings → Live
+        speed.
 
-      - Each of the two also keeps at least twice its own measured
-        cost free, so a slow machine backs off by itself instead of
-        leaving the window no time to respond.
+      - Drawing the graph is the dear part: with a dozen values each
+        picture takes about half a second. The time it really takes is
+        measured, and the graph is redrawn at most so often that the
+        window stays free about two thirds of the time — so the mouse
+        and the buttons keep answering. With no new data the picture
+        is redrawn only once the window has slid by about a pixel. The
+        table keeps at least twice its own cost free. (The time axis
+        used to slide between refreshes as well; each slide was a full
+        drawing of every axis several times a second, for a move of
+        less than a pixel, and was most of the lag.)
+
+      - What is not on screen is not drawn. While the Table tab is in
+        front, the graph waits; while the graph is in front, the
+        table's cells are not written. Each catches up the moment it
+        is shown.
+
+      - A value with Show unticked in the list below the graph is not
+        read at all (see 4.4).
 
       - The live window is NOT capped. It used to be shortened to
         twelve hours, which meant the graph disagreed with the period
@@ -374,23 +414,35 @@ read stops at 400 000 samples and it is thinned instead.
         is newer than that value's own last sample, so nothing is
         lost and nothing is counted twice.
 
-3.6 THINNING THE ROWS
+3.6 RAMP / WAVEPLATE
 
-    Master PV      the ramp master, used to recognise rows that are
-                   really the same moment recorded twice.
-    Keep multiples the row is kept only when the master value is a
-    of             multiple of the number you give. Set 5 and you
-                   keep every fifth step.
+    One PV — the waveplate position — marks the steps of a ramp. The
+    group in the left-hand panel uses it three ways:
+
+    Waveplate PV   the ramp master. A row where only the waveplate
+                   moved and nothing else changed is dropped as the
+                   same moment recorded twice. Changing it reads the
+                   period again.
+    Keep steps     1000 to start with: a row is kept only when the
+    every          waveplate stands on a multiple of this number (a
+                   whole step). Empty keeps every row. It applies at
+                   once — to the graph, the table, the XY plot, the
+                   statistics and the export. When no row of the
+                   period is on a step, every row is kept and the Log
+                   says so.
 
     On a dataset where the archive recorded ten times more often than
     the experiment changed, this is the difference between a readable
     graph and a solid block of ink.
 
-    Skip zero-energy shots at same waveplate
+    Presets and setting tabs remember all of it, the dead-shot rule
+    below included.
+
+    Leave dead shots out of statistics
                    on to start with. A shot whose energy (the channel
                    in the Energy box, the SBW4 energy to start with) is
-                   below the number beside it, while the Master PV —
-                   the waveplate — stands where it stood on the shot
+                   below the number beside it, while the waveplate
+                   stands where it stood on the shot
                    before, is a trigger shot or a dropout. It is left
                    out of the selection statistics, and it does not
                    count as firing for "Restart after pause". A low
@@ -398,8 +450,8 @@ read stops at 400 000 samples and it is thinned instead.
                    reading at the new setting and is counted. Untick
                    it to count every shot — for instance to look at
                    the trigger shots themselves. The graph draws every
-                   shot either way. The energy channel and the Master
-                   PV must both be in the PV list.
+                   shot either way. The energy channel and the
+                   waveplate PV must both be in the PV list.
 
 3.7 INFO, AND THE CONTROLS ABOVE IT
 
@@ -420,7 +472,7 @@ read stops at 400 000 samples and it is thinned instead.
 
       DATA FILTER   Conditions, Limit crossings
       GRAPH         Reference lines, Graph settings, View ▾, Clean graph,
-                    Font, Avg to
+                    Font, Detail
       SELECTION     Clear selection
 
     They are described in 4.3a.
@@ -514,6 +566,41 @@ read stops at 400 000 samples and it is thinned instead.
       - The loupe (see 4.3) magnifies the graph around the mouse while
         you drag.
 
+    THE HEADING AND THE SHOT COUNT. The line above the cards reads
+      Selection statistics · 2026-10-16 10:00:00 → 11:30:12 ·
+      1 h 30 min 12 s · 1,080 shots
+    — start, end, the length written out in days, hours, minutes and
+    seconds, and the number of shots in the selection. A shot is a
+    moment when at least half of the signals running at the shot rate
+    wrote a value. The program finds the rate itself: the spacing most
+    signals repeat at. A signal on its own clock (a temperature read
+    every minute, a camera running free at 10 Hz) has no vote, and one
+    signal that skips a shot does not lose it. Hold the mouse over the
+    heading for the rate and the deciding signals. With Conditions,
+    "Keep multiples of" or the dead-shot rule leaving shots out, it
+    says "950 of 1,080 shots".
+
+    WHY A SIGNAL'S N CAN BE LOWER THAN THE SHOT COUNT. A card's N is
+    the number of values that signal really recorded in the selection.
+    The archive does not always store a value for every shot — a
+    signal is often written only when it changes, and now and then a
+    sample is dropped — so 187 against 200 shots means 13 shots that
+    signal did not record. A custom PV has one value per shot: on a
+    shot where a source recorded nothing new, its last value is used.
+    (Before, a custom PV got a point every time ANY loaded signal
+    wrote, including slow housekeeping ones, so its N was not a shot
+    count either.)
+
+    EXACT NUMBERS FROM A THINNED LOAD. A period longer than an hour
+    with Detail above 0 arrives as averaged points, one per time step,
+    not one per shot. Counting those would be wrong, so a selection in
+    such a period reads every archived sample of its own stretch first
+    (two hours at a time); the cards show "…" and the heading how far
+    the read has got. The numbers then are the same as with every
+    sample loaded. Above 20 million samples the read stops — select a
+    shorter range; the heading then says so and shows the thinned
+    numbers, marked with ⚠.
+
     Avg, Min and Max are in the signal's own units. Std and P-P are
     given as A PERCENTAGE OF THE AVERAGE, to hundredths — that is the
     form a shot is judged in, and an absolute 0.07 says nothing until
@@ -581,6 +668,13 @@ read stops at 400 000 samples and it is thinned instead.
     it is pressed in, the left button zooms instead of taking
     statistics.
 
+    A ZOOM ENDS LIVE MODE. Zooming in while Live runs (right-drag, or a
+    drag with the magnifier or the cross) switches Live off, so the
+    stretch you are looking at stays put and no new data arrives under
+    it. From / To become the window that was on screen. Pressing the
+    magnifier or the cross in without dragging does not stop Live. The
+    house button switches Live back on; so does "⏵ Live mode".
+
 4.3 THE PICTURE BUTTONS (the graph toolbar)
 
     One white bar of flat icon buttons in three groups, split by thin
@@ -591,6 +685,8 @@ read stops at 400 000 samples and it is thinned instead.
     VIEW
     house       back to the whole period. This also hands the view
                 back to the program, so live mode may scroll it again.
+                If a zoom switched Live off, the house switches it
+                back on.
     arrows      the previous / next view. One shared history: a zoom
                 made with the right button lands in it too, so there
                 is never a second "back" that disagrees. Greyed out
@@ -768,9 +864,20 @@ read stops at 400 000 samples and it is thinned instead.
             same last good shot is where a line starts at the left
             edge whenever the value just before the window fails.
           - A condition on a value that has no data at all in this
-            window is skipped, and logged. Otherwise one absent
-            value would reject every row on its own and look like a
-            broken filter.
+            window is skipped, logged, and named on the graph: "Not
+            applied (no data in this period)". Its last value from
+            before the window does not count — over a month of 2025,
+            when PTM1, PCM4 and PAP1 recorded nothing, a months-old
+            reading used to throw away every row at the end of the
+            load, after the data had already been shown while loading.
+          - OVER A LONG PERIOD A POINT STANDS FOR A STRETCH OF SHOTS
+            (about 10 minutes). It is kept when any part of that
+            stretch — from its lowest to its highest recorded value —
+            passes the condition, not judged by its average. A stretch
+            with a few good shots among laser-off ones has an average
+            below the limit, and a day with something important on it
+            used to vanish. Zoom in: the zoomed stretch is read again
+            and judged shot by shot (to the sample at about an hour).
 
         Computed values can be used as condition values.
 
@@ -783,10 +890,14 @@ read stops at 400 000 samples and it is thinned instead.
         mode every refresh used to draw the raw samples again, so a
         rejected shot (SBW4 under 0.15, say) was back on the graph a
         moment after the filter had removed it. Also fixed: the value
-        from before the window is not drawn when it fails, the shaded
-        min–max band no longer reaches down to rejected values, and the
+        from before the window is not drawn when it fails, and the
         Min / Max / Mean / Count in the settings table count only the
-        shots that pass.
+        points that pass. The shaded min–max band of a kept point is
+        its whole recorded range, so a spike is never hidden.
+
+        Zooming in reads finer data also with the conditions on and
+        with "Keep steps every" at its 1000 — that box stops it only
+        when the waveplate value is loaded and the filter really acts.
 
     Graph settings
         Fonts. The spacing of the axis columns (they now start packed
@@ -832,13 +943,16 @@ read stops at 400 000 samples and it is thinned instead.
         title readable and goes back to your setting when the room
         returns, so no space is wasted either way.
 
-    Font / Avg to
-        The font size, and how many points the curves are thinned
-        down to before drawing. A million samples cannot be drawn as
+    Font / Detail
+        The font size, and how many points per PV are read for the
+        period (up to 20 000; "all" = every sample as archived,
+        slow for long periods). A million samples cannot be drawn as
         a million points; the question is only whether the reduction
         is done deliberately. Each drawn point keeps the lowest and
-        highest value behind it (the light band), so the thinning
-        changes the detail, never the extremes.
+        highest value behind it (the light band), so the detail
+        changes, never the extremes. Zooming in reads finer detail
+        by itself. (This used to be called "Avg to"; nothing is
+        averaged away.)
 
 4.4 THE SIGNAL LIST BELOW THE GRAPH
 
@@ -846,6 +960,15 @@ read stops at 400 000 samples and it is thinned instead.
     under the cursor, the vertical minimum and maximum, autoscale,
     the line width, the line style, the point style, the point size,
     the transparency, smoothing and grid.
+
+    SHOW UNTICKED = NOT READ. A value with Show unticked is not read
+    from the archiver at all — not at the load, not on any Live poll
+    — so it costs nothing and cannot slow Live down. Its row stays in
+    this list. Tick Show again and only that value is read for the
+    period on screen and drawn in. Three exceptions are still read
+    while hidden, because the program needs them: a value used by
+    Conditions, a value a shown custom (ƒ) PV is computed from, and
+    the Waveplate (master) PV.
 
     HOW MUCH ROOM IT TAKES. The graph is what the tab is for, so the
     list opens on about four or five rows — roughly a quarter of the
@@ -1111,17 +1234,22 @@ read stops at 400 000 samples and it is thinned instead.
     main graph, and dragging a rectangle with the right button zooms.
     "Clean XY" removes the points and keeps the frame.
 
-    PAIRING THE TWO UP. A point needs a value for both at the same
-    moment, and the two are rarely recorded at the very same instant —
-    demanding that they appear in the same merged row gave an almost
-    empty plot, which is what made the tab look broken. Each value's
-    last known reading is now carried forward until the other reports,
-    the same thing the time graph does with its held lines. A reading
-    only stands in for a limited time (a small share of the period, at
-    least a minute and at most half an hour), so a value that has
-    stopped reporting cannot go on inventing points for ever. The
-    caption says how many points came out of how many rows, so a thin
-    plot explains itself.
+    PAIRING THE TWO UP. A point is one shot in which BOTH values were
+    recorded. A value recorded a few milliseconds after the other one
+    (an energy usually is) still counts for its own shot. A value from
+    an earlier shot is never used. Until October 2026 the last known
+    reading was carried forward for minutes. That paired a low SBW4
+    reading from one shot with a full-power PTM1 reading from another,
+    which drew points that never happened. The points pass the same
+    filters as the shot count of a selection: Conditions, "Keep
+    multiples of" and the dead-shot rule. The caption says how many
+    points came out of how many shots.
+
+    A PERIOD LONGER THAN ONE HOUR is loaded as 1-minute archive
+    averages, not single shots. A strong shot among weak ones then
+    shows up as a small average (several joules of SBW4 came out at
+    about 0.3 J). The caption under the XY plot says so in dark orange
+    ink. Load one hour or less to see every shot.
 
     THE COLOURS say how far through the period each point is, from
     dark blue through purple to red. Built by hand rather than taken
@@ -1190,7 +1318,12 @@ read stops at 400 000 samples and it is thinned instead.
     add points of its own and the same number would be counted into
     the distribution several times over.
 
-    CONDITIONS use the same rows as the Conditions window (section
+    CONDITIONS sit in their own window, opened by the "Conditions"
+    button in the row at the top of the tab. The button shows how many
+    are in force — "Conditions (2)", or "Conditions (off)" when they
+    are switched off. The window can stay open: the plot behind it
+    redraws as the rows change. These rows belong to the PV Time Plot
+    alone. They work like the rows of the Conditions window (section
     on Conditions above): on/off tick, value, kind (Between, Target
     ± %, Target ± value, At least, At most, Outside) and how many
     shots each row keeps on its own. "+ Add condition" adds a row. A
@@ -1429,14 +1562,15 @@ particular load is saved.
       Live speed, "Table refresh" is the one that costs: rebuilding
       the table walks the whole history. Raising it to two or three
       seconds leaves the graph moving as before. If that is not
-      enough, shorten the list.
+      enough, shorten the list, or untick Show for the values you do
+      not watch — those are then not read at all.
 
   The graph moves in jumps instead of gliding
-      "Graph refresh" under Graph settings → Live speed is too high,
-      or each refresh is genuinely taking that long — the program
-      keeps at least twice the measured cost free, so it slows itself
-      down on a machine that cannot keep up. Fewer values, or a
-      smaller "Avg to", both help.
+      Each picture of a dozen values takes about half a second to
+      draw, and the program keeps the window free about two thirds of
+      the time, so with many values the graph steps forward every
+      second or two. Fewer values shown (Show unticked), or a smaller
+      "Detail", both help.
 
   My selected region and its statistics disappeared
       They should not, and no longer do — see section 4.2. They are
@@ -1464,7 +1598,7 @@ particular load is saved.
       pointing at the wrong channel will drop everything.
 
   The graph is a solid block of ink
-      Too many samples for the width. Use "Avg to" to reduce the
+      Too many samples for the width. Use "Detail" to reduce the
       point count, or the master multiple filter to thin the rows.
 
   The time stamps along the bottom disappeared

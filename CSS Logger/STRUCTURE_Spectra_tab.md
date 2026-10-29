@@ -65,7 +65,7 @@ the shot filter.
 | `PV_ENERGY` | `HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy` — SBW4 energy (default search signal + per-region scalar) |
 | `PV_ALPHA_ENERGY` | `HAPLS-ENER_IN_GPL_LT2_DIAG2:Energy` — Alpha output energy |
 | `PV_SPEC_X` / `PV_SPEC_Y` | `L3-SBDP-SPIDER:SpecDomain_Int_X` / `_Y` — wavelength / intensity waveform |
-| `CPVA_URL` | `https://10.78.0.57:8443/api/1.0/cpva` |
+| `CPVA_URL` | `https://10.78.0.57:8443/api/1.0/cpva` — read through `cpva_core._get_json_or_backup`, so an unreachable archiver is answered by the L3 proxy (.64/.65); an L3BT / FCT channel is read from its own proxy (`archive_of`) and `_cpva_load_all_channels` adds their names (`extra_channel_names`) |
 | `ORDER_PVS` | `(label, channel)` for Order 2/3/4 = **GDD, TOD, FOD** — averaged per region and shown in the details |
 | `DEFAULT_SEARCH_PVS` | Default search-PV list (SBW4, Alpha, GDD, TOD) — user-editable |
 | `SIDEBAR_W` | `340` px — fixed sidebar width |
@@ -121,8 +121,7 @@ the shot filter.
 | `_spectral_metrics(x, y)` | `peak_wl`, `peak_int`, `centroid`, `fwhm`, `rms_bw`, `area` |
 | `_smooth(y, win)` | Moving-average smoothing |
 | `_split_query(text)` | PV search: text → lowercase tokens. Spaces, commas, semicolons and `*` all separate, so `l3 sbw4`, `l3,sbw4` and `*l3**sbw4*` are one query. |
-| `_tokens_in_order(hay, tokens)` | True when every token appears in the order typed. |
-| `_rank_pv_match(name, tokens)` | Sort weight (lower = better) or `None`. **AND semantics** — a missing token means no hit. Tiers: exact channel 0, exact field 1, prefix 2, in field 3, anywhere 4; the *weakest* token sets the tier and the sum only breaks ties. `+5` when the tokens are out of order, `+100` for a camera channel (`^C\d{2}-\d{2,3}-`), because the camera channels are a large slice of the archiver list and would otherwise bury every real hit. |
+| `_rank_pv_match(name, tokens)` | Sort weight (lower = better) or `None`. **AND semantics** — a missing token means no hit. The order of the tokens never matters. Tiers: exact channel 0, exact field 1, prefix 2, in field 3, anywhere 4; the *weakest* token sets the tier and the sum only breaks ties. `+100` for a camera channel (`^C\d{2}-\d{2,3}-`), because the camera channels are a large slice of the archiver list and would otherwise bury every real hit. |
 | `_pv_search(channels, text, exclude=None)` | The ranked result list. **Empty query returns nothing** — not everything. |
 
 The four above are the same PV-search behaviour as the Image Slider picker; that
@@ -130,7 +129,7 @@ one is the reference implementation.
 | `_load_search_presets()` / `_save_search_presets(p)` | `search_presets.json` I/O |
 | `_ns_to_dt` / `_fmt_hms` / `_fmt_date` / `_fmt_dur` | ns → Prague datetime / `HH:MM:SS` / `YYYY-MM-DD` / `Xm YYs` |
 | `_fmt_window(w)` | one picked window → `2026-08-25 08:00-12:00` |
-| `_import_daypicker()` | Loads the sibling `daypicker.py` **by path**, one instance per process, registered in `sys.modules` before exec. Re-exports `PickSeg`, `seg_bounds_ns`, `DayTimePicker`. Not a plain `import daypicker` on purpose: the builder's module-home check would see the same module name in two program folders and refuse to build (`Dev Tools/b_t.py`) |
+| `_import_daypicker()` | Loads the sibling `daypicker.py` **by path**, one instance per process, registered in `sys.modules` before exec. Re-exports `PickSeg`, `seg_bounds_ns`, `DayTimePicker`. Not a plain `import daypicker` on purpose: the builder's module-home check would see the same module name in two program folders and refuse to build (`Dev Tools/dt_core.py::check_module_homes`) |
 | `_bg(fn)` | Runs `fn` in a daemon `threading.Thread` |
 | `_fit_button(btn, extra=22)` | Minimum width measured from the button's own label. **Never `setFixedWidth` on a button holding text** — `_APP_STYLESHEET` spends ~16 px on padding + border, so a hand-picked number clipped "Change…" to "Chang…", and clipped harder at 125/150 % display scaling |
 | `_step_card(number, title)` | One numbered sidebar card → `(frame, body_layout)`. Number badge + coloured left stripe; the fill and border are scoped to the frame's object name so they cannot cascade onto the table or spin boxes inside |

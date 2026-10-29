@@ -1,4 +1,5 @@
 import atexit
+import re
 import sys
 import os
 from pathlib import Path
@@ -19,6 +20,19 @@ from PySide6.QtGui import QPalette, QColor
 # ---------------------------------------------------------------------------
 
 APP_DIR = Path(__file__).parent
+
+
+def _app_version():
+    """Version of the running build, e.g. "v1.3.7", or "" when run from source.
+
+    The builder names every exe "Diagnostic vX.Y.Z.exe", so the running exe's
+    own file name is the one place that always tells the truth — also for an
+    older version started from the archive.
+    """
+    if not getattr(sys, "frozen", False):
+        return ""
+    m = re.search(r"\s(v\d+(?:\.\d+)*)$", Path(sys.executable).stem)
+    return m.group(1) if m else ""
 
 # PID lock file: lets remote_launcher.py tell whether the app is already
 # running (so a Webex "run diagnostic" command doesn't spawn a second copy).
@@ -92,6 +106,15 @@ APP_STYLESHEET = """
     QTableView::indicator:checked, QCheckBox::indicator:checked {
         background: #1565C0; border-color: #1565C0;
     }
+    /* A selected row is painted blue, so the blue box above would vanish into
+       it: on a selected row the box gets a white rim -- dark navy = off,
+       white = on. */
+    QTableView::indicator:selected {
+        border: 2px solid #ffffff; background: #0d2a5c;
+    }
+    QTableView::indicator:checked:selected {
+        border: 2px solid #ffffff; background: #ffffff;
+    }
     QToolTip {
         background: #ffffcc; color: #111;
         border: 1px solid #aaa; padding: 4px;
@@ -111,18 +134,20 @@ class _WheelGuard(QObject):
     """The mouse wheel must never change a number box, drop-down or slider just
     because the pointer happens to be over it.
 
-    A field answers the wheel only after it has been CLICKED, and only while
-    the pointer has stayed on it since. Otherwise the notch goes to the panel
-    behind it (the PV table, a settings page), which scrolls as expected.
-
-    "Has focus" alone was the old test and it never held: a combo keeps its
-    focus after a pick, so scrolling the PV table over a "Depends on" dropdown
-    used a minute ago changed it again; and a freshly opened dialog hands its
-    first field the focus, so that field answered the wheel before it was ever
-    touched. Same rule as CSS Logger's guard.
+    Number boxes, drop-downs and sliders answer the wheel only after they were
+    CLICKED (or reached with Tab), and only while the pointer is over them --
+    Qt delivers a wheel notch to the control under the pointer, so a selected
+    field elsewhere on the page is never touched. Moving the pointer away keeps
+    the field selected (the keyboard still edits it); the wheel works on it
+    again when the pointer comes back. Selecting another control ends it. An
+    unselected field passes the notch to the panel behind it (the PV table, a
+    settings page), which scrolls as expected. The focus a freshly opened
+    dialog HANDS its first field does not count. Scroll bars are left out:
+    they are sliders too, and the wheel is how a pane gets scrolled. Same rule
+    as the other programs' guards.
     """
 
-    _ARMED = "_wheel_armed"
+    _ARMED = "wheelReady"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -131,6 +156,18 @@ class _WheelGuard(QObject):
         self._targets = (QAbstractSpinBox, QComboBox, QAbstractSlider)
         self._scrollbar = QScrollBar
         self._scroll_area = QAbstractScrollArea
+        self._earned = (Qt.FocusReason.MouseFocusReason,
+                        Qt.FocusReason.TabFocusReason,
+                        Qt.FocusReason.BacktabFocusReason,
+                        Qt.FocusReason.ShortcutFocusReason)
+        # Focus that leaves only for a moment and comes back to the same field:
+        # another window was activated, or the drop-down's own list opened.
+        self._keep = (Qt.FocusReason.ActiveWindowFocusReason,
+                      Qt.FocusReason.PopupFocusReason)
+
+    def _is_field(self, obj):
+        return isinstance(obj, self._targets) and \
+            not isinstance(obj, self._scrollbar)
 
     def _target_of(self, obj):
         """The guarded field ``obj`` belongs to: itself, or the spin box /
@@ -139,7 +176,7 @@ class _WheelGuard(QObject):
         for _ in range(3):
             if w is None or not isinstance(w, QWidget):
                 return None
-            if isinstance(w, self._targets) and not isinstance(w, self._scrollbar):
+            if self._is_field(w):
                 return w
             w = w.parentWidget()
         return None
@@ -160,32 +197,35 @@ class _WheelGuard(QObject):
         if t == QEvent.Type.Polish:
             # Born WheelFocus: Qt would hand the field focus from the wheel
             # itself, before this filter sees the notch.
-            if isinstance(obj, self._targets) and \
+            if self._is_field(obj) and \
                     obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
                 obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             return False
         if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+            # A click is what selects the field -- also the field that already
+            # HAD the focus, where no FocusIn follows the click. The press lands
+            # on the spin box's own text line, so look one or two levels up.
             tgt = self._target_of(obj)
             if tgt is not None:
                 tgt.setProperty(self._ARMED, True)
             return False
-        if t in (QEvent.Type.Leave, QEvent.Type.FocusOut, QEvent.Type.Hide):
-            # A combo's own list popping up takes the focus for a moment; that
-            # is still the click, so it keeps the field armed.
-            if t == QEvent.Type.FocusOut and \
-                    ev.reason() == Qt.FocusReason.PopupFocusReason:
-                return False
-            if isinstance(obj, self._targets) and obj.property(self._ARMED):
+        if t == QEvent.Type.FocusIn and self._is_field(obj):
+            if ev.reason() in self._earned:
+                obj.setProperty(self._ARMED, True)
+            return False
+        if t == QEvent.Type.FocusOut and self._is_field(obj):
+            # The pointer leaving does not end it; selecting something else does.
+            if ev.reason() not in self._keep:
                 obj.setProperty(self._ARMED, False)
             return False
         if t != QEvent.Type.Wheel:
             return False
-        tgt = self._target_of(obj)
-        if tgt is None:
+        if not self._is_field(obj):
             return False
-        if tgt.property(self._ARMED) and tgt.hasFocus():
+        if (obj.property("wheelAlways")
+                or (obj.property(self._ARMED) and obj.hasFocus())):
             return False                    # clicked into it -> normal behaviour
-        w = tgt.parentWidget()
+        w = obj.parentWidget()
         while w is not None:                # pass the scroll on to the panel
             if isinstance(w, self._scroll_area):
                 QApplication.sendEvent(w.viewport(), ev)
@@ -212,7 +252,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Diagnostic")
+        ver = _app_version()
+        self.setWindowTitle(f"Diagnostic {ver}" if ver else "Diagnostic (source)")
         # Fallback size for when the window is un-maximized; on launch the
         # window opens maximized (see main()). Wide enough that the PV table
         # shows all columns without a horizontal scrollbar.
@@ -313,6 +354,57 @@ def _icon_app_id(prefix: str, ico_path) -> str | None:
     return f"{prefix}.{uuid.uuid4().hex[:12]}"
 
 
+def _nudge_taskbar_icon(hwnd) -> None:
+    """Make the taskbar re-read this window's icon a few times after start.
+
+    Explorer reads a taskbar button's picture once, when it creates the
+    button, and does not ask again by itself. When that one read misses, the
+    button keeps the blank window placeholder for the whole run although the
+    window holds the right icon -- measured on Diagnostic v1.3.4, 15.10.2026:
+    started from C:, a fresh per-launch id, WM_GETICON answering with the
+    magnifier, the button blank. Re-sending the same icon changed nothing;
+    taking the icon away and giving it back made Explorer re-read it, and the
+    same running window drew the magnifier at once. So that is done here a few
+    times while the button may still be appearing (a slow start, a busy
+    Explorer after logon). Runs on a daemon thread; the window's own icon
+    handles are put back, so nothing is created or leaked.
+    """
+    if not hwnd:
+        return
+    import threading
+
+    def run():
+        import ctypes
+        import ctypes.wintypes as wt
+        import time
+        user32 = ctypes.windll.user32
+        send = user32.SendMessageTimeoutW
+        send.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT,
+                         wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send.restype = ctypes.c_size_t
+        res = ctypes.c_size_t()
+        for delay in (2, 8, 20, 30):          # at about 2, 10, 30 and 60 s
+            time.sleep(delay)
+            try:
+                if not user32.IsWindow(wt.HWND(hwnd)):
+                    return
+                held = {}
+                for which in (1, 0):          # ICON_BIG, ICON_SMALL
+                    res.value = 0
+                    # SMTO_ABORTIFHUNG: a frozen window just skips this round
+                    if send(hwnd, 0x007F, which, 0, 0x0002, 2000,
+                            ctypes.byref(res)) and res.value:
+                        held[which] = res.value
+                for which in held:
+                    send(hwnd, 0x0080, which, 0, 0x0002, 2000, ctypes.byref(res))
+                for which, h in held.items():
+                    send(hwnd, 0x0080, which, h, 0x0002, 2000, ctypes.byref(res))
+            except Exception:
+                pass
+
+    threading.Thread(target=run, daemon=True, name="taskbar-icon").start()
+
+
 def main():
     _acquire_lock()
     atexit.register(_release_lock)
@@ -373,6 +465,7 @@ def main():
         from PySide6.QtGui import QIcon
         window.setWindowIcon(QIcon(str(_ico)))
     window.showMaximized()
+    _nudge_taskbar_icon(int(window.winId()))
     splash.close()
     sys.exit(app.exec())
 

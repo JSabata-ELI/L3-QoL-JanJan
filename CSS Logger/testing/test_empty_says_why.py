@@ -96,8 +96,11 @@ def main():
     xy = w._lbl_xy_info.text()
     check("a silent pair of channels still says so", "neither channel" in xy, repr(xy))
 
-    # And a normal plot puts the line back to grey.
+    # And a normal plot puts the line back to grey. The XY cloud is paired
+    # from the channels' own samples, shot by shot.
     w._conditions = []
+    w._samples_by_pv = {
+        pv: [(ts, rd[pv][0], "") for ts, rd in _rows(20)] for pv in (PV_X, PV_Y)}
     w._table_rows_unfiltered = _rows(20)
     w._table_rows = w._apply_conditions_to_rows(w._table_rows_unfiltered)
     w._plot_xy()

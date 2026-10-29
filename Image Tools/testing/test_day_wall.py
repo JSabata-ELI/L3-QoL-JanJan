@@ -299,8 +299,14 @@ def main():
     check("the walls share one frame cache",
           cam_wall._raw is w._day_wall._raw is w._wall_shared.raw)
 
-    print("\nday by day: a row per CAMERA, its days left to right")
+    print("\nday by day (Horizontal): a row per CAMERA, its days left to right")
     dw = w._day_wall
+    # Vertical is the default now (test_day_wall_vertical.py); this part is about
+    # the horizontal layout, so it asks for it — on the wall, not through the
+    # button, which would write the user's own UI-state file.
+    check("the day-by-day wall opens in the remembered layout",
+          dw.layout_mode() == w._day_layout, f"{dw.layout_mode()} vs {w._day_layout}")
+    dw.set_layout_mode("rows")
     dw.resize(900, 500)
     dw._relayout()
     # One camera over three days: ONE row, three columns. It used to be the
@@ -310,8 +316,8 @@ def main():
     check("the banner names the camera",
           dw._row_heads[0][1].startswith("C03-040-PTM11WNF"),
           dw._row_heads[0][1])
-    check("and says how many days its line reaches across",
-          "3 days" in dw._row_heads[0][1], dw._row_heads[0][1])
+    check("and no day count (each caption names its own day)",
+          "days" not in dw._row_heads[0][1], dw._row_heads[0][1])
     check("the wall asks for the height its rows need",
           dw.minimumHeight() >= dw.rows_content_height() > 0,
           f"min {dw.minimumHeight()} vs {dw.rows_content_height()}")

@@ -102,7 +102,8 @@ def _win(pvs=None, value=16.2, shared_ok=True, saved=None):
         logged=[],
         saved=saved,
         _change_pending={},
-        _change_undo=None,
+        _undo_stack=[],
+        history=[],
         _chart_jobs=[],
         hub=types.SimpleNamespace(
             webex=types.SimpleNamespace(bot_name="Diagnostics")),
@@ -114,6 +115,9 @@ def _win(pvs=None, value=16.2, shared_ok=True, saved=None):
     win.persist = types.MethodType(
         lambda self: self.saved.append([p.to_dict() for p in self.pvs]), win)
     win._cancel_jobs = types.MethodType(lambda self: [], win)
+    win._history_add = types.MethodType(
+        lambda self, kind, text, pv="", who="": self.history.append(
+            (kind, text, pv, who)), win)
     # The gates are not being read here, so no profile matches and Global is
     # "in force" — which is the honest answer for a stand-in with no poll.
     win._gate_value = types.MethodType(lambda self, name: None, win)
@@ -122,10 +126,12 @@ def _win(pvs=None, value=16.2, shared_ok=True, saved=None):
                  "_cmd_change", "_change_listing", "_limit_scope_values",
                  "_apply_limit_changes", "_limit_warnings", "_change_done",
                  "_cmd_undo", "_cmd_cancel", "_strip_mention",
-                 "_change_in_one_line"):
+                 "_change_in_one_line", "_push_undo", "_pv_named",
+                 "_after_pv_change", "_settings_changed"):
         setattr(win, name, types.MethodType(getattr(mt.MonitorWidget, name),
                                             win))
-    for name in ("_limit_get", "_limit_set", "_limits_label"):  # staticmethods
+    for name in ("_limit_get", "_limit_set", "_limits_label",
+                 "_pv_snapshot", "_add_picks"):  # staticmethods
         setattr(win, name, getattr(mt.MonitorWidget, name))
     return win
 
@@ -460,15 +466,43 @@ def test_undo_restores_every_limit_of_one_answer():
     assert win.pvs[0].profiles[0]["warn_high"] == 16.8
 
 
-def test_undo_is_one_step_only():
+def test_undo_walks_back_one_step_at_a_time():
     win = _win()
     _change(win, "DA1 warn high 22")
     _change(win, "DA1 warn high 23")
     win._cmd_undo(ME)
     assert win.pvs[0].warn_high == 22.0
+    assert "1 more step" in win.replies[-1]
+    win._cmd_undo(ME)
+    assert win.pvs[0].warn_high == 24.0
     win._cmd_undo(ME)
     assert "Nothing to undo" in win.replies[-1]
-    assert win.pvs[0].warn_high == 22.0
+    assert win.pvs[0].warn_high == 24.0
+
+
+def test_undo_leaves_a_later_window_edit_of_another_field_alone():
+    """Only what the chat change touched comes back."""
+    win = _win()
+    _change(win, "DA1 warn high 22")
+    win.pvs[0].enabled = False            # somebody unticks On in the window
+    win._cmd_undo(ME)
+    assert win.pvs[0].warn_high == 24.0
+    assert win.pvs[0].enabled is False
+
+
+def test_undo_keeps_at_most_its_depth():
+    win = _win()
+    for i in range(mt.UNDO_DEPTH + 5):
+        _change(win, f"DA1 warn high {20 + i * 0.01:.2f}")
+    assert len(win._undo_stack) == mt.UNDO_DEPTH
+
+
+def test_a_limit_change_goes_into_the_history():
+    win = _win()
+    _change(win, "DA1 warn high 22")
+    kind, text, pv, who = win.history[-1]
+    assert kind == "change" and pv == "DA1 Chiller" and who == ME
+    assert "22" in text
 
 
 def test_undo_with_nothing_behind_it():

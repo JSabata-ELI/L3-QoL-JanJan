@@ -26,8 +26,8 @@ each build carrying its own copy, this one dummy project is built with PyInstall
 so that its `_internal/` folder holds all of them, and that single folder is then
 distributed to each deployed program.
 
-The distribution end is **Dev Tools → Copy Manager → Build internal / Deploy
-internal**; `Extractor/e.py` is the older manual route.
+The distribution end is **Dev Tools → Builder (tick Internal Builder) and Copy
+Manager → Deploy Libraries**; `Extractor/e.py` is the older manual route.
 
 The file **is not executed as an application.** Its whole content is import
 statements, and that is the point: PyInstaller follows imports, so an import here

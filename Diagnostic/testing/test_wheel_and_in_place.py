@@ -119,24 +119,25 @@ check("a clicked combo answers the wheel, also after its list was open",
       combo.currentIndex(), 2)
 QApplication.sendEvent(combo, QEvent(QEvent.Type.Leave))
 wheel(combo, up=False)
-check("after the pointer left, it ignores the wheel again",
-      combo.currentIndex(), 2)
-click(combo)
+check("the pointer leaving does not deselect it: back over it, the wheel works",
+      combo.currentIndex(), 3)
+combo.setCurrentIndex(2)
 focus(combo, QEvent.Type.FocusOut, Qt.FocusReason.TabFocusReason)
 wheel(combo, up=False)
-check("after focus left, it ignores the wheel again", combo.currentIndex(), 2)
+check("after another control was selected, it ignores the wheel again",
+      combo.currentIndex(), 2)
 click(combo)
 focus(combo, QEvent.Type.FocusOut, Qt.FocusReason.ActiveWindowFocusReason)
 wheel(combo, up=False)
-check("after switching to another program, it ignores the wheel",
-      combo.currentIndex(), 2)
+check("switching to another program and back keeps it selected",
+      combo.currentIndex(), 3)
 mt_combo = None
 
 line = spin.lineEdit()
 click(line)                    # the click lands on the spin box's text field
 spin.hasFocus = lambda: True
 check("a click on its text field arms the spin box",
-      bool(spin.property("_wheel_armed")))
+      bool(spin.property("wheelReady")))
 wheel(spin)
 check("a clicked spin box answers the wheel", spin.value() != 5.0)
 host.hide()

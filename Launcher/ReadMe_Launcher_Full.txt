@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (l.py, 1586 lines)
+Verified against source: 2026-10-16  (l.py, 2310 lines, PySide6)
 -----------------------------------------------------------------
 Short version: Readme Launcher.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -57,11 +57,10 @@ source is highlighted. Everything else changes in place: moving a
 program to another group, opening or closing a group, a new version
 turning up, or acknowledging one only touches the cards involved —
 nothing is reloaded and the window does not flicker. The version list
-under the arrow button is read at the moment you open it, so it always
-shows what is on disk now. The mouse wheel only scrolls the program
-list, and only while the pointer is over the Launcher window.
+under the clock button is read at the moment you open it, so it always
+shows what is on disk now.
 
-The two configurable paths are set with the gear button and stored
+The two configurable paths are set with the Set paths button and stored
 per user, together with your acknowledged versions and any groups you
 have moved programs into.
 
@@ -81,9 +80,9 @@ almost always what is happening. Wait it out; it recovers.
 =================================================================
 
   THE BIG BUTTON
-      The program's name and version. Click it to start the current
-      version. When a newer version is on disk than the one you last
-      used, the button turns amber and gains an up arrow.
+      The program's icon and its full name. Click it to start the
+      current version. When a newer version is on disk than the one
+      you last used, the button turns orange.
 
   ReadMe
       The short description — what the program is for and how it
@@ -99,22 +98,27 @@ almost always what is happening. Wait it out; it recovers.
       published to the folder you are looking at — see the note at
       the end of section 10.
 
-  The tick
-      "I have seen that there is a new version." Clears the amber
-      without starting anything, and the acknowledgement survives a
-      restart. Only shown while an update is pending.
-
   The folder
       Opens the program's folder in Explorer.
 
-  The arrow down
+  The clock
       A list of older versions, newest first. Click one to run it —
-      see section 5.
+      see section 5. Only shown when there is an older version.
 
-  RIGHT-CLICK
-      Move this program into a different group, or reset it to its
-      default one. Your choice is stored per user, so you can
-      rearrange the window without affecting anybody else.
+  RIGHT-CLICK THE BIG BUTTON
+      Acknowledge update — "I have seen that there is a new version."
+      Clears the orange without starting anything, and the
+      acknowledgement survives a restart. Only offered while the card
+      is orange.
+
+      Move to group — puts this program into a different group; the
+      current group has a tick. Reset to default puts it back. Your
+      choice is stored per user, so you can rearrange the window
+      without affecting anybody else.
+
+  Names are never shortened: every program button is as wide as the
+  longest name in the open groups, and the window widens itself so
+  that two cards always fit side by side.
 
 
 =================================================================
@@ -209,7 +213,7 @@ Two things follow from case 3:
     happens and the temporary folder is left behind. The Launcher
     detects that: it refuses to launch that program again, and offers
     to put the current files back. That check runs after every scan,
-    and on demand with the broom button.
+    and on demand with the Clean button.
 
 Case 4 needs Python on the computer, and if those sources stop with
 an error the message is shown. Without that they would fail in
@@ -257,7 +261,8 @@ from the version you last acknowledged.
 Two things clear it:
 
   - starting the program, which acknowledges it automatically, or
-  - pressing the tick, which acknowledges it without starting.
+  - right-clicking the card and choosing Acknowledge update, which
+    acknowledges it without starting.
 
 The acknowledgement is stored per user, so the highlight is about
 you, not about the share. Somebody else on the same share still sees
@@ -278,8 +283,8 @@ the Launcher was closed is highlighted the next time you open it.
   Not working correctly    known broken
   Personal                 build and deployment tooling
 
-Click a header to expand or collapse the section. The number of cards
-per row follows the window width.
+Click a header to expand or collapse the section. Only Main scripts
+is open when the Launcher starts. The cards always sit two to a row.
 
 A program that is not in any of the lists inside the Launcher lands in
 "External". That is not a statement about the program — it just means
@@ -291,16 +296,16 @@ the list in the source.
 9. THE THREE SMALL BUTTONS
 =================================================================
 
-  Notes (clipboard)
+  Notes
       Opens the shared notes file on the current share, the one
       everybody writes into.
 
-  Set paths (gear)
+  Set paths
       Your two office paths. Stored per user. The dialog says which
       folder to pick for each; once a folder is chosen, that source is
       selected and loaded straight away.
 
-  Clean (broom)
+  Clean
       Two housekeeping checks, on demand:
         - version files that are not where their version lives — it
           lists each one and offers to tidy them up. Two cases: a
@@ -315,7 +320,7 @@ the list in the source.
         - programs left in a half-finished version swap — it offers
           to restore them.
       Every scan runs both checks in the background. When something is
-      found, the button gets an orange frame and a count ("Clean (3)")
+      found, the button turns orange and shows a count ("Clean (3)")
       and the status line says what it is. No window opens by itself —
       a dialog that popped up after a scan used to take the keyboard
       from whatever you were typing into. Click the button to see the
@@ -356,17 +361,17 @@ Launcher.
 
   The window is empty after picking a source
       The path does not exist, or holds no program folders. Check the
-      path with the gear button.
+      path with the Set paths button.
 
   It seems frozen for the better part of a minute
       An unreachable share. See the warning in section 2.
 
   A program refuses to launch, saying a swap is unfinished
-      An old version was killed instead of closed. Press the broom
+      An old version was killed instead of closed. Press the Clean
       button and accept the restore.
 
-  A card is amber and I do not want it to be
-      Press the tick.
+  A card is orange and I do not want it to be
+      Right-click it and choose Acknowledge update.
 
   A ReadMe or Details button does nothing
       The file is named something the Launcher does not look for.

@@ -29,7 +29,7 @@ Integration:  class SpectraWidget, method cancel_scan()
 
 from __future__ import annotations
 
-import csv, json, os, re, ssl, sys, threading, urllib.parse, urllib.request, warnings
+import csv, json, os, re, ssl, sys, threading, time, urllib.parse, urllib.request, warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
@@ -81,7 +81,7 @@ def _import_daypicker():
     daypicker.py owns HOW A DAY AND A TIME WINDOW ARE PICKED for every program in
     the suite. The master copy lives in Image Tools/; this folder keeps a verbatim
     copy because the builder only ever bundles .py files from the program's own
-    folder (Dev Tools/b_t.py). testing/test_daypicker_sync.py fails the moment the
+    folder (Dev Tools/dt_core.py). testing/test_daypicker_sync.py fails the moment the
     two copies differ.
 
     Not a plain `import daypicker`: the same module name lives in three program
@@ -92,7 +92,7 @@ def _import_daypicker():
     Three locations are searched because a built app has no single answer. Next to
     this file means _internal, and _internal never survives the trip to the share:
     copying a program there does not bring its _internal at all, and "Deploy
-    Libraries" (Dev Tools/cm_t.py) fills the destination's one from a single
+    Libraries" (Dev Tools/dt_core.py) fills the destination's one from a single
     shared runtime library, deleting whatever that library does not have.
     daypicker.py is not in it and cannot be — that is what made the network copy
     fail. The compiled-in copy and the loose file the deploy drops beside the exe
@@ -889,15 +889,24 @@ def _ssl_ctx() -> ssl.SSLContext:
 
 
 def _cpva_fetch(channel: str, start_ns: int, end_ns: int) -> list:
+    # Through the Logger tab's request path, so an unreachable archiver is
+    # answered by the L3 proxy here too, and an L3BT / FCT channel is read from
+    # its own proxy (cpva_core._get_json_or_backup, archive_of).
+    from cpva_core import (_get_json_or_backup, _proxy_get_json, archive_of,
+                           EXTRA_ARCHIVES)
     params = urllib.parse.urlencode({
         "channelName": channel,
         "start": int(start_ns),
         "end":   int(end_ns),
     })
-    req = urllib.request.urlopen(
-        f"{CPVA_URL}/samples?{params}", context=_ssl_ctx(), timeout=30
-    )
-    return json.loads(req.read())
+    proxy_params = urllib.parse.urlencode({"start": int(start_ns),
+                                           "end":   int(end_ns)})
+    proxy_path = f"/samples/{urllib.parse.quote(channel, safe='')}?{proxy_params}"
+    extra = archive_of(channel)
+    if extra is not None:
+        return _proxy_get_json(EXTRA_ARCHIVES[extra], proxy_path, 30)
+    return _get_json_or_backup(f"{CPVA_URL}/samples?{params}", proxy_path,
+                               timeout=30)
 
 
 # The archiver answers with HTTP 500 when a single response would carry too many
@@ -1142,16 +1151,39 @@ def _not_a_spectrum_msg(channel: str) -> str:
 
 
 _cpva_channel_cache: list = []   # module-level cache shared between dialogs
+# When the cache was last filled (time.monotonic()). The list is asked for again
+# on every dialog opening and by the inline search once it is older than
+# _CPVA_CHANNELS_MAX_AGE_S: channels are added to the archiver while the program
+# stays open (SPIDER GDD, TPD and FOG appeared mid-session on 2026-10-13 and were
+# not offered until a restart). Measured 2026-10-13: 9747 names in ~0.03 s.
+_cpva_channel_cache_at: float = 0.0
+_CPVA_CHANNELS_MAX_AGE_S = 30.0
+
+
+def _remember_channels(channels: list) -> bool:
+    """Keep a fresh listing in the shared cache. An empty one (a failed
+    download) never replaces a list already held. True when it was kept."""
+    global _cpva_channel_cache, _cpva_channel_cache_at
+    if not channels:
+        return False
+    _cpva_channel_cache = channels
+    _cpva_channel_cache_at = time.monotonic()
+    return True
+
 
 def _cpva_load_all_channels() -> list:
     """Fetch every archived channel name from CPVA (no filter — filter locally).
     Uses the /channels-by-pattern endpoint (pattern=** → all ~9600 channels).
     The response is a JSON list of names, or of dicts carrying the name under
-    channelName / name / channel. Returns a sorted list of strings; [] on failure."""
+    channelName / name / channel. The L3BT and FCT proxies' names are added, so
+    their channels can be picked too. Returns a sorted list of strings; [] on
+    failure."""
+    from cpva_core import _get_json_or_backup, extra_channel_names
     url = f"{CPVA_URL}/channels-by-pattern?" + urllib.parse.urlencode({"pattern": "**"})
     try:
-        req = urllib.request.urlopen(url, context=_ssl_ctx(), timeout=20)
-        data = json.loads(req.read())
+        # The proxy takes the pattern as a path segment.
+        data = _get_json_or_backup(url, "/channels-by-pattern/" +
+                                   urllib.parse.quote("**", safe=""), timeout=20)
         names = []
         if isinstance(data, list):
             for x in data:
@@ -1161,6 +1193,7 @@ def _cpva_load_all_channels() -> list:
                     n = x.get("channelName") or x.get("name") or x.get("channel")
                     if n:
                         names.append(str(n))
+        names.extend(extra_channel_names(names, timeout=20))
         return sorted(set(names))
     except Exception:
         pass
@@ -1181,21 +1214,10 @@ def _split_query(text: str) -> list:
     return [t for t in re.split(r"[\s,;*]+", (text or "").strip().lower()) if t]
 
 
-def _tokens_in_order(hay: str, tokens: list) -> bool:
-    """True when every token occurs in `hay` in the order typed."""
-    pos = 0
-    for t in tokens:
-        i = hay.find(t, pos)
-        if i < 0:
-            return False
-        pos = i + len(t)
-    return True
-
-
 def _rank_pv_match(name: str, tokens: list) -> "int | None":
     """Sort weight of one channel against the tokens (lower = better), or None
     when it doesn't match. Multi-token queries are AND-matched anywhere in the
-    name; tokens found in the typed order rank above scrambled ones."""
+    name; the order of the words does not matter."""
     if not tokens:
         return None
     k = name.lower()
@@ -1219,8 +1241,6 @@ def _rank_pv_match(name: str, tokens: list) -> "int | None":
         total += s
     # The weakest token decides the tier; the sum only breaks ties.
     score = worst * 10 + min(total, 9)
-    if len(tokens) > 1 and not _tokens_in_order(k, tokens):
-        score += 5
     if _CAM_CHANNEL_RE.match(name):
         score += 100
     return score
@@ -2178,8 +2198,7 @@ class PvSearchDialog(QDialog):
             self._lbl_status.setText(
                 f"{len(self._all_channels)} channels loaded. Type to filter."
             )
-        else:
-            self._kick_load()
+        self._kick_load()                    # fresh on every opening, see _remember_channels
         self._filter(self._edit.text())      # the custom PVs show before any typing
 
     def _reload_cpvs(self):
@@ -2282,8 +2301,10 @@ class PvSearchDialog(QDialog):
         _bg(_work)
 
     def _on_loaded(self, channels: list):
-        global _cpva_channel_cache
-        _cpva_channel_cache = channels
+        if not _remember_channels(channels) and self._all_channels:
+            return                           # a failed refresh keeps the list held
+        if channels == self._all_channels:
+            return                           # nothing new — keep the list as it is
         self._all_channels = channels
         self._lbl_status.setText(
             f"{len(channels)} channels loaded. Type to filter."
@@ -2454,8 +2475,7 @@ class XAxisSourceDialog(QDialog):
             self._lbl_status.setText(f"{len(self._all_channels)} channels. Type to filter.")
             if self._want_src:
                 self._filter(self._edit.text())
-        else:
-            self._kick_load()
+        self._kick_load()                    # fresh on every opening, see _remember_channels
 
     @staticmethod
     def _ink(lbl: QLabel, extra: str = "") -> QLabel:
@@ -2623,8 +2643,13 @@ class XAxisSourceDialog(QDialog):
         _bg(_work)
 
     def _on_loaded(self, channels: list):
-        global _cpva_channel_cache
-        _cpva_channel_cache = channels
+        if not _remember_channels(channels) and self._all_channels:
+            return                           # a failed refresh keeps the list held
+        if channels == self._all_channels:
+            return                           # nothing new — keep the list as it is
+        cur = self._lst.currentItem()
+        if cur is not None:                  # the row picked so far stays picked
+            self._want_src = cur.text()
         self._all_channels = channels
         self._lbl_status.setText(
             f"{len(channels)} channels. Type to filter."
@@ -2704,8 +2729,7 @@ class PresetEditDialog(QDialog):
         self._refresh_list()
         if self._all_channels:
             self._lbl_search.setText(f"{len(self._all_channels)} channels. Type to filter.")
-        else:
-            self._kick_load()
+        self._kick_load()                    # fresh on every opening, see _remember_channels
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -2873,8 +2897,10 @@ class PresetEditDialog(QDialog):
         _bg(_work)
 
     def _on_ch_loaded(self, channels: list):
-        global _cpva_channel_cache
-        _cpva_channel_cache = channels
+        if not _remember_channels(channels) and self._all_channels:
+            return                           # a failed refresh keeps the list held
+        if channels == self._all_channels:
+            return                           # nothing new — keep the list as it is
         self._all_channels = channels
         self._lbl_search.setText(
             f"{len(channels)} channels. Type to filter."
@@ -6970,8 +6996,14 @@ class SpectraWidget(QWidget):
 
     # ── Inline CPVA channel search (fast add) ──────────────────────────────
     def _ensure_channels_loaded(self):
-        if _cpva_channel_cache:
+        """Fill the shared list when it is empty, and ask again once it is older
+        than _CPVA_CHANNELS_MAX_AGE_S — the old list keeps answering meanwhile."""
+        if _cpva_channel_cache and (time.monotonic() - _cpva_channel_cache_at
+                                    < _CPVA_CHANNELS_MAX_AGE_S):
             return
+        if getattr(self, "_channels_in_flight", False):
+            return
+        self._channels_in_flight = True
         sig = _Sig(self)
         sig.done.connect(self._on_channels_loaded)
         def _work():
@@ -6986,10 +7018,11 @@ class SpectraWidget(QWidget):
         _bg(_work)
 
     def _on_channels_loaded(self, channels: list):
-        global _cpva_channel_cache
-        if channels:
-            _cpva_channel_cache = channels
-        self._on_inline_search(self._edit_pv_search.text())
+        self._channels_in_flight = False
+        old = _cpva_channel_cache
+        _remember_channels(channels)
+        if _cpva_channel_cache != old:
+            self._on_inline_search(self._edit_pv_search.text())
 
     def _on_inline_search(self, text: str):
         q = text.strip().lower()
@@ -6997,8 +7030,8 @@ class SpectraWidget(QWidget):
         if not q:
             self._lst_pv_search.setVisible(False)
             return
+        self._ensure_channels_loaded()       # refreshes a list grown stale
         if not _cpva_channel_cache:
-            self._ensure_channels_loaded()
             self._lst_pv_search.setVisible(False)
             return
         matches = _pv_search(_cpva_channel_cache, q)

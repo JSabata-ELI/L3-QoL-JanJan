@@ -52,7 +52,7 @@ announces itself**.
 | `main.py` | The entry point. Taskbar identity, the look, the header row with the circle, the tabs, the settings file, shutting down. Owns no verdicts. |
 | `ann_log.py` | **Qt-free at import.** The crash log: `faulthandler`, `sys.excepthook`, `threading.excepthook` and Qt's own message handler, all into one file under `%LOCALAPPDATA%\Announcer`. Installed by `main.py` *before* Qt is imported. |
 | `ann_core.py` | **Qt-free.** The item model, the pure verdicts, the config file, the migration, the readable failure text, the channel search. |
-| `ann_cpva.py` | **Qt-free.** The archiver: a keep-alive connection pool, one fetch, the three reductions, the widening look-back, a whole pass with a deadline. |
+| `ann_cpva.py` | **Qt-free.** The archiver: a keep-alive connection pool, one fetch, the three reductions, the widening look-back, a whole pass with a deadline. Backup: `_cpva_or_backup` asks the L3 proxy (.64/.65, same archive) only when CPVA cannot be reached (transport error, connection never opened, HTTP 502/503/504), then skips CPVA for `CPVA_DOWN_S` = 60 s; never on a timeout or another HTTP error. L3BT and FCT: `archive_of` reads a channel from the L3BT / FCT proxy (`EXTRA_ARCHIVES`) when that proxy lists it and CPVA does not; `fetch_channels` merges their names into the picker's list. Test: `testing/test_cpva_backup.py`. |
 | `ann_screen.py` | The screens in both coordinate spaces, the PIL grab, the picture difference, the drag-out overlay, the numbered monitor overlay. |
 | `ann_watch.py` | The engine: two clocks, two single-flight guards, a wedge watchdog, per-item state, latching, the one-shot alarm. |
 | `ann_alarm.py` | The flashing window and the panel that stays on top. |

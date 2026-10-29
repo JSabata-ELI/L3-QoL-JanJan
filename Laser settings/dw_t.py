@@ -2,7 +2,7 @@
 
 Meant for OPR1, the PC with the Remote Desktop window to the deformable
 mirror's PC open. Switched on here, this PC photographs that window every 5 s,
-finds the Set-up grid of Mirror Control Window in it and writes what it saw to
+finds the Applied voltages grid (the left one) of Mirror Control Window in it and writes what it saw to
 the scratch share, where the DM settings tab on every PC reads it (`ls_dm`).
 
 Nothing is done TO the Remote Desktop window: it is never activated, moved,
@@ -62,15 +62,17 @@ class DmWriterTab(QWidget):
         box = QGroupBox("Reading the deformable mirror on this PC")
         lay = QVBoxLayout(box)
         lay.setSpacing(8)
-        self._write = QCheckBox("Read the Set-up grid from the Remote Desktop "
+        self._write = QCheckBox("Read the Applied voltages grid from the "
+                                "Remote Desktop "
                                 "window and write it to the scratch share")
         self._write.setStyleSheet(U.chk_qss())
         self._write.setToolTip(
             "Tick this only on the PC that has the Remote Desktop window to the "
             "mirror's PC open (OPR1).\nEvery few seconds (Look every) the "
             "window is photographed in "
-            "memory — never activated, moved or clicked — and what the Set-up "
-            "grid shows is written for the DM settings tab on every PC.\n"
+            "memory — never activated, moved or clicked — and what the "
+            "Applied voltages grid (the left one, what is really on the "
+            "mirror) shows is written for the DM settings tab on every PC.\n"
             "While the window is minimised it cannot be read, and \"unknown\" "
             "is written.")
         self._write.toggled.connect(self._typed)
@@ -117,7 +119,7 @@ class DmWriterTab(QWidget):
             "Save a picture of the window", icon_name="save",
             tip="Save what this PC photographs of the Remote Desktop window, "
                 "as a PNG next to the state file on the scratch share.\nDone "
-                "by itself the first time the Set-up grid is not found.")
+                "by itself the first time the Applied voltages grid is not found.")
         self._pic_btn.clicked.connect(self._save_picture)
         pic_row.addWidget(self._pic_btn)
         self._pic_note = QLabel("")

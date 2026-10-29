@@ -145,7 +145,8 @@ class ChannelPicker(QDialog):
 
     def _load(self):
         self._count.setText("Asking the archiver for the channel list…")
-        _in_background(self, lambda: A.fetch_channels(timeout=4.0),
+        # Fresh on every opening: channels added since are offered too.
+        _in_background(self, lambda: A.fetch_channels(timeout=4.0, refresh=True),
                        self._loaded)
 
     def _loaded(self, names, exc):

@@ -121,14 +121,25 @@ def main() -> int:
     v = _drawn_values(w, PVS[0])
     check("the value from before the window is not drawn when rejected",
           v.size and np.nanmin(v) >= 120.0, f"min {np.nanmin(v)}")
-    # The archiver's bin min/max would cover rejected shots.
+    # Thinned bins: those lying wholly below the condition stay out; a kept
+    # bin's band is its whole archived range (so no spike is hidden).
     s = w._samples_by_pv[PVS[0]]
-    w._minmax_by_pv[PVS[0]] = (np.array([t for t, _v, _u in s], dtype=float),
-                               np.full(len(s), 1.0), np.full(len(s), 999.0))
+    s_t = np.array([t for t, _v, _u in s], dtype=float)
+    s_v = np.array([v for _t, v, _u in s], dtype=float)
+    w._minmax_by_pv[PVS[0]] = (s_t, s_v - 30.0, s_v + 1.5)
     w._update_graph_data()
     lo_band = w._graph_env[w._graph_pvs.index(PVS[0])][0]
-    check("the band stays inside the condition",
-          np.nanmin(lo_band) >= 120.0, f"min {np.nanmin(lo_band)}")
+    check("the band holds only the kept bins' ranges",
+          np.nanmin(lo_band) >= 119.0 - 30.0, f"min {np.nanmin(lo_band)}")
+    # A thinned bin is judged by the shots behind it, not by its mean: a bin
+    # whose maximum reaches the condition may hold a good shot, and is kept
+    # (a day with a few good shots among laser-off ones vanished before).
+    keep = w._condition_mask(s_t.astype(np.int64), w._condition_tables())
+    check("a bin whose range reaches the condition is kept",
+          bool(keep[s_v == 119.0].all()) and not bool(keep[s_v == 118.0].any()),
+          f"lowest kept {s_v[keep].min() if keep.any() else None}")
+    w._minmax_by_pv[PVS[0]] = None
+    w._update_graph_data()
     st = w._pv_stats(PVS[0])
     check("PV table numbers obey the conditions",
           float(st["min"]) >= 120.0 and st["count"] == "20", str(st))

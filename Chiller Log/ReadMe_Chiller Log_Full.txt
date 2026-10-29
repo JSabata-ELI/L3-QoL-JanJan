@@ -2,7 +2,8 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05  (cpt.py, 3247 lines)
+Verified against source: 2026-10-15  (cpt.py, 3363 lines)
+  Program folder: 424 kB in 8 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_Chiller Log.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md

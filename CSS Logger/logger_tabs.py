@@ -41,41 +41,53 @@ AUTOSAVE_MS = 15_000
 BACKGROUND_FIRST_MS = 4_000
 BACKGROUND_NEXT_MS = 3_000
 
+# The setting tabs have the program tabs' shape (rounded top, closed bottom)
+# but are quieter: smaller, thin grey rim, pale fill — so they never read as
+# one of the big program tabs they share the row with. The text is bold and a
+# little larger, inside the same 26 px height. The width follows the name with
+# a small reserve: the negative right padding cuts Qt's 6 px gap before the
+# close button to 1 px; the button's 14 px hold the 12 px "×" plus 2 px off the
+# tab's edge. The left padding (15 px) equals that, so the name sits in the
+# tab's middle. The one on screen is light slate.
 _TAB_QSS = """
 QTabBar::tab {
-    background: #e4e4e4; color: #333;
-    padding: 3px 6px 3px 12px; border: 1px solid #c4c4c4;
-    border-bottom: none; border-radius: 3px 3px 0 0;
-    margin-right: 2px; min-width: 70px; font-size: 11px;
+    background: #f5f7f8; color: #37474f;
+    padding: 0px -5px 0px 15px; border: 1px solid #b0bec5;
+    border-radius: 0px; border-top-left-radius: 4px; border-top-right-radius: 4px;
+    margin: 0px 2px 2px 0px; min-width: 60px; height: 22px;
+    font-size: 13px; font-weight: bold;
 }
-QTabBar::tab:selected { background: #ffffff; color: #111; font-weight: 600; }
-QTabBar::tab:hover    { background: #d8e8ff; color: #111; }
+QTabBar::tab:selected { background: #cfd8dc; color: #263238; border-color: #78909c; }
+QTabBar::tab:hover:!selected { background: #e3e8eb; color: #263238; }
 """
 
+# Close "×" (dark on every tab — all of them are light).
 _BTN_QSS = """
 QToolButton { background: transparent; border: 1px solid transparent;
-              border-radius: 3px; padding: 0px; }
-QToolButton:hover   { background: #d0d8e4; border-color: #9aa6b6; }
-QToolButton:pressed { background: #b8c4d4; }
+              border-radius: 6px; padding: 0px; margin: 0px 2px 0px 0px; }
+QToolButton:hover   { background: #b0bec5; }
+QToolButton:pressed { background: #90a4ae; }
 """
 
 _PLUS_QSS = """
-QToolButton { background: #ffffff; border: 1px solid #9aa6b6;
-              border-radius: 3px; padding: 0px; margin: 1px 4px; }
-QToolButton:hover   { background: #d8e8ff; }
-QToolButton:pressed { background: #b8c4d4; }
+QToolButton { background: #ffffff; border: 1px solid #b0bec5;
+              border-radius: 0px; border-top-left-radius: 4px;
+              border-top-right-radius: 4px; padding: 0px; margin: 0px 2px 2px 2px; }
+QToolButton:hover   { background: #e3e8eb; }
+QToolButton:pressed { background: #cfd8dc; }
 """
 
 
-def _drawn_icon(kind: str, side: int = 14) -> QIcon:
-    """Dark ink '+' or '×', painted (not a font glyph), sharp on high-DPI screens.
-    The same pixmap is registered for every icon mode so no style can pale it."""
+def _drawn_icon(kind: str, side: int = 14, ink: str = "#2b2b2b") -> QIcon:
+    """'+' or '×' in `ink` (dark by default), painted (not a font glyph), sharp on
+    high-DPI screens. The same pixmap is registered for every icon mode so no
+    style can pale it."""
     scale = 3
     pm = QPixmap(side * scale, side * scale)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    pen = QPen(QColor("#2b2b2b"))
+    pen = QPen(QColor(ink))
     pen.setWidthF(2.0 * scale)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     p.setPen(pen)
@@ -108,6 +120,13 @@ class _Bar(QTabBar):
         super().changeEvent(ev)
         self.updateGeometry()
 
+    def minimumSizeHint(self):
+        # With scroll buttons on, the minimum is one tab + both arrows — wider
+        # than a lone short tab, which left a gap before the "+". Never ask for
+        # more than the tabs themselves need.
+        m = super().minimumSizeHint()
+        return QSize(min(m.width(), self.sizeHint().width()), m.height())
+
 
 class _TabArea(QWidget):
     """A tab bar with the "+" button right after the last tab, over a page stack.
@@ -124,7 +143,7 @@ class _TabArea(QWidget):
         self.corner = QWidget(self)                  # holds the "+" button
         self.chrome = QWidget(self)
         row = QHBoxLayout(self.chrome)
-        row.setContentsMargins(0, 2, 0, 0)
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
         row.addWidget(self._bar)
         row.addWidget(self.corner)
@@ -236,11 +255,11 @@ class LoggerTabs(QWidget):
         bar.setStyleSheet(_TAB_QSS)
         lay.addWidget(self._tabs)
 
-        self._close_icon = _drawn_icon("close", 12)
+        self._close_icon = _drawn_icon("close", 10)
         self._btn_new = QToolButton(self._tabs.corner)
-        self._btn_new.setIcon(_drawn_icon("plus", 14))
-        self._btn_new.setIconSize(QSize(14, 14))
-        self._btn_new.setFixedSize(30, 22)
+        self._btn_new.setIcon(_drawn_icon("plus", 12))
+        self._btn_new.setIconSize(QSize(12, 12))
+        self._btn_new.setFixedSize(28, 20)
         self._btn_new.setStyleSheet(_PLUS_QSS)
         self._btn_new.setToolTip("New setting tab — starts as a copy of the tab "
                                  "on screen; change its channels, conditions or "
@@ -252,6 +271,8 @@ class LoggerTabs(QWidget):
 
         bar.tabBarDoubleClicked.connect(self._start_rename)
         bar.tabMoved.connect(lambda *_: self.save())
+        bar.tabMoved.connect(lambda *_: self._sync_close_icons())
+        self._tabs.currentChanged.connect(lambda *_: self._sync_close_icons())
         self._tabs.currentChanged.connect(self._on_current_changed)
 
         saved = self._load()
@@ -323,10 +344,8 @@ class LoggerTabs(QWidget):
         idx = self._tabs.addTab(page, name)
         self._tabs.setTabToolTip(idx, "Double-click to rename")
         btn = QToolButton()
-        btn.setIcon(self._close_icon)
-        btn.setIconSize(QSize(12, 12))
-        btn.setFixedSize(18, 18)
-        btn.setStyleSheet(_BTN_QSS)
+        btn.setIconSize(QSize(10, 10))
+        btn.setFixedSize(14, 12)
         btn.setToolTip("Close this setting tab")
         btn.clicked.connect(lambda _=False, p=page: self._close_page(p))
         self._tabs.tabBar().setTabButton(idx, QTabBar.ButtonPosition.RightSide, btn)
@@ -342,7 +361,18 @@ class LoggerTabs(QWidget):
             b = bar.tabButton(i, QTabBar.ButtonPosition.RightSide)
             if b is not None:
                 b.setVisible(not only)
+        self._sync_close_icons()
         bar.updateGeometry()
+
+    def _sync_close_icons(self):
+        """The dark "×" on every tab (a tab moved or added gets it too)."""
+        bar = self._tabs.tabBar()
+        for i in range(bar.count()):
+            b = bar.tabButton(i, QTabBar.ButtonPosition.RightSide)
+            if b is None:
+                continue
+            b.setIcon(self._close_icon)
+            b.setStyleSheet(_BTN_QSS)
 
     def _build(self, page: "_TabPage | None", hidden: bool = False):
         """The page's CSSLoggerWidget, built on first need. One built for a tab

@@ -32,6 +32,11 @@ _app.setStyle("Fusion")
 def _panel():
     w = wk_t.WorkshopWidget()
     w.resize(1400, 900)
+    # On screen (real fonts), but never taking the keyboard focus.
+    w.setAttribute(wk_t.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+    w.setWindowFlags(wk_t.Qt.WindowType.Tool
+                     | wk_t.Qt.WindowType.WindowDoesNotAcceptFocus)
+    w.move(-3000, 0)
     w.show()
     _app.processEvents()
     return w
@@ -80,6 +85,22 @@ def test_it_never_narrows_again():
     _app.processEvents()
     w._fit_panel_width()
     assert w._panel_scroll.minimumWidth() == wide
+    w.close()
+
+
+def test_expand_and_collapse_all():
+    """The two buttons above the groups open and shut every group, the panel
+    widens for what was opened, and the state is remembered."""
+    w = _panel()
+    w._set_all_sections(True)
+    _app.processEvents()
+    assert all(s.body.isVisible() for s in w._sections.values())
+    assert w._panel_scroll.minimumWidth() >= w._panel.sizeHint().width()
+    assert all(w._ui_state.get(f"sec_{k}") is True for k in w._sections)
+    w._set_all_sections(False)
+    _app.processEvents()
+    assert not any(s.body.isVisible() for s in w._sections.values())
+    assert all(w._ui_state.get(f"sec_{k}") is False for k in w._sections)
     w.close()
 
 

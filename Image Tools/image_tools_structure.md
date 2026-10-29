@@ -124,7 +124,7 @@ has the half-by-half map; `if_t.py`'s module docstring is the design spec.
 | L373-390 | `_make_lut` / `_make_binary_lut` / `_make_stepped_lut` | LUTs |
 | L426/431 | `_app_dir` / `load_readme_text` | |
 | L536 | `_read_img_max_value` | the frame's PEAK in raw counts (`MaxValue` tEXt, by NAME) — empty-frame test only |
-| L550/563 | `_render_u8` / `_scale_note` | the tab's one render step (absolute or the Auto stretch, then gamma and the manual Contrast / Brightness pair — all of it in `img_scale.render_u8`) and the readout line under the preview, which names every one of them |
+| L550 | `_render_u8` | the tab's one render step (absolute or the Auto stretch, then gamma and the manual Contrast / Brightness pair — all of it in `img_scale.render_u8`). The readout line under the preview (`_scale_note`) was removed 12.10.2026 |
 | L581 | `_image_is_nonempty` | frame peak, contrast fallback |
 | L641/666 | `_style_calendar` / `_make_mpl_toolbar` | house calendar QSS; toolbar built so the dark palette does not tint the icons away |
 | L789 | `_make_multiselect_calendar` | multi-select calendar factory |
@@ -399,7 +399,7 @@ which are bound to this module itself.
 | `region_stats` / `_region_mask` / `line_profile` | measurement, always on pre-display data |
 | `_SLOT_UNDO_LIMIT` = 30, `_ZOOM_MIN/MAX` = 0.02/64, `_DRAG_DEAD_PX` = 6, `_PIXEL_VALUE_ZOOM` = 24 | |
 | `_BTN_QSS` / `_DANGER_QSS` / `_TOOLBTN_QSS` / `_CHECK_QSS`, `_btn`, `_small_label` | every colour stated explicitly (light app stylesheet, dark canvas) |
-| `_TOOL_STRIP`, `_SECTION_ACCENTS`, `COMPARE_MODES`, `_UI_STATE_PATH` | |
+| `_TOOL_STRIP`, `_SECTION_ACCENTS`, `_UI_STATE_PATH` | |
 
 ### Classes
 | Class | Members |
@@ -410,7 +410,7 @@ which are bound to this module itself.
 | `_FallbackSection` / `_section_cls` | stand-in for `is_t.CollapsibleSection` |
 | `_StatCell` / `_HistogramWidget` / `_PlotWidget` / `ProfileDialog` / `_TableDialog` / `_CurveDialog` / `_PlayDialog` | painted or plain-Qt by hand — no matplotlib, so no toolbar icon-tinting workaround needed. `_PlayDialog` uses a PreciseTimer: a default Qt timer at 33 ms fires at about 21 Hz on Windows |
 | `_WriteSignals` / `_WriteTask` | anything that writes files, off the GUI thread (Save all, animation) |
-| `WorkshopWidget(QWidget)` | `_build_tool_strip` + `_build_*_section` (images / display / measure / beam / filters / edit / combine / compare / save), `receive_image`, `open_files`, `_add_derived_slot`, `_duplicate_slot`, `_paste_clipboard`, `_show_in_slider`, `_activate_slot`, `_on_view_control` / `_apply_view_now` / `_sync_view_controls`, `_refresh_measure` / `_measure_table` / `_show_results` / `_show_histogram_numbers`, `_set_scale` / `_add_scale_bar`, `_show_profile`, `_beam_stats` / `_show_beam_report` / `_show_radial` / `_show_encircled` / `_mark_centroid`, `_editing_blocked`, `_apply_to_both` + `_filter_*`, `_rotate` / `_flip` / `_resize_dialog` / `_rotate_arbitrary` / `_straighten` / `_bin_dialog` / `_do_diff`, `_do_project` / `_do_merge`, `_update_compare`, `_render_for_save` / `_save` / `_save_data_tiff` / `_save_all` / `_save_animation` / `_play_images` / `_copy_clipboard`, `_save_session` / `_load_session`, `_canvas_menu`, `_after_change`, `_update_enabled` |
+| `WorkshopWidget(QWidget)` | `_build_tool_strip` + `_build_*_section` (images table / display / collage / measure / beam / filters / edit / combine / save), `receive_image`, `open_files`, `_add_derived_slot`, `_duplicate_slot`, `_paste_clipboard`, `_show_in_slider`, `_activate_slot`, `_on_view_control` / `_apply_view_now` / `_sync_view_controls`, `_refresh_measure` / `_measure_table` / `_show_results` / `_show_histogram_numbers`, `_set_scale` / `_add_scale_bar`, `_show_profile`, `_beam_stats` / `_show_beam_report` / `_show_radial` / `_show_encircled` / `_mark_centroid`, `_editing_blocked`, `_apply_to_both` + `_filter_*`, `_rotate` / `_flip` / `_resize_dialog` / `_rotate_arbitrary` / `_straighten` / `_bin_dialog` / `_do_diff`, `_do_project`, `_sync_collage_order` / `_on_img_table_changed`, `_update_compare`, `_render_for_save` / `_save` / `_save_data_tiff` / `_save_all` / `_save_animation` / `_play_images` / `_copy_clipboard`, `_save_session` / `_load_session`, `_canvas_menu`, `_after_change`, `_update_enabled` |
 
 ---
 
@@ -647,6 +647,38 @@ gap: it watches shots as they arrive. Scrubbing an archive day would raise a tri
 frame the slider landed on, dated by when the operator dragged past it, and would still
 not answer "was BR ever over X today" — only the frames looked at are ever read. That
 question needs a sweep of the day's archived samples, which is a different feature.
+
+## CHANGES 2026-10-26 (eight Image Slider fixes)
+
+- **Double-click = one camera into its own window.** `_solo_toggle_now` → `_pop_enter` /
+  `_pop_leave` / `_pop_rehome` (Viewer); the window is a `_FocusWindow` with `on_leave`
+  set (double-click inside, Esc, F11, Alt+F4 go back). `MultiCameraGrid._popped` keeps
+  those tiles out of `_rebuild_grid` (the rest go to an auto container). Geometry per
+  camera in slider_ui_state.json under `popped_windows`. `_SoloWindow` (full screen) is
+  gone. Test: testing/test_solo_camera.py.
+- **References kept for the session** by camera name: `_ref_keep`, `_ref_keep_put/_drop`,
+  `_reapply_kept_references_multi` (after `setup_cameras` in `_setup_multi_cam`),
+  `_reapply_kept_reference_single` (end of `_reset_ui_for_new_scan`). Never saved.
+- **Threshold click keeps the histogram column still:** `_cam_diff_stale` (old numbers
+  stand in, marked provisional) and `_cam_diff_shown` (a tile with no numbers keeps its
+  last block). Test: testing/test_refs_kept_and_diff_steady.py.
+- **Live → past → snap back:** `_merge_restored_history` defers while `_navigating()`
+  (`_backfill_pending`, `_retry_restored_history`); `_restore_cam_ts` reads the row
+  HANDLE; `_restore_redisplay_multicam` leaves slaves in `_user_moved_cams` alone.
+  Test cases [7] [8] in testing/test_live_leave_and_restore.py.
+- **Binary in live:** `_cam_live_side` → HQ_SIDE for cyclic palettes and for lifted-out
+  tiles; `_ni_rgb32_image` (one 65536-entry lookup) replaces `_rgb_to_qimage(_ni_*_rgb)`
+  in load_image_scaled (~200 → ~32 ms on 2560x2160). Test: testing/test_ni_rgb32_table.py.
+- **Long-run stutter:** main.install_gui_thread_gc has CPython's full-collection brake
+  and measures GUI stalls; the minute diag line gains `stall= gcMs= gcMax= gcFull=` and
+  no longer walks `gc.get_objects()`. Live caps trim in chunks (`ONLINE_TRIM_SLACK`).
+  `_TripBox._paint_row` writes only rows whose state changed.
+- **Grid Config dialog:** two `CollapsibleSection`s ("Grid layout", "Lines and labels"),
+  open state in `Pdxm1GridConfigDialog._section_open` (session only).
+
+**26.10.2026: camera faults no longer trip.** `_note_cam_fault_trip` returns at once while
+the module flag `CAM_FAULT_TRIPS` is False (user rule: trips = energy limits only). The red
+dot (`_live_health`) is unchanged.
 
 - **`PV_LIMITS` / `pv_limits_for` / `_coerce_limit`** (module level, next to `PV_LABELS`):
   PV name → `(low, high)`, either side `None`. New `pv_limits` key in

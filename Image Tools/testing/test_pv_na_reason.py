@@ -11,14 +11,13 @@ nějaký čas... musíme ale myslet do budoucnosti a počítat s tím, že někd
 i energie rychlostí 3,3hz"* — show the value that came with the frame, but be ready for
 the day the energies arrive as fast as the frames.
 
-So the widening is measured off the channel's OWN cadence and switches itself off when
-that cadence catches up with the camera. Both regimes are pinned here:
+REVISED 13.10.2026: the archiver writes a sample only when the value CHANGES, so a
+frame with nothing inside its window reads the last sample BEFORE it, as its own value
+with no dot (permanent orange/red dots otherwise — the user's report). Both regimes:
 
-  sparse (5 s)   → the nearest reading is shown, labelled "(-2.5 s)", greyed, with a
-                   tooltip naming the moment it came from.
-  dense (3.3 Hz) → no widening at all, even across a hole in the archive: a frame with
-                   no sample of its own reads "n/a", because at that rate anything
-                   outside the window is a NEIGHBOURING SHOT.
+  sparse (5 s)   → the last reading before the frame, plain, no offset.
+  dense (3.3 Hz) → still no widening; a frame in a hole reads the last value before
+                   the hole, plain.
 
   python testing/test_pv_na_reason.py
 """
@@ -83,22 +82,16 @@ def main() -> int:
     print(f"  row: {text!r} grey={grey}")
     for line in (tip or "(none)").splitlines():
         print(f"    {line}")
-    check("the nearest reading is shown, not n/a",
-          any(c.isdigit() for c in text) and not text.startswith(cpva.PV_TEXT_NOT_FOUND),
-          f"text={text!r}")
-    # 05.10.2026: the label is the orange dot; the offset is in the tooltip.
-    check("and it carries the other-shot dot", grey == m.PV_STATE_HELD, f"state={grey!r}")
-    check("…the tooltip says how far: 2.5 s", "2.5 s" in (tip or ""), f"tip={tip!r}")
-    check("dotted, so it cannot pass for this frame's own reading", bool(grey))
-    check("the tooltip names the moment it was read at", "Read at" in (tip or ""))
-    off = v._pv_sample_offset_s("PTM1")
-    check("the offset is signed and measured to the SAMPLE",
-          off is not None and abs(abs(off) - 2.5) < 0.05, f"{off}")
+    # 13.10.2026: the archiver writes only on CHANGE, so nothing written since the
+    # last sample means the value did not change — that sample IS this frame's value.
+    check("the last reading BEFORE the frame is shown, not n/a",
+          text.startswith("90.40"), f"text={text!r}")
+    check("as this frame's own value — no dot", not grey, f"state={grey!r}")
+    check("no offset is claimed", v._pv_sample_offset_s("PTM1") is None)
 
-    # The BURN-IN is a permanent record: it must carry the same label the screen did.
     burn = m.pv_text_for_ts(frame, ["PTM1"])
     print(f"  burn-in: {burn!r}")
-    check("the burned-in line carries the dot too", m.pv_bar_dot("held") in burn,
+    check("the burned-in line is plain too", m.pv_bar_plain(burn) == burn,
           f"burn={burn!r}")
     burn_on = m.pv_text_for_ts(published[41][0], ["PTM1"])
     check("and a frame with its own reading burns in plainly",
@@ -127,9 +120,10 @@ def main() -> int:
     print(f"  in the hole: {text3!r}")
     for line in (tip3 or "(none)").splitlines():
         print(f"    {line}")
-    check("a frame inside the hole has no value (grey dot), never a neighbouring shot",
-          text3 == "" and grey3 == m.PV_STATE_NONE, f"text={text3!r} state={grey3!r}")
-    check("and the tooltip says why", "nearest" in (tip3 or "").lower(), f"tip={tip3!r}")
+    want = [s for s in dense if s[0] <= hole_at + 1_500_000_000][-1][1]
+    check("a frame inside the hole reads the last value before it, no dot",
+          text3.startswith(f"{want:.3f}") and not grey3,
+          f"text={text3!r} want={want:.3f} state={grey3!r}")
 
     text4, _g4, _t4 = show_frame(app, v2, dense[1000][0])
     check("an ordinary 3.3 Hz frame still reads its own value plainly",

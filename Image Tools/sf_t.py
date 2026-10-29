@@ -575,6 +575,121 @@ def _ns_to_prague(t_ns: int) -> datetime:
     return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc).replace(tzinfo=None)
 
 
+# ── formulas as search columns ────────────────────────────────────────────────
+# A formula picked in the shared picker (e.g. "Compressed SBW4" = SBW4 × 0.749) is a
+# column of this tab like any other: it gets a row, it can be filtered on and it is
+# printed in the results. Its column key is its name. The PVs it is computed from are
+# read here behind the scenes — they do NOT need a row of their own, which is the
+# whole point: picking the recipe takes its source off the list on purpose.
+def _col_formula(col: str) -> "dict | None":
+    """The formula behind a column, or None for a column that is an archiver channel."""
+    try:
+        return _get_slider_module().pv_derived_def(col)
+    except Exception:
+        return None
+
+
+def _formula_leaves(name: str, _seen: "set | None" = None) -> "list[tuple[str, str]]":
+    """(registry name, archiver channel) of every PV a formula is computed from,
+    followed through chained formulas, in letter order and without repeats."""
+    sl = _get_slider_module()
+    d = sl.pv_derived_def(name)
+    if d is None:
+        ch = sl.pv_channel_for(name)
+        return [(name, ch)] if ch else []
+    seen = _seen if _seen is not None else set()
+    if name in seen:                     # a formula that refers to itself
+        return []
+    seen.add(name)
+    out: list = []
+    binds = d.get("bindings") or {}
+    for letter in sl.pv_expr_vars(d.get("expr") or ""):
+        src = binds.get(letter)
+        if not src:
+            continue
+        for leaf in _formula_leaves(src, seen):
+            if leaf not in out:
+                out.append(leaf)
+    return out
+
+
+def _col_read_channels(col: str) -> "list[str]":
+    """The archiver channels a column needs read: its own channel, or for a formula
+    the channels of everything it is computed from."""
+    if _col_formula(col) is None:
+        return [CPVA_CHANNEL_MAP.get(col, col)]
+    return [ch for _n, ch in _formula_leaves(col)]
+
+
+def _formula_signature(cols) -> tuple:
+    """What the formulas among `cols` compute — part of a run's identity, so an edited
+    expression is read again instead of reusing numbers worked out the old way."""
+    out = []
+    for c in cols:
+        d = _col_formula(c)
+        if d is not None:
+            out.append((c, str(d.get("expr") or ""),
+                        tuple(sorted((d.get("bindings") or {}).items()))))
+    return tuple(out)
+
+
+def _formula_rows_for_day(col: str, date_key: str, span_ns, log
+                          ) -> "tuple[list[dict], dict]":
+    """One day of a formula column, computed sample by sample.
+
+    The time base is the first PV the formula reads; every other source is paired with
+    its nearest sample within EXTRA_COL_MATCH_TOL_S, the same rule the extra columns of
+    the results use. A moment some source has no sample for gives no value rather than
+    a value made from another shot."""
+    sl = _get_slider_module()
+    leaves = _formula_leaves(col)
+    meta = {"source": "none", "status": "empty"}
+    if not leaves:
+        log(f"  formula {col}: reads no archiver PV — nothing to compute")
+        return [], meta
+    samples: dict = {}
+    for name, ch in leaves:
+        res = cpva.get_day(ch, date_key, timeout=CPVA_HTTP_TIMEOUT, span_ns=span_ns)
+        if res.status == "error":
+            log(f"  formula {col}: source {ch} FETCH FAILED — shown as ERR")
+            meta["status"] = "error"
+            return [], meta
+        if res.status == "stale":
+            meta["status"] = "stale"
+        pts = []
+        for t_ns, v in res.samples:
+            try:
+                pts.append((int(t_ns), float(v)))
+            except (TypeError, ValueError):
+                continue
+        samples[name] = pts
+    base_name = leaves[0][0]
+    others = [(n, [t for t, _v in samples[n]], samples[n])
+              for n, _ch in leaves[1:]]
+    tol_ns = int(EXTRA_COL_MATCH_TOL_S * 1_000_000_000)
+    rows: list = []
+    for t_ns, v in samples[base_name]:
+        raw = {base_name: v}
+        for n, ts, pts in others:
+            i = bisect.bisect_left(ts, t_ns)
+            best = None
+            for j in (i - 1, i):
+                if 0 <= j < len(pts) and abs(ts[j] - t_ns) <= tol_ns:
+                    if best is None or abs(ts[j] - t_ns) < abs(ts[best] - t_ns):
+                        best = j
+            raw[n] = pts[best][1] if best is not None else None
+        val, _st = sl.pv_eval_derived([col], raw, {}).get(col, (None, "missing"))
+        if val is not None:
+            rows.append({"_dt": _ns_to_prague(t_ns), "_ns": t_ns, col: str(val)})
+    if rows:
+        meta["source"] = "api"
+        if meta["status"] == "empty":
+            meta["status"] = "ok"
+    log(f"  formula {col}: {len(rows)} values from "
+        + ", ".join(ch for _n, ch in leaves))
+    return rows, meta
+
+
 def _load_api_for_day(day: date, cols: "list[str]",
                       log=None,
                       csv_root: "str | None" = None,
@@ -614,6 +729,10 @@ def _load_api_for_day(day: date, cols: "list[str]",
     col_meta: dict[str, dict] = {}
 
     def _fetch_one_col(col: str) -> "tuple[str, list[dict], dict]":
+        if _col_formula(col) is not None:
+            f_rows, f_meta = _formula_rows_for_day(
+                col, day.strftime("%Y-%m-%d"), span_ns, _log)
+            return col, f_rows, f_meta
         # Preset cols map to a friendly channel; arbitrary cols ARE the channel.
         channel = CPVA_CHANNEL_MAP.get(col, col)
         col_rows: list[dict] = []
@@ -738,9 +857,11 @@ def _lookup_col_value(per_col: "dict[str, list[dict]]", col_meta: "dict[str, dic
         if best is not None and best_diff <= tol_ns:
             return best.get(col, ""), "ok"
 
-    # No sample in window — slow PVs look back for the last known value.
+    # No sample in window — slow PVs look back for the last known value. A formula
+    # has no channel of its own to look back on.
     channel = CPVA_CHANNEL_MAP.get(col, col)
-    if cpva.is_step_channel(channel, int(target_ns), network_ok=allow_network):
+    if _col_formula(col) is None and cpva.is_step_channel(
+            channel, int(target_ns), network_ok=allow_network):
         res = cpva.value_at_or_before(channel, int(target_ns),
                                       timeout=CPVA_HTTP_TIMEOUT,
                                       network_ok=allow_network)
@@ -830,6 +951,78 @@ def _find_best_match(rows: list[dict], col: str, target: float) -> dict | None:
             best_diff = diff
             best = row
     return best
+
+
+# ── PV filter bands ───────────────────────────────────────────────────────────
+#
+# Each ticked PV filters with one of these. The search only ever asks "is the value
+# between lo and hi" (an open side is None); the reference point is what Δ is
+# measured from and what "closest" means: the target, the middle of a range, or
+# the one limit of above/below.
+PV_FILTER_MODES = ("tol", "pct", "range", "above", "below")
+PV_FILTER_MODE_LABELS = {
+    "tol":   "± value",
+    "pct":   "± %",
+    "range": "from – to",
+    "above": "above",
+    "below": "below",
+}
+PV_FILTER_MODE_TIPS = {
+    "tol":   "Target ± a value: matches target − value … target + value",
+    "pct":   "Target ± a percentage of the target",
+    "range": "From one value to another (both included)",
+    "above": "This value or more",
+    "below": "This value or less",
+}
+
+
+def _pv_filter_mode(cfg: dict) -> str:
+    """The cfg's band mode; a cfg saved before the modes existed is target ± value."""
+    m = cfg.get("mode", "tol")
+    return m if m in PV_FILTER_MODES else "tol"
+
+
+def _band_of(cfg: dict) -> "tuple[float | None, float | None, float]":
+    """(lo, hi, ref) of a PV filter in the cfg's own (UI) units."""
+    mode = _pv_filter_mode(cfg)
+    t = float(cfg.get("target", 0.0))
+    if mode == "pct":
+        w = abs(t) * float(cfg.get("pct", 0.0)) / 100.0
+        return t - w, t + w, t
+    if mode == "range":
+        a, b = float(cfg.get("lo", 0.0)), float(cfg.get("hi", 0.0))
+        if a > b:
+            a, b = b, a
+        return a, b, (a + b) / 2.0
+    if mode == "above":
+        lo = float(cfg.get("lo", 0.0))
+        return lo, None, lo
+    if mode == "below":
+        hi = float(cfg.get("hi", 0.0))
+        return None, hi, hi
+    tol = float(cfg.get("tol", 0.0))
+    return t - tol, t + tol, t
+
+
+def _in_band(v: float, lo, hi) -> bool:
+    return (lo is None or v >= lo) and (hi is None or v <= hi)
+
+
+def _band_text(cfg: dict, unit: str = "") -> str:
+    """The band as the operator reads it: "20 ± 2 J", "20 J ± 5 %", "18 … 22 J",
+    "≥ 20 J", "≤ 22 J"."""
+    mode = _pv_filter_mode(cfg)
+    u = f" {unit}" if unit else ""
+    if mode == "pct":
+        return f"{cfg.get('target', 0.0):g}{u} ± {cfg.get('pct', 0.0):g} %"
+    if mode == "range":
+        lo, hi, _ref = _band_of(cfg)
+        return f"{lo:g} … {hi:g}{u}"
+    if mode == "above":
+        return f"≥ {cfg.get('lo', 0.0):g}{u}"
+    if mode == "below":
+        return f"≤ {cfg.get('hi', 0.0):g}{u}"
+    return f"{cfg.get('target', 0.0):g} ± {cfg.get('tol', 0.0):g}{u}"
 
 
 def _folder_hour_from_prague(prague_hour: int, ref_date: date) -> int:
@@ -1516,7 +1709,22 @@ class _TrimSpinBox(QDoubleSpinBox):
     the part that gets dropped; the digits that decide the search are always shown.
 
     The wheel is ignored for the same reason _NoScrollComboBox exists: a scroll
-    over the panel must never silently retune the search."""
+    over the panel must never silently retune the search.
+
+    "0.8" and "0,8" both mean 0.8: whichever of the two the locale does not use
+    as its decimal point is turned into the one it does, as it is typed. Left to
+    Qt, the other mark is a thousands separator ("0,8" read as 8) or refused."""
+
+    def _decimal_text(self, text):
+        dp = str(self.locale().decimalPoint()) or "."
+        other = "," if dp == "." else "."
+        return text.replace(other, dp)
+
+    def validate(self, text, pos):
+        return super().validate(self._decimal_text(text), pos)
+
+    def valueFromText(self, text):
+        return super().valueFromText(self._decimal_text(text))
 
     def textFromValue(self, value):
         s = super().textFromValue(value)
@@ -1543,7 +1751,107 @@ _TABLE_QSS = (
     " border: 0px; border-right: 1px solid #dfe4ea;"
     " border-bottom: 1px solid #cfd6de; padding: 4px 6px; }"
     "QTableCornerButton::section { background: #eef1f5; border: 0px; }"
+    # The heading's empty stretch beyond the last column (there is one once a
+    # column has been dragged narrower) is painted by the header itself.
+    "QHeaderView { background: #eef1f5; }"
 )
+
+
+class _ResultsTable(QTableWidget):
+    """A Shot Finder table whose columns fit their text — until the operator
+    drags one.
+
+    By default every column is as wide as its contents, and the last one (Folder,
+    Frame time) also takes whatever width is left, or its own text's width when
+    that is more — then the table scrolls sideways instead of cutting a share
+    path. A column the operator drags keeps the width it was given, even when it
+    cuts its text (the cut text is elided in the middle); a double-click on its
+    edge in the heading gives it back to the automatic fit.
+
+    `measure_last=False` sizes the last column from the leftover width only: the
+    shot list's Frame time column is filled in row by row in the background, and
+    measuring it after every row is the cost its old Stretch mode existed to avoid."""
+
+    def __init__(self, rows: int, cols: int, parent=None, *,
+                 measure_last: bool = True):
+        super().__init__(rows, cols, parent)
+        self._measure_last = measure_last
+        self._user_sized: "set[int]" = set()
+        self._auto_resizing = False
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(0)
+        self._fit_timer.timeout.connect(self._fit_columns)
+        m = self.model()
+        m.rowsInserted.connect(self._fit_timer.start)
+        m.rowsRemoved.connect(self._fit_timer.start)
+        if measure_last:
+            # Without measure_last only the last column's text ever changes after
+            # the fill, and that column is not measured — re-measuring the others
+            # over every row on each background write would be pure cost.
+            m.dataChanged.connect(self._fit_timer.start)
+        # Other columns, other meaning: a width dragged for column 3 of the last
+        # search says nothing about column 3 of the next one.
+        m.columnsInserted.connect(self._forget_user_widths)
+        m.columnsRemoved.connect(self._forget_user_widths)
+        hh = self.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hh.sectionResized.connect(self._on_section_resized)
+        hh.sectionHandleDoubleClicked.connect(self._on_handle_double_clicked)
+
+    def _forget_user_widths(self, *_a) -> None:
+        self._user_sized.clear()
+        self.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive)
+        self._fit_timer.start()
+
+    def _on_section_resized(self, idx: int, _old: int, _new: int) -> None:
+        if self._auto_resizing:
+            return
+        # Only the operator's drag gets here: every width this class sets itself
+        # is set with _auto_resizing raised.
+        self._user_sized.add(idx)
+        if idx != self.columnCount() - 1:
+            self._fit_timer.start()          # the last column takes up the slack
+
+    def _on_handle_double_clicked(self, idx: int) -> None:
+        self._user_sized.discard(idx)
+        self._fit_timer.start()
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        try:
+            self._fit_columns()
+        except Exception:
+            pass
+
+    def _set_width(self, col: int, w: int) -> None:
+        if self.columnWidth(col) == w:
+            return
+        self._auto_resizing = True
+        try:
+            self.horizontalHeader().resizeSection(col, w)
+        finally:
+            self._auto_resizing = False
+
+    def _fit_columns(self) -> None:
+        last = self.columnCount() - 1
+        if last < 0:
+            return
+        hh = self.horizontalHeader()
+        for c in range(last):
+            if c not in self._user_sized and not self.isColumnHidden(c):
+                self._set_width(c, max(self.sizeHintForColumn(c),
+                                       hh.sectionSizeHint(c)))
+        if last in self._user_sized:
+            return
+        others = sum(self.columnWidth(c) for c in range(last)
+                     if not self.isColumnHidden(c))
+        free = self.viewport().width() - others
+        need = hh.sectionSizeHint(last)
+        if self._measure_last:
+            need = max(need, self.sizeHintForColumn(last))
+        self._set_width(last, max(need, free))
 
 # ── rendered frames kept in memory ───────────────────────────────────────────
 #
@@ -2173,7 +2481,8 @@ class ShotFinderWidget(QWidget):
             "Choose which PVs to search and show — the Image Slider's own picker,\n"
             "so a PV added or renamed in one tab is the same PV in the other.\n"
             "A PV with its eye open gets a row below; tick that row to search by it\n"
-            "(target ± tolerance), leave it unticked to only show its value.")
+            "(± value, ± %, from – to, above or below), leave it unticked to only\n"
+            "show its value.")
         self._btn_pv_cfg.clicked.connect(self._open_pv_config)
         ll.addWidget(self._btn_pv_cfg)
 
@@ -2183,24 +2492,6 @@ class ShotFinderWidget(QWidget):
         self._pv_container_layout.setContentsMargins(0, 0, 0, 0)
         self._pv_container_layout.setSpacing(2)
         ll.addWidget(self._pv_container)
-
-        # Hidden legacy spinboxes — kept so existing code that references them still works
-        self._target_sb = QDoubleSpinBox()
-        self._target_sb.setRange(-1e9, 1e9)
-        self._target_sb.setDecimals(3)
-        self._target_sb.setValue(10.0)
-        self._target_sb.setVisible(False)
-        self._unit_lbl = QLabel("J")
-        self._unit_lbl.setVisible(False)
-        self._pm_lbl = QLabel("±")
-        self._pm_lbl.setVisible(False)
-        self._tol_sb = QDoubleSpinBox()
-        self._tol_sb.setRange(0.0, 1e9)
-        self._tol_sb.setDecimals(3)
-        self._tol_sb.setValue(SBW4_WARNING_THRESHOLD_J)
-        self._tol_sb.setVisible(False)
-        self._tol_unit_lbl = QLabel("J")
-        self._tol_unit_lbl.setVisible(False)
 
         # ══════════════════ Group: CAMERAS ══════════════════════════════════
         # The search box + floating suggestion list that used to sit here are what
@@ -2548,7 +2839,9 @@ class ShotFinderWidget(QWidget):
         # camera this is, and closes it. No Open/Save buttons either: they exist once,
         # in the panel's Save & Send group, where the "Act on" selector says whether
         # they mean the day or the shot picked here.
-        self._day_table = QTableWidget(0, 1)
+        self._day_table = _ResultsTable(0, 1, measure_last=False)
+        self._day_table.setWordWrap(False)
+        self._day_table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self._day_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._day_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._day_table.setAlternatingRowColors(True)
@@ -3000,13 +3293,10 @@ class ShotFinderWidget(QWidget):
                 hi.setToolTip(tip)
         hh = tbl.horizontalHeader()
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for h_idx in range(len(headers)):
-            hh.setSectionResizeMode(h_idx, QHeaderView.ResizeMode.ResizeToContents)
-        # The frame time takes whatever width is left, so the column cannot end up
-        # behind a horizontal scrollbar. It is also the only column the background
-        # fill writes to, and Stretch means its width is never recomputed from the
-        # cells — a ResizeToContents column would be re-measured over every row.
-        hh.setSectionResizeMode(self._day_img_col, QHeaderView.ResizeMode.Stretch)
+        # Columns fit their contents and the frame time takes whatever width is
+        # left; a column the operator drags keeps its width (_ResultsTable, built
+        # with measure_last=False: the frame time is the column the background
+        # fill writes to, and it is never re-measured over every row).
 
         def _row_col_value(row, cc, row_ns):
             raw = row.get(cc, "")
@@ -3182,12 +3472,22 @@ class ShotFinderWidget(QWidget):
                             fontsize=8, color=colr)
             axis.tick_params(axis="y", labelsize=7, colors=colr)
 
-            # Target ± tolerance, in the same units
+            # The searched band, in the same units: dashed line at the target (or
+            # at the one limit of above/below), shaded band; an open side runs to
+            # the edge of the plot.
             tgt = _diff_ui_value(cc, crit.get("target_csv", 0.0))
-            tol = float(crit.get("tol_ui", 0.0) or 0.0)
+            lo_ui, hi_ui = crit.get("lo_ui"), crit.get("hi_ui")
+            if "lo_ui" not in crit:          # a result from before the modes
+                tol = float(crit.get("tol_ui", 0.0) or 0.0)
+                lo_ui, hi_ui = tgt - tol, tgt + tol
             axis.axhline(tgt, color=colr, lw=0.7, ls="--", alpha=0.7)
-            if tol > 0:
-                axis.axhspan(tgt - tol, tgt + tol, color=colr, alpha=0.10, lw=0)
+            y0, y1 = axis.get_ylim()
+            span_lo = y0 if lo_ui is None else lo_ui
+            span_hi = y1 if hi_ui is None else hi_ui
+            if span_hi > span_lo:
+                axis.axhspan(span_lo, span_hi, color=colr, alpha=0.10, lw=0)
+            if lo_ui is None or hi_ui is None:
+                axis.set_ylim(y0, y1)
 
             # The shots that made it into the list
             if k == 0 and self._day_plot_ns:
@@ -3666,20 +3966,31 @@ class ShotFinderWidget(QWidget):
                 pass
 
     def _make_results_table(self) -> QTableWidget:
-        table = QTableWidget(0, len(RES_HEADERS))
+        table = _ResultsTable(0, len(RES_HEADERS))
         table.setHorizontalHeaderLabels(RES_HEADERS)
         hh = table.horizontalHeader()
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for c in range(len(RES_HEADERS)):
-            hh.setSectionResizeMode(
-                c, QHeaderView.ResizeMode.Stretch if c == RES_COL_FOLDER
-                else QHeaderView.ResizeMode.ResizeToContents)
+        # Every column fits its contents; the Folder column (the last one) takes
+        # whatever width is left, or its path's width when that is more — then the
+        # table scrolls sideways. A column the operator drags keeps that width
+        # (_ResultsTable).
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # No word wrap: Qt breaks the path after the hyphen of "\\users-L3…" and
+        # a one-line row then showed only "\\users-". Two-line PV cells keep
+        # their lines — those are real line breaks, not wrapping.
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         hi = table.horizontalHeaderItem(RES_COL_IMG)
         if hi is not None:
             hi.setToolTip("✓ the frame of this row is on the share\n"
                           "✕ looked for, nothing within "
                           f"{IMG_MATCH_TOL_NS / 1e9:.0f} s of the shot\n"
                           "— not looked for yet (press Load images)")
+        hd = table.horizontalHeaderItem(RES_COL_DIFF)
+        if hd is not None:
+            hd.setToolTip("How far the value is from the target.\n"
+                          "from – to: from the middle of the range;\n"
+                          "above / below: from the limit.")
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
@@ -3965,7 +4276,12 @@ class ShotFinderWidget(QWidget):
         Preset labels ("SBW4 [J]") hide which beamline the channel belongs to —
         SBW4 is L3-SBW4-PM311:Energy, PTM1 is a HAPLS- name — so every place the
         user points at a PV must be able to show this name.  Arbitrary typed-in
-        channels are their own name."""
+        channels are their own name. A formula shows its expression and the channels
+        it is computed from."""
+        d = _col_formula(col)
+        if d is not None:
+            chans = ", ".join(_col_read_channels(col)) or "no PV"
+            return f"{d.get('expr') or ''}  (from {chans})"
         return CPVA_CHANNEL_MAP.get(col, col)
 
     # ── SEARCH PROGRESS ───────────────────────────────────────────────────────
@@ -4060,6 +4376,9 @@ class ShotFinderWidget(QWidget):
         # one into the shared picker. Still nothing rather than a guess when not.
         try:
             sl = _get_slider_module()
+            d = sl.pv_derived_def(col)
+            if d is not None:                 # a formula carries its own unit
+                return sl.unit_text(str(d.get("unit") or ""))
             # Shown, never edited here: `mm^2` reads as `mm²`.
             return sl.unit_text(sl.PV_CUSTOM_UNITS.get(self._name_for_col(col), ""))
         except Exception:
@@ -4116,12 +4435,9 @@ class ShotFinderWidget(QWidget):
         selected = list(dlg.selected_names())
         self._pv_registered = selected
         hidden_now = set(dlg.hidden_names()) & set(selected)
-        # A formula is computed, not archived. This tab reads channels straight out of
-        # the archiver (see the note on PV_COLUMNS), so a formula row would come back
-        # empty on every day — say so once rather than let it sit there reading "—".
-        dropped = [n for n in selected if sl.pv_is_derived(n)]
-        visible = [n for n in selected
-                   if n not in hidden_now and not sl.pv_is_derived(n)]
+        # A formula is a column like any other: the search reads the PVs it is
+        # computed from by itself (_formula_rows_for_day), so they need no row here.
+        visible = [n for n in selected if n not in hidden_now]
         # The band each PV was judged against survives the trip: matched back by the
         # column, so re-opening the picker to add one PV cannot retype the others.
         old = {c["col"]: c for c in self._pv_cfg}
@@ -4133,9 +4449,6 @@ class ShotFinderWidget(QWidget):
         self._pv_hidden = hidden_now
         self._rebuild_pv_rows()
         self._save_pv_state()
-        if dropped:
-            self._log("Formulas are not searchable here — "
-                      + ", ".join(dropped) + " left out of the list.")
         self._log(f"PV list: {len(self._pv_cfg)} shown"
                   + (f", {len(hidden_now)} hidden" if hidden_now else ""))
 
@@ -4280,13 +4593,22 @@ class ShotFinderWidget(QWidget):
             if not isinstance(e, dict):
                 continue
             col = str(e.get("col", "")).strip()
+            # SBW4 saved under its other archiver name is the SBW4 preset (one row).
+            col = self._col_for_name(sl.pv_fold_name(self._name_for_col(col))) if col else col
             if not col or any(c["col"] == col for c in self._pv_cfg):
                 continue
-            # Only these four keys are read back: a state file written by the version
-            # that had a per-PV "scale" must not resurrect it as a hidden factor.
+            # Only these keys are read back: a state file written by the version that
+            # had a per-PV "scale" must not resurrect it as a hidden factor. A file
+            # from before the band modes has no "mode" — it was target ± value.
+            target = _num(e, "target", 10.0)
+            tol = _num(e, "tol", 0.0)
             self._pv_cfg.append({"col":    col,
-                                 "target": _num(e, "target", 10.0),
-                                 "tol":    _num(e, "tol", 0.0),
+                                 "mode":   _pv_filter_mode(e),
+                                 "target": target,
+                                 "tol":    tol,
+                                 "pct":    _num(e, "pct", 5.0),
+                                 "lo":     _num(e, "lo", target - tol),
+                                 "hi":     _num(e, "hi", target + tol),
                                  "filter": bool(e.get("filter", True))})
 
         # A PV that is picked but has no row (its eye is shut in the picker). Kept
@@ -4304,6 +4626,8 @@ class ShotFinderWidget(QWidget):
         else:
             self._pv_registered = [self._name_for_col(c["col"])
                                    for c in self._pv_cfg]
+        self._pv_registered = sl.pv_fold_selection(self._pv_registered,
+                                                   self._pv_hidden)
 
     def _save_pv_state(self):
         # A remembered list is a convenience, never a must — _write_ui_state_file
@@ -4329,41 +4653,92 @@ class ShotFinderWidget(QWidget):
         """Copy live widget values back into _pv_cfg (the single source of truth)."""
         for r in getattr(self, "_pv_rows", []):
             cfg = r["cfg"]
+            cfg["mode"]   = r["mode_cb"].currentData() or "tol"
             cfg["target"] = r["target_sb"].value()
             cfg["tol"]    = r["tol_sb"].value()
+            cfg["pct"]    = r["pct_sb"].value()
+            cfg["lo"]     = r["lo_sb"].value()
+            cfg["hi"]     = r["hi_sb"].value()
             cfg["filter"] = r["chk"].isChecked()
 
-    # Text budget for the PV name inside one row, in px: with the target/tol
-    # spinboxes shown the name gets what is left of the 280 px panel; unticked
-    # rows hide them and the name may run wide. Longer names are elided in the
-    # middle — the full archiver name stays in the tooltip.
-    _PV_NAME_W_FILTER = 68
-    _PV_NAME_W_SHOW   = 186
+    # Text budget for the PV name on the first line of a row, in px. A ticked row
+    # shares that line with the mode box and the ✕; an unticked row has no mode box
+    # and the name may run wide. Longer names are elided in the middle — the full
+    # archiver name stays in the tooltip. Checked by testing/test_sf_pv_row.py.
+    _PV_NAME_W_FILTER = 128
+    _PV_NAME_W_SHOW   = 200
+    _PV_BOX_W         = 64       # every number box on the band line
+    _PV_MODE_W        = 74       # the mode box
+    _PV_BAND_INDENT   = 22       # band line starts under the name, not the tick
+
+    _PV_SMALL_LBL_QSS = "font-size: 10px; color: #16202c; background: transparent;"
+    _PV_MODE_QSS = (
+        "QComboBox { padding: 1px 4px; background: #ffffff; color: #16202c;"
+        " border: 1px solid #b8c0ca; border-radius: 3px; font-size: 10px; }"
+        "QComboBox QAbstractItemView { background: #ffffff; color: #16202c;"
+        " selection-background-color: #cfe0f7; selection-color: #10243c;"
+        " font-size: 11px; }")
+    _PV_WARN_QSS = ("QDoubleSpinBox { background: #fff3cd; color: #856404;"
+                    " font-weight: 700; }")
 
     def _rebuild_pv_rows(self):
-        """Rebuild one single-line row per entry in self._pv_cfg:
+        """Rebuild one row per entry in self._pv_cfg, on two lines:
 
-            [✓] PV NAME   T:<target> ±<tol> <unit>  ✕
+            [✓] PV NAME              [± value ▾]  ✕
+                target [20] ± [2] J
 
-        The tick marks a PV the search filters on; unticked hides the target/tol
-        spinboxes (the name then gets their space) and the PV is only reported in
-        the results table + image caption."""
+        The tick marks a PV the search filters on; the mode box picks how its band
+        is given (± value, ± %, from – to, above, below) and the second line shows
+        only that mode's boxes. Unticked hides the mode box and the second line —
+        the PV is then only reported in the results table + image caption."""
         from PySide6.QtGui import QFontMetrics
 
         while self._pv_container_layout.count():
             item = self._pv_container_layout.takeAt(0)
             w = item.widget()
             if w:
+                # Out of the layout but still a visible child until deleteLater
+                # runs — hidden, or its pieces show through the new rows.
+                w.hide()
                 w.deleteLater()
+
+        def _small(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(self._PV_SMALL_LBL_QSS)
+            return lbl
+
+        def _box(lo: float, hi: float, value: float, tip: str) -> _TrimSpinBox:
+            sb = _TrimSpinBox()
+            sb.setRange(lo, hi)
+            sb.setDecimals(3)
+            sb.setValue(value)
+            sb.setFixedWidth(self._PV_BOX_W)
+            sb.setToolTip(tip)
+            return sb
 
         self._pv_rows = []
         for cfg in self._pv_cfg:
             col = cfg["col"]
-            row_w = QWidget()
-            row_l = QHBoxLayout(row_w)
-            row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(2)
+            # A cfg made before the band modes (or by the picker) gets the rest of
+            # the band from what it has: target ± tol is also the range it covers.
+            cfg["mode"] = _pv_filter_mode(cfg)
+            t0 = float(cfg.get("target", 10.0))
+            tol0 = float(cfg.get("tol", 0.0))
+            cfg.setdefault("target", t0)
+            cfg.setdefault("tol", tol0)
+            cfg.setdefault("pct", 5.0)
+            cfg.setdefault("lo", t0 - tol0)
+            cfg.setdefault("hi", t0 + tol0)
 
+            row_w = QWidget()
+            row_v = QVBoxLayout(row_w)
+            row_v.setContentsMargins(0, 0, 0, 2)
+            row_v.setSpacing(1)
+
+            # ── line 1: tick + name, mode, ✕ ─────────────────────────────
+            top_l = QHBoxLayout()
+            top_l.setContentsMargins(0, 0, 0, 0)
+            top_l.setSpacing(2)
             chk = QCheckBox()
             chk.setStyleSheet(_CHECKBOX_STYLE_SM)
             chk.setChecked(bool(cfg["filter"]))
@@ -4381,13 +4756,12 @@ class ShotFinderWidget(QWidget):
                          if channel != full_label else "")
             row_tip = (
                 f"{full_label}{chan_line}\n"
-                "Ticked: search filters on this PV (target ± tolerance).\n"
+                "Ticked: search filters on this PV (pick how in the box on the right).\n"
                 "Unticked: value is only shown in the results and on the images.\n"
                 "Right-click: rename, copy channel name, remove.")
             chk.setToolTip(row_tip)
-            # The same tip on the whole row: the name is elided to ~68 px and the
-            # rest of the row is empty stretch, so pointing "at the PV" usually
-            # means pointing next to the tick box, where there was no tip at all.
+            # The same tip on the whole row: pointing "at the PV" often means
+            # pointing next to the tick box.
             row_w.setToolTip(row_tip)
             # The menu is hooked to the tick box as well as to the row: the box covers
             # most of the row, and a policy set on the parent alone never sees the
@@ -4396,74 +4770,151 @@ class ShotFinderWidget(QWidget):
                 _w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
                 _w.customContextMenuRequested.connect(
                     lambda pos, c=col: self._on_pv_row_menu(c, pos))
-            row_l.addWidget(chk)
-            row_l.addStretch(1)
+            top_l.addWidget(chk)
+            top_l.addStretch(1)
 
-            tgt_w = QWidget()
-            tgt_l = QHBoxLayout(tgt_w)
-            tgt_l.setContentsMargins(0, 0, 0, 0)
-            tgt_l.setSpacing(2)
-            t_lbl = QLabel("T:")
-            t_lbl.setStyleSheet("font-size: 10px;")
-            tgt_l.addWidget(t_lbl)
-            t_sb = _TrimSpinBox()
-            t_sb.setRange(-1e9, 1e9)
-            t_sb.setDecimals(3)
-            t_sb.setValue(cfg.get("target", 10.0))
-            t_sb.setFixedWidth(56)
-            t_sb.setToolTip(f"Target value for {full_label}\n{channel}")
-            tgt_l.addWidget(t_sb)
-            pm_lbl = QLabel("±")
-            pm_lbl.setStyleSheet("font-size: 10px;")
-            tgt_l.addWidget(pm_lbl)
-            tol_sb = _TrimSpinBox()
-            tol_sb.setRange(0.0, 1e9)
-            tol_sb.setDecimals(3)
-            tol_sb.setValue(cfg.get("tol", 0.0))
-            tol_sb.setFixedWidth(56)
-            tgt_l.addWidget(tol_sb)
-            # A tolerance as big as the target lets EVERY value through — that is
-            # never what someone means by "20 ± something", so the box says so
-            # instead of the search quietly returning the whole day.
-            def _mark_tol(*_a, _t=t_sb, _tol=tol_sb, _lbl=full_label, _ch=channel):
-                tip = f"Tolerance around the target for {_lbl}\n{_ch}"
-                if _tol.value() >= abs(_t.value()) and _tol.value() > 0:
-                    _tol.setStyleSheet(
-                        "QDoubleSpinBox { background: #fff3cd; color: #856404;"
-                        " font-weight: 700; }")
-                    _tol.setToolTip(
-                        tip + "\n⚠ This band is wider than the target itself — "
-                              "every archived value matches it.")
-                else:
-                    _tol.setStyleSheet("")
-                    _tol.setToolTip(tip)
-            t_sb.valueChanged.connect(_mark_tol)
-            tol_sb.valueChanged.connect(_mark_tol)
-            _mark_tol()
-            unit = self._col_unit(col)
-            if unit:
-                u_lbl = QLabel(unit)
-                u_lbl.setStyleSheet("font-size: 10px;")
-                tgt_l.addWidget(u_lbl)
-            row_l.addWidget(tgt_w)
-            row_l.addWidget(self._make_remove_btn(
+            mode_cb = _NoScrollComboBox()
+            for m in PV_FILTER_MODES:
+                mode_cb.addItem(PV_FILTER_MODE_LABELS[m], m)
+                mode_cb.setItemData(mode_cb.count() - 1, PV_FILTER_MODE_TIPS[m],
+                                    Qt.ItemDataRole.ToolTipRole)
+            mode_cb.setCurrentIndex(PV_FILTER_MODES.index(cfg["mode"]))
+            mode_cb.setFixedWidth(self._PV_MODE_W)
+            mode_cb.setStyleSheet(self._PV_MODE_QSS)
+            mode_cb.setToolTip(f"How the search filters on {full_label}")
+            top_l.addWidget(mode_cb)
+            top_l.addWidget(self._make_remove_btn(
                 lambda _=False, c=col: self._remove_pv_col(c)))
+            row_v.addLayout(top_l)
 
-            def _apply_filter_state(checked, _cfg=cfg, _tw=tgt_w, _chk=chk,
-                                    _fm=fm, _txt=short_label):
+            # ── line 2: the boxes of the chosen mode ─────────────────────
+            band_w = QWidget()
+            band_l = QHBoxLayout(band_w)
+            band_l.setContentsMargins(self._PV_BAND_INDENT, 0, 0, 0)
+            band_l.setSpacing(3)
+            unit = self._col_unit(col)
+            t_sb = _box(-1e9, 1e9, cfg["target"],
+                        f"Target value for {full_label}\n{channel}")
+            tol_sb = _box(0.0, 1e9, cfg["tol"],
+                          f"Tolerance around the target for {full_label}\n{channel}")
+            pct_sb = _box(0.0, 1e6, cfg["pct"],
+                          f"Tolerance as % of the target for {full_label}\n{channel}")
+            lo_sb = _box(-1e9, 1e9, cfg["lo"],
+                         f"Lowest value that matches, for {full_label}\n{channel}")
+            hi_sb = _box(-1e9, 1e9, cfg["hi"],
+                         f"Highest value that matches, for {full_label}\n{channel}")
+            l_target = _small("target")
+            l_pm = _small("±")
+            l_dash = _small("–")
+            l_ge = _small("≥")
+            l_le = _small("≤")
+            l_pct = _small("%")
+            # The unit never pushes the boxes off the panel: capped and elided,
+            # the full unit in its tooltip.
+            l_unit = _small("")
+            if unit:
+                l_unit.setText(QFontMetrics(l_unit.font()).elidedText(
+                    unit, Qt.TextElideMode.ElideRight, 34))
+                l_unit.setToolTip(unit)
+            l_unit.setMaximumWidth(38)
+            for wdg in (l_target, t_sb, l_pm, l_ge, lo_sb, l_dash, l_le, hi_sb,
+                        tol_sb, pct_sb, l_pct, l_unit):
+                band_l.addWidget(wdg)
+            band_l.addStretch(1)
+            row_v.addWidget(band_w)
+
+            # Which widgets each mode shows. The line above is laid out so that
+            # every mode's own subset reads left to right in the right order.
+            shown = {
+                "tol":   (l_target, t_sb, l_pm, tol_sb, l_unit),
+                "pct":   (l_target, t_sb, l_pm, pct_sb, l_pct),
+                "range": (lo_sb, l_dash, hi_sb, l_unit),
+                "above": (l_ge, lo_sb, l_unit),
+                "below": (l_le, hi_sb, l_unit),
+            }
+            all_band = (l_target, t_sb, l_pm, l_ge, lo_sb, l_dash, l_le, hi_sb,
+                        tol_sb, pct_sb, l_pct, l_unit)
+
+            # A band that lets everything through, or none of it, is never what was
+            # meant — the box says so instead of the search quietly returning the
+            # whole day (a ±2000 J band once did).
+            def _mark(*_a, _cfg=cfg, _t=t_sb, _tol=tol_sb, _pct=pct_sb,
+                      _lo=lo_sb, _hi=hi_sb, _cb=mode_cb):
+                mode = _cb.currentData()
+                warn: "dict[object, str]" = {}
+                if mode == "tol" and _tol.value() > 0 \
+                        and _tol.value() >= abs(_t.value()):
+                    warn[_tol] = ("⚠ This band is wider than the target itself — "
+                                  "every archived value matches it.")
+                if mode == "pct" and _pct.value() >= 100:
+                    warn[_pct] = ("⚠ 100 % or more of the target — the band "
+                                  "reaches zero and lets almost everything through.")
+                if mode == "range" and _lo.value() > _hi.value():
+                    msg = "⚠ From is above To — the two are swapped for the search."
+                    warn[_lo] = msg
+                    warn[_hi] = msg
+                for sb in (_tol, _pct, _lo, _hi):
+                    base_tip = sb.toolTip().split("\n⚠")[0]
+                    if sb in warn:
+                        sb.setStyleSheet(self._PV_WARN_QSS)
+                        sb.setToolTip(base_tip + "\n" + warn[sb])
+                    else:
+                        sb.setStyleSheet("")
+                        sb.setToolTip(base_tip)
+
+            def _apply_mode(_idx=None, _cfg=cfg, _cb=mode_cb, _shown=shown,
+                            _all=all_band, _t=t_sb, _tol=tol_sb, _lo=lo_sb,
+                            _hi=hi_sb, _bw=band_w, _chk=chk, _u=l_unit,
+                            _has_unit=bool(unit)):
+                old = _cfg.get("mode", "tol")
+                mode = _cb.currentData() or "tol"
+                # Switching keeps the same band where it can: ± value → from – to
+                # starts at target − tol … target + tol, and back.
+                if old != mode and _idx is not None:
+                    if old in ("tol", "pct") and mode in ("range", "above", "below"):
+                        lo, hi, _ref = _band_of(dict(_cfg, target=_t.value(),
+                                                     tol=_tol.value()))
+                        _lo.setValue(lo)
+                        _hi.setValue(hi)
+                    elif old == "range" and mode in ("tol", "pct"):
+                        a, b = sorted((_lo.value(), _hi.value()))
+                        _t.setValue((a + b) / 2.0)
+                        _tol.setValue((b - a) / 2.0)
+                _cfg["mode"] = mode
+                _bw.setUpdatesEnabled(False)
+                for wdg in _all:
+                    wdg.setVisible(False)
+                for wdg in _shown[mode]:
+                    if wdg is _u and not _has_unit:
+                        continue
+                    wdg.setVisible(True)
+                _bw.setUpdatesEnabled(True)
+                _bw.setVisible(_chk.isChecked())
+                _mark()
+
+            mode_cb.currentIndexChanged.connect(_apply_mode)
+            for sb in (t_sb, tol_sb, pct_sb, lo_sb, hi_sb):
+                sb.valueChanged.connect(_mark)
+
+            def _apply_filter_state(checked, _cfg=cfg, _bw=band_w, _cb=mode_cb,
+                                    _chk=chk, _fm=fm, _txt=short_label):
                 _cfg["filter"] = bool(checked)
-                _tw.setVisible(bool(checked))
+                _bw.setVisible(bool(checked))
+                _cb.setVisible(bool(checked))
                 budget = (self._PV_NAME_W_FILTER if checked
                           else self._PV_NAME_W_SHOW)
                 _chk.setText(_fm.elidedText(
                     _txt, Qt.TextElideMode.ElideMiddle, budget))
 
             chk.toggled.connect(_apply_filter_state)
+            _apply_mode()
             _apply_filter_state(chk.isChecked())
 
             self._pv_container_layout.addWidget(row_w)
             self._pv_rows.append({"cfg": cfg, "col": col, "chk": chk,
-                                  "target_sb": t_sb, "tol_sb": tol_sb})
+                                  "mode_cb": mode_cb, "target_sb": t_sb,
+                                  "tol_sb": tol_sb, "pct_sb": pct_sb,
+                                  "lo_sb": lo_sb, "hi_sb": hi_sb})
 
     def _filter_cols(self) -> "list[str]":
         """PVs the search filters on (ticked), in pick order."""
@@ -4476,9 +4927,10 @@ class ShotFinderWidget(QWidget):
         return [c["col"] for c in self._pv_cfg if not c["filter"]]
 
     def _get_criteria(self) -> "list[dict]":
-        """Current filter criteria as [{col, target, tol}, …]."""
+        """Current filter criteria as [{col, mode, target, tol, pct, lo, hi}, …]."""
         self._sync_pv_cfg_from_rows()
-        return [{"col": c["col"], "target": c["target"], "tol": c["tol"]}
+        keys = ("col", "mode", "target", "tol", "pct", "lo", "hi")
+        return [{k: c[k] for k in keys if k in c}
                 for c in self._pv_cfg if c["filter"]]
 
     def _update_date_info(self):
@@ -5434,7 +5886,8 @@ class ShotFinderWidget(QWidget):
         return (
             tuple(sorted((d.toordinal(), s, e) for d, (s, e) in day_wins.items())),
             tuple(search_cols), tuple(extra_cols),
-            tuple((c["col"], c["target_csv"], c["tol_csv"]) for c in criteria_csv),
+            tuple((c["col"], c.get("mode", "tol"), c["target_csv"],
+                   c.get("lo_csv"), c.get("hi_csv")) for c in criteria_csv),
         )
 
     def _start_search(self, want_images: bool = True):
@@ -5466,8 +5919,7 @@ class ShotFinderWidget(QWidget):
         # Kept for the results heading: the band the rows below it were judged
         # against, so a surprising result can be checked against it on the spot.
         self._searched_bands = [
-            f"{self._col_short(c['col'])} {c['target']:g} ± {c['tol']:g}"
-            + (f" {self._col_unit(c['col'])}" if self._col_unit(c["col"]) else "")
+            f"{self._col_short(c['col'])} {_band_text(c, self._col_unit(c['col']))}"
             for c in criteria]
 
         search_cols = [c["col"] for c in criteria]
@@ -5480,14 +5932,23 @@ class ShotFinderWidget(QWidget):
         def _to_csv_units(c_col, c_val):
             return c_val / 1000.0 if c_col in MJ_COLUMNS else c_val
 
+        # The band is worked out in the units the operator typed (a % of 20 mJ is a
+        # % of 20 mJ), then each end is converted. "target" is the band's reference
+        # point — what Δ is measured from and what "closest" means.
         criteria_csv = []
         for crit in criteria:
+            c_col = crit["col"]
+            lo_ui, hi_ui, ref_ui = _band_of(crit)
             criteria_csv.append({
-                "col":        crit["col"],
-                "target_csv": _to_csv_units(crit["col"], crit["target"]),
-                "tol_csv":    _to_csv_units(crit["col"], crit["tol"]),
-                "target_ui":  crit["target"],
-                "tol_ui":     crit["tol"],
+                "col":        c_col,
+                "mode":       _pv_filter_mode(crit),
+                "target_csv": _to_csv_units(c_col, ref_ui),
+                "lo_csv":     None if lo_ui is None else _to_csv_units(c_col, lo_ui),
+                "hi_csv":     None if hi_ui is None else _to_csv_units(c_col, hi_ui),
+                "target_ui":  ref_ui,
+                "lo_ui":      lo_ui,
+                "hi_ui":      hi_ui,
+                "band_text":  _band_text(crit, self._col_unit(c_col)),
             })
 
         # Every camera in the list is searched, each into its own results tab. The list
@@ -5500,7 +5961,8 @@ class ShotFinderWidget(QWidget):
         # What this run is reading. The cameras are NOT in it: the numbers do not
         # depend on which camera the picture comes from, so picking other cameras
         # after Load data still gets the fast path.
-        run_key = self._run_key(day_wins, search_cols, extra_cols, criteria_csv)
+        run_key = (self._run_key(day_wins, search_cols, extra_cols, criteria_csv)
+                   + (_formula_signature(list(search_cols) + list(extra_cols)),))
         # Day by day: a day the archiver could not answer last time is not in the
         # payload, and is read again rather than failing twice for the same reason.
         reuse = (want_images and run_key == self._pv_run_key
@@ -5613,7 +6075,12 @@ class ShotFinderWidget(QWidget):
 
         def worker():
             all_cols = list(all_cols_pre)
-            _chans = [CPVA_CHANNEL_MAP.get(c, c) for c in all_cols]
+            # A formula column warms the channels it is computed from.
+            _chans = []
+            for _c in all_cols:
+                for _ch in _col_read_channels(_c):
+                    if _ch not in _chans:
+                        _chans.append(_ch)
             _day_of = {d.strftime("%Y-%m-%d"): d for d in days}
             _warm_done = [0]
             _warm_total = len(_chans) * len(days)
@@ -5861,7 +6328,8 @@ class ShotFinderWidget(QWidget):
                         primary_crit = criteria_csv[0]
                         day_col      = primary_crit["col"]
                         target_csv   = primary_crit["target_csv"]
-                        day_tol_csv  = primary_crit["tol_csv"]
+                        day_lo_csv   = primary_crit["lo_csv"]
+                        day_hi_csv   = primary_crit["hi_csv"]
 
                         # Rows in tolerance: primary col within tol, AND all other
                         # criteria match. Values go through _quantize_col first — the
@@ -5874,15 +6342,13 @@ class ShotFinderWidget(QWidget):
                                 v_primary = _quantize_col(day_col, float(raw_primary))
                             except Exception:
                                 continue
-                            if abs(v_primary - target_csv) > day_tol_csv:
+                            if not _in_band(v_primary, day_lo_csv, day_hi_csv):
                                 continue
                             # Check all secondary criteria using per-col closest-timestamp lookup
                             ok = True
                             row_ns = row.get("_ns", 0)
                             for sec in criteria_csv[1:]:
                                 sec_col     = sec["col"]
-                                sec_t_csv   = sec["target_csv"]
-                                sec_tol_csv = sec["tol_csv"]
                                 # Try the merged row first
                                 raw_sec = row.get(sec_col, "")
                                 if not raw_sec:
@@ -5897,7 +6363,7 @@ class ShotFinderWidget(QWidget):
                                 except Exception:
                                     ok = False
                                     break
-                                if abs(v_sec - sec_t_csv) > sec_tol_csv:
+                                if not _in_band(v_sec, sec["lo_csv"], sec["hi_csv"]):
                                     ok = False
                                     break
                             if ok:
@@ -6095,8 +6561,8 @@ class ShotFinderWidget(QWidget):
                     reason or "Looked for, no frame found")
         if status == "skipped":
             return (IMG_MARK_NOT_TRIED, QColor("#856404"),
-                    "No shot fell inside the tolerance on this day, so no frame "
-                    "was looked for.\nWiden the tolerance to search this day.")
+                    "No shot fell inside the band on this day, so no frame "
+                    "was looked for.\nWiden the band to search this day.")
         return (IMG_MARK_NOT_TRIED, QColor("#555555"),
                 "Not looked for yet — press Load images")
 
@@ -6210,7 +6676,7 @@ class ShotFinderWidget(QWidget):
         criteria_csv_res = result.get("criteria_csv", [])
         if not criteria_csv_res:
             criteria_csv_res = [{"col": col, "target_csv": result["target_csv"],
-                                 "tol_ui": self._tol_sb.value()}]
+                                 "lo_csv": None, "hi_csv": None}]
 
         display_vals = result.get("display_vals", {})
 
@@ -6233,6 +6699,18 @@ class ShotFinderWidget(QWidget):
             d = abs(v - target_csv)
             return _diff_ui_value(cc, d), _format_diff(cc, d)
 
+        def _off_band(cc, crit) -> bool:
+            """The best shot's value lies outside this PV's searched band."""
+            raw, _state = _val_at(cc)
+            try:
+                v = _quantize_col(cc, float(raw))
+            except (ValueError, TypeError):
+                return False
+            if "lo_csv" in crit:
+                return not _in_band(v, crit["lo_csv"], crit["hi_csv"])
+            return (_diff_ui_value(cc, abs(v - crit["target_csv"]))
+                    > crit.get("tol_ui", 0.0))
+
         # PV / Δ columns keep one line per search PV; the Value cell is a single
         # combined line with EVERY searched PV (+ also-show extras).
         pv_lines, val_parts, diff_lines, off_pvs = [], [], [], []
@@ -6248,7 +6726,7 @@ class ShotFinderWidget(QWidget):
             val_parts.append(f"{short}: {_format_value_state(cc, raw_cc, state_cc)}")
             dval, dstr = _diff_ui(cc, crit["target_csv"])
             diff_lines.append(f"{short}: {dstr}")
-            if dval is not None and dval > crit.get("tol_ui", 0.0):
+            if dval is not None and _off_band(cc, crit):
                 off_pvs.append(f"{short} off {dstr}")
 
         # 'Also show' PVs appended to the Value cell
@@ -6333,9 +6811,11 @@ class ShotFinderWidget(QWidget):
             t_ui = crit.get("target_ui")
             if t_ui is None:
                 t_ui = crit.get("target_csv", 0.0)
+            band = crit.get("band_text") or (
+                f"{t_ui:g} ± {crit.get('tol_ui', 0.0):g}"
+                + (f" {unit}" if unit else ""))
             band_tips.append(
-                f"{self._col_short(cc)}: {t_ui:g} ± {crit.get('tol_ui', 0.0):g}"
-                + (f" {unit}" if unit else "")
+                f"{self._col_short(cc)}: {band}"
                 + f"  ({self._col_channel(cc)})")
         band_tip = "Searched band:\n" + "\n".join(band_tips)
 
@@ -6453,7 +6933,7 @@ class ShotFinderWidget(QWidget):
             return
         if not dr.rows_in_tol:
             QMessageBox.information(self, "Nothing in range",
-                                    f"No values within tolerance for {dr.day}.")
+                                    f"No values within the band for {dr.day}.")
             return
         self._show_day_panel(dr)
 
@@ -6912,52 +7392,90 @@ class ShotFinderWidget(QWidget):
 def install_wheel_guard(app):
     """A value must never change just because the pointer crossed its control.
 
-    Number fields, drop-downs and setting sliders answer the mouse wheel only
-    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
-    the notch goes to the panel behind them instead, so a settings panel still
-    scrolls when the pointer happens to pass over a field on the way down. A
-    control that is meant to take the wheel at any time carries the "wheelAlways"
-    property.
+    Number boxes, drop-downs and sliders answer the wheel only after they were
+    CLICKED (or reached with Tab), and only while the pointer is over them --
+    Qt delivers a wheel notch to the control under the pointer, so a selected
+    field elsewhere on the page is never touched. Moving the pointer away keeps
+    the field selected (the keyboard still edits it); the wheel works on it
+    again when the pointer comes back. Selecting another control ends it. An
+    unselected field passes the notch to the panel behind it, so a settings
+    panel still scrolls when the pointer happens to pass over a field. The
+    focus a freshly opened window HANDS its first field does not count.
 
-    Scroll bars are left out: they are sliders too, and the wheel is how a pane
-    gets scrolled.
+    A control meant to take the wheel at any time carries the "wheelAlways"
+    property -- the frame sliders set it, because stepping through shots with
+    the wheel is the whole point of them. Scroll bars are left out: they are
+    sliders too, and the wheel is how a pane gets scrolled.
 
-    One app-wide filter, so a dialog built much later is covered as well. It is
-    spelled out in every entry point rather than imported once: each tab also
-    runs on its own, and a sibling module would have to survive the frozen build
-    (the same reason `_import_img_scale` is copied into each tab).
+    One app-wide filter, installed once, so a dialog built much later is
+    covered as well. It is spelled out in every entry point rather than
+    imported once: each tab also runs on its own, and a sibling module would
+    have to survive the frozen build (the same reason `_import_img_scale` is
+    copied into each tab). The copies in main.py, is_t.py, if_t.py and sf_t.py
+    are identical (testing/test_wheel_guard.py checks it).
     """
+    from PySide6.QtCore import QEvent, QObject, Qt
     from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
-                                   QAbstractSpinBox, QScrollBar)
+                                   QAbstractSpinBox, QApplication, QComboBox,
+                                   QScrollBar)
+
+    app = app or QApplication.instance()
+    if app is None or getattr(app, "_wheel_guard", None) is not None:
+        return
 
     class _WheelGuard(QObject):
         _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
-        # Focus the user asked for. The focus a freshly opened window HANDS to its
-        # first field (ActiveWindow / Other) does not count, or the top field of a
-        # panel would answer the wheel before it had ever been touched.
         _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
                    Qt.FocusReason.BacktabFocusReason,
                    Qt.FocusReason.ShortcutFocusReason)
-        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
-                  Qt.FocusReason.OtherFocusReason)
+        # Focus that leaves only for a moment and comes back to the same field:
+        # another window was activated, or the drop-down's own list opened.
+        _KEEP = (Qt.FocusReason.ActiveWindowFocusReason,
+                 Qt.FocusReason.PopupFocusReason)
 
         def eventFilter(self, obj, ev):
+            """EVERY event in the program passes through here, so it may not
+            raise -- ever. An exception escaping a Python override on the whole
+            application leaves PySide6 in an error state and the process dies
+            later with an access violation (measured 2026-09-17), and `obj` can
+            be a widget Qt is tearing down. A stray scroll is the cheaper loss.
+            """
+            try:
+                return self._filter(obj, ev)
+            except Exception:
+                return False
+
+        def _filter(self, obj, ev):
             t = ev.type()
             if t == QEvent.Type.Polish and isinstance(obj, self._GUARDED):
-                # Spin boxes and drop-downs come with Qt's WheelFocus: the wheel
-                # notch ITSELF hands them the focus, with the same "mouse" reason
-                # a click gives, before this filter sees the notch -- so every
-                # field the pointer crossed counted as clicked and took the
-                # value change. Without WheelFocus only a click or Tab focuses.
+                # Spin boxes and drop-downs come with WheelFocus: Qt hands them
+                # the focus, as a MOUSE focus, the moment a wheel notch lands on
+                # them -- before the notch itself is delivered. That made every
+                # untouched field "clicked" just in time to take the notch.
+                # StrongFocus still takes a click or Tab, never the wheel.
                 if obj.focusPolicy() == Qt.FocusPolicy.WheelFocus:
                     obj.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 return False
+            if t in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+                # A click is what selects the field -- also the field that
+                # already HAD the focus (the first one of a window is handed
+                # it), where no FocusIn follows the click. The press lands on
+                # the spin box's own text line, so look one or two levels up.
+                w = obj
+                for _ in range(3):
+                    if isinstance(w, self._GUARDED):
+                        w.setProperty("wheelReady", True)
+                        break
+                    w = w.parentWidget() if hasattr(w, "parentWidget") else None
+                    if w is None:
+                        break
+                return False
             if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
-                # Popup and menu reasons are left as they are: closing a drop-down
-                # hands the focus back, which must not undo the click that opened it.
                 if ev.reason() in self._EARNED:
                     obj.setProperty("wheelReady", True)
-                elif ev.reason() in self._GIVEN:
+                return False
+            if t == QEvent.Type.FocusOut and isinstance(obj, self._GUARDED):
+                if ev.reason() not in self._KEEP:
                     obj.setProperty("wheelReady", False)
                 return False
             if t != QEvent.Type.Wheel:
@@ -6974,7 +7492,9 @@ def install_wheel_guard(app):
                 QApplication.sendEvent(pane.viewport(), ev)
             return True
 
-    app.installEventFilter(_WheelGuard(app))
+    guard = _WheelGuard(app)
+    app.installEventFilter(guard)
+    app._wheel_guard = guard
 
 
 # ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────

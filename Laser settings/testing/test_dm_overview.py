@@ -39,12 +39,22 @@ def check(what, got, want):
 
 
 class Energy:
-    """An SBW4 reading as the engine hands it over."""
+    """An SBW4 reading as the engine hands it over. `before` is the samples
+    ahead of the newest one, as (stamp, J)."""
 
-    def __init__(self, value, stamp):
+    def __init__(self, value, stamp, before=()):
         self.value = value
         self.error = None
         self.newest_ns = stamp
+        self.recent_ns = tuple(t for t, _v in before) + (stamp,)
+        self.recent_v = tuple(v for _t, v in before) + (value,)
+
+
+def stream(value, last_s, n, gap_s=0.8):
+    """An SBW4 reading ending in `n` samples of `value` J, `gap_s` apart,
+    the newest at `last_s` (seconds; stamps in ns)."""
+    stamps = [int((last_s - gap_s * (n - 1 - i)) * 1e9) for i in range(n)]
+    return Energy(value, stamps[-1], [(t, value) for t in stamps[:-1]])
 
 
 def test_the_rule():
@@ -84,6 +94,18 @@ def test_the_rule():
     for what, power, energy, shutter, want in cases:
         check(what, C.dm_judge(power, energy, "x", shutter)[0], want)
 
+    print("the shutter open within 2 min of a high power shot is still HP")
+    cases = [
+        ("High, shutter open, HP 30 s ago", high, None, True, 30.0,
+         C.STATE_OK),
+        ("Low, shutter open, HP 30 s ago", low, None, True, 30.0,
+         C.STATE_OK),
+        ("High, shutter open, a low stream, HP 30 s ago", high, (0.02, 1.0),
+         True, 30.0, C.STATE_BAD),
+    ]
+    for what, power, energy, shutter, age, want in cases:
+        check(what, C.dm_judge(power, energy, "x", shutter, age)[0], want)
+
     print("the SAST1 shutter's state: 1 = open")
     reading = Energy(1.0, 1)
     check("1 is open", C.shutter_open({C.DM_SHUTTER_CHANNEL: reading},
@@ -108,10 +130,48 @@ def test_the_rule():
     watch.update(readings, last_ok, 1000.0, 50.0)
     check("the sample there at start-up is not fresh",
           watch.fresh_energy(50.0), None)
-    readings[SBW4] = Energy(0.02, 2)
+    readings[SBW4] = Energy(0.4, 2)
     watch.update(readings, last_ok, 1000.0, 60.0)
-    check("a new one is", watch.fresh_energy(62.0), (0.02, 2.0))
+    check("a new one is", watch.fresh_energy(62.0), (0.4, 2.0))
     check("and 15 s later it is not", watch.fresh_energy(75.0), None)
+
+    print("a trigger in a high power sequence is not low power (15.10.2026)")
+    watch = C.FiringWatch()
+    readings[SBW4] = Energy(0.3, 10 * 10**9)
+    watch.update(readings, last_ok, 1000.0, 100.0)          # history
+    readings[SBW4] = Energy(0.3, 15 * 10**9)
+    watch.update(readings, last_ok, 1000.0, 105.0)
+    readings[SBW4] = Energy(0.02, 17 * 10**9, [(15 * 10**9, 0.3)])
+    watch.update(readings, last_ok, 1000.0, 107.0)
+    check("still the HP shot", watch.fresh_energy(107.0), (0.3, 2.0))
+    check("the hall is still being shot into",
+          watch.update(readings, last_ok, 1000.0, 108.0)[0], True)
+    check("a lone trigger 20 s on is no fresh energy at all",
+          watch.fresh_energy(125.0), None)
+    check("but a high power sequence for 2 min", watch.high_age(125.0), 20.0)
+    check("and then not", watch.high_age(226.0), None)
+    print("a trigger and an HP shot in the same pass: the HP shot counts")
+    readings[SBW4] = Energy(0.02, 22 * 10**9, [(17 * 10**9, 0.02),
+                                              (20 * 10**9, 0.3)])
+    watch.update(readings, last_ok, 1000.0, 230.0)
+    check("HP", watch.fresh_energy(230.0), (0.3, 0.0))
+
+    print("a stream of low shots is low power")
+    watch = C.FiringWatch()
+    readings[SBW4] = Energy(0.02, 1)
+    watch.update(readings, last_ok, 1000.0, 300.0)          # history
+    readings[SBW4] = stream(0.02, 100.0, 4)
+    watch.update(readings, last_ok, 1000.0, 301.0)
+    check("four in 10 s: not yet", watch.fresh_energy(301.0), None)
+    readings[SBW4] = stream(0.02, 101.0, 6)
+    watch.update(readings, last_ok, 1000.0, 302.0)
+    check("six: low power", watch.fresh_energy(302.0), (0.02, 0.0))
+    readings[SBW4] = stream(0.02, 100.0, 5, gap_s=5.0)
+    watch2 = C.FiringWatch()
+    watch2.update({SBW4: Energy(0.02, 1)}, last_ok, 1000.0, 300.0)
+    watch2.update(readings, last_ok, 1000.0, 301.0)
+    check("five 5 s apart (HP pace): a trigger each, not low power",
+          watch2.fresh_energy(301.0), None)
 
 
 def test_the_overview():
@@ -186,9 +246,17 @@ def test_the_overview():
         check("High power, tick", row(), ("High power", C.STATE_OK))
         check("nothing blinks", blinking(), [])
 
-        print("a fresh 0.02 J shot on High power: cross, the hall blinks")
+        print("a lone 0.02 J trigger on High power: a tick, nothing blinks")
         clock[0] += 5
         shot(0.02, 2)
+        ov.refresh()
+        check("tick", row(), ("High power", C.STATE_OK))
+        check("nothing blinks", blinking(), [])
+
+        print("a stream of 0.02 J shots on High power: cross, the hall "
+              "blinks")
+        clock[0] += 5
+        readings[SBW4] = stream(0.02, 10.0, 8)
         ov.refresh()
         check("cross", row(), ("High power", C.STATE_BAD))
         check("Int blinks, though the laser is not firing", blinking(),
@@ -215,7 +283,7 @@ def test_the_overview():
         print("Low power and a fresh 0.3 J shot: cross")
         mirror(low)
         clock[0] += 1
-        shot(0.3, 3)
+        shot(0.3, 20 * 10**9)
         ov.refresh()
         check("cross", row(), ("Low power", C.STATE_BAD))
         check("Int blinks", blinking(), ["Int"])

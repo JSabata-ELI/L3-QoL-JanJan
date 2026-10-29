@@ -11,6 +11,9 @@ goes to a temporary folder on C: unless CPVA_CACHE_DIR is set — never the
 shared one. Run it twice with the same CPVA_CACHE_DIR to time a cached load.
 
 Run:  python testing/bench_long_load.py [days=90] [preset=Operation]
+      BENCH_REPEAT=1 loads the same period again a minute later (a reload);
+      with BENCH_FRESH=1 that second load starts from an empty memory, as
+      after a restart (only the cache folder helps).
 """
 import os
 import pathlib
@@ -65,8 +68,10 @@ def _partial(self, *a, **k):
         edge = getattr(self, "_loading_from_ns", None)
         edge_s = (datetime.fromtimestamp(edge / 1e9).strftime("%d.%m %H:%M")
                   if edge else "-")
+        frac = a[4] if len(a) > 4 else None
         print(f"{time.monotonic() - t0[0]:7.1f}s partial #{shots[0]} "
-              f"took {time.monotonic() - s:.2f}s, read back to {edge_s}", flush=True)
+              f"took {time.monotonic() - s:.2f}s, read back to {edge_s}, "
+              f"{frac if frac is None else f'{frac:.0%}'} read", flush=True)
         if os.environ.get("BENCH_DETAIL"):
             for pv, smp in self._samples_by_pv.items():
                 first = (datetime.fromtimestamp(smp[0][0] / 1e9).strftime("%d.%m %H:%M")
@@ -154,8 +159,23 @@ def check():
     w._plot_graph()
     print(f"         a redraw with nothing else running: {time.monotonic() - s:.2f}s",
           flush=True)
+    # BENCH_REPEAT=1: the same period once more, a minute later, in the same
+    # program — what a reload costs (the open day is then mostly in memory).
+    if os.environ.get("BENCH_REPEAT") and not repeated[0]:
+        repeated[0] = True
+        if os.environ.get("BENCH_FRESH"):
+            # A restart: nothing in memory, only what the cache folder holds.
+            M._DAY_CACHE = None
+            print("--- the same load again, after a restart", flush=True)
+        else:
+            print("--- the same load again, in the same program", flush=True)
+        QTimer.singleShot(60000, go)
+        return
     # Let the cache writer finish before the process ends.
     QTimer.singleShot(3000, app.quit)
+
+
+repeated = [False]
 
 
 QTimer.singleShot(1500, go)

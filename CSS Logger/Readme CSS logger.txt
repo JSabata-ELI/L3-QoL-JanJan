@@ -78,7 +78,7 @@ LOADING DATA (the left-hand side)
                     the selected PV names; Ctrl+V adds the names on the
                     clipboard (one per line, or separated by commas).
   + Add PV          find values to add. Type words; they must all
-                    appear in the name, in the order you typed them.
+                    appear in the name, in any order.
   Custom PV         a new signal computed from the loaded ones with a
                     formula.
   Remove            drops the selected values; the one below moves up
@@ -94,7 +94,7 @@ LOADING DATA (the left-hand side)
 
   Above INFO are the controls for the graph and the data, in groups:
   DATA FILTER (Conditions, Limit crossings), GRAPH (Reference lines,
-  Graph settings, View ▾, Clean graph, font size, Avg to) and SELECTION
+  Graph settings, View ▾, Clean graph, font size, Detail) and SELECTION
   (Clear selection). They are described under "In the graph".
 
   There is no "Load data" button. Adding or removing a value, choosing
@@ -136,15 +136,18 @@ LOADING DATA (the left-hand side)
   end at "now", so those keep Live running. The Live button always
   overrides either way.
 
-  Master PV and "Keep multiples of" thin the rows down where the
-  archive recorded far more often than you need.
+  RAMP / WAVEPLATE: the Waveplate PV marks the steps of a ramp. "Keep
+  steps every" (1000 to start with, empty = every row) keeps only the
+  rows where the waveplate stands on a whole step — graph, table, XY,
+  statistics and export alike, applied at once.
 
-  "Skip zero-energy shots at same waveplate" (under Master PV, on to
-  start with): a shot whose energy (the channel named under it, SBW4
-  to start with) is below the limit while the waveplate — the Master
-  PV — has not moved since the shot before is a trigger shot or a
-  dropout, and is left out of the selection statistics. Untick it to
-  count those shots too. Both channels must be in the PV list.
+  "Leave dead shots out of statistics" (on to start with): a shot
+  whose energy (the channel named under it, SBW4 to start with) is
+  below the limit while the waveplate has not moved since the shot
+  before is a trigger shot or a dropout, and is left out of the
+  selection statistics only. Untick it to count those shots too. Both
+  channels must be in the PV list. Presets and setting tabs remember
+  all of it.
 
 
 THE TABS
@@ -152,11 +155,12 @@ THE TABS
   Graph          all the values in one plot, each with its own
                  horizontal band and its own vertical axis on the
                  left, in the style of the control-room displays.
-  XY Plot        one value against another, as a scatter. The two are
-                 rarely recorded at the very same instant, so each
-                 one's last known value is held until the other
-                 reports; a value that has gone stale stops counting.
-                 The colour says how far through the period a point
+  XY Plot        one value against another, as a scatter. A point is
+                 one shot in which both values were recorded; a value
+                 from an earlier shot is never used. Over a period
+                 longer than one hour the points are 1-minute archive
+                 averages, and the line under the plot warns about it —
+                 load one hour or less to see every shot. The colour says how far through the period a point
                  is, running from dark blue to red. In Live mode the
                  cloud grows on its own, and Conditions thin it out
                  straight away — the same rows the Table and the Graph
@@ -167,8 +171,9 @@ THE TABS
                  showing how the shots were spread, read straight
                  from the archive for the days you pick. It redraws by
                  itself when you change the value, the days, the mode
-                 or a condition. Conditions work as in the Conditions
-                 window (below); a row that is off and empty switches
+                 or a condition. Its own "Conditions" button opens its
+                 own condition rows in a window, working as in the
+                 Conditions window (below); a row that is off and empty switches
                  on once you type a number into it. "Apply conditions"
                  switches them all off and on; "Copy from Graph
                  conditions" brings over the Conditions window's rows.
@@ -202,6 +207,18 @@ IN THE GRAPH
                    The numbers count the real recorded shots, however
                    much the curve is thinned for the screen, so the
                    count does not wander as the graph refreshes.
+                   When the period was loaded thinned (Detail above 0,
+                   longer than an hour), every archived sample of the
+                   selection is read first — the cards show "…" until
+                   then — so the numbers are always exact.
+                   The title gives the start and end, the length
+                   (1 h 30 min 12 s) and the number of shots. A shot is
+                   a moment when most of the signals running at the
+                   shot rate wrote a value; hold the mouse over the
+                   title to see the rate and which signals decide.
+                   A signal's own N can be lower than the shot count:
+                   that is the shots it did not record. A custom PV has
+                   one value per shot.
                    An edge let go a few pixels from the first shot
                    after a pause (or the last one before it) lands
                    exactly on that shot. Start and End above the
@@ -292,6 +309,14 @@ IN THE GRAPH
                     an empty screen is never mistaken for lost data.
                     They hold in Live mode too, and for the band and
                     the Min / Max in the list under the graph.
+                    Over a long period a point stands for a stretch of
+                    shots: it is kept when any part of the stretch
+                    (lowest to highest) passes, so a day with a few
+                    good shots is not lost. Zoom in to see the shots
+                    judged one by one.
+                    A condition whose value was never recorded in the
+                    period cannot judge it: it is left out, and the
+                    graph says "Not applied (no data in this period)".
   Apply conditions  tick box under Conditions: off shows every shot
                     (trigger shots, everything outside the limits),
                     on filters again. The condition rows are kept.

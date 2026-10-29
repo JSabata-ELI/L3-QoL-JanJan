@@ -1,7 +1,7 @@
 """Command-language parsing for the PV Monitor Webex bot.
 
 Deliberately Qt-free and network-free, so the whole grammar can be unit-tested
-on its own (``test_bot_commands.py``) without starting the app.
+on its own (``testing/test_bot_commands.py``) without starting the app.
 
 Grammar
 -------
@@ -92,23 +92,12 @@ def split_query(text: str) -> list[str]:
     return [t for t in re.split(r"[\s,;*]+", (text or "").strip().lower()) if t]
 
 
-def tokens_in_order(hay: str, tokens: list[str]) -> bool:
-    """True when every token occurs in `hay` in the order typed."""
-    pos = 0
-    for t in tokens:
-        i = hay.find(t, pos)
-        if i < 0:
-            return False
-        pos = i + len(t)
-    return True
-
-
 def rank_pv_match(display_name: str, name: str, q) -> Optional[int]:
     """Sort weight of one PV against query `q` (lower = better), or None when it
     does not match at all. `q` may be raw text or a token list.
 
-    Tokens found in the typed order rank above the same tokens scrambled, so a
-    wrong guess at the order never hides a PV.
+    The order of the words does not matter: "vrt3 plfe" gives exactly what
+    "plfe vrt3" gives, in the same ranking.
     """
     tokens = q if isinstance(q, (list, tuple)) else split_query(q)
     if not tokens:
@@ -133,11 +122,7 @@ def rank_pv_match(display_name: str, name: str, q) -> Optional[int]:
         worst = max(worst, s)
         total += s
     # Weakest token decides the tier; the sum only breaks ties.
-    score = worst * 10 + min(total, 9)
-    if len(tokens) > 1 and not (tokens_in_order(d, tokens)
-                                or tokens_in_order(k, tokens)):
-        score += 5
-    return score
+    return worst * 10 + min(total, 9)
 
 
 def search_pvs(pvs, q) -> list:
@@ -806,6 +791,551 @@ def parse_plot_options(options: list[str], now_ns: int,
 
 
 # ---------------------------------------------------------------------------
+# Notification control — how long, which channel, when to keep quiet
+#
+# Everything the bot can mute is parsed here, Qt-free, so the schedule logic
+# that decides whether a message goes out at 3 a.m. is tested on its own. The
+# alert levels are plain ints (0 OK, 1 WARNING, 2 ALARM — alerting.AlertLevel
+# is an IntEnum with those values), so nothing here imports the alert engine.
+# ---------------------------------------------------------------------------
+
+LEVEL_OK, LEVEL_WARNING, LEVEL_ALARM = 0, 1, 2
+
+# The alert channels, in the order every listing uses.
+CHANNELS = ("webex", "email", "teams")
+_CHANNEL_WORDS = {
+    "webex": "webex", "wx": "webex", "chat": "webex",
+    "email": "email", "e-mail": "email", "mail": "email", "emails": "email",
+    "teams": "teams", "msteams": "teams",
+}
+
+# Monday = 0, as datetime.weekday() counts.
+DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DAY_WORDS = {
+    "mon": 0, "monday": 0, "po": 0, "pondeli": 0, "pondělí": 0,
+    "tue": 1, "tuesday": 1, "ut": 1, "út": 1, "utery": 1, "úterý": 1,
+    "wed": 2, "wednesday": 2, "st": 2, "streda": 2, "středa": 2,
+    "thu": 3, "thursday": 3, "ct": 3, "čt": 3, "ctvrtek": 3, "čtvrtek": 3,
+    "fri": 4, "friday": 4, "pa": 4, "pá": 4, "patek": 4, "pátek": 4,
+    "sat": 5, "saturday": 5, "so": 5, "sobota": 5,
+    "sun": 6, "sunday": 6, "ne": 6, "nedele": 6, "neděle": 6,
+}
+_DAY_GROUPS = {
+    "daily": list(range(7)), "every day": list(range(7)),
+    "everyday": list(range(7)), "all days": list(range(7)),
+    "weekdays": list(range(5)), "workdays": list(range(5)),
+    "weekday": list(range(5)), "weekend": [5, 6], "weekends": [5, 6],
+}
+
+# What a quiet rule holds back. "warnings" is the useful middle: a night
+# without warnings and reminders, but an alarm still wakes somebody.
+HOLD_KINDS = ("all", "warnings", "reminders")
+_HOLD_WORDS = {
+    "all": "all", "everything": "all", "vse": "all", "vše": "all",
+    "warnings": "warnings", "warning": "warnings", "warn": "warnings",
+    "reminders": "reminders", "reminder": "reminders", "repeats": "reminders",
+}
+HOLD_TEXT = {
+    "all": "nothing goes out",
+    "warnings": "warnings and reminders held, alarms pass",
+    "reminders": "only reminders held",
+}
+
+_DUR_RE = re.compile(
+    r"^(\d+(?:[.,]\d+)?)\s*(h|hod|hours?|m|min|mins?|minutes?|d|days?)$", re.I)
+_HHMM_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?$")
+
+
+def parse_channel(word: str) -> str:
+    """'mail' → 'email'; '' when the word is not a channel."""
+    return _CHANNEL_WORDS.get((word or "").strip().lower(), "")
+
+
+def parse_channels(text: str) -> list:
+    """'email, webex' / 'all' → channel names in CHANNELS order. Raises."""
+    words = [w for w in re.split(r"[\s,+&]+|\band\b", (text or "").lower())
+             if w]
+    if not words:
+        raise CommandError("Say which channel: `webex`, `email`, `teams` or "
+                           "`all`.")
+    if words == ["all"]:
+        return list(CHANNELS)
+    got = set()
+    for w in words:
+        ch = parse_channel(w)
+        if not ch:
+            raise CommandError(f"`{w}` is not a channel — `webex`, `email`, "
+                               f"`teams` or `all`.")
+        got.add(ch)
+    return [c for c in CHANNELS if c in got]
+
+
+def parse_days(text: str) -> Optional[list]:
+    """'mon-fri' / 'sat,sun' / 'weekend' / 'daily' → sorted weekday numbers.
+    None when the text is not a day list at all (so it can be tried as
+    something else); CommandError when it plainly is one but is wrong."""
+    t = " ".join((text or "").lower().split())
+    if not t:
+        return None
+    if t in _DAY_GROUPS:
+        return list(_DAY_GROUPS[t])
+    days = set()
+    for part in re.split(r"\s*[,\s]\s*", t):
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if a in _DAY_WORDS and b in _DAY_WORDS:
+                i, j = _DAY_WORDS[a], _DAY_WORDS[b]
+                k = i
+                while True:            # "fri-mon" runs over the weekend
+                    days.add(k)
+                    if k == j:
+                        break
+                    k = (k + 1) % 7
+                continue
+            return None
+        if part in _DAY_WORDS:
+            days.add(_DAY_WORDS[part])
+            continue
+        if part in _DAY_GROUPS:
+            days.update(_DAY_GROUPS[part])
+            continue
+        return None
+    return sorted(days) if days else None
+
+
+def days_text(days) -> str:
+    """[0..4] → 'mon-fri'; [5, 6] → 'sat-sun'; every day → 'daily'."""
+    ds = sorted(set(days or []))
+    if len(ds) == 7:
+        return "daily"
+    if not ds:
+        return "never"
+    runs, start, prev = [], ds[0], ds[0]
+    for d in ds[1:] + [None]:
+        if d is not None and d == prev + 1:
+            prev = d
+            continue
+        runs.append(DAY_NAMES[start] if start == prev
+                    else f"{DAY_NAMES[start]}-{DAY_NAMES[prev]}")
+        if d is not None:
+            start = prev = d
+    return ",".join(runs)
+
+
+def parse_clock(token: str) -> Optional[tuple]:
+    """'22', '22:00', '6:30' → (h, m); None if it is not a time of day."""
+    m = _HHMM_RE.match((token or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2) or 0)
+    if h > 24 or mi > 59 or (h == 24 and mi):
+        return None
+    return (h, mi)
+
+
+def clock_text(hm) -> str:
+    return f"{hm[0]:02d}:{hm[1]:02d}"
+
+
+def parse_duration_s(text: str) -> Optional[float]:
+    """'2h', '30m', '1,5 h', '2d' → seconds; None if it is not a length."""
+    m = _DUR_RE.match(" ".join((text or "").split()))
+    if not m:
+        return None
+    n = float(m.group(1).replace(",", "."))
+    unit = m.group(2).lower()[0]
+    return n * {"h": 3600.0, "m": 60.0, "d": 86400.0}[unit]
+
+
+def fmt_minutes(minutes: float) -> str:
+    """90 → '1 h 30 min'; 45 → '45 min'; 2880 → '2 d'."""
+    m = int(round(minutes))
+    if m % 1440 == 0 and m >= 1440:
+        return f"{m // 1440} d"
+    if m >= 60:
+        h, r = divmod(m, 60)
+        return f"{h} h" + (f" {r} min" if r else "")
+    return f"{m} min"
+
+
+FOREVER = "forever"
+_FOREVER_WORDS = {"forever", "indefinitely", "always", "navzdy", "navždy",
+                  "until on", "until further notice"}
+
+
+def parse_until(spec: str, now_ns: int, tz=TZ_DEFAULT):
+    """How long a mute lasts → the end as ns, or FOREVER.
+
+    Accepted: `2h`, `30m`, `1.5h`, `2d`; `until 8:00` / `8:00` (the next
+    time the clock shows it); `until tomorrow 8:00`; `until 21.10. 8:00`;
+    `forever`. Raises CommandError worded for the chat.
+    """
+    s = " ".join((spec or "").lower().split())
+    if not s:
+        raise CommandError("Say for how long: `2h`, `30m`, `until 8:00`, "
+                           "`until tomorrow 8:00` or `forever`.")
+    if s in _FOREVER_WORDS:
+        return FOREVER
+    secs = parse_duration_s(s)
+    if secs is not None:
+        if secs <= 0:
+            raise CommandError("The time has to be longer than zero.")
+        if secs > 366 * 86400:
+            raise CommandError("That is more than a year — use `forever` and "
+                               "switch it back on by hand.")
+        return now_ns + int(secs * NS)
+    now = datetime.fromtimestamp(now_ns / NS, tz=tz)
+    words = s.split()
+    if words and words[0] in ("until", "till", "to", "do"):
+        words = words[1:]
+    day = None
+    if words and words[0] in ("tomorrow", "zitra", "zítra"):
+        day, words = (now + timedelta(days=1)).date(), words[1:]
+    elif words and words[0] in ("today", "dnes"):
+        day, words = now.date(), words[1:]
+    elif words:
+        d = _CZ_DATE_RE.match(words[0]) or _ISO_DATE_RE.match(words[0])
+        if d:
+            day = _parse_date(words[0], now)
+            if day is not None and day < now.date():
+                # A bare "21.10." meant as an end is in the future, not last
+                # year — _parse_date leans the other way for /plot windows.
+                try:
+                    day = day.replace(year=day.year + 1)
+                except ValueError:
+                    day = day.replace(year=day.year + 1, day=28)
+            words = words[1:]
+    hm = parse_clock(words[0]) if len(words) == 1 else None
+    if words and hm is None:
+        raise CommandError(f"I don't understand `{spec}` as a length or an "
+                           f"end time — try `2h`, `until 8:00` or `forever`.")
+    if hm is None:
+        hm = (8, 0) if day is not None else None     # "until tomorrow" = 8:00
+    if hm is None:
+        raise CommandError(f"I don't understand `{spec}`.")
+    base = day or now.date()
+    end = datetime.combine(base, dtime(0, 0), tzinfo=tz) + timedelta(
+        hours=hm[0], minutes=hm[1])
+    if day is None and end <= now:
+        end += timedelta(days=1)          # "until 8:00" typed at 22:00
+    if end <= now:
+        raise CommandError(f"`{spec}` is already over.")
+    return int(end.timestamp() * NS)
+
+
+def until_text(end, now_ns: int, tz=TZ_DEFAULT) -> str:
+    """The end of a mute, said the short way: 'until 08:00', 'until Tue
+    21.10. 08:00', 'until switched back on'."""
+    if end in (None, FOREVER):
+        return "until switched back on"
+    e = datetime.fromtimestamp(int(end) / NS, tz=tz)
+    n = datetime.fromtimestamp(now_ns / NS, tz=tz)
+    if e.date() == n.date():
+        return f"until {e:%H:%M}"
+    if e.date() == (n + timedelta(days=1)).date():
+        return f"until tomorrow {e:%H:%M}"
+    return f"until {DAY_NAMES[e.weekday()].capitalize()} {e.day}.{e.month}. " \
+           f"{e:%H:%M}"
+
+
+def mute_live(end, now_ns: int) -> bool:
+    """True while a mute stored as ns / FOREVER is still in force."""
+    if end in (None, "", 0):
+        return False
+    if end == FOREVER:
+        return True
+    try:
+        return int(end) > now_ns
+    except (TypeError, ValueError):
+        return False
+
+
+# --- quiet rules ------------------------------------------------------------
+#
+# A rule is a plain dict, because it lives in the settings JSON:
+#   {"label": "Night", "on": True, "channels": ["email"],
+#    "days": [0, 1, 2, 3, 4], "start": "22:00", "end": "06:00",
+#    "duration_min": None, "hold": "warnings"}
+# `end` and `duration_min` are alternatives: a window to a clock time, or one
+# of a set length. A window that runs past midnight belongs to the day it
+# STARTS on — "fri 22:00-06:00" covers the small hours of Saturday.
+
+def parse_quiet_rule(segments: list) -> dict:
+    """The `;` segments after `/quiet add` → a rule dict. Raises CommandError.
+
+    Order does not matter; each segment is recognised by its shape:
+      channels   `email`, `webex, teams`, `all`
+      days       `mon-fri`, `sat,sun`, `weekend`, `daily`  (default: daily)
+      window     `22:00-06:00`, `22-6`, `all day`, or a start `18:00` plus a
+                 length `3h` in another segment
+      hold       `all`, `warnings`, `reminders`             (default: all)
+      label      `label Night` / `name Night`
+    """
+    rule = {"label": "", "on": True, "channels": [], "days": list(range(7)),
+            "start": "", "end": "", "duration_min": None, "hold": "all"}
+    start = end = None
+    duration = None
+    for raw in segments:
+        seg = " ".join((raw or "").split())
+        low = seg.lower()
+        if not seg:
+            continue
+        m = re.match(r"^(label|name|nazev|název)\s+(.+)$", seg, re.I)
+        if m:
+            rule["label"] = m.group(2).strip()
+            continue
+        if low in _HOLD_WORDS and not rule["channels"] and low == "all":
+            # "all" first is the channel list; a later bare "all" is the hold.
+            rule["channels"] = list(CHANNELS)
+            continue
+        if low in _HOLD_WORDS:
+            rule["hold"] = _HOLD_WORDS[low]
+            continue
+        if low in ("all day", "allday", "whole day", "celý den", "cely den"):
+            start, end = (0, 0), (24, 0)
+            continue
+        secs = parse_duration_s(low)
+        if secs is not None:
+            if not (0 < secs <= 7 * 86400):
+                raise CommandError("A quiet window is between a minute and "
+                                   "a week long.")
+            duration = secs / 60.0
+            continue
+        win = re.match(r"^(\S+)\s*[-–—]\s*(\S+)$", low)
+        if win and parse_clock(win.group(1)) and parse_clock(win.group(2)):
+            start, end = parse_clock(win.group(1)), parse_clock(win.group(2))
+            continue
+        hm = parse_clock(low)
+        if hm is not None:
+            start = hm
+            continue
+        days = parse_days(low)
+        if days is not None:
+            rule["days"] = days
+            continue
+        try:
+            chans = parse_channels(low)
+        except CommandError:
+            raise CommandError(
+                f"I don't understand `{seg}` — a rule takes the channels, the "
+                f"days, the hours and what to hold, e.g. `/quiet add email; "
+                f"mon-fri; 22:00-06:00; warnings`.") from None
+        rule["channels"] = sorted(set(rule["channels"]) | set(chans),
+                                  key=CHANNELS.index)
+    if not rule["channels"]:
+        raise CommandError("Say which channel the rule is for: `webex`, "
+                           "`email`, `teams` or `all`.")
+    if start is None:
+        raise CommandError("Say when: `22:00-06:00`, `all day`, or a start "
+                           "and a length like `18:00; 3h`.")
+    if end is not None and duration is not None:
+        raise CommandError("Give an end time or a length, not both.")
+    if end is None and duration is None:
+        raise CommandError(f"From {clock_text(start)} until when? Add an end "
+                           f"(`{clock_text(start)}-06:00`) or a length (`3h`).")
+    rule["start"] = clock_text(start)
+    if end is not None:
+        if end == start:
+            raise CommandError("The window starts and ends at the same time — "
+                               "use `all day` for the whole day.")
+        rule["end"] = clock_text(end)
+    else:
+        rule["duration_min"] = duration
+    return rule
+
+
+def _rule_span_min(rule: dict) -> Optional[tuple]:
+    """(start minute of the day, length in minutes) of a rule, or None."""
+    st = parse_clock(rule.get("start") or "")
+    if st is None:
+        return None
+    s_min = st[0] * 60 + st[1]
+    if rule.get("duration_min"):
+        try:
+            return s_min, float(rule["duration_min"])
+        except (TypeError, ValueError):
+            return None
+    en = parse_clock(rule.get("end") or "")
+    if en is None:
+        return None
+    e_min = en[0] * 60 + en[1]
+    length = e_min - s_min
+    if length <= 0:
+        length += 1440                    # 22:00-06:00 crosses midnight
+    return s_min, float(length)
+
+
+def quiet_rule_active(rule: dict, now_ns: int, tz=TZ_DEFAULT) -> bool:
+    """True when `rule` is switched on and `now` falls inside one of its
+    windows. A window is anchored to the day it starts on, so yesterday's
+    (and, for a long one, earlier days') window may still be running."""
+    if not rule or not rule.get("on", True):
+        return False
+    span = _rule_span_min(rule)
+    if span is None:
+        return False
+    s_min, length = span
+    days = set(rule.get("days") or [])
+    now = datetime.fromtimestamp(now_ns / NS, tz=tz)
+    midnight = datetime.combine(now.date(), dtime(0, 0), tzinfo=tz)
+    back = int(length // 1440) + 1
+    for k in range(0, back + 1):
+        day = midnight - timedelta(days=k)
+        if day.weekday() not in days:
+            continue
+        start = day + timedelta(minutes=s_min)
+        if start <= now < start + timedelta(minutes=length):
+            return True
+    return False
+
+
+def hold_applies(hold: str, level: int, prev_level: int, kind: str) -> bool:
+    """Whether a rule holding `hold` keeps this message back.
+
+    A recovery is judged by what it recovers FROM: the all-clear after an
+    alarm is as much news as the alarm was.
+    """
+    if hold == "all":
+        return True
+    if hold == "reminders":
+        return kind == "reminder"
+    # "warnings": everything but alarms (reminders of an alarm still go).
+    weight = prev_level if level == LEVEL_OK else level
+    return weight < LEVEL_ALARM
+
+
+def quiet_rule_text(rule: dict) -> str:
+    """One line: 'email · mon-fri 22:00-06:00 · warnings and reminders held,
+    alarms pass'."""
+    chans = ", ".join(rule.get("channels") or []) or "no channel"
+    when = rule.get("start") or "?"
+    if rule.get("duration_min"):
+        when += f" for {fmt_minutes(float(rule['duration_min']))}"
+    elif rule.get("start") == "00:00" and rule.get("end") in ("24:00",
+                                                              "00:00"):
+        when = "all day"
+    else:
+        when += f"-{rule.get('end') or '?'}"
+    label = (rule.get("label") or "").strip()
+    head = f"**{label}** " if label else ""
+    off = "" if rule.get("on", True) else " — *switched off*"
+    return (f"{head}{chans} · {days_text(rule.get('days'))} {when} · "
+            f"{HOLD_TEXT.get(rule.get('hold'), rule.get('hold'))}{off}")
+
+
+def channel_hold_reason(settings: dict, channel: str, level: int,
+                        prev_level: int, kind: str, now_ns: int,
+                        tz=TZ_DEFAULT) -> str:
+    """'' when an alert may go out over `channel` now, else why not.
+
+    Two things can hold it: a manual mute (`channel_off_until`), which holds
+    everything, and a quiet rule in force — only while the master switch
+    `quiet_rules_enabled` is on, so the whole schedule can be suspended from
+    the window without losing it.
+    """
+    off = (settings.get("channel_off_until") or {}).get(channel)
+    if mute_live(off, now_ns):
+        return f"{channel} muted {until_text(off, now_ns, tz)}"
+    if not settings.get("quiet_rules_enabled", True):
+        return ""
+    for i, rule in enumerate(settings.get("quiet_rules") or []):
+        if channel not in (rule.get("channels") or []):
+            continue
+        if not quiet_rule_active(rule, now_ns, tz):
+            continue
+        if hold_applies(rule.get("hold", "all"), level, prev_level, kind):
+            name = (rule.get("label") or "").strip() or f"rule {i + 1}"
+            return f"quiet: {name}"
+    return ""
+
+
+# --- pacing ------------------------------------------------------------------
+#
+# (word, settings key, label as in Settings, unit, low, high). A bool has
+# unit "" and no range.
+PACING = (
+    ("reminder", "renotify_cooldown_minutes", "Re-notify cooldown", "min",
+     0, 1440),
+    ("recovery", "recovery_notify", "Notify on recovery to OK", "", None, None),
+    ("hold", "rule_change_grace_minutes", "Hold after a rule change", "min",
+     0, 240),
+    ("debounce", "debounce_count", "Debounce", "polls", 1, 20),
+    ("settle", "settle_minutes", "Settle wait", "min", 0, 120),
+    ("stable", "stable_seconds", "Stability hold", "s", 0, 3600),
+)
+_PACING_WORDS = {
+    "reminder": "reminder", "reminders": "reminder", "cooldown": "reminder",
+    "renotify": "reminder", "repeat": "reminder",
+    "recovery": "recovery", "recover": "recovery", "allclear": "recovery",
+    "hold": "hold", "grace": "hold", "rulehold": "hold",
+    "debounce": "debounce", "settle": "settle",
+    "stable": "stable", "stability": "stable",
+}
+_ON_WORDS = {"on", "yes", "true", "1", "ano", "zap", "zapnout"}
+_OFF_WORDS = {"off", "no", "false", "0", "ne", "vyp", "vypnout"}
+
+
+def parse_on_off(word: str) -> Optional[bool]:
+    w = (word or "").strip().lower()
+    if w in _ON_WORDS:
+        return True
+    if w in _OFF_WORDS:
+        return False
+    return None
+
+
+def parse_pacing(text: str) -> list:
+    """'reminder 60, recovery off' → [(settings key, value), …]. Raises."""
+    out = []
+    for part in re.split(r"[,;]", text or ""):
+        words = part.split()
+        if not words:
+            continue
+        if len(words) != 2:
+            raise CommandError(f"`{part.strip()}` — say the setting and the "
+                               f"value, e.g. `reminder 60`.")
+        word = _PACING_WORDS.get(words[0].lower())
+        if word is None:
+            raise CommandError(
+                f"`{words[0]}` is not one of them — "
+                + ", ".join(f"`{p[0]}`" for p in PACING) + ".")
+        _w, key, label, unit, lo, hi = next(p for p in PACING if p[0] == word)
+        if unit == "":
+            v = parse_on_off(words[1])
+            if v is None:
+                raise CommandError(f"{label} is `on` or `off`.")
+            out.append((key, v))
+            continue
+        n = parse_number(words[1])
+        if n is None:
+            raise CommandError(f"{label} needs a number ({unit}).")
+        if not (lo <= n <= hi):
+            raise CommandError(f"{label} goes from {lo} to {hi} {unit}.")
+        if key in ("debounce_count", "stable_seconds",
+                   "renotify_cooldown_minutes"):
+            n = int(round(n))
+        out.append((key, n))
+    if not out:
+        raise CommandError("Say what to set, e.g. `/pacing reminder 60`.")
+    return out
+
+
+def is_yes(text: str) -> Optional[bool]:
+    """'ano' / 'yes' → True, 'ne' / 'no' → False, anything else → None.
+
+    Deliberately no 'ok' or single letters: this confirms a removal, and an
+    'ok' typed into the conversation must not be taken for one."""
+    w = (text or "").strip().lower().rstrip(".!")
+    if w in ("ano", "yes", "confirm", "potvrdit", "remove", "smazat"):
+        return True
+    if w in ("ne", "no", "n", "nope", "cancel", "zrusit", "zrušit"):
+        return False
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The syntax half of /help (the command list lives with the commands)
 # ---------------------------------------------------------------------------
 
@@ -869,7 +1399,8 @@ SYNTAX_HELP = (
     "`/help time`.\n"
     "PV names are matched loosely — any part of the name, any order, case "
     "ignored (`plfe vrt`) — and a fragment that fits several PVs takes them "
-    "all. Only `/graph` and `/change` need a single PV."
+    "all. Only `/graph`, `/change`, `/remove`, `/rename` and `/rule` need a "
+    "single PV."
 )
 # ---------------------------------------------------------------------------
 # `/help <command>` — the long version of one command
@@ -1046,18 +1577,216 @@ _HELP_CHANGE = (
 )
 
 _HELP_UNDO = (
-    "**`/undo`** — put the last limit change back.\n"
+    "**`/undo`** — put the last change made from the chat back.\n"
     "\n"
-    "One step, and only for `/change`: the values as they were before the most "
-    "recent change, whoever made it. The reply names them.\n"
+    "Every change made here can be taken back: limits (`/change`), PVs added, "
+    "removed or renamed, rules, snoozes, `/enable`/`/disable`, channel mutes, "
+    "quiet rules and pacing. Send it again to go one more step back — up to "
+    "20 steps, whoever made them. The reply says what was put back.\n"
     "\n"
     "**Watch out for**\n"
-    "- **One step only.** Two changes and one `/undo` leaves the first one "
-    "standing; `/change` it back by hand.\n"
-    "- **It is forgotten when the app restarts**, and it does not reach back "
-    "past an edit made in the window itself.\n"
-    "- Undoing is a change like any other, so the same wait before alerting "
-    "resumes applies."
+    "- **Only what that change touched comes back.** Undoing a limit change "
+    "does not undo an edit made in the window since.\n"
+    "- **A removed PV comes back with its limits and rules**, but its graph "
+    "starts again from the archive.\n"
+    "- `/ack` is not a change and cannot be undone — it ends by itself when "
+    "the level moves.\n"
+    "- **It is forgotten when the app restarts.**\n"
+    "- Undoing limits is a change like any other, so the same wait before "
+    "alerting resumes applies."
+)
+
+_HELP_ADD = (
+    "**`/add <archive name>`** — start monitoring a PV.\n"
+    "\n"
+    "**Examples**\n"
+    "- `/add L3-UTIL-CHL03-007:Temp` — the exact name, added at once\n"
+    "- `/add chl03 temp` — any parts of the name; several matches come back "
+    "numbered, answer `2` (or `2, 5` for two)\n"
+    "\n"
+    "**Watch out for**\n"
+    "- **A new PV has alerting off and no limits.** It is read and plotted "
+    "straight away; `/change <pv>` sets the limits, then `/enable <pv>`.\n"
+    "- **It sits in no group** — groups are arranged in the window.\n"
+    "- **In a room the answer needs the tag** (`@Diagnostics 2`), or send "
+    "`/add 2`.\n"
+    "- It is saved to the shared PV list like any edit; `/undo` takes it out "
+    "again."
+)
+
+_HELP_REMOVE = (
+    "**`/remove <pv>`** — stop monitoring one PV.\n"
+    "\n"
+    "I ask first: answer `ano` (or `/remove ano` in a room); `ne` or "
+    "`/cancel` keeps it.\n"
+    "\n"
+    "**Watch out for**\n"
+    "- **One PV at a time**, named exactly enough to be the only match.\n"
+    "- **A dependency PV of another PV's rules** keeps being read for those "
+    "rules; it only leaves the table and the graph. The question says so.\n"
+    "- `/undo` brings it back with its limits and rules. To silence a PV for "
+    "a while, `/snooze` or `/disable` is the lighter tool."
+)
+
+_HELP_RENAME = (
+    "**`/rename <pv>; <new name>`** — the name shown in the table, the graph, "
+    "the alerts and every reply.\n"
+    "\n"
+    "Example: `/rename CHL03-001; DA1 Chiller`. The `;` keeps a name with "
+    "spaces in one piece. The archive name never changes, so history and "
+    "limits stay with the PV. A name another PV already has is refused; "
+    "`/undo` puts the old one back."
+)
+
+_HELP_RULE = (
+    "**`/rules <pv>`** shows a PV's dependency PVs and its rules; "
+    "**`/rule <pv>; <action>`** changes them.\n"
+    "\n"
+    "A rule is a second set of limits used while the dependency PVs are in a "
+    "given state — e.g. a chiller held tighter at 3,3 Hz. Rules are checked "
+    "top to bottom and the first that matches wins; with none matching, the "
+    "Global limits apply.\n"
+    "\n"
+    "**Actions**\n"
+    "- `/rule DA1; gate 1 L3-TIMING-TIMING:SysRate` — dependency PV 1 (a "
+    "second is `gate 2 …`; `gate 2 none` clears it)\n"
+    "- `/rule DA1; add 3,3 Hz; 2.3` — a new rule, with its condition on "
+    "dependency 1; a second `; <cond>` is for dependency 2\n"
+    "- `/rule DA1; cond 2; 1; 0.2-0.3` — new conditions for rule 2\n"
+    "- `/rule DA1; label 2 Night`, `/rule DA1; move 3 1`, "
+    "`/rule DA1; remove 2`\n"
+    "\n"
+    "**Conditions:** `1` (exactly), `0.2-3` (range), `>=5`, `<=2`, `any`.\n"
+    "\n"
+    "**Watch out for**\n"
+    "- **A new rule has no limits** and so never applies until "
+    "`/change <pv>` gives it some — the listing numbers its four.\n"
+    "- **Clearing a dependency drops every rule's condition on it.**\n"
+    "- A new dependency PV has no value until the next reading, so its rules "
+    "cannot match before then.\n"
+    "- Each step can be undone with `/undo`."
+)
+
+_HELP_SNOOZE = (
+    "**`/snooze <pv, …>; <how long>`** — no alerts about these PVs for a "
+    "while. **`/unsnooze <pv|all>`** ends it early; `/snooze` alone lists "
+    "what is snoozed.\n"
+    "\n"
+    "**How long:** `2h`, `30m`, `1.5h`, `2d`, `until 8:00`, `until tomorrow "
+    "8:00`, `until 21.10. 8:00`, `forever`. Without a `;` the time may stand "
+    "at the end: `/snooze DA1 2h`.\n"
+    "\n"
+    "**Watch out for**\n"
+    "- **The PV is still read, judged and shown** — only the messages stop. "
+    "The table says `snoozed → 08:00`.\n"
+    "- **If it is still out of its limits when the snooze ends, one alert "
+    "goes out then**, so a problem cannot hide behind a snooze that ran out.\n"
+    "- A name fragment takes the whole group, like `/disable`; the reply "
+    "names every PV. It is saved, so a restart does not end it.\n"
+    "- For everything at once use `/stop <hours>`; for one channel, "
+    "`/channels`."
+)
+
+_HELP_ACK = (
+    "**`/ack [pv, …]`** — I know about it: the reminders stop.\n"
+    "\n"
+    "Acknowledges what is in warning or alarm now (no PV = all of it). The "
+    "repeat reminders for that level stop; **getting worse, or recovering, "
+    "is announced as usual** and ends the acknowledgement.\n"
+    "\n"
+    "**Watch out for:** it lasts only while the level stays the same and is "
+    "forgotten on restart. To silence a PV whatever it does, `/snooze` it."
+)
+
+_HELP_HISTORY = (
+    "**`/history [pv][; window]`** — what was sent, what was held back, and "
+    "what was changed from the chat, newest last (the last 20).\n"
+    "\n"
+    "**Examples:** `/history`, `/history DA1`, `/history; 24h`, "
+    "`/history chiller; yesterday`. Windows as on `/help time`.\n"
+    "\n"
+    "📣 sent · 🔇 held back (snoozed, acknowledged, muted, quiet hours) · ⚠ "
+    "failed to send · ✏️ changed from the chat · 🧪 test. Kept on this PC "
+    "across restarts — the last 2000 lines."
+)
+
+_HELP_TEST = (
+    "**`/test [webex|email|teams]`** — send a test message, to every working "
+    "channel or just the named one, and say which arrived.\n"
+    "\n"
+    "**Watch out for:** a test ignores mutes and quiet hours on purpose — "
+    "the reply says when real alerts would be held right now. The Webex test "
+    "goes to every alert room, not only this one."
+)
+
+_HELP_CHANNELS = (
+    "**`/channels`** — which alert channels work, and which are muted or in "
+    "quiet hours right now.\n"
+    "\n"
+    "**Examples**\n"
+    "- `/channels email off 4h` — no alert e-mails for four hours\n"
+    "- `/channels email off until 7:00`, `/channels webex off` (until "
+    "switched back on)\n"
+    "- `/channels email on` — back on now\n"
+    "- `/channels all off 1h`\n"
+    "\n"
+    "**Watch out for**\n"
+    "- **Muting every channel means nobody hears anything** — the reply "
+    "warns when that is the result.\n"
+    "- Replies to commands are never muted; only alerts are.\n"
+    "- A mute belongs to this PC, like the channels themselves. Regular "
+    "quiet hours are `/quiet`."
+)
+
+_HELP_QUIET = (
+    "**`/quiet`** — regular quiet hours per channel. `/quiet` alone lists "
+    "the rules and marks the ones in force.\n"
+    "\n"
+    "**Adding:** `/quiet add <channels>; <days>; <hours>; <what>` — order "
+    "does not matter.\n"
+    "- `/quiet add email; mon-fri; 22:00-06:00; warnings` — weeknights "
+    "without warnings or reminders, alarms still go\n"
+    "- `/quiet add webex, email; weekend; all day; reminders`\n"
+    "- `/quiet add email; daily; 12:00; 1h; label Lunch` — a start and a "
+    "length\n"
+    "\n"
+    "**Days:** `mon-fri`, `sat,sun`, `weekend`, `weekdays`, `daily` "
+    "(default), Czech `po-pá` too. **What is held:** `all` (default), "
+    "`warnings` (warnings and reminders, alarms pass), `reminders`.\n"
+    "\n"
+    "**Changing:** `/quiet remove 2`, `/quiet off 2` / `/quiet on 2`, "
+    "`/quiet off` suspends every rule at once (Settings has the same "
+    "switch), `/quiet on`.\n"
+    "\n"
+    "**Watch out for**\n"
+    "- **A window past midnight belongs to its first day**: `fri; "
+    "22:00-06:00` covers Saturday's small hours, not Friday's.\n"
+    "- An alarm's all-clear counts as an alarm, so `warnings` lets it "
+    "through.\n"
+    "- Held alerts are in `/history` (🔇). Rules belong to this PC and are "
+    "also edited in Settings → Notification channels."
+)
+
+_HELP_PACING = (
+    "**`/pacing`** — how often and how soon alerts go out; the same figures "
+    "as Settings → Monitoring.\n"
+    "\n"
+    "- `reminder <min>` — Re-notify cooldown: the gap between reminders of "
+    "an ongoing alert (0 = no reminders)\n"
+    "- `recovery on|off` — an all-clear message when a PV is back to OK\n"
+    "- `hold <min>` — Hold after a rule change\n"
+    "- `debounce <polls>` — readings in a row before a state counts\n"
+    "- `settle <min>` — wait after a PV first leaves its limits\n"
+    "- `stable <s>` — Stability hold\n"
+    "\n"
+    "Example: `/pacing reminder 60, recovery off`. **Shared** with the PV "
+    "list, so every copy of the program uses it; `/undo` puts it back."
+)
+
+_HELP_SETTINGS = (
+    "**`/settings`** — everything about alerting in one message: "
+    "monitoring on or off, the channels and their mutes, the quiet rules, "
+    "the pacing, and which PVs are snoozed, acknowledged or switched off."
 )
 
 _HELP_ALARMS = (
@@ -1142,8 +1871,9 @@ _HELP_CANCEL = (
     "window can be asked for straight away. **Nothing at all is sent for a "
     "cancelled plot.**\n"
     "\n"
-    "It also drops an unanswered `/change` question, so a limit listing you no "
-    "longer want cannot be answered by accident.\n"
+    "It also drops an unanswered question of mine — a `/change` listing, an "
+    "`/add` list, a `/remove` confirmation — so it cannot be answered by "
+    "accident.\n"
     "\n"
     "**Watch out for:** requests already in flight still have to come back, so "
     "the reply is not instant. \"Nothing is running\" means there was nothing "
@@ -1200,6 +1930,18 @@ COMMAND_HELP = {
     "yaxis": _HELP_YAXIS,
     "datawatchdog": _HELP_WATCHDOG,
     "run": _HELP_RUN,
+    "add": _HELP_ADD,
+    "remove": _HELP_REMOVE,
+    "rename": _HELP_RENAME,
+    "rule": _HELP_RULE,
+    "snooze": _HELP_SNOOZE,
+    "ack": _HELP_ACK,
+    "history": _HELP_HISTORY,
+    "test": _HELP_TEST,
+    "channels": _HELP_CHANNELS,
+    "quiet": _HELP_QUIET,
+    "pacing": _HELP_PACING,
+    "settings": _HELP_SETTINGS,
 }
 
 # `mention` is not in COMMAND_HELP because its page has to carry the bot's real
@@ -1233,6 +1975,21 @@ _HELP_ALIASES = {
     "limit": "change", "limits": "change", "threshold": "change",
     "thresholds": "change", "setlimit": "change", "set": "change",
     "undochange": "undo", "revert": "undo", "back": "undo",
+    "addpv": "add", "new": "add",
+    "removepv": "remove", "delete": "remove", "del": "remove",
+    "name": "rename",
+    "rules": "rule", "gate": "rule", "gates": "rule", "dependency": "rule",
+    "dependencies": "rule", "condition": "rule", "conditions": "rule",
+    "unsnooze": "snooze", "mute": "snooze", "unmute": "snooze",
+    "acknowledge": "ack", "acknowledged": "ack",
+    "log": "history",
+    "channel": "channels", "email": "channels", "webex": "channels",
+    "teams": "channels",
+    "quiethours": "quiet", "schedule": "quiet", "night": "quiet",
+    "reminder": "pacing", "reminders": "pacing", "cooldown": "pacing",
+    "recovery": "pacing", "hold": "pacing", "grace": "pacing",
+    "debounce": "pacing", "settle": "pacing",
+    "setting": "settings", "overview": "settings", "config": "settings",
 }
 
 

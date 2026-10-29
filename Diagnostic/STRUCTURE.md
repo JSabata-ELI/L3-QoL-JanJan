@@ -6,10 +6,10 @@
 > `main.py` 485 L · `shared_pvs.py` 364 L · `okbase_capture.py` 248 L ·
 > `notify_provision.py` 238 L · `memstats.py` 187 L ·
 > `secrets_util.py` 70 L ·
-> tests: `test_okbase_menu.py` 895 L · `testing/test_okbase_orders.py` 790 L ·
-> `test_monitor_frozen.py` 639 L · `test_alerting.py` 490 L ·
-> `test_edge_cdp.py` 340 L · `test_rule_change_grace.py` 332 L ·
-> `test_bot_commands.py` 243 L · `testing/test_stale_sso_cookie.py` 241 L ·
+> tests: `testing/test_okbase_menu.py` 895 L · `testing/test_okbase_orders.py` 790 L ·
+> `testing/test_monitor_frozen.py` 639 L · `testing/test_alerting.py` 490 L ·
+> `testing/test_edge_cdp.py` 340 L · `testing/test_rule_change_grace.py` 332 L ·
+> `testing/test_bot_commands.py` 243 L · `testing/test_stale_sso_cookie.py` 241 L ·
 > `testing/test_signin_undecided.py` 196 L ·
 > `testing/` 16 test files + `bench_long_plot.py`
 
@@ -35,7 +35,7 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `notify_provision.py` | Bakes / reads `notify_provision.dat`, the channel settings shipped inside the build. |
 | `bot_commands.py` | Grammar of the chat commands. Qt-free on purpose so it can be tested alone. |
 | `okbase_menu.py` | The canteen menu behind `/food`: OKbase REST client, the `menu_cache.json` on the share, the `/food` word parser and the markdown it returns. Also the one owner of *reading a paste* (`read_paste`, `parse_curl`, `parse_cookies`, `describe_cookies`), so the script, the Settings dialog and the field all understand the same things. Qt-free and runnable alone (`python okbase_menu.py --check`, `--week`). |
-| `edge_cdp.py` | The **Sign in with Edge** button: opens a visible Edge window on the OKbase page with a debug port and a profile of its own, waits for the person to sign in, and reads the cookies out of that window over the DevTools protocol. Includes a ~90-line websocket client because the stdlib has none. No new dependency, Qt-free, testable offline (`test_edge_cdp.py`). See below. |
+| `edge_cdp.py` | The **Sign in with Edge** button: opens a visible Edge window on the OKbase page with a debug port and a profile of its own, waits for the person to sign in, and reads the cookies out of that window over the DevTools protocol. Includes a ~90-line websocket client because the stdlib has none. No new dependency, Qt-free, testable offline (`testing/test_edge_cdp.py`). See below. |
 | `okbase_capture.py` | The same job as the Settings buttons, from a shell: reads a "Copy as cURL" (or `--edge`) and saves the sign-in, ids and request template. A script, not part of the app — the fallback for when the app will not start. Its parsing now lives in `okbase_menu`. |
 | `memstats.py` | Windows memory figures via `ctypes` (no psutil): this process's **commit** and working set, and the PC's commit charge/limit. Used by the status line, the half-hourly log line and the listener's console. |
 | `remote_launcher.py` | Standalone always-on Webex listener that starts the app on `/run` and answers `/food` while the app is closed. Built as its own exe (`extra_exes` in `build_config.json`). |
@@ -55,6 +55,13 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 
 ```
 CPVA archive (REST, https://10.78.0.57:8443)
+  │    backup: L3 proxy .64/.65 via cpva_api._get_json_or_backup — only when
+  │    CPVA cannot be reached (ConnectionError, 502/503/504), then CPVA skipped
+  │    for CPVA_DOWN_S = 60 s; never on read timeout or 500 (the splitter's).
+  │    Both gone → ArchiveUnreachable (not split). testing/test_cpva_backup.py
+  │  + EXTRA_ARCHIVES (L3BT, FCT proxies): archive_of reads a channel there
+  │    when that proxy lists it and CPVA does not; cpva_fetch_channels adds
+  │    their names to the picker list
   │  cpva_api.cpva_fetch_samples()
   ▼
 monitor_tab._PollWorker       every poll_interval_s, poll_max_workers at a time
@@ -165,7 +172,7 @@ Measured on `L3-UTIL-CHL03-001:Temp` (DA1 Chiller, 13 Sep 2026): a sample every
 chiller was announced as `PV NOT UPDATING — value unchanged for 2 h 0 min` and
 "recovered" a couple of hours later, all night long. Removed on 16 Sep 2026 with
 `alerting.detect_frozen`, the `frozen_after_minutes` / `frozen_min_points` settings
-and the extra history pre-fill that armed it. `test_monitor_frozen.py` now asserts
+and the extra history pre-fill that armed it. `testing/test_monitor_frozen.py` now asserts
 the opposite (`test_a_steady_value_is_not_reported`).
 
 The graph's history is therefore pre-filled to the visible window only
@@ -209,7 +216,7 @@ it was *added* beside it — dropping it there would have let the tight running 
 apply all night whenever the pump happens to run. The same pass widened the `3,3 Hz`
 rate window to 3.0–3.5 on all four: DA1 asked for exactly 2.3 and DA2–DA4 for
 2.0–3.0, so at the real 3.3 Hz none of them had ever matched.
-`test_rule_change_grace.py` holds both: the start-up with the hold off, and that
+`testing/test_rule_change_grace.py` holds both: the start-up with the hold off, and that
 evening still alarming.
 
 The hold must not hide the reading: `PVRuntime.display_level()` reports the raw
@@ -285,9 +292,11 @@ the mention rule.
 `_NoWheelMixin` + `_NoWheelSpinBox` / `_NoWheelDoubleSpinBox` / `_NoWheelComboBox`:
 the wheel must not change a control the pointer merely hovers over. The real gate
 is the app-wide `_WheelGuard` in `main.py` (`install_wheel_guard`, same rule as
-CSS Logger): a spin box / combo / slider answers the wheel only after a CLICK and
-only while the pointer stays on it; leaving it, losing focus (except to its own
-popup list) or hiding disarms it, and the notch goes to the scroll area behind.
+the other programs): a spin box / combo / slider answers the wheel only after a
+CLICK (or Tab) and only while the pointer is over it. Moving the pointer away
+does not disarm it; losing focus to another control does (focus going to its
+own popup list or to another window does not). Otherwise the notch goes to the
+scroll area behind. Scroll bars are left out.
 `hasFocus()` alone was not enough — a combo keeps focus after a pick, and a dialog
 hands its first field focus on opening.
 
@@ -392,6 +401,13 @@ table and the graph are always live; the button arms only threshold evaluation, 
 dispatch and the data watchdog. `toggle_monitoring` also updates `run_status.json`, so
 `remote_launcher.py` can answer "is it tracking".
 
+The data watchdog (`_check_data_watchdog`) works in episodes, so a flapping
+archiver does not post an ALARM/OK pair every few minutes: ALARM after
+`data_watchdog_fail_polls` fully-failed polls, a reminder every
+`data_watchdog_remind_hours` while still failing, and the OK only after
+`data_watchdog_ok_after_minutes` with no fully-failed poll (a failure inside
+that wait restarts it silently). Pinned by `testing/test_data_watchdog_episode.py`.
+
 ### Staying up for weeks
 
 This app and `remote_launcher.py` are meant to be left running, so anything that
@@ -439,8 +455,11 @@ Two structural separators, and only two, because a PV name may contain spaces:
 | `parse_yaxis_spec(spec)` | `y 15-35` / `y auto` |
 | `parse_plot_options(options, now_ns, …)` → `PlotOptions` | the `/plot` option list, including `detail` and `dpi` |
 | `parse_dpi_spec(spec)` → `int | None` | `300dpi` / `300 dpi` / `dpi 300`, range `DPI_MIN…DPI_MAX` (50–1200). Tried **before** the time parser: a bare number there is a window in hours, so `300dpi` must not reach it |
-| `split_query` / `tokens_in_order` / `rank_pv_match` / `search_pvs(pvs, q)` | PV name matching — tokens, AND, ranked; a fragment is a filter, not an error (see below) |
+| `split_query` / `rank_pv_match` / `search_pvs(pvs, q)` | PV name matching — tokens, AND, any order, ranked; a fragment is a filter, not an error (see below) |
 | `LIMIT_FIELDS` / `limit_rows(pv)` / `parse_limit_field` / `parse_change_answer` / `looks_like_answer` / `check_limit_order` | the `/change` listing and its answers — see below |
+| `parse_until` / `until_text` / `mute_live` / `FOREVER` | how long a `/snooze` or `/channels … off` lasts: `2h`, `until 8:00`, `until tomorrow 8:00`, `forever` |
+| `parse_quiet_rule` / `quiet_rule_active` / `hold_applies` / `quiet_rule_text` / `channel_hold_reason` | quiet hours and channel mutes — whether an alert may go out over one channel now |
+| `parse_channels` / `parse_days` / `days_text` / `parse_pacing` / `PACING` / `is_yes` | the smaller pieces of the same commands |
 | `bot_tag(bot_name)` / `mention_help(bot_name)` / `mention_help_full(bot_name)` | the two-sentence tag reminder at the top of `/help`, and the `/help mention` page. Built rather than constant, because they have to carry the bot's real name |
 | `COMMAND_HELP` + `help_topic(name)` / `command_help(name)` / `help_topics()` / `is_mention_topic(name)` | the long help for one command, behind `/help plot`. Aliases (`dpi`, `alerts`, `abort`, `y`, `watchdog`, `limits`, `times`, …) map onto the fifteen pages; `/food` and `mention` are deliberately absent from the dict, the first so `okbase_menu.FOOD_HELP` stays the single copy, the second because its page needs the bot name. `monitor_tab._cmd_help_topic` is the seam that hands both over and answers an unknown topic with the list |
 
@@ -472,11 +491,13 @@ a clock window is), one entirely in the future, and anything over three years.
 
 ### PV name matching — a fragment is a filter
 
-`split_query` / `tokens_in_order` / `rank_pv_match` / `search_pvs` are the house PV
+`split_query` / `rank_pv_match` / `search_pvs` are the house PV
 search rules (the Image Slider's `cpva_client` is the reference, copied here because
 Diagnostic does not import it): words separated by spaces, commas or `*` are tokens,
-AND-matched anywhere in the display name or the PV name, ranked exact → field →
-prefix → inside-field → anywhere, with the typed word order breaking ties.
+AND-matched anywhere in the display name or the PV name, in any order, ranked
+exact → field → prefix → inside-field → anywhere. The typed word order changes
+neither the hits nor their ranking. The "Add PV — browse channels" dialog
+(`_apply_filter`) ranks with the same `rank_pv_match`.
 
 `monitor_tab._find_pvs` wraps it (an exact name still wins alone) and
 `_resolve_pvs(items, expand=True)` turns each comma-separated item into **every** PV
@@ -538,11 +559,69 @@ writes a monitoring rule.
 - **Alerting.** Nothing touches `PVRuntime`: `_check_limits_change` keys the grace on the
   four numbers, so a chat edit gets the same 20-minute hold a rule switch does, and an
   alarm nobody was told about is cleared, for free.
-- **`/undo`** keeps one step in `_change_undo` (in memory, gone on restart) and puts the
-  previous numbers back through the same path.
+- **`/undo`** — see the undo stack below.
 
 Not answered by `remote_launcher.py`: the standalone listener never reads the PV list,
-so `/change` only works while the app is open.
+so `/change` and every command in the next section only work while the app is open.
+
+### Running notifying from the chat (20 Oct 2026)
+
+Everything about *who is told what* can be done from the chat; grouping stays
+window-only. The parsing is all in `bot_commands` (Qt-free), the commands are
+`MonitorWidget._cmd_*` methods dispatched from `_handle_command`.
+
+| Command | Method | Writes |
+|---|---|---|
+| `/add <name>` | `_cmd_add` → `_add_named` | new `PVConfig` (alerting off, no limits, no group) + `PVRuntime`, `_backfill_one` fetches its graph span |
+| `/remove <pv>` | `_cmd_remove` → `_answer_remove` | `_drop_pv` (runtime, `_gate_values`, open questions about it) |
+| `/rename <pv>; <name>` | `_cmd_rename` | `display_name`; `graph.refresh_combo` now restores the selection by `currentData` (the archive name), so a rename keeps it |
+| `/rules`, `/rule <pv>; …` | `_cmd_rules`, `_cmd_rule` → `_rule_edit` | `gate_pvs`, `profiles`; conditions through the window's own `_parse_cond`; a refusal restores the snapshot, then `_apply_pv_edit` |
+| `/snooze`, `/unsnooze` | `_cmd_snooze`, `_cmd_unsnooze` | `PVConfig.snoozed_until` (ns or `bot_commands.FOREVER`) + `snoozed_by` — saved and shared with the PV |
+| `/ack` | `_cmd_ack` | `PVRuntime.acked_level/_by/_ns` — memory only |
+| `/channels`, `/quiet` | `_cmd_channels`, `_cmd_quiet` | settings `channel_off_until`, `quiet_rules`, `quiet_rules_enabled` — `SHARE_LOCAL_ONLY_KEYS` |
+| `/pacing` | `_cmd_pacing` | the `bot_commands.PACING` settings; `_settings_changed` rebuilds the evaluator |
+| `/history`, `/test`, `/settings` | `_cmd_history`, `_cmd_test` (`_TestWorker`), `_cmd_settings` | — |
+
+**Questions.** `_ChangeSession` now carries a `kind`: `limits` (the `/change` listing),
+`add` (numbered archive names in `choices`), `remove` (waits for `ano`/`ne`,
+`bot_commands.is_yes`, which deliberately does not take `ok`). `_is_change_answer`
+and `_answer_change` dispatch on it, so a bare line, a tagged line and `/add 2` /
+`/remove ano` / `/change 6 15` all reach the right question; `kinds=` keeps
+`/change` from answering an `/add` question.
+
+**The undo stack.** `_undo_stack` holds up to `UNDO_DEPTH` (20) `_UndoStep`s. A step
+keeps only what its change touched — `pv_fields` {PV name: {field: value before}},
+`settings` {key: value before}, `added` names, `removed` (index, `to_dict()`) — so
+undoing a limit change does not roll back an unrelated edit made in the window since.
+`_LIMIT_KEYS` / `_RULE_KEYS` are the field sets; `gate_pvs` in a step is what tells
+`_cmd_undo` to redo the dependency dropdown. `/ack` is not a step.
+
+**The alert gate.** In `_on_poll` the evaluator still runs every pass; only the
+note is filtered. `_pv_hold_reason` holds everything while snoozed and the
+reminders of an acknowledged level; `_hold_alert` logs it and records a snooze
+debt (`PVRuntime.snooze_owed`), which `_settle_snooze` pays with one alert when the
+snooze has ended and the PV is still not OK. `_expire_snooze` clears a finished
+snooze. An acknowledgement is cleared the moment `rt.alert.level` differs from it.
+Then `_launch_alert_worker` — the single path of every automatic alert, frozen,
+refresh and watchdog ones included — asks `_channel_plan`, which runs
+`bot_commands.channel_hold_reason` per active channel (manual mute first, then the
+quiet rules if `quiet_rules_enabled`). The worker gets `only=` and
+`NotificationHub.dispatch(…, only=)` skips the rest; with nothing left it is not
+started and the PV's Alarm status reads `held (quiet)`. Tag `manual` (Send plot
+now) bypasses the gate; bot replies never go through it.
+
+**Quiet rules** are dicts (see `parse_quiet_rule`). `quiet_rule_active` anchors a
+window to the day it starts on and looks back as many days as the window is long,
+so `fri 22:00-06:00` covers Saturday 03:00 and a `2d` window reaches Sunday.
+`hold_applies` judges a recovery by the level it recovers from, so `warnings` lets
+an alarm's all-clear through. Settings → Notification channels has
+`QuietRulesWidget`, plain text cells read back through the same
+`parse_quiet_rule`; a row that does not parse keeps the dialog open.
+
+**History.** `_history_add` appends a JSON line to `HISTORY_FILE`
+(`bot_history.jsonl` beside the program) and to the `_history` deque; past
+`HISTORY_TRIM_AT` lines the file is rewritten from the deque (`HISTORY_KEEP`).
+Kinds: `alert`, `held`, `failed`, `change` (with `who`), `test`.
 
 ---
 
@@ -744,7 +823,7 @@ thing if it is "tidied up":
 
 Verified end to end on 2026-09-02: the debug port answered, `Storage.getCookies`
 returned the profile's cookies, and the line it produced round-tripped through
-`parse_cookies`. `test_edge_cdp.py` covers the framing, the domain filter and the
+`parse_cookies`. `testing/test_edge_cdp.py` covers the framing, the domain filter and the
 flags offline — no browser, no network.
 
 #### The two pages it walks past by itself (2026-09-03)
@@ -1436,7 +1515,7 @@ after this folder: `ReadMe_Diagnostic Webex listener.txt` and
 `ReadMe_Diagnostic Webex listener_Full.txt`. The Launcher builds its ReadMe/Details
 targets from the program folder name, which for the listener is
 `Diagnostic Webex listener`, so `ReadMe_Diagnostic.txt` would never be found for it;
-`b_t.py::_build_one_helper` copies both into `dist\Diagnostic Webex listener\vX.Y.Z\`.
+`Dev Tools/dt_core.py::build_one_helper` copies both into `dist\Diagnostic Webex listener\vX.Y.Z\`.
 
 Fixed 2026-08-20: the startup banner printed an undefined `COMMAND` (the constant is
 `COMMANDS`), so `main()` raised `NameError` immediately after the configuration check
@@ -1472,13 +1551,13 @@ silently decrypts to an empty string and alerting stops working with no error.
 ## Tests (offline, no network)
 
 ```
-python test_alerting.py         the alerting layer
-python test_monitor_frozen.py   the two "not live" checks as the tab uses them:
+python testing/test_alerting.py         the alerting layer
+python testing/test_monitor_frozen.py   the two "not live" checks as the tab uses them:
                                 "not updating" (verdict, one-shot notification,
                                 table rendering) and the refresh watchdog
                                 (/status, /alarms, State column, chart stamp,
                                 and when a lasting stall reaches the chat)
-python -m pytest test_rule_change_grace.py
+python -m pytest testing/test_rule_change_grace.py
                                 the hold after the limits in force change: when
                                 it opens, what it does to a half-built alert
                                 state, what the table and the bot say meanwhile,
@@ -1515,7 +1594,7 @@ python -m pytest testing/test_backfill_memory.py
                                 awkward asks — a refused plan, a tripped memory
                                 guard and one unreadable PV — each reporting back
                                 instead of wedging the caller's in-flight flag
-python test_bot_commands.py     the chat command grammar
+python testing/test_bot_commands.py     the chat command grammar
 python testing/test_help_topics.py
                                 `/help plot`: that EVERY command has a page (a
                                 new command without one fails here), that the
@@ -1535,8 +1614,23 @@ python testing/test_change_limits.py
                                 conversation is never taken for an answer, the
                                 order check the window's own editor lacks,
                                 two people changing different PVs at once, the
-                                question going stale, /undo, and that the change
-                                opens the same alerting hold a rule switch does
+                                question going stale, the /undo stack, and that
+                                the change opens the same alerting hold a rule
+                                switch does
+python testing/test_bot_control.py
+                                the rest of running notifying from the chat:
+                                /add (exact name, numbered pick), /remove (asks,
+                                `ok` is not a yes), /rename, /rule edits and
+                                their refusals, /snooze and the one alert owed
+                                when it ends, /ack spent when the level moves,
+                                /channels, /quiet, /pacing, /settings, undo
+                                across different commands, /history on disk
+python testing/test_quiet_rules.py
+                                the pure half: quiet-rule spellings, a window
+                                past midnight belonging to its first day,
+                                "warnings" letting alarms and their all-clear
+                                through, the master switch, mute lengths
+                                (`2h`, `until 8:00`, `forever`)
 python testing/test_plot_dpi.py
                                 the `; 300dpi` option, that a bare number there
                                 is still a window in hours, the PNG really
@@ -1551,7 +1645,7 @@ python testing/test_pv_filter.py
                                 plfe is scoped to that group and says so when
                                 alerting is off for all of it, and /graph still
                                 insists on one PV
-python test_okbase_menu.py      the canteen menu, pinned against a live
+python testing/test_okbase_menu.py      the canteen menu, pinned against a live
                                 capture: the real payload and its three
                                 traps, splitting the two languages out of
                                 one field, grouping by course, reviving a
@@ -1596,7 +1690,7 @@ python testing/test_signin_is_kept.py
                                 "expired" verdict is cleared — the bug where
                                 the dialog said "the sign-in works" and the
                                 bot went on saying the opposite
-python -m pytest test_edge_cdp.py
+python -m pytest testing/test_edge_cdp.py
                                 the Sign in with Edge plumbing, offline: the
                                 hand-written websocket framing (masking, the
                                 three length forms, fragments, pings, a

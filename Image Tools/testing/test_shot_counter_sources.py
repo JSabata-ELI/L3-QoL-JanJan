@@ -122,6 +122,7 @@ def main() -> int:
     c.add("cam:A", [t + 160 * MS], 60.1)
     check(c.shown == before + 1, f"the next shot adds one, not two ({c.shown})")
     c.set_main("cam:C")                               # a camera never seen before
+    c.set_cameras(["cam:A", "cam:C"])                 # ...in place of B
     c.prime("cam:C", [t + 300 * MS])                  # its frame of the last shot
     t += 5 * S
     c.add("cam:C", [t + 300 * MS], 65.0)
@@ -223,6 +224,57 @@ def main() -> int:
     got = judged(plan, {"cam:A": (160 * MS, set(), None),
                         "cam:F": (0, set(), 300 * MS)})
     check(got == 120, f"20 shots at 5 s, then 100 at 3.3 Hz = 120 ({got})")
+
+    def low_power(cams, n, gap=5 * S, before=0, stop=None, resume=None, closed=None):
+        """The archiver answers every poll, the energies read a pulse for the first
+        `before` shots only (then meter noise, filtered out). `cams` = {name: (lag,
+        free)}: a triggered camera stores one frame per shot while the laser fires
+        (shots 0..n-1 except stop <= k < resume), a free one stores every `gap`
+        regardless. `closed` = (k, name): that camera is closed at shot k. Returns
+        the counter and the count after every shot."""
+        c = is_t.ShotCounter(reset_s=1e9)
+        t0 = 1000 * S
+        for name, (lag, _free) in cams.items():
+            c.prime(name, [t0 - k * gap + lag for k in range(1, 4)])
+        c.energy_answered(0.0)
+        c.add_energy("PTM1", [t0 - k * gap for k in range(1, 5)] if before else [], 0.0)
+        open_cams = set(cams)
+        c.set_cameras(open_cams)
+        counts = []
+        for k in range(n):
+            t = t0 + k * gap
+            now = 1.0 + k * gap / S
+            firing = not (stop is not None and stop <= k < (resume or n))
+            if closed and k == closed[0]:
+                open_cams.discard(closed[1])
+                c.set_cameras(open_cams)
+            for name, (lag, free) in cams.items():
+                if name in open_cams and (free or firing):
+                    c.add(name, [t + lag], now)
+            c.energy_answered(now)
+            c.add_energy("PTM1", [t] if firing and k < before else [], now + 0.5)
+            counts.append(c.count)
+        return c, counts
+
+    print("Low power: the archiver answers, the energies read only noise")
+    trig = {"cam:A": (160 * MS, False), "cam:B": (500 * MS, False)}
+    c, counts = low_power(trig, 60)
+    check(c.count == 60, f"60 shots on two cameras = 60 ({c.count})")
+    lagging = max(k + 1 - got for k, got in enumerate(counts))
+    check(lagging <= 1, f"the count keeps up shot by shot, never more than 1 behind "
+                        f"({lagging})")
+    c, counts = low_power(trig, 60, before=20)
+    check(c.count == 60, f"20 full-power shots, then 40 low-power = 60 ({c.count})")
+    jumps = max(b - a for a, b in zip(counts, counts[1:]))
+    check(jumps <= 8, f"the switch to frames adds at most a few shots at once "
+                      f"({jumps})")
+    c, counts = low_power({**trig, "cam:D": (-100 * MS, True)}, 60, stop=30, resume=45)
+    check(c.count == 45, f"laser stops at 30, back at 45; a camera running free "
+                         f"stores on meanwhile = 45 ({c.count})")
+    check(max(b - a for a, b in zip(counts, counts[1:])) <= 8,
+          "no burst when the laser comes back")
+    c, counts = low_power(trig, 60, closed=(20, "cam:B"))
+    check(c.count == 60, f"one of two cameras closed at 20 = 60 ({c.count})")
 
     print()
     if fails:

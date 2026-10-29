@@ -100,7 +100,12 @@ def make_dialog(m, samples_by_ch: dict, step_channels=(), checked=()):
         dlg._pv_list.blockSignals(False)
         dlg._refresh_primary_combo()
         dlg._reload_series()
-    B.wait_for(lambda: bool(dlg._series), timeout_s=10.0)
+    # Every ticked PV, not just the first: since 27.10.2026 each PV is drawn as
+    # it arrives, so "something loaded" is only the first of them.
+    want = [ch for _lbl, ch in dlg._checked_channels()]
+    B.wait_for(lambda: bool(dlg._series)
+               and all(ch in (dlg._series.get(DAY) or {}) for ch in want),
+               timeout_s=10.0)
     dlg._redraw()
     return dlg
 

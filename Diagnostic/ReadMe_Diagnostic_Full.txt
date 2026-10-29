@@ -2,12 +2,14 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-10-05
-  (monitor_tab.py 10394 lines, okbase_menu.py 3090, bot_commands.py 1256,
-   alerting.py 1117, edge_cdp.py 992, chart_history.py 890,
-   remote_launcher.py 802, cpva_api.py 585, main.py 463,
-   shared_pvs.py 364, okbase_capture.py 248, notify_provision.py 238,
-   memstats.py 187, secrets_util.py 70)
+Verified against source: 2026-10-15
+  (main.py 450 lines, monitor_tab.py 10621, okbase_menu.py 3090,
+   bot_commands.py 1241, alerting.py 1117, edge_cdp.py 992,
+   chart_history.py 890, remote_launcher.py 808, cpva_api.py 770,
+   shared_pvs.py 364, okbase_capture.py 250, notify_provision.py 238,
+   memstats.py 187, operation_history_logic.py 128,
+   secrets_util.py 70; 21216 lines in all)
+  Program folder: 5.4 MB in 226 files (without testing/, build output and caches)
 -----------------------------------------------------------------
 Short version: ReadMe_Diagnostic.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -50,7 +52,7 @@ it could only report the file missing.
 | File | What it is |
 |------|-----------|
 | `main.py` | Entry point and window. Builds the tabs, shows a splash, and records that it is running (`run_status.json` in `%APPDATA%\Diagnostic`, plus the legacy `diagnostic.lock`) so `remote_launcher.py` can tell whether the app is already up. matplotlib is imported **lazily** (`monitor_tab` inside `main()` after the splash) — on a cold file cache that import costs tens of seconds, and this way the splash paints first. |
-| `monitor_tab.py` | The whole PV Monitor tab: PV table, live graph, threshold/condition editing, Settings, share publishing, alert dispatch, Webex commands. By far the largest module (~6.4 k lines) |
+| `monitor_tab.py` | The whole PV Monitor tab: PV table, live graph, threshold/condition editing, Settings, share publishing, alert dispatch, Webex commands. By far the largest module (~10.6 k lines) |
 | `alerting.py` | The alert state machine and the notification channels — Teams (`build_messagecard`), SMTP email, and `WebexNotifier` (send + two-way command listening). Also the Qt-free sample-series check `classify_trend` (reminder pacing), and the run-status file (`run_status_path` / `read_run_status` / `write_run_status`) that lets `remote_launcher.py` see from outside whether the app is up and tracking |
 | `cpva_api.py` | Thin CPVA REST client + `get_app_dir()` used to resolve every path |
 | `shared_pvs.py` | PV list + shared settings on the scratch share (see below) |
@@ -59,12 +61,12 @@ it could only report the file missing.
 | `bot_commands.py` | Grammar of the chat commands — `,` between items, `;` before options, and the time/Y-range parsers. Qt-free on purpose so it can be tested alone |
 | `memstats.py` | Reads the Windows memory figures with `ctypes` (no extra package): this program's committed memory and working set, and the whole PC's commit charge against its limit. Feeds the status bar, the half-hourly log line and the listener's console — see "Memory on a long uptime" |
 | `remote_launcher.py` | Standalone Webex listener that starts the app on `/run` (see below). Built as its own program — `dist\Diagnostic Webex listener\` |
-| `test_alerting.py` | Offline tests for the alerting layer (`python test_alerting.py`) |
-| `test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict (a new reading arriving is the whole question — a steady number is asserted NOT to be a fault, so the chiller false alarms cannot come back), its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python test_monitor_frozen.py`) |
-| `test_rule_change_grace.py` | Offline tests for the hold that follows a change of the limits in force: when it opens, what it does to a half-built alert state, what the table and the bot say while it runs, and a regression test reproducing the end-of-shift chiller messages with the hold switched off (`python -m pytest test_rule_change_grace.py`) |
-| `test_bot_commands.py` | Offline tests for the chat command grammar (`python test_bot_commands.py`) |
+| `testing\test_alerting.py` | Offline tests for the alerting layer (`python testing\test_alerting.py`) |
+| `testing\test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict (a new reading arriving is the whole question — a steady number is asserted NOT to be a fault, so the chiller false alarms cannot come back), its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python testing\test_monitor_frozen.py`) |
+| `testing\test_rule_change_grace.py` | Offline tests for the hold that follows a change of the limits in force: when it opens, what it does to a half-built alert state, what the table and the bot say while it runs, and a regression test reproducing the end-of-shift chiller messages with the hold switched off (`python -m pytest testing\test_rule_change_grace.py`) |
+| `testing\test_bot_commands.py` | Offline tests for the chat command grammar (`python testing\test_bot_commands.py`) |
 | `edge_cdp.py` | The **Sign in with Edge** button: opens a browser window of its own on the canteen page, waits for the sign-in, and reads it out of that window. No extra library — it carries a small websocket client of its own |
-| `test_edge_cdp.py` | Offline tests for that, with no browser and no network (`python -m pytest test_edge_cdp.py`) |
+| `testing\test_edge_cdp.py` | Offline tests for that, with no browser and no network (`python -m pytest testing\test_edge_cdp.py`) |
 | `build_config.json`, `icon.ico` | Build settings for Dev Tools (`extra_files` carries `notify_provision.dat`; `win32crypt`, `okbase_menu` and `edge_cdp` are forced into the bundle) and the app icon |
 | `STRUCTURE.md` | Developer map of every module, class and function |
 
@@ -80,6 +82,10 @@ thrown away: `DataRepository\`, `RampingRepository\`, `builder_config.json`,
 
 ```
 CPVA archive (REST, https://10.78.0.57:8443)
+  │    backup when it cannot be reached at all: the L3 proxy on
+  │    10.78.0.64 / .65, same archive; used for a minute, then CPVA again
+  │  + the L3 beam transport (L3BT) and facility (FCT) archives on the same
+  │    hosts, for channels CPVA does not have; the PV search finds them too
   │
   │  cpva_api.cpva_fetch_samples()
   ▼
@@ -119,9 +125,26 @@ Live monitoring and alerting — in practice the whole program.
 - **Table** — one row per PV: On, name, value, updated, state, thresholds,
   conditional rules, valid range, group. Alert state is one of ok / warn / alarm /
   no-data / bad-data (out-of-range sensor reading, painted distinctly from no-data)
-  / not-updating (see below).
+  / not-updating (see below). A PV without its own valid range uses the global
+  one from Settings → **Sensor-error ranges**: a table with one row per kind
+  of PV (Name, Groups, Units, Reject below <, Reject above >; an empty limit
+  is no bound). A PV takes the first row naming its **group or subgroup**;
+  failing that, the first row listing its **unit**; failing that, the
+  "Everything else" pair below the table. So a new kind of PV — humidity in
+  %RH, helium pressure in psi — gets its own range by adding a row, with no
+  code change. On the first launch of this version the table is built from
+  the old fields: "Pressure" (Torr, mTorr, mbar, bar, Pa, kPa, MPa, psi) with
+  the old pressure ceiling, "Temperature" (DegC, °C, K, …) with the old
+  temperature ceiling. Edit PV says which row a PV is under. Keep a row's
+  ceiling above the alarm limits of its PVs: a reading above the ceiling is
+  dropped as a sensor fault before the limits ever see it. (One shared ceiling
+  of 80 once marked a vented chamber's ~800 Torr as bad data; PSI, unknown as
+  a pressure until 20 Oct 2026, fell under the temperature ceiling the same
+  way.)
 - **Graph** — the recent history of the selected PVs (`graph_window_minutes`).
-  Right-click a tick-label area for that axis's range/autoscale, or the plot
+  Right-click a tick-label area for that axis's range/autoscale (left or any
+  right-hand unit axis; Refresh clears all of them, a toolbar zoom pins all
+  of them until Home / Reset zoom), or the plot
   itself for the view options: grid lines, **PV list beside graph**, and
   **Legend**.
 - **PV list beside the graph** (default, `graph_pv_panel`) — a fixed, scrollable
@@ -159,7 +182,11 @@ Live monitoring and alerting — in practice the whole program.
   hysteresis), `renotify_cooldown_minutes` reminders that speed up or slow down
   with the recent trend (`trend_*` keys), recovery notices, and a data watchdog
   that alerts once when *every* PV stops returning data for
-  `data_watchdog_fail_polls` polls and once when the flow resumes.
+  `data_watchdog_fail_polls` polls and once when the flow resumes. Outages
+  close together count as one episode: while it lasts the alarm is repeated
+  only every `data_watchdog_remind_hours` (12), and the OK is sent only after
+  `data_watchdog_ok_after_minutes` (15) with no fully-failed poll — a failure
+  inside that wait restarts it without a new message.
 - **Rule-change grace** — a conditional rule swaps a PV's whole band the instant
   its dependency PVs move, and the measured value cannot follow that fast, so
   alerting for that PV is held for `rule_change_grace_minutes` after every such
@@ -299,7 +326,7 @@ exists:
 
 In the room marked **Listen for commands** the bot answers one-line commands.
 `/help` prints the whole thing in the chat; the grammar itself lives in
-`bot_commands.py` and is tested by `test_bot_commands.py`.
+`bot_commands.py` and is tested by `testing\test_bot_commands.py`.
 
 **Tag the bot.** As soon as a space has more than two people in it, Webex shows a
 bot **only** the messages that @mention it — the Messages API answers `403` for
@@ -370,17 +397,31 @@ The commands themselves:
 | Command | What it does |
 |---|---|
 | `/help`, `/?` | this cheat sheet (a bare `help` with no slash works too). One line per command — what it takes and the one condition that catches people out — because it is read on a phone standing at the machine. Everything longer than that lives on the `/help <command>` pages, including the whole of lunch ordering (`/help food`) |
-| `/help <command>` | the long version of one command: its syntax, worked examples and **what to watch out for** — the part a list of options cannot carry. `/help plot` is the one worth reading (why the band looks like a thick line, when `SAMPLED` appears, why `; 300` is 300 hours and `; 300dpi` is a resolution). Pages exist for `status`, `alarms`, `list`, `plot`, `time`, `change`, `undo`, `graph`, `stop`, `enable`, `cancel`, `window`, `yaxis`, `datawatchdog`, `run`, `food` and `mention`; the words people reach for are aliased onto them (`/help dpi`, `/help alerts`, `/help abort`, and `plot help` with no slash). An unknown topic is answered with the list instead of the cheat sheet |
+| `/help <command>` | the long version of one command: its syntax, worked examples and **what to watch out for** — the part a list of options cannot carry. `/help plot` is the one worth reading (why the band looks like a thick line, when `SAMPLED` appears, why `; 300` is 300 hours and `; 300dpi` is a resolution). Pages exist for `status`, `alarms`, `list`, `plot`, `time`, `change`, `undo`, `add`, `remove`, `rename`, `rule`, `snooze`, `ack`, `history`, `test`, `channels`, `quiet`, `pacing`, `settings`, `graph`, `stop`, `enable`, `cancel`, `window`, `yaxis`, `datawatchdog`, `run`, `food` and `mention`; the words people reach for are aliased onto them (`/help dpi`, `/help alerts`, `/help abort`, and `plot help` with no slash). An unknown topic is answered with the list instead of the cheat sheet |
 | `/status [pv, pv]` | value + state for all PVs, or only the named ones. Always ends with when those values were read; if the program has stopped reading, a warning goes above the list and each line reads `not refreshed` in place of `ok`. The whole-list reply also carries the uptime and memory footer, and — only when the canteen sign-in has actually been refused — one quiet line about that |
 | `/alarms [pv, pv]` | only PVs currently in warning/alarm. With a part of a name, only that group (`/alarms chiller`); if alerting is off for every PV in the group it says that instead of "all clear". Refuses to answer "all clear" while the values are out of date |
 | `/list [pv, pv]` | the configured PVs. With a part of a name, only the matching ones — `/list plfe` answers with the four PLFE pressures and says "4 of 31" so the reply cannot be mistaken for the whole list |
 | `/plot <pv, pv, …>[; window][; y lo-hi][; detail][; 300dpi]` | **one** graph with a curve per PV. `/plot all` takes every PV. A single PV also gets its warning/alarm lines — an overlay does not, since the lines would belong to no visible curve. Without a window option the **Alert plot window** from Settings is used. `; 300dpi` (also `; dpi 300`, 50–1200) draws that one picture at another resolution instead of the **Picture resolution** from Settings, and the reply says which was used. Over a long window see "A plot over weeks or months" below |
-| `/cancel`, `/abort` | take back a plot that is still being fetched. A year-long window is hundreds of requests to the archiver and minutes of waiting; this stops the requests that have not gone out yet and sends nothing, so the right window can be asked for straight away. Requests already in flight still have to come back, so the reply is not instant. "Nothing is running" means there was nothing to take back |
+| `/cancel`, `/abort` | take back a plot that is still being fetched, or drop an open question of the bot's (a `/change` listing, an `/add` list, a `/remove` confirmation). A year-long window is hundreds of requests to the archiver and minutes of waiting; this stops the requests that have not gone out yet and sends nothing, so the right window can be asked for straight away. Requests already in flight still have to come back, so the reply is not instant. "Nothing is running" means there was nothing to take back |
 | `/start` | alerting on (PVs are read and plotted either way) |
 | `/stop [hours]` | alerting off; with hours, auto-resume later. This is about **alerting**, not about a running plot — that one is `/cancel`. If a plot is still being fetched, the reply says so and offers `/cancel` |
 | `/enable <pv, pv>` / `/disable <pv, pv>` | alerting per PV |
 | `/change <pv>` | move a warning or alarm limit without walking to the PC. `/change DA1` prints that PV's limits with a number against each one — the Global four, then four per conditional rule, with the rule in force marked and the current value above them — and the answer is `6 15`. `limit 6 hodnota 15`, `6 = 15`, `6 15, 7 17`, `warn high 25` and `3,3 Hz warn high 14.6` all work, and `6 none` clears a bound. **In a room the answer has to tag the bot too** (`@Diagnostics 6 15`), because Webex delivers nothing else; `/change 6 15` is the form that always gets through, and the whole thing fits on one line as `/change DA1 warn high 25`. One PV at a time: a fragment fitting several is answered with the candidates. Unlike the window's own editor it checks the order — alarm low, warn low, warn high, alarm high, lowest to highest — and refuses a value that would cross another, writing nothing. It takes effect at the next reading and then holds alerting for that PV for the usual rule-change wait. Saved and published like any other change; the question is forgotten after 15 min or on `/cancel`. Only while the app is open |
-| `/undo` | put the last `/change` back. One step, in memory only, gone when the program restarts |
+| `/undo` | put the last change made from the chat back — limits, PVs added/removed/renamed, rules, snoozes, `/enable`/`/disable`, channel mutes, quiet rules, pacing. Send it again for one more step back, up to 20, whoever made them. Only the fields that change touched come back, so a later edit in the window is left alone. In memory only, gone when the program restarts; `/ack` is not undoable |
+| `/add <archive name>` | start monitoring a PV. Any part of the name: one match is added at once, several are listed numbered (up to 15, already-monitored ones marked) and the answer is the number (`2`, or `2, 5`; in a room `@Diagnostics 2` or `/add 2`). The new PV is read and plotted straight away (its graph history is fetched), but has **no limits and alerting off** until `/change` and `/enable`. It sits in no group; groups are arranged in the window |
+| `/remove <pv>` | stop monitoring one PV. Asks first; `ano` (or `/remove ano`) removes, `ne` or `/cancel` keeps it. Says so when the PV is another PV's dependency (its rules keep reading it). `/undo` brings it back in the same place with its limits and rules |
+| `/rename <pv>; <new name>` | the name shown everywhere. Refused if another PV already has it. The archive name and everything keyed on it stay |
+| `/rules <pv>` | the PV's dependency PVs (with their current values) and its rules, numbered, with their conditions and limits and the one in force marked |
+| `/rule <pv>; <action>` | edit the rules: `gate 1 <archive name>` / `gate 2 none` (dependency PVs; clearing one drops every rule's condition on it), `add <label>; <cond>[; <cond>]`, `cond <n>; <cond>[; <cond>]`, `label <n> <text>`, `move <n> <position>`, `remove <n>`. Conditions: `1`, `0.2-3`, `>=5`, `<=2`, `any`. A new rule has no limits — `/change` gives it some. A refused edit leaves the PV exactly as it was |
+| `/snooze <pv, pv>; <how long>` | no alert about these PVs (their data faults included) for `2h`, `30m`, `until 8:00`, `until tomorrow 8:00`, `until 21.10. 8:00` or `forever`; without a `;` the time may stand at the end (`/snooze DA1 2h`). The PV is still read and judged; the Alarm status cell shows `snoozed → 08:00`. Saved with the PV, so a restart does not end it. **If the PV is still out of its limits when the snooze ends, one alert goes out then.** `/snooze` alone lists the snoozed PVs |
+| `/unsnooze <pv, pv\|all>` | end a snooze early |
+| `/ack [pv, pv]` | acknowledge what is in warning or alarm now (no PV = everything alarming): reminders for that level stop; a worse level or a recovery is announced as usual and ends the acknowledgement. Memory only |
+| `/history [pv][; window]` | the last 20 entries: alerts sent (📣), held back by a snooze, acknowledgement, mute or quiet rule (🔇), failed to send (⚠), changes made from the chat with who made them (✏️), tests (🧪). Kept in `bot_history.jsonl` beside the program, the last 2000 lines, so it survives a restart |
+| `/test [webex\|email\|teams]` | a test message to every working channel, or the one named; the reply says which arrived. Ignores mutes and quiet hours, and says when real alerts would be held right now |
+| `/channels` | each channel: not set up / on / muted until … / in a quiet rule now. `/channels email off 4h` (`off` alone = until switched back on, `until 7:00` works too), `/channels email on`, `/channels all off 1h`. Warns when every channel ends up muted |
+| `/quiet …` | regular quiet hours: `/quiet` lists them; `/quiet add <channels>; <days>; <hours>; <what>` in any order — e.g. `email; mon-fri; 22:00-06:00; warnings`, `webex, email; weekend; all day; reminders`, `email; daily; 12:00; 1h; label Lunch`. `warnings` holds warnings and reminders but lets alarms (and an alarm's all-clear) through; `reminders` holds only reminders; `all` (default) holds everything. `/quiet remove 2`, `/quiet off 2` / `on 2`, `/quiet off` / `on` (all of them). The same rules are edited in Settings |
+| `/pacing` | shows and sets Re-notify cooldown (`reminder 60`), Notify on recovery (`recovery off`), Hold after a rule change (`hold 20`), Debounce, Settle wait and Stability hold — several at once with commas. Shared with the PV list like the same fields in Settings |
+| `/settings` | one message: monitoring on/off, channels and mutes, quiet rules, pacing, snoozed / acknowledged / switched-off PVs, data watchdog, whether the shared list is reachable |
 | `/datawatchdog on\|off` | the "no data at all" alert; no argument shows the state |
 | `/graph <pv\|all>` | what the app window itself shows (one PV or all) |
 | `/window <minutes>` | time window of that live graph |
@@ -1008,10 +1049,11 @@ it. A row whose **On** box is unchecked still shows `off` as before.
   PV's row is redrawn; the rest of the table stays as it is. A new dependency PV's
   own value still arrives with the next poll.
 - Number boxes, dropdowns and sliders react to the mouse wheel only after you
-  have **clicked** them, and only while the pointer stays on them. Scrolling over
-  a field you have not clicked (or have since moved away from) scrolls the table
-  or the page instead. This applies to every window of the program, the Settings
-  dialog and the PV editor included.
+  have **clicked** them, and only while the pointer is over them. Moving the
+  pointer away does not unselect the field: back over it, the wheel works again.
+  Clicking another control ends it. Scrolling over a field you have not clicked
+  scrolls the table or the page instead. This applies to every window of the
+  program, the Settings dialog and the PV editor included.
 - The Settings **Send test** buttons run in the background: the dialog stays
   usable while a test waits on a slow server, and the result appears below.
 - The program's own startup splash never takes the keyboard focus and does not
@@ -1089,7 +1131,7 @@ set took over and until when nothing will be raised. `/status` and `/alarms` add
 It is a delay, not an amnesty: a value still outside the new band when the hold
 expires goes through the ordinary debounce and settle and alerts then — a chiller
 switched on and still at 14.5 °C three quarters of an hour later is not cooling,
-and that is worth a message. `test_rule_change_grace.py` covers all of it,
+and that is worth a message. `testing\test_rule_change_grace.py` covers all of it,
 including the morning start-up with the hold off (so the reason for the feature
 cannot be quietly removed) and the 31.08. evening, which it asserts still alarms,
 because that one is the missing `PumpON` dependency and not this.
@@ -1285,6 +1327,36 @@ group's config with a stale copy).
 A shared file written by an older version has no `settings` block; the first
 upgraded copy publishes its own settings once as the baseline and says so in the
 Log tab.
+
+### Muting channels and quiet hours
+
+The channels' on/off ticks come from the build and are never saved, so a mute
+written into them would be gone at the next restart. Mutes therefore live in
+three settings of their own, kept on this PC only (not on the share, because the
+channels are this PC's):
+
+- `channel_off_until` — `/channels email off 4h`: channel → end time, or
+  "forever". Holds every alert on that channel until then.
+- `quiet_rules` — regular windows: channels, weekdays, a start with an end or a
+  length, and what is held (`all`, `warnings` = warnings and reminders but not
+  alarms, `reminders`). A window past midnight belongs to the day it starts on.
+  Edited with `/quiet` in the chat or in Settings → Notification channels →
+  **Quiet hours** (a row that cannot be read keeps the dialog open and says
+  which).
+- `quiet_rules_enabled` — **Apply the quiet hours below** in Settings, and
+  `/quiet on|off` in the chat: off suspends every rule without losing them.
+
+Every alert the monitor raises (limits, "not updating", "not refreshing", the
+data watchdog) goes through one gate before it is sent; each channel that is
+muted or in quiet hours is left out, and an alert with no channel left is not
+sent at all. Each one is still logged, and written to `/history` as "held"
+with the reason. Replies to chat commands, **Send plot now** and `/test` are
+never held.
+
+A snoozed PV (`/snooze`) is held the same way for all its alerts; the snooze is
+saved with the PV and ends by itself. If the PV is still out of its limits when
+it ends, one alert goes out then. `/ack` is memory-only and holds only the
+reminders of the level that was acknowledged.
 
 ### Notification channels baked into the build
 

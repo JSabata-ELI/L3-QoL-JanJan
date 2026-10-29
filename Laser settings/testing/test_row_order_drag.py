@@ -4,9 +4,10 @@
 
 Asked for on 12.10.2026:
 
-  * rows dragged into the operator's own order on the Limits tab — driven
-    through the table's own drop handler (`_RowTable.on_drop` /
-    `SettingsTab.move_rows`), never with synthetic mouse input;
+  * rows dragged into the operator's own order on the Limits tab — through
+    `SettingsTab.move_rows`, and (since the 12.10.2026 fix, when a real drag
+    only picked rows) through `_RowTable`'s own mouse handlers, called
+    directly on a window that is never shown — no input goes to the screen;
   * a formula keeps meaning the same rows after a move;
   * dropping a row under the "Not shown" line unticks its Show;
   * the Overview's Scanning box switches every row with scan limits at once;
@@ -103,6 +104,75 @@ def main():
     lim.move_rows([0, 1], 4)
     flush()
     check("the list", names()[:4], ["Alpha", "Beta", "Twice A", "Gamma"])
+
+    print("dragged with the mouse, through the table's own handlers")
+    from PySide6.QtCore import QEvent, QItemSelectionModel, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    table = lim._table
+    left, nobutton = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+
+    def mouse(kind, y, button=left, buttons=left):
+        p = QPointF(30, y)
+        return QMouseEvent(kind, p, p, button, buttons,
+                           Qt.KeyboardModifier.NoModifier)
+
+    def mid(r):
+        return table.rowViewportPosition(r) + table.rowHeight(r) // 2
+
+    def low(r):                     # the lower half: "after this row"
+        return table.rowViewportPosition(r) + table.rowHeight(r) * 3 // 4
+
+    def drag(from_y, to_y):
+        table.mousePressEvent(mouse(QEvent.Type.MouseButtonPress, from_y))
+        table.mouseMoveEvent(mouse(QEvent.Type.MouseMove, from_y + 12,
+                                   nobutton))
+        table.mouseMoveEvent(mouse(QEvent.Type.MouseMove, to_y, nobutton))
+        moving = table.is_moving()
+        line = not table._line.isHidden()
+        table.mouseReleaseEvent(mouse(QEvent.Type.MouseButtonRelease, to_y,
+                                      left, nobutton))
+        flush()
+        return moving, line
+
+    table.resize(900, 400)
+    moving, line = drag(mid(0), low(2))     # Alpha to after Twice A
+    check("the press and move became a move, not a picking",
+          (moving, line), (True, True))
+    check("the list", names()[:4], ["Beta", "Twice A", "Alpha", "Gamma"])
+
+    table = lim._table
+    table.clearSelection()
+    model = table.selectionModel()
+    for r in (0, 1):
+        model.select(table.model().index(r, 0),
+                     QItemSelectionModel.SelectionFlag.Select
+                     | QItemSelectionModel.SelectionFlag.Rows)
+    drag(mid(1), low(3))                    # the picked pair to the bottom
+    check("a picked group moves together", names()[:4],
+          ["Alpha", "Gamma", "Beta", "Twice A"])
+
+    table = lim._table
+    table.mousePressEvent(mouse(QEvent.Type.MouseButtonPress, mid(0)))
+    table.mouseMoveEvent(mouse(QEvent.Type.MouseMove, mid(0) + 40, nobutton))
+    from PySide6.QtGui import QKeyEvent
+    table.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                                  Qt.KeyboardModifier.NoModifier))
+    table.mouseReleaseEvent(mouse(QEvent.Type.MouseButtonRelease,
+                                  mid(0) + 40, left, nobutton))
+    flush()
+    check("Esc cancels", names()[:4], ["Alpha", "Gamma", "Beta", "Twice A"])
+    lim.move_rows([1], 4)                   # back to the order below
+    flush()
+    check("(order put back)", names()[:4],
+          ["Alpha", "Beta", "Twice A", "Gamma"])
+
+    print("the limits table grows with the window")
+    small = lim._table.minimumHeight()
+    n = min(lim._table.rowCount(), lim._MIN_ROWS)
+    check(f"never shorter than its first {n} rows",
+          small >= n * lim._table.rowHeight(0), True)
+    check("no fixed height any more",
+          lim._table.maximumHeight() > 10000, True)
 
     print("dropped under the Not shown line, Show goes off")
     beta = win.rows()[1]

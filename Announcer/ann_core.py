@@ -236,36 +236,55 @@ def search_channels(names, query, limit=400):
     * the query is split into WORDS, and every word has to appear somewhere in
       the name. Nothing has to be at the start, and nothing has to be adjacent
       — "chl temp" finds `L3-UTIL-CHL03-001:Temp`;
-    * the ORDER is honoured: a name carrying the words in the order they were
-      typed ranks above one carrying them jumbled;
+    * the ORDER of the words does not matter: "temp chl" gives exactly what
+      "chl temp" gives, in the same ranking;
+    * commas, semicolons and `*` separate words just like spaces;
     * a fragment that fits several channels returns THOSE channels. It is a
       filter, never an error and never the whole list back.
 
     `total` is how many matched before `limit` cut the list, so the caller can
     say "showing 400 of 1620" rather than silently showing part of an answer.
     """
-    words = [w for w in (query or "").lower().split() if w]
+    text = (query or "").lower()
+    for sep in ",;*":
+        text = text.replace(sep, " ")
+    words = text.split()
     if not words:
         return [], 0
     scored = []
     for name in names:
-        low = name.lower()
-        if any(w not in low for w in words):
-            continue
-        # In order, and how early it starts: both cheap, and together they put
-        # the obvious answer first.
-        pos, in_order, at = 0, True, []
-        for w in words:
-            found = low.find(w, pos)
-            if found < 0:
-                in_order = False
-                found = low.find(w)
-            at.append(found)
-            pos = max(pos, found + len(w))
-        score = (0 if in_order else 1, min(at), len(name), name)
-        scored.append((score, name))
+        s = _rank_channel(name, words)
+        if s is not None:
+            scored.append(((s, len(name), name), name))
     scored.sort()
     return [n for _s, n in scored[:limit]], len(scored)
+
+
+def _rank_channel(name, words):
+    """Sort weight of one channel (lower = better), or None when a word is
+    missing. Each word is graded on its own — exact name 0, exact field (the
+    part after the last ':') 1, a prefix 2, inside the field 3, anywhere 4 —
+    the weakest word sets the tier and the sum breaks ties. Nothing here looks
+    at the order the words were typed in."""
+    low = name.lower()
+    field = low.rsplit(":", 1)[-1]
+    worst = total = 0
+    for w in words:
+        if w == low:
+            s = 0
+        elif w == field:
+            s = 1
+        elif low.startswith(w) or field.startswith(w):
+            s = 2
+        elif w in field:
+            s = 3
+        elif w in low:
+            s = 4
+        else:
+            return None
+        worst = max(worst, s)
+        total += s
+    return worst * 10 + min(total, 9)
 
 
 def short_summary(item):

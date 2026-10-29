@@ -12,7 +12,7 @@ WHAT IT DOES
   programs, and puts those programs onto the shares where everybody
   runs them from.
 
-  One window (it opens maximised), two tabs sharing one log:
+  One window (it opens at its normal size, not maximised), two tabs sharing one log:
 
     Builder        source folder  ->  a program
     Copy Manager   a program      ->  the shares
@@ -36,10 +36,12 @@ BUILDER
   that contains a source file is a project, and the starting file is
   found automatically.
 
-  Each project shows the version it was last built as and the next
-  one, which is the last number stepped up by one and can be typed
-  over. Projects are grouped as Main, Side or Ignored, and the
-  grouping is remembered.
+  Each project shows the next version in the list. Click a line and
+  the "Selected program" panel on the right shows the version it was
+  last built as and the next one, which is the last number stepped up
+  by one and can be typed over. The same panel sets the Group (Main,
+  Side or Ignored — remembered; Ignored ones show only with "Show
+  ignored") and has "Open ReadMe" for the program's short document.
 
   Tick what you want and press Build. The result goes into a folder
   named after the version, together with a copy of the sources, the
@@ -63,11 +65,10 @@ BUILDER
   A project can also declare helper programs — small programs that
   live in the same folder but are started on their own. Those appear
   as an extra line under the project, and each one builds into its
-  own folder with its own version, and with its own ReadMe and
-  Details buttons like any other program. Click the project —
-  anywhere on its line, or its tick box, or Details — and its helpers
-  open; the little arrow in front of the name closes them again.
-  Opening and closing never changes what is ticked.
+  own folder with its own version and its own ReadMe, like any other
+  program. Click the project — anywhere on its line, or its tick box —
+  and its helpers open; the little arrow in front of the name closes
+  them again. Opening and closing never changes what is ticked.
 
 
 COPY MANAGER
@@ -96,12 +97,12 @@ COPY MANAGER
 
   The other buttons:
 
-    ReadMe only       refresh just the documentation files — both the
+    Copy ReadMe only  refresh just the documentation files — both the
                       short one and the detailed one
     Fix               repair old archive folders, the helper
                       programs' folders included
-    Build internal    build the shared support folder
-    Deploy internal   push that folder to the selected programs
+    Deploy Libraries  push the shared support folder (built by the
+                      Internal Builder project) to the ticked programs
 
 
 THE ARCHIVE LAYOUT
@@ -125,6 +126,6 @@ THE ONE NAMING RULE
 
   And remember that the documentation only reaches a share when you
   publish it. Writing a new ReadMe in the repository changes nothing
-  on Z: until Copy or "ReadMe only" has run.
+  on Z: until Copy or "Copy ReadMe only" has run.
 
 -----------------------------------------------------------------

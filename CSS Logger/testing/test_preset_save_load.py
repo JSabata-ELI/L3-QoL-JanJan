@@ -111,7 +111,7 @@ def main() -> int:
     t = by_name("Tuning")[0]
     check("Save keeps conditions", t.get("conditions") == [{"pv": "c", "min": 1}], str(t))
     check("Save keeps master PV / multiple", a._master_pv_edit is None
-          or (t.get("master_pv") == "L3-M:RawPos" and t.get("master_multiple") == "1000"),
+          or (t.get("master_pv") == "L3-M:RawPos" and t.get("master_step") == "1000"),
           str(t))
 
     # 6. Save as new under an existing name overwrites, after a Yes.

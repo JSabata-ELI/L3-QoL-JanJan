@@ -200,6 +200,8 @@ def test_one_number_pv():
 def test_x_axis_dialog(w):
     print("X axis settings dialog")
     sp_t._cpva_channel_cache[:] = ["L3-SBDP-SPIDER:SpecDomain_Int_X", "OTHER:X"]
+    # The dialog asks the archiver again on every opening; answer from here.
+    sp_t._cpva_load_all_channels = lambda: list(sp_t._cpva_channel_cache)
     d = sp_t.XAxisSourceDialog("L3-SBDP-SPIDER:FWHM_FL", w,
                                current={"mode": "linear",
                                         "source_pv": "L3-SBDP-SPIDER:SpecDomain_Int_X",

@@ -45,7 +45,9 @@ PICKING CAMERAS
   the preset buttons appear in. The Search box finds a camera among
   the hundred in the list. The whole list is kept next to the program
   and survives a restart; "Restore defaults" brings the original
-  presets back. Hover a preset to see what is in it.
+  presets back. Hover a preset to see what is in it. "Clear all"
+  (the red button at the bottom right of Presets) unticks every
+  camera, monitor and preset at once.
 
   Ticking cameras also ticks the monitors those cameras are shown
   on, so a screenshot run does not need a second selection.
